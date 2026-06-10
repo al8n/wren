@@ -57,3 +57,8 @@ pub mod frame;
 
 /// Opening handshakes (RFC 6455 §4) and their completion type.
 pub mod handshake;
+
+/// Handshake-result negotiation: subprotocols and (plan 3b) extensions.
+pub mod negotiation;
+
+pub use negotiation::Negotiated;
