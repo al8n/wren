@@ -1,0 +1,40 @@
+[package]
+name = "websocket-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+license = "MIT OR Apache-2.0"
+description = "Sans-I/O WebSocket protocol state machines (RFC 6455/7692/8441/9220; no_std, no_alloc capable, panic-free)."
+repository = "https://github.com/al8n/websockit"
+readme = "README.md"
+keywords = ["websocket", "no-std", "sans-io", "embedded", "protocol"]
+categories = ["network-programming", "no-std", "embedded", "web-programming::websocket"]
+
+[features]
+default = ["std"]
+std = ["alloc", "thiserror/std", "smol_str/std", "bytes/std", "rand?/std"]
+alloc = ["dep:smol_str", "dep:bytes"]
+heapless = ["dep:heapless"]
+deflate = ["alloc", "dep:miniz_oxide"]
+
+[dependencies]
+thiserror.workspace = true
+derive_more.workspace = true
+rand_core.workspace = true
+sha1.workspace = true
+smol_str = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+heapless = { workspace = true, optional = true }
+miniz_oxide = { workspace = true, optional = true, features = ["with-alloc"] }
+rand = { workspace = true, optional = true, features = ["std", "thread_rng"] }
+
+[dev-dependencies]
+base64 = "0.22"
+proptest = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
