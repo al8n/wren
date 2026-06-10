@@ -27,7 +27,7 @@ pub use events::{
   CloseReceived, Closed, ControlPayload, Event, MessageKind, MessageStart, TextChunk,
 };
 pub use recv::{Events, HandleError};
-// `pub use send::EncodeError;` activates with Task 4's send path.
+pub use send::{EncodeError, FragmentKind};
 
 use crate::{negotiation::Negotiated, time::Instant};
 use role::Role;
@@ -85,9 +85,6 @@ impl ConnectionConfig {
 /// clock; `Ro` is the [`role`] (client or server), fixed at the type level.
 #[derive(Debug)]
 pub struct Connection<I, Ro> {
-  // Read by Task 4's outbound masking (`Role::next_mask`); the recv path
-  // needs only the `EXPECT_MASKED_INBOUND` associated const.
-  #[allow(dead_code)]
   pub(crate) role: Ro,
   pub(crate) config: ConnectionConfig,
   #[cfg(feature = "deflate")]
@@ -103,10 +100,7 @@ pub struct Connection<I, Ro> {
 pub(crate) enum Lifecycle {
   /// Open for data both ways.
   Open,
-  /// We sent (queued) a close; awaiting the peer's echo. Constructed by
-  /// Task 4's `close()`; the recv path only reads it to suppress a duplicate
-  /// echo.
-  #[allow(dead_code)]
+  /// We sent (queued) a close; awaiting the peer's echo.
   CloseSent,
   /// Peer's close received (echo queued); inbound is drained/discarded.
   PeerClosed,
