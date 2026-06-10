@@ -8,9 +8,16 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 rand_core = { version = "0.10", default-features = false }
 websocket-proto = { path = "..", features = ["std", "deflate"] }
+
+[[bin]]
+name = "connection_handle"
+path = "fuzz_targets/connection_handle.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "frame_decode"
