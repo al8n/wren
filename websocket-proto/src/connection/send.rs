@@ -103,6 +103,32 @@ pub enum FragmentKind {
   Continue,
 }
 
+impl FragmentKind {
+  /// The wire opcode plus whether this fragment STARTS a message.
+  const fn into_parts(self) -> (Opcode, bool) {
+    match self {
+      Self::TextStart => (Opcode::Text, true),
+      Self::BinaryStart => (Opcode::Binary, true),
+      Self::Continue => (Opcode::Continuation, false),
+    }
+  }
+}
+
+/// A serialized frame header for vectored writes
+/// (`writev([header.as_slice(), payload])`).
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct EncodedHeader {
+  buf: [u8; crate::constants::MAX_FRAME_HEADER],
+  len: u8,
+}
+
+impl EncodedHeader {
+  /// The header bytes (2–14).
+  pub fn as_slice(&self) -> &[u8] {
+    self.buf.get(..usize::from(self.len)).unwrap_or(&self.buf)
+  }
+}
+
 impl<I, Ro> Connection<I, Ro>
 where
   I: Instant,
@@ -127,12 +153,54 @@ where
     payload: &[u8],
     out: &mut [u8],
   ) -> Result<usize, EncodeError> {
-    let (opcode, starting) = match kind {
-      FragmentKind::TextStart => (Opcode::Text, true),
-      FragmentKind::BinaryStart => (Opcode::Binary, true),
-      FragmentKind::Continue => (Opcode::Continuation, false),
-    };
+    let (opcode, starting) = kind.into_parts();
     self.encode_data(opcode, starting, fin, payload, out)
+  }
+
+  /// The vectored-write twin of [`encode_fragment`]: masks `payload` **in
+  /// place** (clients; servers leave it untouched) and returns the frame
+  /// header for the driver to write first —
+  /// `writev([header.as_slice(), payload])`. Same lifecycle and sequencing
+  /// rules.
+  ///
+  /// [`encode_fragment`]: Connection::encode_fragment
+  pub fn prepare_fragment(
+    &mut self,
+    kind: FragmentKind,
+    fin: bool,
+    payload: &mut [u8],
+  ) -> Result<EncodedHeader, EncodeError> {
+    let (opcode, starting) = kind.into_parts();
+    self.check_data_send(starting)?;
+
+    let key = self.role.next_mask();
+    let header = FrameHeader::new(opcode, u64::try_from(payload.len()).unwrap_or(u64::MAX))
+      .with_fin(fin)
+      .with_mask(key);
+    let mut buf = [0u8; crate::constants::MAX_FRAME_HEADER];
+    let len = match header.encode(&mut buf) {
+      Ok(n) => n,
+      // Unreachable: the buffer is MAX_FRAME_HEADER and the length is a
+      // usize (never exceeds the §5.2 maximum).
+      Err(_) => {
+        return Err(EncodeError::BufferTooSmall(BufferTooSmallDetail::new(
+          crate::constants::MAX_FRAME_HEADER,
+          0,
+        )));
+      }
+    };
+    if let Some(k) = key {
+      mask(payload, k, 0);
+    }
+    self.send.message = if fin {
+      SendMessageState::Idle
+    } else {
+      SendMessageState::InMessage
+    };
+    Ok(EncodedHeader {
+      buf,
+      len: u8::try_from(len).unwrap_or(0),
+    })
   }
 
   /// Encodes a ping with an application payload (≤ 125 bytes).
@@ -209,6 +277,19 @@ where
     Ok(None)
   }
 
+  /// Shared lifecycle + fragmentation-sequencing prologue for the data
+  /// encoders.
+  fn check_data_send(&self, starting: bool) -> Result<(), EncodeError> {
+    if !matches!(self.lifecycle, Lifecycle::Open) {
+      return Err(EncodeError::Closing);
+    }
+    match (starting, self.send.message) {
+      (true, SendMessageState::Idle) => Ok(()),
+      (false, SendMessageState::InMessage) => Ok(()),
+      _ => Err(EncodeError::FragmentSequence),
+    }
+  }
+
   fn encode_data(
     &mut self,
     opcode: Opcode,
@@ -217,14 +298,7 @@ where
     payload: &[u8],
     out: &mut [u8],
   ) -> Result<usize, EncodeError> {
-    if !matches!(self.lifecycle, Lifecycle::Open) {
-      return Err(EncodeError::Closing);
-    }
-    match (starting, self.send.message) {
-      (true, SendMessageState::Idle) => {}
-      (false, SendMessageState::InMessage) => {}
-      _ => return Err(EncodeError::FragmentSequence),
-    }
+    self.check_data_send(starting)?;
     let n = self.write_frame(opcode, fin, false, payload, out)?;
     self.send.message = if fin {
       SendMessageState::Idle
@@ -426,6 +500,53 @@ mod tests {
         .unwrap()
         .is_none()
     );
+  }
+
+  #[test]
+  fn prepare_fragment_masks_in_place_and_returns_the_header() {
+    let mut conn = client();
+    let mut payload = *b"Hello";
+    let header = conn
+      .prepare_fragment(FragmentKind::TextStart, true, &mut payload)
+      .unwrap();
+
+    // Reassemble header ++ payload: must decode as one masked text frame
+    // whose unmasked payload is the original.
+    let mut wire = header.as_slice().to_vec();
+    wire.extend_from_slice(&payload);
+    let d = match crate::frame::FrameHeader::decode(&wire).unwrap() {
+      crate::frame::Decoded::Complete(d) => d,
+      _ => panic!(),
+    };
+    assert_eq!(d.header().opcode(), crate::frame::Opcode::Text);
+    let key = d.header().mask().unwrap();
+    let mut p = wire[d.consumed()..].to_vec();
+    crate::frame::mask(&mut p, key, 0);
+    assert_eq!(&p, b"Hello");
+
+    // Server side: no mask, payload untouched.
+    let mut conn = server();
+    let mut payload = *b"Hi";
+    let header = conn
+      .prepare_fragment(FragmentKind::BinaryStart, true, &mut payload)
+      .unwrap();
+    assert_eq!(header.as_slice(), &[0x82, 0x02]);
+    assert_eq!(&payload, b"Hi");
+
+    // Sequencing shares state with encode_fragment.
+    let mut conn = server();
+    let mut p = *b"a";
+    conn
+      .prepare_fragment(FragmentKind::TextStart, false, &mut p)
+      .unwrap();
+    let mut out = [0u8; 16];
+    assert!(matches!(
+      conn.encode_text("nope", &mut out),
+      Err(EncodeError::FragmentSequence)
+    ));
+    conn
+      .prepare_fragment(FragmentKind::Continue, true, &mut p)
+      .unwrap();
   }
 
   #[test]

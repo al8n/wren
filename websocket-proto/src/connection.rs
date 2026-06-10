@@ -27,7 +27,7 @@ pub use events::{
   CloseReceived, Closed, ControlPayload, Event, MessageKind, MessageStart, TextChunk,
 };
 pub use recv::{Events, HandleError};
-pub use send::{EncodeError, FragmentKind};
+pub use send::{EncodeError, EncodedHeader, FragmentKind};
 
 use crate::{negotiation::Negotiated, time::Instant};
 use role::Role;
