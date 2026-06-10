@@ -10,6 +10,9 @@
 //! Over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) the HTTP stack owns the
 //! bytes; the `connect` module (plan 3b) expresses the same negotiation as
 //! header data instead.
+//!
+//! [`h1::ClientHandshake`]: crate::handshake::h1::ClientHandshake
+//! [`h1::ServerHandshake`]: crate::handshake::h1::ServerHandshake
 
 pub(crate) mod parser;
 
