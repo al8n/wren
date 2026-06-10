@@ -25,16 +25,24 @@
   )
 )]
 
-// The alias trips `unused_extern_crates` until the first alloc-backed module lands.
-#[allow(unused_extern_crates)]
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[cfg(all(not(feature = "std"), any(feature = "alloc", feature = "no-atomic")))]
 extern crate alloc as std;
 
 #[cfg(feature = "std")]
 extern crate std;
 
+// `cfg_heap!` / `cfg_storage!` — declared first so they are in textual scope for
+// every module below.
+#[macro_use]
+mod macros;
+
 /// Protocol-level constants (RFC 6455 limits and well-known values).
 pub mod constants;
+
+cfg_heap! {
+  // Refcounted text / binary storage-backend aliases (atomic vs portable-atomic).
+  mod backend;
+}
 
 /// Monotonic time abstraction.
 pub mod time;
