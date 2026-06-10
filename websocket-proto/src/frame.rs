@@ -7,13 +7,14 @@
 //! canonicality, however, IS wire grammar (§5.2 requires minimal length
 //! encoding and a zero MSB on 64-bit lengths) and is enforced here.
 
-// mod close;
+mod close;
 // mod header;
 // mod mask;
 mod opcode;
 
+pub use close::CloseCode;
 // pub use close::{
-//   ClosePayloadError, CloseCode, DecodedClose, decode_close_payload, encode_close_payload,
+//   ClosePayloadError, DecodedClose, decode_close_payload, encode_close_payload,
 // };
 // pub use header::{
 //   DecodeError, Decoded, DecodedHeader, EncodeError, FrameHeader, MoreNeeded,
