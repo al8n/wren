@@ -74,3 +74,44 @@ pub mod message;
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 pub use message::{AssembleError, Message, MessageAssembler};
+
+/// Internal hot-path accessors for the `no-panic` link-time test
+/// (`tests/no_panic.rs`). Gated behind `test-no-panic`, doc-hidden, and exempt
+/// from semver: these `pub` wrappers expose otherwise-`pub(crate)` hot paths so
+/// the panic-freedom test can wrap them in `#[no_panic]` shims. A `pub use` of
+/// a `pub(crate)` item is illegal (E0364/E0365), so they are thin forwarders.
+#[cfg(feature = "test-no-panic")]
+#[doc(hidden)]
+pub mod __no_panic_internals {
+  /// Forwards to the crate-internal base64 encoder. `#[inline]` so the
+  /// no-panic link test can prove the wrapped body panic-free at the call site.
+  #[inline]
+  pub fn base64_encode(input: &[u8], out: &mut [u8]) -> Option<usize> {
+    crate::base64::encode(input, out)
+  }
+
+  /// A `pub` newtype over the crate-internal streaming UTF-8 validator,
+  /// exposing only the `feed` hot path the no-panic test exercises.
+  pub struct Utf8Validator(crate::utf8::Utf8Validator);
+
+  impl Utf8Validator {
+    /// A fresh validator at a character boundary.
+    #[inline]
+    pub fn new() -> Self {
+      Self(crate::utf8::Utf8Validator::new())
+    }
+
+    /// Validates `input`, returning whether it was accepted (the no-panic
+    /// shim only needs the panic-free verdict, not the detail).
+    #[inline]
+    pub fn feed(&mut self, input: &[u8]) -> bool {
+      self.0.feed(input).is_ok()
+    }
+  }
+
+  impl Default for Utf8Validator {
+    fn default() -> Self {
+      Self::new()
+    }
+  }
+}

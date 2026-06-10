@@ -95,6 +95,9 @@ impl Utf8Validator {
   ///
   /// [`reset`]: Utf8Validator::reset
   /// [`is_boundary`]: Utf8Validator::is_boundary
+  // `#[inline]`: per-chunk hot path on the text receive path, and inlining lets
+  // the `no-panic` link test prove panic-freedom at the call site.
+  #[inline]
   pub(crate) fn feed(&mut self, input: &[u8]) -> Result<usize, InvalidUtf8> {
     let mut complete = 0;
     for (i, &b) in input.iter().enumerate() {

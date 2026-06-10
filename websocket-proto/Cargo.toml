@@ -16,6 +16,10 @@ std = ["alloc", "thiserror/std", "smol_str/std", "bytes/std", "rand?/std", "rand
 alloc = ["dep:smol_str", "dep:bytes"]
 heapless = ["dep:heapless"]
 deflate = ["alloc", "dep:miniz_oxide"]
+# Internal: exposes `pub(crate)` hot paths so `tests/no_panic.rs` can wrap them
+# in `#[no_panic]` shims. Implies `std` (the test driver is std-only). Not for
+# downstream use — the re-exports are doc-hidden and unstable.
+test-no-panic = ["std"]
 
 [dependencies]
 thiserror.workspace = true
@@ -31,6 +35,7 @@ rand = { workspace = true, optional = true, features = ["std_rng"] }
 [dev-dependencies]
 base64 = "0.22"
 proptest = "1"
+no-panic = "0.1"
 
 [[example]]
 name = "autobahn-server"

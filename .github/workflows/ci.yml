@@ -140,11 +140,22 @@ jobs:
             cargo fuzz run "$target" -- -runs=100000 -max_total_time=120
           done
 
-# There is deliberately NO release-symbol panic scan: on current toolchains a
-# `pub fn` containing a guaranteed panic emits no symbols into the rlib at all
-# (verified empirically — uninstantiated library code ships as metadata, with
-# codegen deferred to downstream binaries), and `cargo bloat` cannot read
-# rlib-only crates, so symbol-grepping either artifact is silently blind.
-# Panic-freedom is instead enforced by the clippy lint wall above and verified
-# by `no-panic`-decorated tests landing with the conformance/hardening cycle,
-# which act at final-binary link time where codegen actually happens.
+  # Panic-freedom is enforced statically by the clippy lint wall above; this job
+  # adds the link-time half. `no-panic` proves the core leaf primitives compile
+  # to panic-free code by failing the LINK if a panic path survives, so it MUST
+  # run in release (the optimizer has to prune dead panic branches first; in
+  # debug the check is disabled and would false-positive).
+  #
+  # There is deliberately NO release-symbol panic *scan*: on current toolchains
+  # a `pub fn` with a guaranteed panic emits no symbols into the rlib at all
+  # (codegen is deferred to downstream binaries) and `cargo bloat` cannot read
+  # rlib-only crates, so symbol-grepping either artifact is silently blind. The
+  # `no-panic` link test acts at final-binary link time where codegen happens.
+  no-panic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: no-panic link-time verification (release)
+        run: cargo test -p websocket-proto --release --features test-no-panic --test no_panic

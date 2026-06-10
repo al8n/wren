@@ -252,6 +252,10 @@ pub enum EncodeError {
 impl FrameHeader {
   /// Encodes the header into `out` in its minimal (canonical) form,
   /// returning the byte count (2–14).
+  // `#[inline]`: a tiny per-frame hot path, and inlining lets the `no-panic`
+  // link-time test (`tests/no_panic.rs`) prove the body is panic-free at the
+  // call site (a non-inlined cross-crate call is opaque to that analysis).
+  #[inline]
   pub fn encode(&self, out: &mut [u8]) -> Result<usize, EncodeError> {
     if self.payload_len & 0x8000_0000_0000_0000 != 0 {
       return Err(EncodeError::PayloadTooLarge(self.payload_len));
@@ -348,6 +352,9 @@ impl FrameHeader {
   /// A satisfied [`Decoded::Incomplete`] does not guarantee the completing
   /// call returns [`Decoded::Complete`]: grammar errors (non-canonical or
   /// oversized lengths) surface only once the bytes that prove them arrive.
+  // `#[inline]`: see [`FrameHeader::encode`] — hot per-frame path, and inlining
+  // lets the `no-panic` link test prove panic-freedom at the call site.
+  #[inline]
   pub fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
     let (&b0, &b1) = match (buf.first(), buf.get(1)) {
       (None, _) => return Ok(Decoded::Incomplete(MoreNeeded { at_least: 2 })),

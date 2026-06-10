@@ -30,6 +30,10 @@ fn sextet(idx: u8) -> Option<u8> {
 ///
 /// Slice patterns are used instead of `copy_from_slice`/indexing so every
 /// access is statically panic-free.
+// `#[inline]`: lets the `no-panic` link test (`tests/no_panic.rs`) prove the
+// body panic-free at the call site (a non-inlined cross-crate call is opaque
+// to that analysis); the encoder is small and used only at handshake time.
+#[inline]
 pub(crate) fn encode(input: &[u8], out: &mut [u8]) -> Option<usize> {
   let needed = encoded_len(input.len())?;
   let out = out.get_mut(..needed)?;

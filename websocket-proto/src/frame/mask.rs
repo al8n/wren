@@ -6,6 +6,9 @@
 //! the previous call stopped (only `offset % 4` matters).
 
 /// XORs `payload` in place with `key`, starting at key phase `offset % 4`.
+// `#[inline]`: the hottest leaf in the crate (every payload byte), and inlining
+// lets the `no-panic` link test prove panic-freedom at the call site.
+#[inline]
 pub fn mask(payload: &mut [u8], key: [u8; 4], offset: u64) {
   // `& 3` bounds the phase below the key length, so `get` never misses;
   // the Option dance exists only to satisfy the no-indexing wall.
