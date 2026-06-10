@@ -32,3 +32,6 @@ extern crate alloc as std;
 
 #[cfg(feature = "std")]
 extern crate std;
+
+/// Protocol-level constants (RFC 6455 limits and well-known values).
+pub mod constants;
