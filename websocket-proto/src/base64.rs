@@ -18,6 +18,8 @@ pub(crate) const fn encoded_len(input_len: usize) -> Option<usize> {
   }
 }
 
+// The `0x3f` mask keeps the index below `ALPHABET.len()`, so the `None` arm is
+// unreachable; the `Option` shape exists only to satisfy the no-indexing wall.
 #[inline]
 fn sextet(idx: u8) -> Option<u8> {
   ALPHABET.get(usize::from(idx & 0x3f)).copied()
@@ -132,7 +134,10 @@ mod tests {
     assert_eq!(encoded_len(4), Some(8));
     assert_eq!(encoded_len(16), Some(24));
     assert_eq!(encoded_len(20), Some(28));
-    assert_eq!(encoded_len(usize::MAX), None);
+    assert_eq!(encoded_len(usize::MAX), None); // checked_add overflows
+    assert_eq!(encoded_len(usize::MAX - 1), None); // checked_add overflows
+    assert_eq!(encoded_len(usize::MAX - 2), None); // checked_mul overflows
+    assert_eq!(encoded_len(usize::MAX - 3), None); // checked_mul overflows
   }
 
   #[test]
