@@ -50,3 +50,6 @@ pub use error::BufferTooSmallDetail;
 // starts consuming these crate-private utilities.
 #[allow(dead_code)]
 mod base64;
+
+#[allow(dead_code)]
+mod utf8;
