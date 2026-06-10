@@ -40,6 +40,15 @@ pub enum EncodeError {
   /// The close reason exceeds 123 bytes.
   #[error("close reason too long")]
   ReasonTooLong,
+
+  /// Compressed send was requested but permessage-deflate was not negotiated,
+  /// or the outbound window-bits negotiated below 15 (miniz_oxide cannot bound
+  /// its 32 KiB compression window to fewer bits — RFC-legal to send plain
+  /// instead).
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  #[error("permessage-deflate not negotiated or outbound window bits < 15")]
+  CompressionUnavailable,
 }
 
 /// Outbound fragmentation state.
@@ -61,16 +70,22 @@ pub(crate) struct SendState {
   pub(crate) queued_code: Option<CloseCode>,
   /// A keepalive ping is pending (empty payload).
   pub(crate) pending_ping: bool,
+  /// Outbound permessage-deflate compressor, created lazily on the first
+  /// compressed send. Boxed to keep `SendState` small.
+  #[cfg(feature = "deflate")]
+  pub(crate) deflate: Option<std::boxed::Box<compress::CompressorBox>>,
 }
 
 impl SendState {
-  pub(crate) const fn new() -> Self {
+  pub(crate) fn new() -> Self {
     Self {
       message: SendMessageState::Idle,
       pending_close: None,
       close_sent: false,
       queued_code: None,
       pending_ping: false,
+      #[cfg(feature = "deflate")]
+      deflate: None,
     }
   }
 
@@ -362,6 +377,460 @@ where
       mask(body, k, 0);
     }
     Ok(total)
+  }
+}
+
+/// Outbound permessage-deflate compression (RFC 7692 §7.2.1).
+///
+/// Compress with a raw-DEFLATE sync-flush and strip the trailing `00 00 FF FF`
+/// boundary before framing (RFC 7692 §7.2.1). The compressor is kept across
+/// messages for context takeover; reset per message when the outbound direction
+/// negotiated `no_context_takeover`.
+#[cfg(feature = "deflate")]
+pub(crate) mod compress {
+
+  use miniz_oxide::deflate::core::{
+    CompressorOxide, TDEFLFlush, compress, create_comp_flags_from_zip_params,
+  };
+  use std::{boxed::Box, vec::Vec};
+
+  /// RFC 7692 §7.2.1: the four trailing bytes a DEFLATE sync-flush always
+  /// appends; these are stripped before putting the compressed bytes on the wire.
+  const SYNC_TAIL: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
+
+  /// Outbound compressor plus its scratch output buffer. Boxed inside
+  /// `SendState` so the large internal state does not inflate the struct.
+  pub(crate) struct CompressorBox {
+    inner: Box<CompressorOxide>,
+    /// Scratch buffer reused across messages; grows as needed but never shrinks.
+    buf: Vec<u8>,
+  }
+
+  impl CompressorBox {
+    /// A fresh raw-DEFLATE compressor (level 6, default strategy).
+    pub(crate) fn new() -> Box<Self> {
+      // window_bits=0 → raw DEFLATE (no zlib wrapper); level 6, strategy 0.
+      let flags = create_comp_flags_from_zip_params(6, 0, 0);
+      Box::new(Self {
+        inner: Box::new(CompressorOxide::new(flags)),
+        buf: Vec::new(),
+      })
+    }
+
+    /// Reset the compressor context for `no_context_takeover`: the next
+    /// message starts with a clean window.
+    pub(crate) fn reset(&mut self) {
+      self.inner.reset();
+    }
+
+    /// Compress `data` with a DEFLATE sync-flush, strip the trailing
+    /// `00 00 FF FF` boundary, and return a slice into the internal scratch
+    /// buffer. The slice is valid until the next call to `compress_message`.
+    pub(crate) fn compress_message(&mut self, data: &[u8]) -> &[u8] {
+      self.buf.clear();
+
+      // Feed all input without flushing.
+      let mut cursor = data;
+      loop {
+        let base = self.buf.len();
+        // Reserve space; grow by at least 64 bytes.
+        let new_cap = base.saturating_add(data.len().saturating_add(128));
+        if self.buf.capacity() < new_cap {
+          self
+            .buf
+            .reserve(new_cap.saturating_sub(self.buf.capacity()));
+        }
+        // Extend with zeros to allow writing.
+        let window_size = 4096usize;
+        self.buf.resize(base.saturating_add(window_size), 0);
+        let Some(window) = self.buf.get_mut(base..) else {
+          break;
+        };
+        let (_status, consumed, written) =
+          compress(&mut self.inner, cursor, window, TDEFLFlush::None);
+        self.buf.truncate(base.saturating_add(written));
+        let rest = cursor.get(consumed..).unwrap_or(&[]);
+        cursor = rest;
+        if cursor.is_empty() {
+          break;
+        }
+      }
+
+      // Sync-flush to emit the trailing `00 00 FF FF` block.
+      let base = self.buf.len();
+      self.buf.resize(base.saturating_add(512), 0);
+      let Some(window) = self.buf.get_mut(base..) else {
+        return &self.buf;
+      };
+      let (_status, _consumed, written) = compress(&mut self.inner, &[], window, TDEFLFlush::Sync);
+      self.buf.truncate(base.saturating_add(written));
+
+      // Strip the sync-flush boundary (RFC 7692 §7.2.1).
+      if self.buf.ends_with(&SYNC_TAIL) {
+        let new_len = self.buf.len().saturating_sub(4);
+        self.buf.truncate(new_len);
+      }
+
+      &self.buf
+    }
+  }
+
+  impl core::fmt::Debug for CompressorBox {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.debug_struct("CompressorBox")
+        .field("scratch_len", &self.buf.len())
+        .finish_non_exhaustive()
+    }
+  }
+}
+
+impl<I, Ro> Connection<I, Ro>
+where
+  I: Instant,
+  Ro: Role,
+{
+  /// Encodes a whole compressed text message (RSV1 set) into `out`.
+  ///
+  /// Requires permessage-deflate to have been negotiated **and** the outbound
+  /// window bits to be 15 (the `miniz_oxide` compressor always uses a 32 KiB
+  /// window; emitting a smaller-window stream requires clamp support that
+  /// miniz_oxide does not provide — RFC-legal to send plain in that case).
+  /// Returns [`EncodeError::CompressionUnavailable`] otherwise.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  pub fn encode_text_compressed(
+    &mut self,
+    payload: &str,
+    out: &mut [u8],
+  ) -> Result<usize, EncodeError> {
+    self.encode_compressed(crate::frame::Opcode::Text, payload.as_bytes(), out)
+  }
+
+  /// Encodes a whole compressed binary message (RSV1 set) into `out`.
+  ///
+  /// Same availability conditions as [`encode_text_compressed`].
+  ///
+  /// [`encode_text_compressed`]: Connection::encode_text_compressed
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  pub fn encode_binary_compressed(
+    &mut self,
+    payload: &[u8],
+    out: &mut [u8],
+  ) -> Result<usize, EncodeError> {
+    self.encode_compressed(crate::frame::Opcode::Binary, payload, out)
+  }
+
+  /// Shared implementation for compressed whole-message sends.
+  #[cfg(feature = "deflate")]
+  fn encode_compressed(
+    &mut self,
+    opcode: crate::frame::Opcode,
+    payload: &[u8],
+    out: &mut [u8],
+  ) -> Result<usize, EncodeError> {
+    use crate::negotiation::DeflateParams;
+
+    // Guard: deflate must be negotiated.
+    let params: DeflateParams = match self.deflate {
+      Some(p) => p,
+      None => return Err(EncodeError::CompressionUnavailable),
+    };
+
+    // Guard: outbound window bits must be 15 (miniz_oxide limitation).
+    let outbound_bits = if Ro::EXPECT_MASKED_INBOUND {
+      // Server receives masked (i.e. client role sends outbound) — but wait:
+      // EXPECT_MASKED_INBOUND is true for SERVER (it expects clients to mask).
+      // So: server sends on server→client direction = server_max_window_bits.
+      // client sends on client→server direction = client_max_window_bits.
+      // Ro::EXPECT_MASKED_INBOUND == true means WE ARE THE SERVER.
+      params.server_max_window_bits()
+    } else {
+      params.client_max_window_bits()
+    };
+    if outbound_bits < 15 {
+      return Err(EncodeError::CompressionUnavailable);
+    }
+
+    // Lifecycle + sequencing check (whole message → starting=true).
+    self.check_data_send(true)?;
+
+    // Determine whether to reset the compressor for this message.
+    let no_takeover = if Ro::EXPECT_MASKED_INBOUND {
+      params.server_no_context_takeover()
+    } else {
+      params.client_no_context_takeover()
+    };
+
+    // Lazily create the compressor, then compress.
+    let had_compressor = self.send.deflate.is_some();
+    let compressor = self
+      .send
+      .deflate
+      .get_or_insert_with(compress::CompressorBox::new);
+    if no_takeover && had_compressor {
+      compressor.reset();
+    }
+    let compressed = compressor.compress_message(payload);
+    // Copy the compressed bytes into a temporary owned buffer so we can call
+    // `write_frame` with them (avoid a double-borrow of `self`).
+    let compressed_owned: std::vec::Vec<u8> = compressed.to_vec();
+
+    let n = self.write_frame(opcode, true, true, &compressed_owned, out)?;
+    self.send.message = SendMessageState::Idle;
+    Ok(n)
+  }
+}
+
+#[cfg(all(test, feature = "std", feature = "deflate"))]
+mod deflate_tests {
+  use super::*;
+  use crate::{
+    connection::{
+      Connection, ConnectionConfig, Events,
+      events::{Event, MessageKind},
+      role::{Client, Server},
+      tests::CountingRng,
+    },
+    frame::{Decoded, FrameHeader, Opcode},
+    negotiation::{DeflateParams, Negotiated, ServerDeflateConfig, accept_deflate_offer},
+    time::testing::TestInstant,
+  };
+
+  // ── helpers ────────────────────────────────────────────────────────────────
+
+  fn deflate_server(params: DeflateParams) -> Connection<TestInstant, Server> {
+    let negotiated = Negotiated::none().with_deflate(Some(params));
+    Connection::new(
+      &negotiated,
+      ConnectionConfig::default(),
+      Server::new(),
+      TestInstant(0),
+    )
+  }
+
+  fn deflate_client(params: DeflateParams) -> Connection<TestInstant, Client<CountingRng>> {
+    let negotiated = Negotiated::none().with_deflate(Some(params));
+    Connection::new(
+      &negotiated,
+      ConnectionConfig::default(),
+      Client::new(CountingRng(0)),
+      TestInstant(0),
+    )
+  }
+
+  fn default_params() -> DeflateParams {
+    DeflateParams::default()
+  }
+
+  /// Drain all events from an Events cursor into an owned summary vec.
+  fn drain_events<I, Ro>(events: &mut Events<'_, '_, I, Ro>) -> Vec<DrainEv>
+  where
+    I: crate::time::Instant,
+    Ro: crate::connection::role::Role,
+  {
+    let mut out = Vec::new();
+    while let Some(e) = events.next() {
+      match e {
+        Event::MessageStart(s) => out.push(DrainEv::Start(s.kind())),
+        Event::TextChunk(t) => {
+          let mut s = t.prefix().to_string();
+          s.push_str(t.body());
+          out.push(DrainEv::Text(s));
+        }
+        Event::BinaryChunk(b) => out.push(DrainEv::Bin(b.to_vec())),
+        Event::MessageEnd => out.push(DrainEv::End),
+        _ => {}
+      }
+    }
+    out
+  }
+
+  /// Fold adjacent Text/Bin chunks.
+  fn fold(evs: Vec<DrainEv>) -> Vec<DrainEv> {
+    let mut out: Vec<DrainEv> = Vec::new();
+    for e in evs {
+      match (out.last_mut(), e) {
+        (Some(DrainEv::Text(acc)), DrainEv::Text(t)) => acc.push_str(&t),
+        (Some(DrainEv::Bin(acc)), DrainEv::Bin(b)) => acc.extend_from_slice(&b),
+        (_, e) => out.push(e),
+      }
+    }
+    out
+  }
+
+  #[derive(Debug, PartialEq, Eq)]
+  enum DrainEv {
+    Start(MessageKind),
+    Text(String),
+    Bin(Vec<u8>),
+    End,
+  }
+
+  // ── tests ──────────────────────────────────────────────────────────────────
+
+  /// T3-1: A client compresses a text message; a server connection inflates it
+  /// and recovers the original text.
+  #[test]
+  fn compressed_text_round_trips_through_recv() {
+    let params = default_params();
+    let mut client = deflate_client(params);
+    let mut server = deflate_server(params);
+
+    let mut wire = vec![0u8; 4096];
+    let n = client
+      .encode_text_compressed("Hello, deflate!", &mut wire)
+      .unwrap();
+    wire.truncate(n);
+
+    let mut events = server.handle(TestInstant(0), &mut wire).unwrap();
+    let evs = fold(drain_events(&mut events));
+    assert_eq!(
+      evs,
+      [
+        DrainEv::Start(MessageKind::Text),
+        DrainEv::Text("Hello, deflate!".into()),
+        DrainEv::End,
+      ]
+    );
+  }
+
+  /// T3-2: A client compresses a binary message; a server connection inflates it
+  /// and recovers the original bytes.
+  #[test]
+  fn compressed_binary_round_trips_through_recv() {
+    let params = default_params();
+    let mut client = deflate_client(params);
+    let mut server = deflate_server(params);
+
+    let data: Vec<u8> = (0u8..128).collect();
+    let mut wire = vec![0u8; 4096];
+    let n = client.encode_binary_compressed(&data, &mut wire).unwrap();
+    wire.truncate(n);
+
+    let mut events = server.handle(TestInstant(0), &mut wire).unwrap();
+    let evs = fold(drain_events(&mut events));
+    assert_eq!(
+      evs,
+      [
+        DrainEv::Start(MessageKind::Binary),
+        DrainEv::Bin(data),
+        DrainEv::End,
+      ]
+    );
+  }
+
+  /// T3-3: The RSV1 bit must be set on a compressed send.
+  #[test]
+  fn compressed_send_sets_rsv1_on_the_wire() {
+    let mut conn = deflate_server(default_params());
+    let mut out = vec![0u8; 4096];
+    let n = conn.encode_text_compressed("test", &mut out).unwrap();
+
+    let wire = &out[..n];
+    let decoded = match FrameHeader::decode(wire).unwrap() {
+      Decoded::Complete(d) => d,
+      _ => panic!("expected a complete frame header"),
+    };
+    assert!(
+      decoded.header().rsv1(),
+      "RSV1 must be set on a compressed frame"
+    );
+    assert_eq!(decoded.header().opcode(), Opcode::Text);
+    assert!(decoded.header().fin());
+  }
+
+  /// T3-4: `encode_text_compressed` returns `EncodeError::CompressionUnavailable`
+  /// when deflate is not negotiated.
+  #[test]
+  fn not_negotiated_returns_compression_unavailable() {
+    let mut conn: Connection<TestInstant, Server> = Connection::new(
+      &Negotiated::none(),
+      ConnectionConfig::default(),
+      Server::new(),
+      TestInstant(0),
+    );
+    let mut out = [0u8; 64];
+    assert!(matches!(
+      conn.encode_text_compressed("hello", &mut out),
+      Err(EncodeError::CompressionUnavailable)
+    ));
+    assert!(matches!(
+      conn.encode_binary_compressed(b"hi", &mut out),
+      Err(EncodeError::CompressionUnavailable)
+    ));
+  }
+
+  /// T3-5: When the server's outbound window bits < 15, `encode_text_compressed`
+  /// returns `EncodeError::CompressionUnavailable` (miniz_oxide cannot honor the
+  /// window constraint).
+  #[test]
+  fn outbound_bits_below_15_returns_compression_unavailable() {
+    // Negotiate server_max_window_bits=10; the SERVER's outbound direction uses
+    // server_max_window_bits, so bits=10 < 15 → CompressionUnavailable.
+    let (params, _) = accept_deflate_offer(
+      ["permessage-deflate; server_max_window_bits=10"].into_iter(),
+      &ServerDeflateConfig::new(),
+    )
+    .expect("offer must be accepted");
+    assert_eq!(params.server_max_window_bits(), 10);
+
+    let mut server = deflate_server(params);
+    let mut out = [0u8; 128];
+    assert!(matches!(
+      server.encode_text_compressed("hello", &mut out),
+      Err(EncodeError::CompressionUnavailable)
+    ));
+    assert!(matches!(
+      server.encode_binary_compressed(b"hi", &mut out),
+      Err(EncodeError::CompressionUnavailable)
+    ));
+  }
+
+  /// T3-6: With `no_context_takeover` on the send direction, two successive
+  /// compressed messages are each independently decodable by a fresh-context
+  /// inflater — verified by decoding both with a server that also negotiated
+  /// no_context_takeover on the inbound side.
+  #[test]
+  fn no_context_takeover_reset_each_message_independently_decodable() {
+    // Negotiate server_no_context_takeover: the server's outbound context
+    // resets per message. The receiving client must also reset per message.
+    let (params, _) = accept_deflate_offer(
+      ["permessage-deflate; server_no_context_takeover"].into_iter(),
+      &ServerDeflateConfig::new(),
+    )
+    .expect("offer must be accepted");
+    assert!(params.server_no_context_takeover());
+
+    let mut server = deflate_server(params);
+    let mut wire1 = vec![0u8; 4096];
+    let n1 = server
+      .encode_text_compressed("the quick brown fox", &mut wire1)
+      .unwrap();
+    wire1.truncate(n1);
+
+    let mut wire2 = vec![0u8; 4096];
+    let n2 = server
+      .encode_text_compressed("the quick brown fox jumps over", &mut wire2)
+      .unwrap();
+    wire2.truncate(n2);
+
+    // Each message must decode independently with a client that has matching
+    // no_context_takeover (each context is fresh).
+    let mut client1 = deflate_client(params);
+    let evs1 = fold(drain_events(
+      &mut client1.handle(TestInstant(0), &mut wire1).unwrap(),
+    ));
+    assert_eq!(evs1[1], DrainEv::Text("the quick brown fox".into()));
+
+    let mut client2 = deflate_client(params);
+    let evs2 = fold(drain_events(
+      &mut client2.handle(TestInstant(0), &mut wire2).unwrap(),
+    ));
+    assert_eq!(
+      evs2[1],
+      DrainEv::Text("the quick brown fox jumps over".into())
+    );
   }
 }
 
