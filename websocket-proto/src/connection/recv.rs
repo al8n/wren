@@ -82,8 +82,15 @@ pub(crate) struct RecvState {
   pub(crate) utf8: Utf8Validator,
   /// Carry bytes of a char split across `handle` calls (len ≤ 3).
   pub(crate) text_carry: ([u8; 4], u8),
-  /// Latest ping payload awaiting echo (drained by poll_transmit).
+  /// The next ping payload awaiting a pong echo (drained by poll_transmit).
   pub(crate) pending_pong: Option<([u8; MAX_CONTROL_PAYLOAD], u8)>,
+  /// Additional pongs owed when several pings arrive before `poll_transmit`
+  /// drains the first. RFC 6455 §5.5.3 permits answering only the most recent
+  /// ping, so on the bare (`no_alloc`) tier we coalesce into `pending_pong`;
+  /// where `alloc` is available we echo every ping (Autobahn §2.10), bounding
+  /// the queue at one pong per inbound control frame in the current batch.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub(crate) pong_overflow: std::collections::VecDeque<([u8; MAX_CONTROL_PAYLOAD], u8)>,
   /// Close/ping/pong payload accumulator (control frames may split across
   /// reads).
   pub(crate) control_buf: [u8; MAX_CONTROL_PAYLOAD],
@@ -106,6 +113,8 @@ impl RecvState {
       utf8: Utf8Validator::new(),
       text_carry: ([0; 4], 0),
       pending_pong: None,
+      #[cfg(any(feature = "alloc", feature = "std"))]
+      pong_overflow: std::collections::VecDeque::new(),
       control_buf: [0; MAX_CONTROL_PAYLOAD],
       control_len: 0,
       #[cfg(feature = "deflate")]
@@ -912,7 +921,24 @@ where
 
     match opcode {
       Opcode::Ping => {
-        self.conn.recv.pending_pong = Some((payload_buf, len_u8));
+        // First ping fills the single slot; later pings in the same batch go to
+        // the overflow queue where `alloc` is available (so every ping gets a
+        // pong — Autobahn §2.10). On the bare tier the slot simply coalesces to
+        // the most recent ping, which RFC 6455 §5.5.3 expressly allows.
+        #[cfg(any(feature = "alloc", feature = "std"))]
+        if self.conn.recv.pending_pong.is_some() {
+          self
+            .conn
+            .recv
+            .pong_overflow
+            .push_back((payload_buf, len_u8));
+        } else {
+          self.conn.recv.pending_pong = Some((payload_buf, len_u8));
+        }
+        #[cfg(not(any(feature = "alloc", feature = "std")))]
+        {
+          self.conn.recv.pending_pong = Some((payload_buf, len_u8));
+        }
         Ok(Event::Ping(payload))
       }
       Opcode::Pong => Ok(Event::Pong(payload)),

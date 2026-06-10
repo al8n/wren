@@ -280,7 +280,16 @@ where
         payload.get(..len).unwrap_or(&[]),
         out,
       )?;
-      self.recv.pending_pong = None;
+      // Refill the slot from the overflow queue so the next `poll_transmit`
+      // emits the following pong (every ping answered where `alloc` exists).
+      #[cfg(any(feature = "alloc", feature = "std"))]
+      {
+        self.recv.pending_pong = self.recv.pong_overflow.pop_front();
+      }
+      #[cfg(not(any(feature = "alloc", feature = "std")))]
+      {
+        self.recv.pending_pong = None;
+      }
       return Ok(Some(n));
     }
     // Keepalive ping (empty payload, no mask key for server; masked for client).
@@ -1173,5 +1182,52 @@ mod tests {
         .unwrap()
         .is_none()
     );
+  }
+
+  /// Regression (Autobahn 2.10): several pings arriving in one `handle` batch
+  /// each get their own pong (where `alloc` is available — every tier the
+  /// suite runs on). The single-slot design coalesced all but the last.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  #[test]
+  fn ping_flood_in_one_batch_pongs_every_ping_in_order() {
+    use crate::frame::{Opcode, mask as apply_mask};
+    let mut conn = server();
+
+    // Ten masked pings with distinct payloads, glued into one buffer.
+    let key = [9, 8, 7, 6];
+    let mut bytes = Vec::new();
+    let payloads: Vec<Vec<u8>> = (0..10)
+      .map(|i| format!("payload-{i}").into_bytes())
+      .collect();
+    for p in &payloads {
+      let h = FrameHeader::new(Opcode::Ping, p.len() as u64).with_mask(Some(key));
+      let mut f = vec![0u8; h.header_len() + p.len()];
+      let n = h.encode(&mut f).unwrap();
+      f[n..].copy_from_slice(p);
+      apply_mask(&mut f[n..], key, 0);
+      bytes.extend(f);
+    }
+
+    {
+      let mut events = conn.handle(TestInstant(0), &mut bytes).unwrap();
+      while events.next().is_some() {}
+    }
+
+    // Drain every queued pong: ten frames, payloads in arrival order, unmasked.
+    let mut out = [0u8; 64];
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    while let Some(n) = conn.poll_transmit(TestInstant(0), &mut out).unwrap() {
+      let decoded = match FrameHeader::decode(&out[..n]).unwrap() {
+        Decoded::Complete(d) => d,
+        _ => panic!("incomplete pong frame"),
+      };
+      assert_eq!(decoded.header().opcode(), Opcode::Pong);
+      assert!(
+        decoded.header().mask().is_none(),
+        "server pongs are unmasked"
+      );
+      got.push(out[decoded.consumed()..n].to_vec());
+    }
+    assert_eq!(got, payloads, "every ping must be answered, in order");
   }
 }
