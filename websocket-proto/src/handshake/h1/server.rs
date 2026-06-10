@@ -173,8 +173,10 @@ impl<'a> Accept<'a> {
     self
   }
 
-  /// Additional response headers (same restrictions as the client's
-  /// extra headers).
+  /// Additional response headers. CR/LF and non-token names are rejected
+  /// at encode time; collisions with the managed handshake headers are NOT
+  /// policed (unlike the client side) — duplicating e.g.
+  /// `Sec-WebSocket-Accept` here is the caller's own foot-gun.
   #[must_use]
   pub const fn with_extra_headers(mut self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
     self.extra_headers = extra_headers;
@@ -263,12 +265,14 @@ impl ServerHandshake {
       return Err(ServerHandshakeError::MissingHost);
     }
 
+    // RFC 9110 §5.3: repeated field lines are one comma-joined list, so the
+    // token may arrive in ANY occurrence (proxies split lists across lines).
     let upgrade_ok = headers
-      .get("upgrade")
-      .is_some_and(|v| token_list_contains(v, "websocket"));
+      .get_all("upgrade")
+      .any(|v| token_list_contains(v, "websocket"));
     let connection_ok = headers
-      .get("connection")
-      .is_some_and(|v| token_list_contains(v, "upgrade"));
+      .get_all("connection")
+      .any(|v| token_list_contains(v, "upgrade"));
     if !upgrade_ok || !connection_ok {
       return Err(ServerHandshakeError::NotAnUpgrade);
     }
@@ -474,6 +478,17 @@ Sec-WebSocket-Version: 13\r\n\
     let v = view(&raw);
     let offers: Vec<&str> = v.subprotocols().collect();
     assert_eq!(offers, ["chat", "superchat", "last"]);
+  }
+
+  #[test]
+  fn split_connection_header_lines_are_conforming() {
+    // RFC 9110 §5.3: a proxy may split a list across repeated field lines.
+    let raw = String::from_utf8(GOOD.to_vec()).unwrap().replace(
+      "Connection: keep-alive, Upgrade\r\n",
+      "Connection: keep-alive\r\nConnection: Upgrade\r\n",
+    );
+    let v = view(raw.as_bytes());
+    assert_eq!(v.host(), "server.example.com");
   }
 
   #[test]

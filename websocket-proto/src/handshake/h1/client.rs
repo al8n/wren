@@ -304,18 +304,22 @@ impl<'a> ClientHandshake<'a> {
     }
 
     let headers = head.headers();
+    // RFC 9110 §5.3: repeated field lines are one comma-joined list, so the
+    // token may arrive in ANY occurrence (proxies split lists across lines).
     let upgrade_ok = headers
-      .get("upgrade")
-      .is_some_and(|v| token_list_contains(v, "websocket"));
+      .get_all("upgrade")
+      .any(|v| token_list_contains(v, "websocket"));
     let connection_ok = headers
-      .get("connection")
-      .is_some_and(|v| token_list_contains(v, "upgrade"));
+      .get_all("connection")
+      .any(|v| token_list_contains(v, "upgrade"));
     if !upgrade_ok || !connection_ok {
       return Err(ClientHandshakeError::NotAnUpgrade);
     }
 
-    if headers.count("sec-websocket-accept") != 1 {
-      return Err(ClientHandshakeError::DuplicateHeader);
+    match headers.count("sec-websocket-accept") {
+      0 => return Err(ClientHandshakeError::AcceptMismatch),
+      1 => {}
+      _ => return Err(ClientHandshakeError::DuplicateHeader),
     }
     let accept_ok = headers
       .get("sec-websocket-accept")
@@ -557,6 +561,29 @@ mod tests {
     assert!(matches!(
       hs.handle(&resp).unwrap_err(),
       ClientHandshakeError::DuplicateHeader
+    ));
+
+    // No accept header at all is a mismatch, not a "duplicate".
+    let resp =
+      b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    assert!(matches!(
+      hs.handle(resp).unwrap_err(),
+      ClientHandshakeError::AcceptMismatch
+    ));
+  }
+
+  #[test]
+  fn split_connection_header_lines_are_conforming() {
+    // RFC 9110 §5.3: a proxy may split a list across repeated field lines.
+    let hs = handshake();
+    let resp = response_for(&hs, "");
+    let s = String::from_utf8(resp).unwrap().replace(
+      "Connection: Upgrade\r\n",
+      "Connection: keep-alive\r\nConnection: Upgrade\r\n",
+    );
+    assert!(matches!(
+      hs.handle(s.as_bytes()).unwrap(),
+      ClientProgress::Complete(_)
     ));
   }
 }
