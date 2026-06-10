@@ -34,6 +34,10 @@ impl InvalidUtf8 {
   /// Index of the offending byte within the input slice of the
   /// [`Utf8Validator::feed`] call that detected it (chunk-relative, not
   /// absolute within the message).
+  // The connection's receive path discards the error detail (it only needs
+  // the fail-fast verdict to close 1007), so this accessor is exercised only
+  // by this module's own tests; kept for diagnostics and oracle assertions.
+  #[allow(dead_code)]
   #[inline(always)]
   pub(crate) const fn at(&self) -> usize {
     self.at

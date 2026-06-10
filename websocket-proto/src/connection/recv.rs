@@ -467,7 +467,9 @@ where
             Some(Event::BinaryChunk(chunk))
           }
         }
-        MessageKind::Text => self.validate_text(chunk, message_done)?.map(Event::TextChunk),
+        MessageKind::Text => self
+          .validate_text(chunk, message_done)?
+          .map(Event::TextChunk),
       }
     };
 
@@ -1017,5 +1019,42 @@ mod tests {
       drain(&mut conn, &bytes),
       [Ev::CloseRecv(1005, "".into()), Ev::Closed(1005, true)]
     );
+  }
+
+  #[cfg(feature = "deflate")]
+  #[test]
+  fn rsv1_passthrough_when_deflate_negotiated() {
+    use crate::negotiation::{DeflateOffer, parse_deflate_response};
+    let params = parse_deflate_response("permessage-deflate", &DeflateOffer::new()).unwrap();
+    let negotiated = Negotiated::none().with_deflate(Some(params));
+    let mut conn: Connection<TestInstant, Server> = Connection::new(
+      &negotiated,
+      ConnectionConfig::default(),
+      Server::new(),
+      TestInstant(0),
+    );
+    // RSV1 on the first frame: accepted, marked compressed, payload raw.
+    let bytes = frame(Opcode::Text, true, true, &[0xAB, 0xCD]);
+    let got = fold(drain(&mut conn, &bytes));
+    assert_eq!(
+      got,
+      [
+        Ev::Start(MessageKind::Text, true),
+        Ev::Bin(vec![0xAB, 0xCD]),
+        Ev::End
+      ]
+    );
+
+    // RSV1 on a continuation still fails.
+    let mut conn: Connection<TestInstant, Server> = Connection::new(
+      &negotiated,
+      ConnectionConfig::default(),
+      Server::new(),
+      TestInstant(0),
+    );
+    let mut bytes = frame(Opcode::Text, false, true, b"x");
+    bytes.extend(frame(Opcode::Continuation, true, true, b"y"));
+    let got = drain(&mut conn, &bytes);
+    assert_eq!(got.last(), Some(&Ev::Closed(1002, false)));
   }
 }
