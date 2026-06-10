@@ -20,6 +20,10 @@ pub use parser::{HeadError, MalformedDetail};
 
 pub mod h1;
 
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub mod connect;
+
 use crate::{constants, error::BufferTooSmallDetail};
 use sha1::{Digest, Sha1};
 
