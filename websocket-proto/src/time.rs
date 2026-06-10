@@ -45,12 +45,15 @@ impl Instant for std::time::Instant {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 pub(crate) mod testing {
   use super::Instant;
   use core::time::Duration;
 
   /// Deterministic test clock: microseconds since an arbitrary epoch.
+  ///
+  /// Resolution is 1 µs — sub-microsecond `Duration`s truncate to zero and
+  /// do not advance the clock.
   #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
   pub(crate) struct TestInstant(pub(crate) u64);
 
@@ -76,6 +79,7 @@ mod tests {
     let a = TestInstant(1_000);
     let b = a.checked_add_duration(Duration::from_micros(500)).unwrap();
     assert_eq!(b, TestInstant(1_500));
+    assert_eq!(a.checked_add_duration(Duration::ZERO), Some(a));
     assert_eq!(
       b.checked_duration_since(a),
       Some(Duration::from_micros(500))
