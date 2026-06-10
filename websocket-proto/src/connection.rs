@@ -4,7 +4,7 @@
 //! TCP socket, an HTTP/2 stream (RFC 8441), or an HTTP/3 stream (RFC 9220) —
 //! because those transports change only the opening handshake. Construct it
 //! from the handshake's [`Negotiated`](crate::negotiation::Negotiated) plus a
-//! [`ConnectionConfig`] and a [`role`](role::Role) value.
+//! [`ConnectionConfig`] and a [`role::Role`](crate::connection::role::Role) value.
 //!
 //! Receive: feed transport bytes to [`Connection::handle`]; payloads are
 //! unmasked **in place** and surfaced as borrowed chunk events — internal
