@@ -49,7 +49,8 @@ pings) are queued internally and drained via [`Connection::poll_transmit`].
 | Feature | Default | Enables |
 |---------|:-------:|---------|
 | `std` | ✅ | `alloc`; an [`Instant`] impl for `std::time::Instant`; `rand` std conveniences when `rand` is also on |
-| `alloc` | | owned [`Message`] assembly ([`MessageAssembler`]) and `SmolStr`-backed negotiated strings; multi-pong queuing |
+| `alloc` | | owned [`Message`] assembly ([`MessageAssembler`]) with cheap-clone `bytes::Bytes` / `smol_str::SmolStr` payloads, `SmolStr`-backed negotiated strings; multi-pong queuing |
+| `no-atomic` | | the heap tier for cores **without** native atomic CAS (Cortex-M0+ / thumbv6m / RP2040): same [`Message`] / [`Negotiated`] storage as `alloc`, but the refcounted text / binary buffers use `portable_atomic_util::Arc` (clone via a `critical-section` impl the final binary provides) instead of `smol_str` + `bytes`. Pick one heap tier; `deflate` is **not** available here |
 | `heapless` | | bounded storage for the `no_std` + no-alloc tier |
 | `deflate` | | RFC 7692 permessage-deflate (implies `alloc`; pulls in `miniz_oxide`) |
 | `rand` | | a default `RngCore` for client mask keys (std-tier convenience; opt in explicitly) |

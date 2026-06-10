@@ -40,7 +40,16 @@ The first functional cycle of the Sans-I/O WebSocket protocol core. Highlights:
 ### Tiers, assembly & tooling
 
 - `alloc`-tier `MessageAssembler` folding events into owned `Message::{Text,
-  Binary}`; bare `no_std` (no-alloc) and `heapless` tiers supported.
+  Binary}`, carrying cheap-clone (`O(1)`) payloads — `smol_str::SmolStr` text and
+  `bytes::Bytes` binary, exposed as the public `TextBuf` / `BinaryBuf` aliases;
+  bare `no_std` (no-alloc) and `heapless` tiers supported.
+- `no-atomic` heap tier for cores without native atomic CAS (Cortex-M0+ /
+  thumbv6m / RP2040): the same `Message` / `Negotiated` storage as `alloc`, but
+  the refcounted text / binary buffers and negotiated subprotocol use
+  `portable_atomic_util::Arc` (clone via a `critical-section` impl the final
+  binary provides) instead of `smol_str` + `bytes`. Pick one heap tier; `deflate`
+  is not available on this tier (it requires `alloc`). Checked on
+  `thumbv6m-none-eabi` in CI.
 - Autobahn TestSuite harnesses (`examples/autobahn-server`,
   `examples/autobahn-client`) and an opt-in `autobahn` CI workflow; sections 1–9
   and the §12/§13 permessage-deflate cases pass.
@@ -56,6 +65,6 @@ The first functional cycle of the Sans-I/O WebSocket protocol core. Highlights:
   drained into a fixed, too-small window. The compressor now drains to
   completion; verified against an independent reference decoder and Autobahn
   §12/§13.
-- Multiple pings arriving in one `handle` batch now each receive a pong where
-  `alloc` is available (Autobahn 2.10); the bare tier still coalesces to the most
+- Multiple pings arriving in one `handle` batch now each receive a pong where a
+  heap is available (Autobahn 2.10); the bare tier still coalesces to the most
   recent ping (RFC 6455 §5.5.3).
