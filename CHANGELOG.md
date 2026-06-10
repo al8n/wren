@@ -1,7 +1,3 @@
 # UNRELEASED
 
-# 0.1.2 (January 6th, 2022)
-
-FEATURES
-
-
+- Workspace scaffolding for `websocket-proto`, the Sans-I/O WebSocket protocol core.
