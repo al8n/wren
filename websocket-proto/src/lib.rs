@@ -61,3 +61,8 @@ pub mod handshake;
 pub mod negotiation;
 
 pub use negotiation::Negotiated;
+
+/// The transport-blind connection state machine.
+pub mod connection;
+
+pub use connection::{Connection, ConnectionConfig};
