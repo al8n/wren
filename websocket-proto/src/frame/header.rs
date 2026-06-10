@@ -1,6 +1,6 @@
 //! Frame header (RFC 6455 §5.2): incremental decode and canonical encode.
 
-use crate::frame::Opcode;
+use crate::{error::BufferTooSmallDetail, frame::Opcode};
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
 /// A parsed (or to-be-encoded) frame header. RSV bits and reserved opcodes
@@ -218,6 +218,109 @@ pub enum DecodeError {
   PayloadTooLarge(u64),
 }
 
+/// Errors encoding a frame header.
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
+#[unwrap(ref)]
+#[try_unwrap(ref)]
+#[non_exhaustive]
+pub enum EncodeError {
+  /// The output buffer cannot hold the encoded header (it never needs more
+  /// than [`MAX_FRAME_HEADER`](crate::constants::MAX_FRAME_HEADER) bytes).
+  #[error("{0}")]
+  BufferTooSmall(BufferTooSmallDetail),
+
+  /// The payload length exceeds the §5.2 maximum (`i64::MAX`).
+  #[error("payload length {0:#x} exceeds the §5.2 maximum (most significant bit must be 0)")]
+  PayloadTooLarge(u64),
+}
+
+impl FrameHeader {
+  /// Encodes the header into `out` in its minimal (canonical) form,
+  /// returning the byte count (2–14).
+  pub fn encode(&self, out: &mut [u8]) -> Result<usize, EncodeError> {
+    if self.payload_len & 0x8000_0000_0000_0000 != 0 {
+      return Err(EncodeError::PayloadTooLarge(self.payload_len));
+    }
+
+    let ext_len: usize = match self.payload_len {
+      0..=125 => 0,
+      126..=65535 => 2,
+      _ => 8,
+    };
+    let mask_len: usize = if self.mask.is_some() { 4 } else { 0 };
+    let needed = 2usize.saturating_add(ext_len).saturating_add(mask_len);
+
+    let Some(out) = out.get_mut(..needed) else {
+      return Err(EncodeError::BufferTooSmall(BufferTooSmallDetail::new(
+        needed,
+        out.len(),
+      )));
+    };
+    let mut cursor = out.iter_mut();
+
+    let mut write = |byte: u8| -> bool {
+      match cursor.next() {
+        Some(slot) => {
+          *slot = byte;
+          true
+        }
+        None => false,
+      }
+    };
+    let short = |needed: usize| EncodeError::BufferTooSmall(BufferTooSmallDetail::new(needed, 0));
+
+    let b0 = (u8::from(self.fin) << 7)
+      | (u8::from(self.rsv1) << 6)
+      | (u8::from(self.rsv2) << 5)
+      | (u8::from(self.rsv3) << 4)
+      | self.opcode.as_bits();
+    let mask_bit = if self.mask.is_some() { 0x80u8 } else { 0 };
+
+    if !write(b0) {
+      return Err(short(needed));
+    }
+    match ext_len {
+      0 => {
+        // payload_len ≤ 125 here, so the cast is lossless.
+        let len7 = u8::try_from(self.payload_len).unwrap_or(0);
+        if !write(mask_bit | len7) {
+          return Err(short(needed));
+        }
+      }
+      2 => {
+        if !write(mask_bit | 126) {
+          return Err(short(needed));
+        }
+        // 126..=65535 here, so the cast is lossless.
+        let be = u16::try_from(self.payload_len).unwrap_or(0).to_be_bytes();
+        for byte in be {
+          if !write(byte) {
+            return Err(short(needed));
+          }
+        }
+      }
+      _ => {
+        if !write(mask_bit | 127) {
+          return Err(short(needed));
+        }
+        for byte in self.payload_len.to_be_bytes() {
+          if !write(byte) {
+            return Err(short(needed));
+          }
+        }
+      }
+    }
+    if let Some(key) = self.mask {
+      for byte in key {
+        if !write(byte) {
+          return Err(short(needed));
+        }
+      }
+    }
+    Ok(needed)
+  }
+}
+
 impl FrameHeader {
   /// Incrementally decodes a header from the front of `buf`.
   ///
@@ -430,6 +533,88 @@ mod tests {
     assert!(matches!(err, DecodeError::PayloadTooLarge(_)));
   }
 
+  #[test]
+  fn encode_matches_rfc6455_5_7_vectors() {
+    let mut buf = [0u8; 14];
+
+    let n = FrameHeader::new(Opcode::Text, 5).encode(&mut buf).unwrap();
+    assert_eq!(&buf[..n], &[0x81, 0x05]);
+
+    let n = FrameHeader::new(Opcode::Text, 5)
+      .with_mask(Some([0x37, 0xFA, 0x21, 0x3D]))
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(&buf[..n], &[0x81, 0x85, 0x37, 0xFA, 0x21, 0x3D]);
+
+    let n = FrameHeader::new(Opcode::Text, 3)
+      .with_fin(false)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(&buf[..n], &[0x01, 0x03]);
+
+    let n = FrameHeader::new(Opcode::Continuation, 2)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(&buf[..n], &[0x80, 0x02]);
+
+    let n = FrameHeader::new(Opcode::Binary, 256)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(&buf[..n], &[0x82, 0x7E, 0x01, 0x00]);
+
+    let n = FrameHeader::new(Opcode::Binary, 65536)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(&buf[..n], &[0x82, 0x7F, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00]);
+  }
+
+  #[test]
+  fn encode_picks_minimal_form_at_boundaries() {
+    let mut buf = [0u8; 14];
+    let n = FrameHeader::new(Opcode::Binary, 125)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(n, 2);
+    let n = FrameHeader::new(Opcode::Binary, 126)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(n, 4);
+    let n = FrameHeader::new(Opcode::Binary, 65535)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(n, 4);
+    let n = FrameHeader::new(Opcode::Binary, 65536)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(n, 10);
+  }
+
+  #[test]
+  fn encode_rejects_oversized_and_small_buffers() {
+    let mut buf = [0u8; 14];
+    let err = FrameHeader::new(Opcode::Binary, u64::MAX)
+      .encode(&mut buf)
+      .unwrap_err();
+    assert!(matches!(err, EncodeError::PayloadTooLarge(_)));
+
+    let mut tiny = [0u8; 3];
+    let err = FrameHeader::new(Opcode::Binary, 256)
+      .encode(&mut tiny)
+      .unwrap_err();
+    assert!(matches!(err, EncodeError::BufferTooSmall(_)));
+  }
+
+  #[test]
+  fn rsv_bits_encode_into_byte0() {
+    let mut buf = [0u8; 14];
+    let n = FrameHeader::new(Opcode::Text, 0)
+      .with_rsv1(true)
+      .with_rsv3(true)
+      .encode(&mut buf)
+      .unwrap();
+    assert_eq!(&buf[..n], &[0xD1, 0x00]); // FIN + RSV1 + RSV3 + text
+  }
+
   mod properties {
     use super::*;
     use proptest::{prelude::*, test_runner::TestCaseError};
@@ -484,6 +669,35 @@ mod tests {
               return Err(TestCaseError::fail(format!("prefix {cut} decoded as complete")));
             }
           }
+        }
+      }
+
+      /// encode → decode is the identity, for headers across all three
+      /// length forms, mask states, RSV combinations, and opcodes.
+      #[test]
+      fn encode_decode_round_trip(
+        fin in any::<bool>(),
+        rsv in any::<(bool, bool, bool)>(),
+        opbits in 0u8..=0x0F,
+        mask in any::<Option<[u8; 4]>>(),
+        len in any::<u64>(),
+      ) {
+        let len = len & 0x7FFF_FFFF_FFFF_FFFF;
+        let header = FrameHeader::new(Opcode::from_bits(opbits), len)
+          .with_fin(fin)
+          .with_rsv1(rsv.0)
+          .with_rsv2(rsv.1)
+          .with_rsv3(rsv.2)
+          .with_mask(mask);
+
+        let mut buf = [0u8; 14];
+        let n = header.encode(&mut buf).unwrap();
+        match FrameHeader::decode(&buf[..n]).unwrap() {
+          Decoded::Complete(d) => {
+            prop_assert_eq!(d.header(), header);
+            prop_assert_eq!(d.consumed(), n);
+          }
+          Decoded::Incomplete(_) => return Err(TestCaseError::fail("round trip incomplete")),
         }
       }
     }

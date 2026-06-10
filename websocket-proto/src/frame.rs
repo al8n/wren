@@ -16,7 +16,8 @@ pub use close::{
   CloseCode, ClosePayloadError, DecodedClose, decode_close_payload, encode_close_payload,
 };
 pub use header::{
-  DecodeError, Decoded, DecodedHeader, FrameHeader, MoreNeeded, NonCanonicalLengthDetail,
+  DecodeError, Decoded, DecodedHeader, EncodeError, FrameHeader, MoreNeeded,
+  NonCanonicalLengthDetail,
 };
 pub use mask::mask;
 pub use opcode::Opcode;
