@@ -102,6 +102,8 @@ pub struct ClientOptions<'a> {
   path: &'a str,
   subprotocols: &'a [&'a str],
   extra_headers: &'a [(&'a str, &'a str)],
+  #[cfg(feature = "deflate")]
+  deflate: Option<crate::negotiation::DeflateOffer>,
 }
 
 impl<'a> ClientOptions<'a> {
@@ -113,6 +115,8 @@ impl<'a> ClientOptions<'a> {
       path,
       subprotocols: &[],
       extra_headers: &[],
+      #[cfg(feature = "deflate")]
+      deflate: None,
     }
   }
 
@@ -129,6 +133,15 @@ impl<'a> ClientOptions<'a> {
   #[must_use]
   pub const fn with_extra_headers(mut self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
     self.extra_headers = extra_headers;
+    self
+  }
+
+  /// Offers permessage-deflate (RFC 7692) in the upgrade request.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  #[must_use]
+  pub const fn with_deflate(mut self, offer: crate::negotiation::DeflateOffer) -> Self {
+    self.deflate = Some(offer);
     self
   }
 }
@@ -220,6 +233,12 @@ impl<'a> ClientHandshake<'a> {
         return Err(invalid("extra header value contains CR/LF"));
       }
     }
+    #[cfg(feature = "deflate")]
+    if let Some(offer) = &options.deflate {
+      offer
+        .validate()
+        .map_err(|_| invalid("deflate offer window bits out of range"))?;
+    }
 
     let mut nonce = [0u8; 16];
     rng.fill_bytes(&mut nonce);
@@ -266,6 +285,12 @@ impl<'a> ClientHandshake<'a> {
         w.push(b", ")?;
         w.push(proto.as_bytes())?;
       }
+      w.push(b"\r\n")?;
+    }
+    #[cfg(feature = "deflate")]
+    if let Some(offer) = &self.options.deflate {
+      w.push(b"Sec-WebSocket-Extensions: ")?;
+      offer.write_to(w)?;
       w.push(b"\r\n")?;
     }
     for (name, value) in self.options.extra_headers {
@@ -353,11 +378,28 @@ impl<'a> ClientHandshake<'a> {
       }
     };
 
-    // Plan 3a offers no extensions, so any granted extension is a §4.1
-    // step-6 failure. Plan 3b replaces this arm with deflate validation.
+    #[cfg(not(feature = "deflate"))]
     if headers.get("sec-websocket-extensions").is_some() {
       return Err(ClientHandshakeError::ExtensionNotOffered);
     }
+    #[cfg(feature = "deflate")]
+    let negotiated = {
+      let mut negotiated = negotiated;
+      match (
+        &self.options.deflate,
+        headers.count("sec-websocket-extensions"),
+      ) {
+        (_, 0) => {}
+        (None, _) => return Err(ClientHandshakeError::ExtensionNotOffered),
+        (Some(_), n) if n > 1 => return Err(ClientHandshakeError::DuplicateHeader),
+        (Some(offer), _) => {
+          let value = headers.get("sec-websocket-extensions").unwrap_or("");
+          let params = crate::negotiation::parse_deflate_response(value, offer)?;
+          negotiated = negotiated.with_deflate(Some(params));
+        }
+      }
+      negotiated
+    };
 
     Ok(ClientProgress::Complete(ClientComplete {
       negotiated,
@@ -585,5 +627,60 @@ mod tests {
       hs.handle(s.as_bytes()).unwrap(),
       ClientProgress::Complete(_)
     ));
+  }
+
+  #[cfg(feature = "deflate")]
+  #[test]
+  fn deflate_offer_and_response_flow() {
+    use crate::negotiation::DeflateOffer;
+
+    let options = ClientOptions::new("h", "/")
+      .with_deflate(DeflateOffer::new().with_server_no_context_takeover(true));
+    let hs = ClientHandshake::new(options, &mut CountingRng(0)).unwrap();
+
+    let mut buf = [0u8; 1024];
+    let n = hs.encode_request(&mut buf).unwrap();
+    let req = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(req.contains(
+      "\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_max_window_bits\r\n"
+    ));
+
+    // Server grants it.
+    let resp = response_for(
+      &hs,
+      "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n",
+    );
+    match hs.handle(&resp).unwrap() {
+      ClientProgress::Complete(done) => {
+        let d = done.negotiated().deflate().unwrap();
+        assert!(d.server_no_context_takeover());
+        assert_eq!(d.client_max_window_bits(), 15);
+      }
+      ClientProgress::NeedMore => panic!("complete"),
+    }
+
+    // Server declines (no extensions header): no deflate in Negotiated.
+    let resp = response_for(&hs, "");
+    match hs.handle(&resp).unwrap() {
+      ClientProgress::Complete(done) => assert!(done.negotiated().deflate().is_none()),
+      ClientProgress::NeedMore => panic!("complete"),
+    }
+
+    // Server grants something invalid → connection fails.
+    let resp = response_for(
+      &hs,
+      "Sec-WebSocket-Extensions: permessage-deflate; bogus\r\n",
+    );
+    assert!(matches!(
+      hs.handle(&resp).unwrap_err(),
+      ClientHandshakeError::Negotiation(_)
+    ));
+
+    // Two extension headers in a response → fail (only one extension legal).
+    let resp = response_for(
+      &hs,
+      "Sec-WebSocket-Extensions: permessage-deflate\r\nSec-WebSocket-Extensions: permessage-deflate\r\n",
+    );
+    assert!(hs.handle(&resp).is_err());
   }
 }

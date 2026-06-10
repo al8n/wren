@@ -53,6 +53,8 @@ pub enum NegotiationError {
 pub struct Negotiated {
   #[cfg(any(feature = "alloc", feature = "heapless"))]
   subprotocol: Option<SubprotocolString>,
+  #[cfg(feature = "deflate")]
+  deflate: Option<DeflateParams>,
 }
 
 impl Negotiated {
@@ -63,6 +65,8 @@ impl Negotiated {
     Self {
       #[cfg(any(feature = "alloc", feature = "heapless"))]
       subprotocol: None,
+      #[cfg(feature = "deflate")]
+      deflate: None,
     }
   }
 
@@ -77,6 +81,8 @@ impl Negotiated {
     let stored = Self::store(subprotocol)?;
     Ok(Self {
       subprotocol: Some(stored),
+      #[cfg(feature = "deflate")]
+      deflate: None,
     })
   }
 
@@ -101,6 +107,22 @@ impl Negotiated {
     {
       None
     }
+  }
+
+  /// The agreed permessage-deflate parameters, when negotiated.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  pub const fn deflate(&self) -> Option<DeflateParams> {
+    self.deflate
+  }
+
+  /// Attaches agreed permessage-deflate parameters.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  #[must_use]
+  pub const fn with_deflate(mut self, deflate: Option<DeflateParams>) -> Self {
+    self.deflate = deflate;
+    self
   }
 }
 

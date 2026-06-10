@@ -124,6 +124,14 @@ impl<'a> RequestView<'a> {
     self.head.headers().get(name)
   }
 
+  /// The raw `Sec-WebSocket-Extensions` values in arrival order (for
+  /// [`crate::negotiation::accept_deflate_offer`]).
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  pub fn extensions(&self) -> impl Iterator<Item = &'a str> + '_ {
+    self.head.headers().get_all("sec-websocket-extensions")
+  }
+
   /// Bytes the request head consumed; data at and beyond this offset
   /// belongs to the frame stream.
   pub const fn consumed(&self) -> usize {
@@ -154,6 +162,8 @@ pub enum ServerProgress<'a> {
 pub struct Accept<'a> {
   subprotocol: Option<&'a str>,
   extra_headers: &'a [(&'a str, &'a str)],
+  #[cfg(feature = "deflate")]
+  deflate: Option<crate::negotiation::DeflateResponse>,
 }
 
 impl<'a> Accept<'a> {
@@ -162,6 +172,8 @@ impl<'a> Accept<'a> {
     Self {
       subprotocol: None,
       extra_headers: &[],
+      #[cfg(feature = "deflate")]
+      deflate: None,
     }
   }
 
@@ -180,6 +192,19 @@ impl<'a> Accept<'a> {
   #[must_use]
   pub const fn with_extra_headers(mut self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
     self.extra_headers = extra_headers;
+    self
+  }
+
+  /// Grant permessage-deflate (from
+  /// [`crate::negotiation::accept_deflate_offer`]).
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  #[must_use]
+  pub const fn with_deflate(
+    mut self,
+    deflate: Option<crate::negotiation::DeflateResponse>,
+  ) -> Self {
+    self.deflate = deflate;
     self
   }
 }
@@ -328,6 +353,9 @@ impl ServerHandshake {
     };
     validate_extras(accept.extra_headers)?;
 
+    #[cfg(feature = "deflate")]
+    let negotiated = negotiated.with_deflate(accept.deflate.map(|r| r.params()));
+
     let accept_bytes = accept_value(request.key());
     let mut w = WriteCursor::new(out);
     write_accept_response(&mut w, &accept_bytes, accept)
@@ -377,6 +405,12 @@ fn write_accept_response(
   if let Some(proto) = accept.subprotocol {
     w.push(b"Sec-WebSocket-Protocol: ")?;
     w.push(proto.as_bytes())?;
+    w.push(b"\r\n")?;
+  }
+  #[cfg(feature = "deflate")]
+  if let Some(response) = &accept.deflate {
+    w.push(b"Sec-WebSocket-Extensions: ")?;
+    response.write_to(w)?;
     w.push(b"\r\n")?;
   }
   for (name, value) in accept.extra_headers {
@@ -644,5 +678,46 @@ Sec-WebSocket-Version: 13\r\n\
         .unwrap_err(),
       ServerHandshakeError::InvalidRejectionStatus(200)
     ));
+  }
+
+  #[cfg(feature = "deflate")]
+  #[test]
+  fn deflate_accept_flow() {
+    use crate::negotiation::{ServerDeflateConfig, accept_deflate_offer};
+
+    let raw = String::from_utf8(GOOD.to_vec()).unwrap().replace(
+      "Sec-WebSocket-Version: 13\r\n",
+      "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n",
+    );
+    let v = view(raw.as_bytes());
+
+    let config = ServerDeflateConfig::new();
+    let granted = accept_deflate_offer(v.extensions(), &config);
+    let (params, response) = granted.unwrap();
+    assert_eq!(params.client_max_window_bits(), 15);
+
+    let mut buf = [0u8; 512];
+    let accept = Accept::new().with_deflate(Some(response));
+    let (n, negotiated) = ServerHandshake::new()
+      .encode_response(&v, &accept, &mut buf)
+      .unwrap();
+    let resp = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(
+      resp.contains("\r\nSec-WebSocket-Extensions: permessage-deflate\r\n"),
+      "{resp}"
+    );
+    assert_eq!(negotiated.deflate(), Some(params));
+
+    // Declining: no header, no deflate.
+    let accept = Accept::new();
+    let (n, negotiated) = ServerHandshake::new()
+      .encode_response(&v, &accept, &mut buf)
+      .unwrap();
+    assert!(
+      !core::str::from_utf8(&buf[..n])
+        .unwrap()
+        .contains("Sec-WebSocket-Extensions")
+    );
+    assert!(negotiated.deflate().is_none());
   }
 }
