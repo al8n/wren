@@ -23,10 +23,11 @@ mod recv;
 pub mod role;
 mod send;
 
-// Re-exports activate once Tasks 2–3 fill the modules.
-// pub use events::{Closed, CloseReceived, Event, Events, MessageKind, MessageStart, TextChunk};
-// pub use recv::HandleError;
-// pub use send::EncodeError;
+pub use events::{
+  CloseReceived, Closed, ControlPayload, Event, MessageKind, MessageStart, TextChunk,
+};
+pub use recv::{Events, HandleError};
+// `pub use send::EncodeError;` activates with Task 4's send path.
 
 use crate::{negotiation::Negotiated, time::Instant};
 use role::Role;
@@ -83,8 +84,10 @@ impl ConnectionConfig {
 /// The WebSocket connection state machine. `I` is the caller's monotonic
 /// clock; `Ro` is the [`role`] (client or server), fixed at the type level.
 #[derive(Debug)]
-#[allow(dead_code)] // fields consumed by Tasks 2–4
 pub struct Connection<I, Ro> {
+  // Read by Task 4's outbound masking (`Role::next_mask`); the recv path
+  // needs only the `EXPECT_MASKED_INBOUND` associated const.
+  #[allow(dead_code)]
   pub(crate) role: Ro,
   pub(crate) config: ConnectionConfig,
   #[cfg(feature = "deflate")]
@@ -97,11 +100,13 @@ pub struct Connection<I, Ro> {
 
 /// Connection lifecycle (close handshake per RFC 6455 §7).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // variants used by Tasks 2–3
 pub(crate) enum Lifecycle {
   /// Open for data both ways.
   Open,
-  /// We sent (queued) a close; awaiting the peer's echo.
+  /// We sent (queued) a close; awaiting the peer's echo. Constructed by
+  /// Task 4's `close()`; the recv path only reads it to suppress a duplicate
+  /// echo.
+  #[allow(dead_code)]
   CloseSent,
   /// Peer's close received (echo queued); inbound is drained/discarded.
   PeerClosed,
