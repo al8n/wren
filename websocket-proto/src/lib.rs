@@ -35,3 +35,8 @@ extern crate std;
 
 /// Protocol-level constants (RFC 6455 limits and well-known values).
 pub mod constants;
+
+/// Monotonic time abstraction.
+pub mod time;
+
+pub use time::Instant;
