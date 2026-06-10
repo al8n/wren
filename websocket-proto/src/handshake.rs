@@ -1,7 +1,4 @@
 //! Opening handshakes (RFC 6455 §4).
-// Items in this module are consumed by the h1 sub-modules (Tasks 4/5); until
-// those land, suppress dead-code noise on tiers that have no other caller.
-#![allow(dead_code)]
 //!
 //! Over HTTP/1.1 this crate owns the bytes: [`h1::ClientHandshake`] emits the
 //! upgrade request and validates the response; [`h1::ServerHandshake`] parses
@@ -14,12 +11,11 @@
 //! bytes; the `connect` module (plan 3b) expresses the same negotiation as
 //! header data instead.
 
-#[allow(dead_code)]
 pub(crate) mod parser;
 
 pub use parser::{HeadError, MalformedDetail};
 
-// pub mod h1;
+pub mod h1;
 
 use crate::{constants, error::BufferTooSmallDetail};
 use sha1::{Digest, Sha1};

@@ -1,0 +1,562 @@
+//! Client side of the h1 opening handshake (RFC 6455 §4.1, §4.2.2 client
+//! validation).
+
+use crate::{
+  constants,
+  error::BufferTooSmallDetail,
+  handshake::{
+    WriteCursor, accept_value,
+    parser::{self, HeadError, Parsed, is_token, token_list_contains},
+  },
+  negotiation::{Negotiated, NegotiationError},
+};
+use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
+use rand_core::Rng as RngCore;
+
+/// Headers this machine manages itself; user extra headers must not collide.
+const MANAGED: &[&str] = &[
+  "host",
+  "upgrade",
+  "connection",
+  "sec-websocket-key",
+  "sec-websocket-version",
+  "sec-websocket-protocol",
+  "sec-websocket-extensions",
+  "sec-websocket-accept",
+];
+
+/// Detail payload: which handshake option was rejected and why.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Display)]
+#[display("invalid handshake option: {what}")]
+pub struct InvalidOptionsDetail {
+  what: &'static str,
+}
+
+impl InvalidOptionsDetail {
+  #[inline(always)]
+  pub(crate) const fn new(what: &'static str) -> Self {
+    Self { what }
+  }
+
+  /// Static description of the rejected option.
+  #[inline(always)]
+  pub const fn what(&self) -> &'static str {
+    self.what
+  }
+}
+
+/// Errors from the client handshake (configuration, encoding, validation).
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
+#[unwrap(ref)]
+#[try_unwrap(ref)]
+#[non_exhaustive]
+pub enum ClientHandshakeError {
+  /// An option failed validation at construction.
+  #[error("{0}")]
+  InvalidOptions(InvalidOptionsDetail),
+
+  /// The output buffer cannot hold the request.
+  #[error("{0}")]
+  BufferTooSmall(BufferTooSmallDetail),
+
+  /// The response head failed HTTP grammar or the head caps.
+  #[error("{0}")]
+  Head(#[from] HeadError),
+
+  /// The response status was not 101.
+  #[error("expected status 101, got {0}")]
+  UnexpectedStatus(u16),
+
+  /// `Upgrade`/`Connection` did not contain the required tokens.
+  #[error("response is not a websocket upgrade")]
+  NotAnUpgrade,
+
+  /// `Sec-WebSocket-Accept` missing or not the derivation of our key.
+  #[error("Sec-WebSocket-Accept mismatch")]
+  AcceptMismatch,
+
+  /// A response header that must appear at most once appeared twice.
+  #[error("duplicate singleton response header")]
+  DuplicateHeader,
+
+  /// The server selected a subprotocol the client never offered, listed
+  /// more than one, or sent a malformed token.
+  #[error("server selected an unoffered subprotocol")]
+  SubprotocolNotOffered,
+
+  /// The server granted an extension the client never offered (RFC 6455
+  /// §4.1 step 6 — fail the connection).
+  #[error("server granted an unoffered extension")]
+  ExtensionNotOffered,
+
+  /// Retaining the negotiation result failed (bounded-tier storage).
+  #[error("{0}")]
+  Negotiation(#[from] NegotiationError),
+}
+
+/// Client handshake configuration. Borrowed: keep it (and the slices it
+/// references) alive for the machine's lifetime.
+#[derive(Debug, Copy, Clone)]
+pub struct ClientOptions<'a> {
+  host: &'a str,
+  path: &'a str,
+  subprotocols: &'a [&'a str],
+  extra_headers: &'a [(&'a str, &'a str)],
+}
+
+impl<'a> ClientOptions<'a> {
+  /// Options for `GET {path}` against `Host: {host}`. `path` must start
+  /// with `/` (origin-form request target).
+  pub const fn new(host: &'a str, path: &'a str) -> Self {
+    Self {
+      host,
+      path,
+      subprotocols: &[],
+      extra_headers: &[],
+    }
+  }
+
+  /// Subprotocols to offer, in preference order.
+  #[must_use]
+  pub const fn with_subprotocols(mut self, subprotocols: &'a [&'a str]) -> Self {
+    self.subprotocols = subprotocols;
+    self
+  }
+
+  /// Additional request headers (auth, origin, cookies). Names must be
+  /// tokens, must not collide with the managed handshake headers, and
+  /// values must not contain CR/LF.
+  #[must_use]
+  pub const fn with_extra_headers(mut self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
+    self.extra_headers = extra_headers;
+    self
+  }
+}
+
+/// Outcome of feeding response bytes to [`ClientHandshake::handle`].
+#[derive(Debug, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref)]
+#[try_unwrap(ref)]
+#[non_exhaustive]
+pub enum ClientProgress {
+  /// The head is not complete yet — read more bytes and call again with
+  /// the whole accumulated buffer.
+  NeedMore,
+  /// Handshake complete.
+  Complete(ClientComplete),
+}
+
+/// A completed client handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientComplete {
+  negotiated: Negotiated,
+  consumed: usize,
+}
+
+impl ClientComplete {
+  /// The negotiation result — feed it to the connection machine.
+  pub fn negotiated(&self) -> &Negotiated {
+    &self.negotiated
+  }
+
+  /// Consumes self into the negotiation result.
+  pub fn into_negotiated(self) -> Negotiated {
+    self.negotiated
+  }
+
+  /// Bytes of the input buffer the handshake consumed; everything at and
+  /// beyond this offset is frame-stream data.
+  pub const fn consumed(&self) -> usize {
+    self.consumed
+  }
+}
+
+/// The client side of the h1 opening handshake. Construct, write the
+/// request with [`encode_request`], then feed the accumulating response
+/// buffer to [`handle`] until it completes.
+///
+/// [`encode_request`]: ClientHandshake::encode_request
+/// [`handle`]: ClientHandshake::handle
+#[derive(Debug, Clone)]
+pub struct ClientHandshake<'a> {
+  options: ClientOptions<'a>,
+  key: [u8; constants::SEC_WEBSOCKET_KEY_LEN],
+}
+
+impl<'a> ClientHandshake<'a> {
+  /// Validates `options` and draws the 16-byte nonce from `rng`
+  /// (RFC 6455 §4.1 requires it to be selected randomly; use a
+  /// CSPRNG-quality source for public-internet connections).
+  pub fn new<R: RngCore>(
+    options: ClientOptions<'a>,
+    rng: &mut R,
+  ) -> Result<Self, ClientHandshakeError> {
+    let invalid =
+      |what: &'static str| ClientHandshakeError::InvalidOptions(InvalidOptionsDetail::new(what));
+    if options.host.is_empty() || options.host.bytes().any(|b| b == b'\r' || b == b'\n') {
+      return Err(invalid("host empty or contains CR/LF"));
+    }
+    if !options.path.starts_with('/')
+      || options
+        .path
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == b' ')
+    {
+      return Err(invalid("path must be origin-form without spaces or CR/LF"));
+    }
+    for proto in options.subprotocols {
+      if !is_token(proto) {
+        return Err(invalid("subprotocol is not a token"));
+      }
+    }
+    for (name, value) in options.extra_headers {
+      if !is_token(name) {
+        return Err(invalid("extra header name is not a token"));
+      }
+      if MANAGED.iter().any(|m| name.eq_ignore_ascii_case(m)) {
+        return Err(invalid("extra header collides with a managed header"));
+      }
+      if value.bytes().any(|b| b == b'\r' || b == b'\n') {
+        return Err(invalid("extra header value contains CR/LF"));
+      }
+    }
+
+    let mut nonce = [0u8; 16];
+    rng.fill_bytes(&mut nonce);
+    let mut key = [0u8; constants::SEC_WEBSOCKET_KEY_LEN];
+    // encoded_len(16) == 24 == the array length; encode always succeeds here.
+    // Using `if let` to satisfy clippy::single_match and the panic-freedom wall.
+    if let Some(written) = crate::base64::encode(&nonce, &mut key) {
+      let _ = written;
+    }
+    Ok(Self { options, key })
+  }
+
+  /// The base64 `Sec-WebSocket-Key` this handshake sends (exposed for
+  /// tests and diagnostics).
+  pub const fn key(&self) -> &[u8; constants::SEC_WEBSOCKET_KEY_LEN] {
+    &self.key
+  }
+
+  /// Writes the upgrade request, returning its length.
+  pub fn encode_request(&self, out: &mut [u8]) -> Result<usize, ClientHandshakeError> {
+    let mut w = WriteCursor::new(out);
+    self
+      .write_request(&mut w)
+      .map_err(ClientHandshakeError::BufferTooSmall)?;
+    Ok(w.written())
+  }
+
+  // Separate helper (not an immediately-invoked closure: that trips
+  // `clippy::redundant_closure_call`).
+  fn write_request(&self, w: &mut WriteCursor<'_>) -> Result<(), BufferTooSmallDetail> {
+    w.push(b"GET ")?;
+    w.push(self.options.path.as_bytes())?;
+    w.push(b" HTTP/1.1\r\nHost: ")?;
+    w.push(self.options.host.as_bytes())?;
+    w.push(b"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ")?;
+    w.push(&self.key)?;
+    w.push(b"\r\nSec-WebSocket-Version: ")?;
+    w.push(constants::WEBSOCKET_VERSION.as_bytes())?;
+    w.push(b"\r\n")?;
+    if let Some((first, rest)) = self.options.subprotocols.split_first() {
+      w.push(b"Sec-WebSocket-Protocol: ")?;
+      w.push(first.as_bytes())?;
+      for proto in rest {
+        w.push(b", ")?;
+        w.push(proto.as_bytes())?;
+      }
+      w.push(b"\r\n")?;
+    }
+    for (name, value) in self.options.extra_headers {
+      w.push(name.as_bytes())?;
+      w.push(b": ")?;
+      w.push(value.as_bytes())?;
+      w.push(b"\r\n")?;
+    }
+    w.push(b"\r\n")
+  }
+
+  /// Parses and validates the accumulated response buffer (stateless:
+  /// re-parses from the start; call again with MORE bytes after
+  /// [`ClientProgress::NeedMore`]).
+  pub fn handle(&self, data: &[u8]) -> Result<ClientProgress, ClientHandshakeError> {
+    let head = match parser::parse_head(data)? {
+      Parsed::NeedMore => return Ok(ClientProgress::NeedMore),
+      Parsed::Complete(head) => head,
+    };
+
+    // Status line: "HTTP/1.1 NNN[ reason]".
+    let line = head.start_line();
+    let Some(rest) = line.strip_prefix("HTTP/1.1 ") else {
+      return Err(ClientHandshakeError::Head(HeadError::Malformed(
+        parser::MalformedDetail::new(0, "not an HTTP/1.1 status line"),
+      )));
+    };
+    let code_str = rest.split(' ').next().unwrap_or("");
+    let Ok(code) = code_str.parse::<u16>() else {
+      return Err(ClientHandshakeError::Head(HeadError::Malformed(
+        parser::MalformedDetail::new(9, "unparsable status code"),
+      )));
+    };
+    if code != 101 {
+      return Err(ClientHandshakeError::UnexpectedStatus(code));
+    }
+
+    let headers = head.headers();
+    let upgrade_ok = headers
+      .get("upgrade")
+      .is_some_and(|v| token_list_contains(v, "websocket"));
+    let connection_ok = headers
+      .get("connection")
+      .is_some_and(|v| token_list_contains(v, "upgrade"));
+    if !upgrade_ok || !connection_ok {
+      return Err(ClientHandshakeError::NotAnUpgrade);
+    }
+
+    if headers.count("sec-websocket-accept") != 1 {
+      return Err(ClientHandshakeError::DuplicateHeader);
+    }
+    let accept_ok = headers
+      .get("sec-websocket-accept")
+      .is_some_and(|v| v.as_bytes() == accept_value(&self.key));
+    if !accept_ok {
+      return Err(ClientHandshakeError::AcceptMismatch);
+    }
+
+    if headers.count("sec-websocket-protocol") > 1 {
+      return Err(ClientHandshakeError::DuplicateHeader);
+    }
+    let negotiated = match headers.get("sec-websocket-protocol") {
+      None => Negotiated::none(),
+      Some(chosen) => {
+        let offered = self
+          .options
+          .subprotocols
+          .iter()
+          .any(|p| p.eq_ignore_ascii_case(chosen));
+        if !offered || !is_token(chosen) {
+          return Err(ClientHandshakeError::SubprotocolNotOffered);
+        }
+        #[cfg(any(feature = "alloc", feature = "heapless"))]
+        {
+          Negotiated::with_subprotocol(chosen)?
+        }
+        #[cfg(not(any(feature = "alloc", feature = "heapless")))]
+        {
+          Negotiated::none()
+        }
+      }
+    };
+
+    // Plan 3a offers no extensions, so any granted extension is a §4.1
+    // step-6 failure. Plan 3b replaces this arm with deflate validation.
+    if headers.get("sec-websocket-extensions").is_some() {
+      return Err(ClientHandshakeError::ExtensionNotOffered);
+    }
+
+    Ok(ClientProgress::Complete(ClientComplete {
+      negotiated,
+      consumed: head.consumed(),
+    }))
+  }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+  use super::*;
+  use crate::handshake::accept_value;
+
+  /// Deterministic Rng: fills with 0,1,2,3,…
+  struct CountingRng(u8);
+
+  impl rand_core::TryRng for CountingRng {
+    type Error = core::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+      let mut b = [0u8; 4];
+      self.try_fill_bytes(&mut b)?;
+      Ok(u32::from_le_bytes(b))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+      let mut b = [0u8; 8];
+      self.try_fill_bytes(&mut b)?;
+      Ok(u64::from_le_bytes(b))
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+      for d in dest {
+        *d = self.0;
+        self.0 = self.0.wrapping_add(1);
+      }
+      Ok(())
+    }
+  }
+
+  fn handshake() -> ClientHandshake<'static> {
+    let options = ClientOptions::new("server.example.com", "/chat")
+      .with_subprotocols(&["chat", "superchat"])
+      .with_extra_headers(&[("Origin", "http://example.com")]);
+    ClientHandshake::new(options, &mut CountingRng(0)).unwrap()
+  }
+
+  fn response_for(hs: &ClientHandshake<'_>, extra: &str) -> Vec<u8> {
+    let accept = accept_value(hs.key());
+    let mut s = String::from(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
+    );
+    s.push_str("Sec-WebSocket-Accept: ");
+    s.push_str(core::str::from_utf8(&accept).unwrap());
+    s.push_str("\r\n");
+    s.push_str(extra);
+    s.push_str("\r\n");
+    s.into_bytes()
+  }
+
+  #[test]
+  fn request_contains_the_required_lines() {
+    let hs = handshake();
+    let mut buf = [0u8; 1024];
+    let n = hs.encode_request(&mut buf).unwrap();
+    let req = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(req.starts_with("GET /chat HTTP/1.1\r\n"), "{req}");
+    assert!(req.contains("\r\nHost: server.example.com\r\n"));
+    assert!(req.contains("\r\nUpgrade: websocket\r\n"));
+    assert!(req.contains("\r\nConnection: Upgrade\r\n"));
+    assert!(req.contains("\r\nSec-WebSocket-Version: 13\r\n"));
+    assert!(req.contains("\r\nSec-WebSocket-Protocol: chat, superchat\r\n"));
+    assert!(req.contains("\r\nOrigin: http://example.com\r\n"));
+    // The key line carries the deterministic nonce: base64 of 0..16.
+    assert!(req.contains("\r\nSec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==\r\n"));
+    assert!(req.ends_with("\r\n\r\n"));
+  }
+
+  #[test]
+  fn buffer_too_small_is_reported() {
+    let hs = handshake();
+    let mut buf = [0u8; 32];
+    assert!(matches!(
+      hs.encode_request(&mut buf).unwrap_err(),
+      ClientHandshakeError::BufferTooSmall(_)
+    ));
+  }
+
+  #[test]
+  fn options_reject_header_injection_and_reserved_names() {
+    let bad = ClientOptions::new("h", "/").with_extra_headers(&[("X-Evil", "a\r\nX-Injected: b")]);
+    assert!(matches!(
+      ClientHandshake::new(bad, &mut CountingRng(0)).unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
+    let reserved = ClientOptions::new("h", "/").with_extra_headers(&[("Sec-WebSocket-Key", "x")]);
+    assert!(matches!(
+      ClientHandshake::new(reserved, &mut CountingRng(0)).unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
+    assert!(matches!(
+      ClientHandshake::new(ClientOptions::new("", "/"), &mut CountingRng(0)).unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
+    assert!(matches!(
+      ClientHandshake::new(ClientOptions::new("h", "nope"), &mut CountingRng(0)).unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
+    let badproto = ClientOptions::new("h", "/").with_subprotocols(&["has space"]);
+    assert!(matches!(
+      ClientHandshake::new(badproto, &mut CountingRng(0)).unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
+  }
+
+  #[test]
+  fn complete_handshake_with_leftover_and_subprotocol() {
+    let hs = handshake();
+    let mut resp = response_for(&hs, "Sec-WebSocket-Protocol: superchat\r\n");
+    resp.extend_from_slice(&[0x81, 0x00]); // first frame bytes after the head
+    match hs.handle(&resp).unwrap() {
+      ClientProgress::Complete(done) => {
+        assert_eq!(done.consumed(), resp.len() - 2);
+        assert_eq!(done.negotiated().subprotocol(), Some("superchat"));
+      }
+      ClientProgress::NeedMore => panic!("complete response reported NeedMore"),
+    }
+    // Stateless: handling again yields the same result.
+    assert!(matches!(
+      hs.handle(&resp).unwrap(),
+      ClientProgress::Complete(_)
+    ));
+  }
+
+  #[test]
+  fn partial_response_needs_more() {
+    let hs = handshake();
+    let resp = response_for(&hs, "");
+    for cut in 0..resp.len() - 1 {
+      assert!(
+        matches!(hs.handle(&resp[..cut]).unwrap(), ClientProgress::NeedMore),
+        "cut at {cut}"
+      );
+    }
+  }
+
+  #[test]
+  fn validation_failures() {
+    let hs = handshake();
+
+    // Wrong status.
+    let resp = b"HTTP/1.1 404 Not Found\r\n\r\n";
+    assert!(matches!(
+      hs.handle(resp).unwrap_err(),
+      ClientHandshakeError::UnexpectedStatus(404)
+    ));
+
+    // Garbled status line.
+    let resp = b"HTTP/1.1 abc\r\n\r\n";
+    assert!(matches!(
+      hs.handle(resp).unwrap_err(),
+      ClientHandshakeError::Head(_)
+    ));
+
+    // Missing upgrade token.
+    let mut resp = response_for(&hs, "");
+    let s = String::from_utf8(resp.clone())
+      .unwrap()
+      .replace("Upgrade: websocket", "Upgrade: h2c");
+    resp = s.into_bytes();
+    assert!(matches!(
+      hs.handle(&resp).unwrap_err(),
+      ClientHandshakeError::NotAnUpgrade
+    ));
+
+    // Wrong accept value.
+    let mut wrong = response_for(&hs, "");
+    let s = String::from_utf8(wrong.clone()).unwrap().replace(
+      core::str::from_utf8(&accept_value(hs.key())).unwrap(),
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    wrong = s.into_bytes();
+    assert!(matches!(
+      hs.handle(&wrong).unwrap_err(),
+      ClientHandshakeError::AcceptMismatch
+    ));
+
+    // Subprotocol the client never offered.
+    let resp = response_for(&hs, "Sec-WebSocket-Protocol: nope\r\n");
+    assert!(matches!(
+      hs.handle(&resp).unwrap_err(),
+      ClientHandshakeError::SubprotocolNotOffered
+    ));
+
+    // An extension when none was offered (plan 3a offers none).
+    let resp = response_for(&hs, "Sec-WebSocket-Extensions: permessage-deflate\r\n");
+    assert!(matches!(
+      hs.handle(&resp).unwrap_err(),
+      ClientHandshakeError::ExtensionNotOffered
+    ));
+
+    // Two accept headers.
+    let resp = response_for(&hs, "Sec-WebSocket-Accept: bogus\r\n");
+    assert!(matches!(
+      hs.handle(&resp).unwrap_err(),
+      ClientHandshakeError::DuplicateHeader
+    ));
+  }
+}

@@ -88,6 +88,9 @@ impl<'a> HeaderMap<'a> {
   }
 
   /// Number of header fields.
+  // Only consumed by tests (gated on `feature = "std"`); production code
+  // uses `count` / `get_all` instead.
+  #[allow(dead_code)]
   pub(crate) const fn len(&self) -> usize {
     self.len
   }
