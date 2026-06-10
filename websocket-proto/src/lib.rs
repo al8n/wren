@@ -25,6 +25,8 @@
   )
 )]
 
+// The alias trips `unused_extern_crates` until the first alloc-backed module lands.
+#[allow(unused_extern_crates)]
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 extern crate alloc as std;
 

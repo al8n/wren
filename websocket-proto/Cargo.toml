@@ -12,7 +12,7 @@ categories = ["network-programming", "no-std", "embedded", "web-programming::web
 
 [features]
 default = ["std"]
-std = ["alloc", "thiserror/std", "smol_str/std", "bytes/std", "rand?/std"]
+std = ["alloc", "thiserror/std", "smol_str/std", "bytes/std", "rand?/std", "rand?/thread_rng"]
 alloc = ["dep:smol_str", "dep:bytes"]
 heapless = ["dep:heapless"]
 deflate = ["alloc", "dep:miniz_oxide"]
@@ -26,7 +26,7 @@ smol_str = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 heapless = { workspace = true, optional = true }
 miniz_oxide = { workspace = true, optional = true, features = ["with-alloc"] }
-rand = { workspace = true, optional = true, features = ["std", "thread_rng"] }
+rand = { workspace = true, optional = true, features = ["std_rng"] }
 
 [dev-dependencies]
 base64 = "0.22"
