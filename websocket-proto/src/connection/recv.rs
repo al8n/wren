@@ -7,11 +7,18 @@
 //! fixed position into it. Each step splits the *front* off that slice with
 //! [`slice::split_at_mut`]: header and consumed-control bytes are split off
 //! and dropped, payload bytes are split off, unmasked in place, then handed
-//! out as a shared `&'a [u8]` reborrow (the by-value `&mut → &` coercion
-//! keeps the `'a` lifetime) while the tail is kept for the next step. All
+//! out as a shared reborrow while the tail is kept for the next step. All
 //! offsets are therefore relative to the current tail, and yielded chunks
 //! never alias the bytes still owned by the cursor — the safe replacement for
 //! the unsafe reborrow the sketch warned against.
+//!
+//! [`Events::next`] is a **lending iterator**: each event borrows the cursor
+//! and is valid only until the next `next()` call. Uncompressed chunks point
+//! into the input slice with no copy (the split-off `&'a mut [u8]` reborrows
+//! to a shared slice at the shorter `&mut self` lifetime); compressed chunks
+//! point into the cursor's internal inflate buffer (same lifetime). Narrowing
+//! both to the `&mut self` borrow lets one signature cover both without
+//! copying the uncompressed path.
 
 use super::{Connection, Lifecycle, events::*, role::Role};
 use crate::{
@@ -100,9 +107,10 @@ impl RecvState {
   }
 }
 
-/// Iterator-like cursor over the events produced by one `handle` call.
-/// Yields events borrowing the input; drop it (or drain it) before calling
-/// `handle` again.
+/// A lending-iterator cursor over the events produced by one `handle` call.
+/// Each [`next`](Events::next) event borrows the cursor and is valid only
+/// until the following `next()` call; fold it into owned storage before
+/// advancing. Drop the cursor (or drain it) before calling `handle` again.
 #[derive(Debug)]
 pub struct Events<'a, 'c, I, Ro> {
   pub(crate) conn: &'c mut Connection<I, Ro>,
@@ -120,8 +128,9 @@ where
   I: Instant,
   Ro: Role,
 {
-  /// Feeds inbound transport bytes. Payload bytes are unmasked in place;
-  /// the returned cursor yields borrowed events.
+  /// Feeds inbound transport bytes. Payload bytes are unmasked in place; the
+  /// returned [`Events`] cursor is a lending iterator over borrowed events
+  /// (each valid until the next `next()` call).
   pub fn handle<'a, 'c>(
     &'c mut self,
     now: I,
@@ -152,13 +161,19 @@ where
 {
   /// The next event, or `None` when this input is exhausted.
   ///
-  /// (A `next(&mut self) -> Option<Event<'a>>` inherent method rather than
-  /// `Iterator`: items borrow the input slice at `'a`, which outlives the
-  /// cursor — that part fits `Iterator` — but keeping it inherent leaves
-  /// room to evolve the signature; a `for`-loop style `while let` is the
-  /// intended call shape.)
+  /// This is a **lending iterator**: each event borrows `self` and is only
+  /// valid until the next `next()` call (or until the cursor is dropped).
+  /// Uncompressed payload chunks still point directly into the input slice
+  /// with no copy; compressed chunks point into the cursor's internal
+  /// inflate buffer — both are reborrowed at the shorter `&mut self`
+  /// lifetime so a single signature covers them. Fold each event into owned
+  /// storage before calling `next()` again. The intended call shape is a
+  /// `while let Some(event) = events.next()` loop.
+  // A lending iterator: `Iterator` cannot express items that borrow `self`
+  // (`Item` has no access to the `&mut self` lifetime of `next`), so this
+  // stays an inherent method.
   #[allow(clippy::should_implement_trait)]
-  pub fn next(&mut self) -> Option<Event<'a>> {
+  pub fn next(&mut self) -> Option<Event<'_>> {
     if self.pending_message_end {
       self.pending_message_end = false;
       return Some(Event::MessageEnd);

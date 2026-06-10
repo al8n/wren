@@ -6,12 +6,17 @@
 //! from the handshake's [`Negotiated`](crate::negotiation::Negotiated) plus a
 //! [`ConnectionConfig`] and a [`role::Role`](crate::connection::role::Role) value.
 //!
-//! Receive: feed transport bytes to [`Connection::handle`]; payloads are
-//! unmasked **in place** and surfaced as borrowed chunk events — internal
-//! state is O(1) in message size. Send: the `encode_*` methods serialize
-//! straight into your buffer (clients mask on the copy with a fresh key per
-//! frame); only protocol-generated frames (pong echoes, close) are queued
-//! internally and drained via [`Connection::poll_transmit`].
+//! Receive: feed transport bytes to [`Connection::handle`]; the returned
+//! [`Events`](crate::connection::Events) cursor is a lending iterator whose
+//! events borrow the cursor and are valid only until the next `next()` call.
+//! Uncompressed payloads are
+//! unmasked **in place** and the chunks point straight into the input —
+//! receive state is O(1) in message size (the inflate path under the
+//! `deflate` feature is the one exception: it buffers each inflated message).
+//! Send: the `encode_*` methods serialize straight into your buffer (clients
+//! mask on the copy with a fresh key per frame); only protocol-generated
+//! frames (pong echoes, close) are queued internally and drained via
+//! [`Connection::poll_transmit`].
 //!
 //! Protocol violations are not `Err`s: the machine queues the prescribed
 //! close frame, becomes terminal, and yields a final

@@ -1,4 +1,9 @@
 //! Borrowed events yielded while feeding inbound bytes.
+//!
+//! Events are produced by the lending iterator [`Events::next`](super::Events):
+//! every borrowed event (and the slices inside it) is valid only until the
+//! next `next()` call. Uncompressed chunks borrow the input slice directly;
+//! compressed chunks borrow the cursor's internal inflate buffer.
 
 use crate::{constants::MAX_CONTROL_PAYLOAD, frame::CloseCode};
 
@@ -52,8 +57,9 @@ impl MessageStart {
 }
 
 /// A validated text payload chunk. `prefix` carries the ≤4 bytes that
-/// complete a character split across `handle` calls; `body` borrows the
-/// input. Their concatenation is the payload run.
+/// complete a character split across `handle` calls; `body` is a borrowed
+/// run valid until the next [`Events::next`](super::Events) call. Their
+/// concatenation is the payload run.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct TextChunk<'a> {
   prefix: ([u8; 4], u8),
@@ -157,9 +163,10 @@ impl Closed {
 pub enum Event<'a> {
   /// A data message began.
   MessageStart(MessageStart),
-  /// A run of binary payload (unmasked in place, borrowing the input). Also
-  /// carries the raw DEFLATE bytes of a compressed message (see
-  /// [`MessageStart::compressed`]).
+  /// A run of binary payload, valid until the next
+  /// [`Events::next`](super::Events) call. Uncompressed payloads are unmasked
+  /// in place and borrow the input directly; compressed payloads borrow the
+  /// cursor's internal inflate buffer (see [`MessageStart::compressed`]).
   BinaryChunk(&'a [u8]),
   /// A run of validated text payload.
   TextChunk(TextChunk<'a>),
