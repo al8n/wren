@@ -120,6 +120,23 @@ jobs:
           # every test through the interpreter.
           PROPTEST_CASES: 8
 
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            websocket-proto/fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz frame_decode (bounded smoke)
+        working-directory: websocket-proto
+        run: cargo fuzz run frame_decode -- -runs=100000 -max_total_time=120
+
 # There is deliberately NO release-symbol panic scan: on current toolchains a
 # `pub fn` containing a guaranteed panic emits no symbols into the rlib at all
 # (verified empirically — uninstantiated library code ships as metadata, with

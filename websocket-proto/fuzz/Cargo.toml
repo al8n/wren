@@ -1,0 +1,22 @@
+[package]
+name = "websocket-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+websocket-proto = { path = "..", features = ["std"] }
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone: not a member of the websockit workspace.
+[workspace]
