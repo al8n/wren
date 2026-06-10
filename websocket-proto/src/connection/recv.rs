@@ -88,6 +88,11 @@ pub(crate) struct RecvState {
   /// reads).
   pub(crate) control_buf: [u8; MAX_CONTROL_PAYLOAD],
   pub(crate) control_len: usize,
+  /// Inbound permessage-deflate decompressor, created lazily at the first
+  /// compressed message. Boxed to keep `RecvState` small (the raw inflate
+  /// dictionary alone is ~32 KiB).
+  #[cfg(feature = "deflate")]
+  pub(crate) inflate: Option<std::boxed::Box<inflate::InflateBox>>,
 }
 
 impl RecvState {
@@ -103,6 +108,172 @@ impl RecvState {
       pending_pong: None,
       control_buf: [0; MAX_CONTROL_PAYLOAD],
       control_len: 0,
+      #[cfg(feature = "deflate")]
+      inflate: None,
+    }
+  }
+}
+
+#[cfg(feature = "deflate")]
+pub(crate) mod inflate {
+  //! Inbound permessage-deflate decompression (RFC 7692 §7.2.2).
+  //!
+  //! Each compressed message is one continuous raw-DEFLATE stream. Per the
+  //! RFC the sender strips the `00 00 FF FF` sync-flush tail before sending,
+  //! so the receiver appends those four octets to the message's final frame
+  //! before inflating. We feed each unmasked frame run through
+  //! [`miniz_oxide`]'s streaming inflater into a reused output buffer and
+  //! never use [`MZFlush::Finish`]: the stream stays open across messages so
+  //! context takeover (the next message back-referencing this one's window)
+  //! keeps working. Context is reset per message only when the inbound
+  //! direction negotiated `no_context_takeover`.
+
+  use miniz_oxide::{
+    DataFormat, MZError, MZFlush, MZStatus,
+    inflate::stream::{InflateState, inflate},
+  };
+  use std::{boxed::Box, vec::Vec};
+
+  /// RFC 7692 §7.2.2: the four octets appended to the last frame's data
+  /// before inflating (the deflate sync-flush boundary the sender removed).
+  const SYNC_TAIL: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
+
+  /// Output is drained from the inflater in fixed stack-sized steps.
+  const INFLATE_CHUNK: usize = 4 * 1024;
+
+  /// Why an inflate run could not complete. Both map to a close code at the
+  /// call site (1007 for a corrupt stream, 1009 for an over-cap message).
+  pub(crate) enum InflateFail {
+    /// The DEFLATE stream is malformed (RFC: fail the connection, 1007).
+    Corrupt,
+    /// The inflated message exceeded `max_message_size` (1009).
+    TooLarge,
+  }
+
+  /// A lazily-created inbound decompressor plus its scratch output buffer.
+  /// Boxed inside `RecvState` so the large dictionary never inflates the
+  /// connection's inline size.
+  pub(crate) struct InflateBox {
+    state: Box<InflateState>,
+    /// Inflated output of the CURRENT frame run; reborrowed by the yielded
+    /// chunk event and overwritten on the next run.
+    buf: Vec<u8>,
+    /// Inflated bytes accumulated for the in-progress message (reset when a
+    /// message completes), checked against `max_message_size`.
+    inflated_total: u64,
+  }
+
+  impl InflateBox {
+    /// A fresh raw-DEFLATE decompressor. The inbound window-bits negotiation
+    /// does not change decoding: `miniz_oxide`'s inflater always allocates
+    /// the full 32 KiB dictionary, which correctly decodes any stream a peer
+    /// produced under an equal-or-smaller window. The negotiated bits matter
+    /// only on the SEND side.
+    pub(crate) fn new() -> Box<Self> {
+      Box::new(Self {
+        state: InflateState::new_boxed(DataFormat::Raw),
+        buf: Vec::new(),
+        inflated_total: 0,
+      })
+    }
+
+    /// The inflated output of the most recent [`run`](Self::run).
+    pub(crate) fn output(&self) -> &[u8] {
+      &self.buf
+    }
+
+    /// Resets the decompressor for a new message (inbound
+    /// `no_context_takeover`): drop the back-reference window so the next
+    /// message decodes independently.
+    pub(crate) fn reset(&mut self) {
+      self.state.reset(DataFormat::Raw);
+    }
+
+    /// Marks the start of a new message: clears the per-message inflated-byte
+    /// counter. (The window itself persists unless [`reset`](Self::reset) is
+    /// called.)
+    pub(crate) fn begin_message(&mut self) {
+      self.inflated_total = 0;
+    }
+
+    /// Inflates one frame run into `buf` (cleared first). On the message's
+    /// final frame, appends the RFC sync-flush tail and drains the trailing
+    /// block. Accumulates `inflated_total` and enforces `max`.
+    pub(crate) fn run(
+      &mut self,
+      data: &[u8],
+      final_frame: bool,
+      max: u64,
+    ) -> Result<(), InflateFail> {
+      self.buf.clear();
+      self.feed(data, max)?;
+      if final_frame {
+        self.feed(&SYNC_TAIL, max)?;
+      }
+      Ok(())
+    }
+
+    /// Drives the streaming inflater over `input`, appending decompressed
+    /// output to `buf` until the input is consumed and no further output is
+    /// produced. `MZFlush::None` keeps the stream open across calls/messages.
+    fn feed(&mut self, input: &[u8], max: u64) -> Result<(), InflateFail> {
+      let mut cursor = input;
+      loop {
+        let base = self.buf.len();
+        self.buf.resize(base.saturating_add(INFLATE_CHUNK), 0);
+        let Some(window) = self.buf.get_mut(base..) else {
+          return Err(InflateFail::Corrupt);
+        };
+        let result = inflate(&mut self.state, cursor, window, MZFlush::None);
+        let written = result.bytes_written;
+        let consumed = result.bytes_consumed;
+        // Trim the resized region back to what was actually produced.
+        self.buf.truncate(base.saturating_add(written));
+
+        self.inflated_total = self
+          .inflated_total
+          .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        if self.inflated_total > max {
+          return Err(InflateFail::TooLarge);
+        }
+
+        cursor = cursor.get(consumed..).unwrap_or(&[]);
+
+        match result.status {
+          // Stream finished (a peer sent a final block): no more output.
+          Ok(MZStatus::StreamEnd) => return Ok(()),
+          Ok(_) => {
+            // Done with this input once it is drained and the last step made
+            // no progress (the open-stream steady state between messages).
+            if cursor.is_empty() && written == 0 && consumed == 0 {
+              return Ok(());
+            }
+            // All input consumed and the inflater did not fill the whole
+            // window — nothing is buffered waiting to come out.
+            if cursor.is_empty() && written < INFLATE_CHUNK {
+              return Ok(());
+            }
+          }
+          // No progress possible. With the stream still open this just means
+          // "need more input"; that is fine once our input is drained.
+          Err(MZError::Buf) => {
+            if cursor.is_empty() {
+              return Ok(());
+            }
+            return Err(InflateFail::Corrupt);
+          }
+          Err(_) => return Err(InflateFail::Corrupt),
+        }
+      }
+    }
+  }
+
+  impl core::fmt::Debug for InflateBox {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.debug_struct("InflateBox")
+        .field("buffered", &self.buf.len())
+        .field("inflated_total", &self.inflated_total)
+        .finish_non_exhaustive()
     }
   }
 }
@@ -207,10 +378,36 @@ where
             return Some(event);
           }
         }
-        FrameState::DataPayload { .. } => match self.step_data_payload() {
-          StepOutcome::Event(event) => return Some(event),
-          StepOutcome::NeedMore => return None,
-          StepOutcome::Continue => {}
+        FrameState::DataPayload { .. } => match self.advance_data_payload() {
+          // Borrow phase: build the event after the mutating `advance` borrow
+          // has ended. A builder yielding `None` means this run produced no
+          // visible event (e.g. an incomplete UTF-8 char folded into the
+          // carry) — keep looping rather than ending the cursor.
+          DataStep::YieldInput {
+            chunk,
+            kind,
+            message_done,
+          } => {
+            if let Some(event) = self.build_input_event(chunk, kind, message_done) {
+              return Some(event);
+            }
+          }
+          #[cfg(feature = "deflate")]
+          DataStep::YieldInflated {
+            chunk,
+            kind,
+            message_done,
+          } => match self.decide_inflated(chunk, kind, message_done) {
+            // Tail return: build the event (borrows the inflate buffer) only
+            // after the owned decision is in hand.
+            InflateDecision::Yield(yielded) => return Some(self.build_inflated_event(yielded)),
+            InflateDecision::MessageEnd => return Some(Event::MessageEnd),
+            InflateDecision::Fail(code) => return Some(self.fail(code)),
+            InflateDecision::Nothing => {}
+          },
+          DataStep::Fail(code) => return Some(self.fail(code)),
+          DataStep::NeedMore => return None,
+          DataStep::Continue => {}
         },
         FrameState::ControlPayload { .. } => match self.step_control_payload() {
           StepOutcome::Event(event) => return Some(event),
@@ -370,6 +567,10 @@ where
         };
         self.conn.recv.utf8.reset();
         self.conn.recv.text_carry = ([0; 4], 0);
+        #[cfg(feature = "deflate")]
+        if compressed {
+          self.begin_inflate_message();
+        }
         self.begin_data_payload(header);
         Some(Event::MessageStart(MessageStart::new(kind, compressed)))
       }
@@ -386,10 +587,41 @@ where
     };
   }
 
-  /// Consumes (part of) the current data payload: split off the available
-  /// run, unmask it in place, account for size, and yield the chunk
-  /// (text-validated or raw) followed by `MessageEnd` on the final frame.
-  fn step_data_payload(&mut self) -> StepOutcome<'a> {
+  /// Prepares the inbound decompressor for a new compressed message: create
+  /// it lazily, reset its window when the inbound direction negotiated
+  /// `no_context_takeover`, and clear the per-message inflated-byte counter.
+  #[cfg(feature = "deflate")]
+  fn begin_inflate_message(&mut self) {
+    // The inbound direction is the one the peer SENDS on: client→server for a
+    // server connection, server→client for a client connection.
+    let no_takeover = self.conn.deflate.is_some_and(|params| {
+      if Ro::EXPECT_MASKED_INBOUND {
+        params.client_no_context_takeover()
+      } else {
+        params.server_no_context_takeover()
+      }
+    });
+    let had_context = self.conn.recv.inflate.is_some();
+    let inflate = self
+      .conn
+      .recv
+      .inflate
+      .get_or_insert_with(inflate::InflateBox::new);
+    // Reset only an EXISTING context; a freshly created one needs none.
+    if no_takeover && had_context {
+      inflate.reset();
+    }
+    inflate.begin_message();
+  }
+
+  /// Advances the current data payload by one run: splits off the available
+  /// bytes, unmasks them in place, applies the per-frame/per-message state
+  /// transitions and the raw size cap, and reports what to yield. The borrow
+  /// of `self` ends with this call — the returned [`DataStep`] only borrows
+  /// the input (`'a`), never `self`, so the event itself is built afterward
+  /// in [`next`](Self::next) (the lending-iterator split that keeps the
+  /// borrow checker happy across the loop).
+  fn advance_data_payload(&mut self) -> DataStep<'a> {
     let FrameState::DataPayload {
       remaining,
       mask: key,
@@ -397,19 +629,20 @@ where
       fin,
     } = self.conn.recv.frame
     else {
-      return StepOutcome::Continue;
+      return DataStep::Continue;
     };
 
     let available = self.remaining();
     let take = clamp_to_usize(remaining, available);
     if take == 0 && remaining > 0 {
-      return StepOutcome::NeedMore;
+      return DataStep::NeedMore;
     }
 
     let head = self.take_front(take);
     if let Some(k) = key {
       mask(head, k, offset);
     }
+    // `head` borrows the input (`'a`), which is disjoint from `self`.
     let chunk: &'a [u8] = head;
 
     let next_remaining = remaining.saturating_sub(widen(take));
@@ -428,35 +661,34 @@ where
       };
     }
 
-    match self.emit_data_chunk(chunk, fin, frame_done) {
-      Ok(Some(event)) => StepOutcome::Event(event),
-      Ok(None) => StepOutcome::Continue,
-      Err(code) => StepOutcome::Event(self.fail(code)),
-    }
-  }
-
-  /// Emits the just-unmasked data chunk: size accounting, UTF-8 gating,
-  /// chunk + `MessageEnd` sequencing.
-  fn emit_data_chunk(
-    &mut self,
-    chunk: &'a [u8],
-    fin: bool,
-    frame_done: bool,
-  ) -> Result<Option<Event<'a>>, CloseCode> {
     let MessageState::InMessage {
       kind,
       compressed,
       received,
     } = self.conn.recv.message
     else {
-      return Err(CloseCode::ProtocolError);
+      return DataStep::Fail(CloseCode::ProtocolError);
     };
-    let len = widen(chunk.len());
-    let received = received.saturating_add(len);
-    if received > self.conn.config.max_message_size() {
-      return Err(CloseCode::MessageTooBig);
-    }
     let message_done = frame_done && fin;
+
+    #[cfg(feature = "deflate")]
+    if compressed {
+      // The inflated-byte cap is enforced during inflation, in `decide_inflated`.
+      if message_done {
+        self.conn.recv.message = MessageState::Idle;
+      }
+      return DataStep::YieldInflated {
+        chunk,
+        kind,
+        message_done,
+      };
+    }
+
+    // Uncompressed: cap on the bytes received here.
+    let received = received.saturating_add(widen(chunk.len()));
+    if received > self.conn.config.max_message_size() {
+      return DataStep::Fail(CloseCode::MessageTooBig);
+    }
     self.conn.recv.message = if message_done {
       MessageState::Idle
     } else {
@@ -466,121 +698,145 @@ where
         received,
       }
     };
-
-    let event = if compressed {
-      // Compressed payloads are NOT UTF-8 validated until inflation (plan 5);
-      // surface the raw DEFLATE bytes as BinaryChunk runs regardless of the
-      // text/binary opcode — MessageStart.compressed() tells the consumer
-      // what they are.
-      if chunk.is_empty() {
-        None
-      } else {
-        Some(Event::BinaryChunk(chunk))
-      }
-    } else {
-      match kind {
-        MessageKind::Binary => {
-          if chunk.is_empty() {
-            None
-          } else {
-            Some(Event::BinaryChunk(chunk))
-          }
-        }
-        MessageKind::Text => self
-          .validate_text(chunk, message_done)?
-          .map(Event::TextChunk),
-      }
-    };
-
-    match event {
-      Some(e) => {
-        if message_done {
-          // MessageEnd must still follow this chunk: stash a pending flag.
-          self.pending_message_end = true;
-        }
-        Ok(Some(e))
-      }
-      None if message_done => Ok(Some(Event::MessageEnd)),
-      None => Ok(None),
+    DataStep::YieldInput {
+      chunk,
+      kind,
+      message_done,
     }
   }
 
-  /// Runs the incremental validator over the chunk, assembling the carry
-  /// prefix. Returns the text chunk to yield (or `None` for empty), or the
-  /// close code on invalid UTF-8.
-  fn validate_text(
+  /// Builds the event for an uncompressed data run (the borrow phase of the
+  /// lending split). `chunk` borrows the input. Sets the pending `MessageEnd`
+  /// flag when the chunk both yields and ends the message.
+  fn build_input_event(
     &mut self,
     chunk: &'a [u8],
+    kind: MessageKind,
     message_done: bool,
-  ) -> Result<Option<TextChunk<'a>>, CloseCode> {
-    let needed_before = usize::from(self.conn.recv.utf8.pending_needed());
-    let complete = match self.conn.recv.utf8.feed(chunk) {
-      Ok(c) => c,
-      Err(_) => return Err(CloseCode::InvalidFramePayload),
+  ) -> Option<Event<'a>> {
+    let event = match kind {
+      MessageKind::Binary => (!chunk.is_empty()).then_some(Event::BinaryChunk(chunk)),
+      MessageKind::Text => {
+        match validate_text_ranges(
+          &mut self.conn.recv.utf8,
+          &mut self.conn.recv.text_carry,
+          chunk,
+          message_done,
+        ) {
+          Ok(y) => y.map(|y| Event::TextChunk(text_chunk(chunk, y))),
+          Err(code) => return Some(self.fail(code)),
+        }
+      }
     };
-    if message_done && !self.conn.recv.utf8.is_boundary() {
-      return Err(CloseCode::InvalidFramePayload);
+    self.finish_data_event(event, message_done)
+  }
+
+  /// Inflates a compressed data run (RFC 7692 §7.2.2) and DECIDES what to
+  /// yield, returning an OWNED [`InflateDecision`] — no borrow of `self`
+  /// outlives this call. The decompressed bytes stay in the inflate buffer;
+  /// [`build_inflated_event`](Self::build_inflated_event) slices them
+  /// afterward. Splitting the mutation (inflate + validate + state) from the
+  /// borrow (slicing the buffer) is what lets the lending iterator type-check:
+  /// when this run yields nothing, `next` keeps looping with no borrow held.
+  /// Text is validated post-inflation through the same UTF-8 machinery as
+  /// uncompressed text. Sets the pending `MessageEnd` flag when a yielded
+  /// chunk also ends the message.
+  #[cfg(feature = "deflate")]
+  fn decide_inflated(
+    &mut self,
+    chunk: &[u8],
+    kind: MessageKind,
+    message_done: bool,
+  ) -> InflateDecision {
+    use inflate::InflateFail;
+    let max = self.conn.config.max_message_size();
+
+    let recv = &mut self.conn.recv;
+    let Some(inflate) = recv.inflate.as_mut() else {
+      // A compressed message always created its decompressor in on_header.
+      return InflateDecision::Fail(CloseCode::ProtocolError);
+    };
+    // The RFC 7692 §7.2.2 sync-flush tail is appended once, after the message's
+    // FINAL frame — keyed on `message_done`, NOT on each frame's completion.
+    match inflate.run(chunk, message_done, max) {
+      Ok(()) => {}
+      Err(InflateFail::Corrupt) => return InflateDecision::Fail(CloseCode::InvalidFramePayload),
+      Err(InflateFail::TooLarge) => return InflateDecision::Fail(CloseCode::MessageTooBig),
     }
 
-    // Prefix: finish the carried char with the first `needed_before` bytes
-    // (if this chunk supplied them all — otherwise everything joins the
-    // carry and nothing is yielded).
-    let (mut carry_buf, carry_len) = self.conn.recv.text_carry;
-    let mut prefix = ([0u8; 4], 0u8);
-    let body_start = if carry_len > 0 {
-      if chunk.len() < needed_before {
-        // Char still incomplete: extend the carry.
-        for (i, b) in chunk.iter().enumerate() {
-          if let Some(slot) = carry_buf.get_mut(usize::from(carry_len).saturating_add(i)) {
-            *slot = *b;
-          }
-        }
-        let new_len = carry_len.saturating_add(u8::try_from(chunk.len()).unwrap_or(0));
-        self.conn.recv.text_carry = (carry_buf, new_len);
-        return Ok(None);
-      }
-      // Char completes: prefix = carry + needed_before bytes.
-      let mut prefix_buf = [0u8; 4];
-      let mut n = 0u8;
-      for b in carry_buf.iter().take(usize::from(carry_len)) {
-        if let Some(slot) = prefix_buf.get_mut(usize::from(n)) {
-          *slot = *b;
-          n = n.saturating_add(1);
+    // Decide what (if anything) to yield. Binary yields the whole inflated
+    // run; text validates it (split borrow: the buffer is read while
+    // `utf8`/`text_carry`, disjoint fields, are mutated) and yields the
+    // validated body range.
+    let yielded = match kind {
+      MessageKind::Binary => {
+        let inflated = recv.inflate.as_deref().map(inflate::InflateBox::output);
+        match inflated {
+          Some(bytes) if !bytes.is_empty() => Some(Yielded::Binary),
+          Some(_) => None,
+          None => return InflateDecision::Fail(CloseCode::ProtocolError),
         }
       }
-      for b in chunk.iter().take(needed_before) {
-        if let Some(slot) = prefix_buf.get_mut(usize::from(n)) {
-          *slot = *b;
-          n = n.saturating_add(1);
+      MessageKind::Text => {
+        let Some(inflated) = recv.inflate.as_deref().map(inflate::InflateBox::output) else {
+          return InflateDecision::Fail(CloseCode::ProtocolError);
+        };
+        match validate_text_ranges(&mut recv.utf8, &mut recv.text_carry, inflated, message_done) {
+          Ok(Some(y)) => Some(Yielded::Text(y)),
+          Ok(None) => None,
+          Err(code) => return InflateDecision::Fail(code),
         }
       }
-      prefix = (prefix_buf, n);
-      self.conn.recv.text_carry = ([0; 4], 0);
-      needed_before
-    } else {
-      0
     };
 
-    // New carry: bytes past the last char boundary in THIS chunk.
-    let new_carry = chunk.get(complete..).unwrap_or(&[]);
-    if !new_carry.is_empty() {
-      let mut carry = [0u8; 4];
-      let mut n = 0u8;
-      for b in new_carry.iter().take(3) {
-        if let Some(slot) = carry.get_mut(usize::from(n)) {
-          *slot = *b;
-          n = n.saturating_add(1);
+    match yielded {
+      Some(y) => {
+        if message_done {
+          self.pending_message_end = true;
         }
+        InflateDecision::Yield(y)
       }
-      self.conn.recv.text_carry = (carry, n);
+      None if message_done => InflateDecision::MessageEnd,
+      None => InflateDecision::Nothing,
     }
+  }
 
-    let body_bytes = chunk.get(body_start..complete).unwrap_or(&[]);
-    let body = core::str::from_utf8(body_bytes).unwrap_or("");
-    if prefix.1 == 0 && body.is_empty() {
-      return Ok(None);
+  /// Borrow-phase tail of [`decide_inflated`](Self::decide_inflated): slices
+  /// the just-produced inflate buffer to build the yielded chunk event. Called
+  /// from `next` only when the decision was [`InflateDecision::Yield`], so the
+  /// `'s` borrow of `self` here is the cursor's final tail return.
+  #[cfg(feature = "deflate")]
+  fn build_inflated_event(&mut self, yielded: Yielded) -> Event<'_> {
+    let inflated = self
+      .conn
+      .recv
+      .inflate
+      .as_deref()
+      .map_or(&[][..], inflate::InflateBox::output);
+    match yielded {
+      Yielded::Binary => Event::BinaryChunk(inflated),
+      Yielded::Text(y) => Event::TextChunk(text_chunk(inflated, y)),
     }
-    Ok(Some(TextChunk::new(prefix, body)))
+  }
+
+  /// Sequences a just-built data chunk with its trailing `MessageEnd`: when
+  /// the chunk yields and the message is done, stash the pending end; when the
+  /// chunk is empty but the message is done, surface `MessageEnd` now.
+  fn finish_data_event<'s>(
+    &mut self,
+    event: Option<Event<'s>>,
+    message_done: bool,
+  ) -> Option<Event<'s>> {
+    match event {
+      Some(e) => {
+        if message_done {
+          self.pending_message_end = true;
+        }
+        Some(e)
+      }
+      None if message_done => Some(Event::MessageEnd),
+      None => None,
+    }
   }
 
   /// Consumes (part of) the current control payload: split off the available
@@ -721,6 +977,57 @@ enum StepOutcome<'a> {
   Continue,
 }
 
+/// What [`advance_data_payload`](Events::advance_data_payload) decided to do
+/// with one payload run. Carries only input-borrowed data (`'a`), never a
+/// borrow of `self`, so [`next`](Events::next) can build the actual event
+/// after the mutating borrow ends — the split that makes the lending
+/// iterator type-check across the `next` loop.
+enum DataStep<'a> {
+  /// Yield an uncompressed run (already unmasked, borrowing the input).
+  YieldInput {
+    chunk: &'a [u8],
+    kind: MessageKind,
+    message_done: bool,
+  },
+  /// Inflate and yield a compressed run (output lands in the inflate buffer).
+  #[cfg(feature = "deflate")]
+  YieldInflated {
+    chunk: &'a [u8],
+    kind: MessageKind,
+    message_done: bool,
+  },
+  /// Fail the connection with this close code.
+  Fail(CloseCode),
+  /// The current frame is not finished and the input is exhausted.
+  NeedMore,
+  /// Nothing to yield from this run; keep looping.
+  Continue,
+}
+
+/// What inflating one compressed run decided to do. Owned (no borrow of
+/// `self`), so the buffer-slicing event build happens afterward in `next`.
+#[cfg(feature = "deflate")]
+enum InflateDecision {
+  /// Yield a chunk built from the inflate buffer (see [`Yielded`]).
+  Yield(Yielded),
+  /// The run ended the message and produced no chunk: yield `MessageEnd`.
+  MessageEnd,
+  /// Nothing to yield from this run; keep looping.
+  Nothing,
+  /// Fail the connection with this close code.
+  Fail(CloseCode),
+}
+
+/// Which kind of chunk an inflated run yields; the bytes live in the inflate
+/// buffer and are sliced in the borrow phase.
+#[cfg(feature = "deflate")]
+enum Yielded {
+  /// The whole inflated run, as a binary chunk.
+  Binary,
+  /// A validated text body (with its carry prefix) over the inflated run.
+  Text(TextYield),
+}
+
 /// The §5.5 control-payload cap as a `u64` for header comparisons.
 fn control_cap() -> u64 {
   widen(MAX_CONTROL_PAYLOAD)
@@ -738,6 +1045,106 @@ fn widen(value: usize) -> u64 {
 /// so the conversion never saturates in practice.
 fn clamp_to_usize(remaining: u64, available: usize) -> usize {
   usize::try_from(remaining.min(widen(available))).unwrap_or(available)
+}
+
+/// The yield of one text-chunk validation: the carried-character prefix plus
+/// the byte range of the chunk that forms the body. Owned (no borrow), so the
+/// validator's borrow of `utf8`/`text_carry` ends before the caller slices the
+/// chunk — letting the body slice borrow a *different* `RecvState` field (the
+/// inflate buffer) than the one validation mutated.
+struct TextYield {
+  prefix: ([u8; 4], u8),
+  body: core::ops::Range<usize>,
+}
+
+/// Runs the incremental validator over a text chunk, assembling the carry
+/// prefix. Returns what to yield (or `None` when the chunk is fully absorbed
+/// into the carry / produced nothing), or the close code on invalid UTF-8.
+///
+/// Free function over the specific fields (not `&mut self`) so the caller can
+/// borrow `utf8`/`text_carry` while `chunk` borrows a different field of the
+/// same `RecvState` — the split borrow a `&mut self` method could not express.
+fn validate_text_ranges(
+  utf8: &mut Utf8Validator,
+  text_carry: &mut ([u8; 4], u8),
+  chunk: &[u8],
+  message_done: bool,
+) -> Result<Option<TextYield>, CloseCode> {
+  let needed_before = usize::from(utf8.pending_needed());
+  let complete = match utf8.feed(chunk) {
+    Ok(c) => c,
+    Err(_) => return Err(CloseCode::InvalidFramePayload),
+  };
+  if message_done && !utf8.is_boundary() {
+    return Err(CloseCode::InvalidFramePayload);
+  }
+
+  // Prefix: finish the carried char with the first `needed_before` bytes (if
+  // this chunk supplied them all — otherwise everything joins the carry and
+  // nothing is yielded).
+  let (mut carry_buf, carry_len) = *text_carry;
+  let mut prefix = ([0u8; 4], 0u8);
+  let body_start = if carry_len > 0 {
+    if chunk.len() < needed_before {
+      // Char still incomplete: extend the carry.
+      for (i, b) in chunk.iter().enumerate() {
+        if let Some(slot) = carry_buf.get_mut(usize::from(carry_len).saturating_add(i)) {
+          *slot = *b;
+        }
+      }
+      let new_len = carry_len.saturating_add(u8::try_from(chunk.len()).unwrap_or(0));
+      *text_carry = (carry_buf, new_len);
+      return Ok(None);
+    }
+    // Char completes: prefix = carry + needed_before bytes.
+    let mut prefix_buf = [0u8; 4];
+    let mut n = 0u8;
+    for b in carry_buf.iter().take(usize::from(carry_len)) {
+      if let Some(slot) = prefix_buf.get_mut(usize::from(n)) {
+        *slot = *b;
+        n = n.saturating_add(1);
+      }
+    }
+    for b in chunk.iter().take(needed_before) {
+      if let Some(slot) = prefix_buf.get_mut(usize::from(n)) {
+        *slot = *b;
+        n = n.saturating_add(1);
+      }
+    }
+    prefix = (prefix_buf, n);
+    *text_carry = ([0; 4], 0);
+    needed_before
+  } else {
+    0
+  };
+
+  // New carry: bytes past the last char boundary in THIS chunk.
+  let new_carry = chunk.get(complete..).unwrap_or(&[]);
+  if !new_carry.is_empty() {
+    let mut carry = [0u8; 4];
+    let mut n = 0u8;
+    for b in new_carry.iter().take(3) {
+      if let Some(slot) = carry.get_mut(usize::from(n)) {
+        *slot = *b;
+        n = n.saturating_add(1);
+      }
+    }
+    *text_carry = (carry, n);
+  }
+
+  let body = body_start.min(complete)..complete;
+  if prefix.1 == 0 && body.is_empty() {
+    return Ok(None);
+  }
+  Ok(Some(TextYield { prefix, body }))
+}
+
+/// Builds a [`TextChunk`] from a validated yield over `chunk`. The body range
+/// is validated UTF-8 by construction (the validator confirmed it).
+fn text_chunk<'s>(chunk: &'s [u8], y: TextYield) -> TextChunk<'s> {
+  let body_bytes = chunk.get(y.body).unwrap_or(&[]);
+  let body = core::str::from_utf8(body_bytes).unwrap_or("");
+  TextChunk::new(y.prefix, body)
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -996,39 +1403,294 @@ mod tests {
   }
 
   #[cfg(feature = "deflate")]
-  #[test]
-  fn rsv1_passthrough_when_deflate_negotiated() {
-    use crate::negotiation::{DeflateOffer, parse_deflate_response};
-    let params = parse_deflate_response("permessage-deflate", &DeflateOffer::new()).unwrap();
-    let negotiated = Negotiated::none().with_deflate(Some(params));
-    let mut conn: Connection<TestInstant, Server> = Connection::new(
-      &negotiated,
-      ConnectionConfig::default(),
-      Server::new(),
-      TestInstant(0),
-    );
-    // RSV1 on the first frame: accepted, marked compressed, payload raw.
-    let bytes = frame(Opcode::Text, true, true, &[0xAB, 0xCD]);
-    let got = fold(drain(&mut conn, &bytes));
-    assert_eq!(
-      got,
-      [
-        Ev::Start(MessageKind::Text, true),
-        Ev::Bin(vec![0xAB, 0xCD]),
-        Ev::End
-      ]
-    );
+  mod deflate {
+    use super::*;
+    use crate::{connection::role::Server, negotiation::DeflateParams};
+    use miniz_oxide::deflate::core::{
+      CompressorOxide, TDEFLFlush, compress, create_comp_flags_from_zip_params,
+    };
 
-    // RSV1 on a continuation still fails.
-    let mut conn: Connection<TestInstant, Server> = Connection::new(
-      &negotiated,
-      ConnectionConfig::default(),
-      Server::new(),
-      TestInstant(0),
-    );
-    let mut bytes = frame(Opcode::Text, false, true, b"x");
-    bytes.extend(frame(Opcode::Continuation, true, true, b"y"));
-    let got = drain(&mut conn, &bytes);
-    assert_eq!(got.last(), Some(&Ev::Closed(1002, false)));
+    /// A permessage-deflate reference COMPRESSOR mirroring real WebSocket peers
+    /// (tungstenite, browsers): each message is emitted with a DEFLATE
+    /// **sync flush** (`Z_SYNC_FLUSH`), which ends every message with the
+    /// `00 00 FF FF` boundary; per RFC 7692 §7.2.1 the sender then strips that
+    /// trailing boundary. The receiver re-appends it (§7.2.2) before inflating.
+    /// One compressor instance models one peer with context takeover across
+    /// messages; `reset` models `no_context_takeover`.
+    struct RefCompressor {
+      inner: CompressorOxide,
+    }
+
+    impl RefCompressor {
+      fn new() -> Self {
+        // Level 6, raw (window_bits = 0 → no zlib wrapper), default strategy.
+        let flags = create_comp_flags_from_zip_params(6, 0, 0);
+        Self {
+          inner: CompressorOxide::new(flags),
+        }
+      }
+
+      /// Reset the compressor context (no_context_takeover between messages).
+      fn reset(&mut self) {
+        self.inner.reset();
+      }
+
+      /// Compress one whole message, sync-flush, and strip the trailing
+      /// `00 00 FF FF` — the bytes a real peer puts on the wire as the RSV1
+      /// payload.
+      fn compress(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; data.len() + 512];
+        let mut written = 0;
+        let mut cursor = data;
+        // Feed all input (no flush) until consumed.
+        loop {
+          if written + 64 > out.len() {
+            out.resize(out.len() * 2, 0);
+          }
+          let (_s, cin, cout) = compress(
+            &mut self.inner,
+            cursor,
+            &mut out[written..],
+            TDEFLFlush::None,
+          );
+          written += cout;
+          cursor = &cursor[cin..];
+          if cursor.is_empty() {
+            break;
+          }
+        }
+        // One sync flush to terminate the message with 00 00 FF FF.
+        if written + 512 > out.len() {
+          out.resize(written + 512, 0);
+        }
+        let (_s, _cin, cout) =
+          compress(&mut self.inner, &[], &mut out[written..], TDEFLFlush::Sync);
+        written += cout;
+        out.truncate(written);
+        // Strip the trailing sync-flush boundary (RFC 7692 §7.2.1).
+        if out.ends_with(&[0x00, 0x00, 0xFF, 0xFF]) {
+          let n = out.len() - 4;
+          out.truncate(n);
+        }
+        out
+      }
+    }
+
+    /// A server connection that negotiated permessage-deflate with `params`.
+    fn deflate_server(params: DeflateParams) -> Connection<TestInstant, Server> {
+      let negotiated = Negotiated::none().with_deflate(Some(params));
+      Connection::new(
+        &negotiated,
+        ConnectionConfig::default(),
+        Server::new(),
+        TestInstant(0),
+      )
+    }
+
+    /// A server connection with a custom config and negotiated deflate.
+    fn deflate_server_cfg(
+      params: DeflateParams,
+      config: ConnectionConfig,
+    ) -> Connection<TestInstant, Server> {
+      let negotiated = Negotiated::none().with_deflate(Some(params));
+      Connection::new(&negotiated, config, Server::new(), TestInstant(0))
+    }
+
+    /// The params a default offer/accept lands on (context takeover both ways,
+    /// 15-bit windows) — exactly `DeflateParams::default`.
+    fn default_params() -> DeflateParams {
+      DeflateParams::default()
+    }
+
+    /// REWRITE of the cycle-1 4a `rsv1_passthrough_when_deflate_negotiated`
+    /// test: RSV1 payloads are now INFLATED (RFC 7692 §7.2.2), not passed
+    /// through as raw DEFLATE bytes. A compressed text frame decodes to the
+    /// original text.
+    #[test]
+    fn rsv1_inflates_when_deflate_negotiated() {
+      let mut peer = RefCompressor::new();
+      let payload = peer.compress(b"Hello");
+      let mut conn = deflate_server(default_params());
+      let bytes = frame(Opcode::Text, true, true, &payload);
+      let got = fold(drain(&mut conn, &bytes));
+      assert_eq!(
+        got,
+        [
+          Ev::Start(MessageKind::Text, true),
+          Ev::Text("Hello".into()),
+          Ev::End
+        ]
+      );
+
+      // RSV1 on a continuation still fails (RSV1 is a per-message, first-frame
+      // flag — §7.2.3.1).
+      let mut conn = deflate_server(default_params());
+      let mut bytes = frame(Opcode::Text, false, true, b"x");
+      bytes.extend(frame(Opcode::Continuation, true, true, b"y"));
+      let got = drain(&mut conn, &bytes);
+      assert_eq!(got.last(), Some(&Ev::Closed(1002, false)));
+    }
+
+    #[test]
+    fn binary_message_round_trips_through_reference_compressor() {
+      let data: Vec<u8> = (0u8..200).collect();
+      let mut peer = RefCompressor::new();
+      let payload = peer.compress(&data);
+      let mut conn = deflate_server(default_params());
+      let got = fold(drain(
+        &mut conn,
+        &frame(Opcode::Binary, true, true, &payload),
+      ));
+      assert_eq!(
+        got,
+        [Ev::Start(MessageKind::Binary, true), Ev::Bin(data), Ev::End]
+      );
+    }
+
+    #[test]
+    fn context_takeover_across_two_messages() {
+      // One compressor (context takeover): the second message's stream
+      // back-references the first's window. The decoder must keep its window
+      // across messages to decode the second.
+      let mut peer = RefCompressor::new();
+      let m1 = b"the quick brown fox";
+      let m2 = b"the quick brown fox jumps over"; // shares a long prefix
+      let p1 = peer.compress(m1);
+      let p2 = peer.compress(m2);
+
+      let mut conn = deflate_server(default_params());
+      let got1 = fold(drain(&mut conn, &frame(Opcode::Text, true, true, &p1)));
+      assert_eq!(
+        got1,
+        [
+          Ev::Start(MessageKind::Text, true),
+          Ev::Text(String::from_utf8(m1.to_vec()).unwrap()),
+          Ev::End
+        ]
+      );
+      let got2 = fold(drain(&mut conn, &frame(Opcode::Text, true, true, &p2)));
+      assert_eq!(
+        got2,
+        [
+          Ev::Start(MessageKind::Text, true),
+          Ev::Text(String::from_utf8(m2.to_vec()).unwrap()),
+          Ev::End
+        ]
+      );
+    }
+
+    #[test]
+    fn no_context_takeover_resets_between_messages() {
+      use crate::negotiation::{ServerDeflateConfig, accept_deflate_offer};
+      // Negotiate client_no_context_takeover: the inbound (client→server)
+      // direction resets per message, so the peer compresses each message with
+      // a fresh context and the decoder must reset to match.
+      let params = match accept_deflate_offer(
+        ["permessage-deflate; client_no_context_takeover"].into_iter(),
+        &ServerDeflateConfig::new(),
+      ) {
+        Some((params, _)) => params,
+        None => panic!("offer must be accepted"),
+      };
+      assert!(params.client_no_context_takeover());
+
+      let mut peer = RefCompressor::new();
+      let m1 = b"the quick brown fox";
+      let m2 = b"the quick brown fox jumps over";
+      let p1 = peer.compress(m1);
+      peer.reset(); // peer resets its context per message
+      let p2 = peer.compress(m2);
+
+      let mut conn = deflate_server(params);
+      let got1 = fold(drain(&mut conn, &frame(Opcode::Text, true, true, &p1)));
+      assert_eq!(got1[1], Ev::Text(String::from_utf8(m1.to_vec()).unwrap()));
+      let got2 = fold(drain(&mut conn, &frame(Opcode::Text, true, true, &p2)));
+      assert_eq!(got2[1], Ev::Text(String::from_utf8(m2.to_vec()).unwrap()));
+    }
+
+    #[test]
+    fn fragmented_compressed_message() {
+      // RSV1 only on the FIRST frame; the compressed stream is split across a
+      // text-start + continuation. The tail is appended only after the final
+      // frame, internally.
+      let data = b"aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeee";
+      let mut peer = RefCompressor::new();
+      let payload = peer.compress(data);
+      let mid = payload.len() / 2;
+
+      let mut conn = deflate_server(default_params());
+      let mut bytes = frame(Opcode::Text, false, true, &payload[..mid]);
+      bytes.extend(frame(Opcode::Continuation, true, false, &payload[mid..]));
+      let got = fold(drain(&mut conn, &bytes));
+      assert_eq!(
+        got,
+        [
+          Ev::Start(MessageKind::Text, true),
+          Ev::Text(String::from_utf8(data.to_vec()).unwrap()),
+          Ev::End
+        ]
+      );
+    }
+
+    #[test]
+    fn malformed_deflate_fails_1007() {
+      // RSV1 set, but the payload is not a valid DEFLATE stream.
+      let mut conn = deflate_server(default_params());
+      let garbage = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+      let got = drain(&mut conn, &frame(Opcode::Binary, true, true, &garbage));
+      assert_eq!(got.last(), Some(&Ev::Closed(1007, false)));
+      assert_eq!(got.first(), Some(&Ev::Start(MessageKind::Binary, true)));
+    }
+
+    #[test]
+    fn inflated_size_cap_fails_1009() {
+      // A highly compressible "bomb": a few KiB compressed inflate to far more
+      // than a tiny max_message_size, which must trip 1009 on inflated bytes.
+      let bomb = vec![0u8; 64 * 1024];
+      let mut peer = RefCompressor::new();
+      let payload = peer.compress(&bomb);
+      assert!(payload.len() < 1024, "bomb should compress small");
+
+      let config = ConnectionConfig::new()
+        .with_max_frame_payload(1 << 20)
+        .with_max_message_size(1024);
+      let mut conn = deflate_server_cfg(default_params(), config);
+      let got = drain(&mut conn, &frame(Opcode::Binary, true, true, &payload));
+      assert_eq!(got.last(), Some(&Ev::Closed(1009, false)));
+    }
+
+    #[test]
+    fn split_anywhere_over_a_compressed_stream() {
+      // Smoke version of the invariance property for a compressed message:
+      // cut the wire at every byte boundary; the folded events must match.
+      let mut peer = RefCompressor::new();
+      let payload = peer.compress("héllo wörld 𐍈 deflate".as_bytes());
+      let whole = frame(Opcode::Text, true, true, &payload);
+
+      let mut reference = deflate_server(default_params());
+      let expected = fold(drain(&mut reference, &whole));
+      assert_eq!(expected.first(), Some(&Ev::Start(MessageKind::Text, true)));
+
+      for cut in 0..=whole.len() {
+        let mut conn = deflate_server(default_params());
+        let mut got = drain(&mut conn, &whole[..cut]);
+        got.extend(drain(&mut conn, &whole[cut..]));
+        assert_eq!(fold(got), expected, "cut at {cut}");
+      }
+    }
+
+    #[test]
+    fn empty_compressed_message_yields_empty() {
+      // An empty payload, compressed, must inflate to nothing: Start then End
+      // with no chunk.
+      let mut peer = RefCompressor::new();
+      let payload = peer.compress(b"");
+      let mut conn = deflate_server(default_params());
+      let got = fold(drain(
+        &mut conn,
+        &frame(Opcode::Binary, true, true, &payload),
+      ));
+      assert_eq!(got, [Ev::Start(MessageKind::Binary, true), Ev::End]);
+    }
   }
 }

@@ -46,10 +46,12 @@ impl MessageStart {
     self.kind
   }
 
-  /// RSV1 was set under a negotiated permessage-deflate: the payload chunks
-  /// of this message are the DEFLATE bit-stream until plan 5's transform
-  /// lands (passthrough this cycle), and arrive as
-  /// [`Event::BinaryChunk`] runs regardless of the text/binary opcode.
+  /// RSV1 was set under a negotiated permessage-deflate (RFC 7692): the wire
+  /// payload was compressed. The chunks delivered for this message are already
+  /// **inflated** — text passes the incremental UTF-8 validator post-inflation
+  /// and arrives as [`Event::TextChunk`], binary as [`Event::BinaryChunk`].
+  /// This flag is observable but the decoding is transparent; a consumer that
+  /// ignores it sees the same decoded bytes either way.
   #[inline(always)]
   pub const fn compressed(&self) -> bool {
     self.compressed
