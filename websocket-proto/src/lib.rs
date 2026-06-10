@@ -40,3 +40,8 @@ pub mod constants;
 pub mod time;
 
 pub use time::Instant;
+
+/// Cross-cutting error types.
+pub mod error;
+
+pub use error::BufferTooSmallDetail;
