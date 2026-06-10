@@ -121,16 +121,20 @@ where
   Ro: Role,
 {
   /// Feeds inbound transport bytes. Payload bytes are unmasked in place;
-  /// the returned cursor yields borrowed events. `now` is accepted for
-  /// signature stability (timers land in plan 4b).
+  /// the returned cursor yields borrowed events.
   pub fn handle<'a, 'c>(
     &'c mut self,
     now: I,
     data: &'a mut [u8],
   ) -> Result<Events<'a, 'c, I, Ro>, HandleError> {
-    let _ = now;
     if self.is_terminal() {
       return Err(HandleError::Terminal);
+    }
+    // Non-empty inbound input re-arms the keepalive timer (measures liveness).
+    if !data.is_empty()
+      && let Some(interval) = self.config.keepalive
+    {
+      self.next_keepalive = now.checked_add_duration(interval);
     }
     Ok(Events {
       conn: self,
@@ -662,6 +666,8 @@ where
         if !matches!(self.conn.lifecycle, Lifecycle::CloseSent) {
           self.conn.send.queue_close(echo, "");
         }
+        // Peer echo clears the close deadline (handshake complete).
+        self.conn.close_deadline = None;
         self.conn.lifecycle = Lifecycle::PeerClosed;
 
         let mut reason_buf = [0u8; MAX_CONTROL_PAYLOAD];

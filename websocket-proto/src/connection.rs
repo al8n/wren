@@ -37,6 +37,10 @@ use role::Role;
 pub struct ConnectionConfig {
   max_frame_payload: u64,
   max_message_size: u64,
+  /// Optional keepalive ping interval. `None` disables keepalive.
+  keepalive: Option<core::time::Duration>,
+  /// Close-handshake timeout (default 10 s).
+  close_timeout: core::time::Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -44,12 +48,14 @@ impl Default for ConnectionConfig {
     Self {
       max_frame_payload: 16 * 1024 * 1024,
       max_message_size: 64 * 1024 * 1024,
+      keepalive: None,
+      close_timeout: core::time::Duration::from_secs(10),
     }
   }
 }
 
 impl ConnectionConfig {
-  /// The defaults: 16 MiB frames, 64 MiB messages.
+  /// The defaults: 16 MiB frames, 64 MiB messages, no keepalive, 10 s close timeout.
   pub fn new() -> Self {
     Self::default()
   }
@@ -68,6 +74,20 @@ impl ConnectionConfig {
     self
   }
 
+  /// Sets the keepalive ping interval (`None` disables keepalive).
+  #[must_use]
+  pub const fn with_keepalive(mut self, interval: Option<core::time::Duration>) -> Self {
+    self.keepalive = interval;
+    self
+  }
+
+  /// Sets the close-handshake timeout.
+  #[must_use]
+  pub const fn with_close_timeout(mut self, timeout: core::time::Duration) -> Self {
+    self.close_timeout = timeout;
+    self
+  }
+
   /// The frame-payload cap.
   #[inline(always)]
   pub const fn max_frame_payload(&self) -> u64 {
@@ -78,6 +98,18 @@ impl ConnectionConfig {
   #[inline(always)]
   pub const fn max_message_size(&self) -> u64 {
     self.max_message_size
+  }
+
+  /// The keepalive interval, if configured.
+  #[inline(always)]
+  pub const fn keepalive(&self) -> Option<core::time::Duration> {
+    self.keepalive
+  }
+
+  /// The close-handshake timeout.
+  #[inline(always)]
+  pub const fn close_timeout(&self) -> core::time::Duration {
+    self.close_timeout
   }
 }
 
@@ -92,6 +124,11 @@ pub struct Connection<I, Ro> {
   pub(crate) recv: recv::RecvState,
   pub(crate) send: send::SendState,
   pub(crate) lifecycle: Lifecycle,
+  /// Deadline after which `handle_timeout` declares the close unclean
+  /// (armed when the close frame drains in `poll_transmit`).
+  pub(crate) close_deadline: Option<I>,
+  /// Next instant at which a keepalive ping should be sent.
+  pub(crate) next_keepalive: Option<I>,
   pub(crate) _clock: core::marker::PhantomData<I>,
 }
 
@@ -113,10 +150,12 @@ where
   I: Instant,
   Ro: Role,
 {
-  /// Builds a connection from a completed handshake. `now` seeds the
-  /// (plan 4b) timers; it is accepted today so the signature is stable.
+  /// Builds a connection from a completed handshake. `now` seeds keepalive
+  /// timer if configured.
   pub fn new(negotiated: &Negotiated, config: ConnectionConfig, role: Ro, now: I) -> Self {
-    let _ = (now, negotiated);
+    let next_keepalive = config.keepalive.and_then(|d| now.checked_add_duration(d));
+    #[cfg(not(feature = "deflate"))]
+    let _ = negotiated;
     Self {
       role,
       config,
@@ -125,6 +164,8 @@ where
       recv: recv::RecvState::new(),
       send: send::SendState::new(),
       lifecycle: Lifecycle::Open,
+      close_deadline: None,
+      next_keepalive,
       _clock: core::marker::PhantomData,
     }
   }
@@ -135,6 +176,58 @@ where
   pub const fn is_terminal(&self) -> bool {
     matches!(self.lifecycle, Lifecycle::Terminal)
   }
+
+  /// Returns the next deadline the caller must arrange to fire
+  /// [`handle_timeout`](Connection::handle_timeout) at. Returns `None` when
+  /// no timers are armed.
+  pub fn poll_timeout(&self) -> Option<I> {
+    let keepalive = if matches!(self.lifecycle, Lifecycle::Open) {
+      self.next_keepalive
+    } else {
+      None
+    };
+    let close = if matches!(self.lifecycle, Lifecycle::CloseSent) {
+      self.close_deadline
+    } else {
+      None
+    };
+    match (keepalive, close) {
+      (Some(a), Some(b)) => Some(a.min(b)),
+      (Some(a), None) => Some(a),
+      (None, Some(b)) => Some(b),
+      (None, None) => None,
+    }
+  }
+
+  /// Advances the timer state to `now`. Returns `Some(Closed)` when the
+  /// close-handshake timeout fires; returns `None` when a keepalive ping is
+  /// queued (drain [`poll_transmit`](Connection::poll_transmit)).
+  pub fn handle_timeout(&mut self, now: I) -> Option<Closed> {
+    // Close deadline check (only in CloseSent).
+    if matches!(self.lifecycle, Lifecycle::CloseSent)
+      && let Some(deadline) = self.close_deadline
+      && now >= deadline
+    {
+      self.lifecycle = Lifecycle::Terminal;
+      let code = self
+        .send
+        .queued_code
+        .unwrap_or(crate::frame::CloseCode::Normal);
+      return Some(Closed::new(code, false));
+    }
+    // Keepalive check (only in Open).
+    if matches!(self.lifecycle, Lifecycle::Open)
+      && let Some(deadline) = self.next_keepalive
+      && now >= deadline
+    {
+      self.send.pending_ping = true;
+      // Re-arm.
+      if let Some(interval) = self.config.keepalive {
+        self.next_keepalive = now.checked_add_duration(interval);
+      }
+    }
+    None
+  }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -143,7 +236,29 @@ pub(crate) mod tests {
     Connection, ConnectionConfig,
     role::{Client, Role, Server},
   };
-  use crate::{negotiation::Negotiated, time::testing::TestInstant};
+  use crate::{
+    frame::{FrameHeader, Opcode, mask as apply_mask},
+    negotiation::Negotiated,
+    time::testing::TestInstant,
+  };
+
+  /// Builds one masked frame (client→server direction) into a `Vec`.
+  pub(crate) fn masked_frame(opcode: Opcode, fin: bool, payload: &[u8]) -> Vec<u8> {
+    masked_frame_payload(opcode, fin, payload)
+  }
+
+  /// Builds one masked frame with the given payload bytes.
+  pub(crate) fn masked_frame_payload(opcode: Opcode, fin: bool, payload: &[u8]) -> Vec<u8> {
+    const KEY: [u8; 4] = [0x37, 0xFA, 0x21, 0x3D];
+    let header = FrameHeader::new(opcode, u64::try_from(payload.len()).unwrap_or(u64::MAX))
+      .with_fin(fin)
+      .with_mask(Some(KEY));
+    let mut out = vec![0u8; header.header_len() + payload.len()];
+    let n = header.encode(&mut out).unwrap();
+    out[n..].copy_from_slice(payload);
+    apply_mask(&mut out[n..], KEY, 0);
+    out
+  }
 
   /// Deterministic RngCore: fills with a repeating counter.
   pub(crate) struct CountingRng(pub(crate) u8);
@@ -204,5 +319,116 @@ pub(crate) mod tests {
       TestInstant(0),
     );
     assert!(!conn.is_terminal());
+  }
+
+  #[test]
+  fn keepalive_pings_on_inbound_silence() {
+    use core::time::Duration;
+    let config = ConnectionConfig::new().with_keepalive(Some(Duration::from_secs(5)));
+    let mut conn: Connection<TestInstant, Server> =
+      Connection::new(&Negotiated::none(), config, Server::new(), TestInstant(0));
+
+    // Armed from construction.
+    assert_eq!(conn.poll_timeout(), Some(TestInstant(5_000_000)));
+    // Not yet due: nothing happens.
+    assert!(conn.handle_timeout(TestInstant(4_999_999)).is_none());
+    let mut out = [0u8; 16];
+    assert!(
+      conn
+        .poll_transmit(TestInstant(0), &mut out)
+        .unwrap()
+        .is_none()
+    );
+    // Due: queues an empty ping and re-arms.
+    assert!(conn.handle_timeout(TestInstant(5_000_000)).is_none());
+    let n = conn
+      .poll_transmit(TestInstant(5_000_000), &mut out)
+      .unwrap()
+      .unwrap();
+    assert_eq!(&out[..n], &[0x89, 0x00]);
+    assert_eq!(conn.poll_timeout(), Some(TestInstant(10_000_000)));
+
+    // Inbound traffic re-arms.
+    let mut ping = crate::connection::tests::masked_frame(crate::frame::Opcode::Ping, true, b"x");
+    {
+      let mut ev = conn.handle(TestInstant(7_000_000), &mut ping).unwrap();
+      while ev.next().is_some() {}
+    }
+    assert_eq!(conn.poll_timeout(), Some(TestInstant(12_000_000)));
+  }
+
+  #[test]
+  fn close_timeout_fires_unclean() {
+    use core::time::Duration;
+    let config = ConnectionConfig::new().with_close_timeout(Duration::from_secs(3));
+    let mut conn: Connection<TestInstant, Server> =
+      Connection::new(&Negotiated::none(), config, Server::new(), TestInstant(0));
+
+    conn.close(crate::frame::CloseCode::GoingAway, "").unwrap();
+    // Deadline arms when the frame DRAINS, not at close().
+    assert_eq!(conn.poll_timeout(), None);
+    let mut out = [0u8; 16];
+    conn
+      .poll_transmit(TestInstant(1_000_000), &mut out)
+      .unwrap()
+      .unwrap();
+    assert_eq!(conn.poll_timeout(), Some(TestInstant(4_000_000)));
+
+    // Keepalive does not surface in CloseSent.
+    // (Even if a keepalive config is present, only close deadline appears.)
+    let config2 = ConnectionConfig::new()
+      .with_keepalive(Some(Duration::from_secs(1)))
+      .with_close_timeout(Duration::from_secs(3));
+    let mut conn2: Connection<TestInstant, Server> =
+      Connection::new(&Negotiated::none(), config2, Server::new(), TestInstant(0));
+    conn2.close(crate::frame::CloseCode::GoingAway, "").unwrap();
+    conn2
+      .poll_transmit(TestInstant(1_000_000), &mut out)
+      .unwrap()
+      .unwrap();
+    // Only the close deadline, not the keepalive.
+    assert_eq!(conn2.poll_timeout(), Some(TestInstant(4_000_000)));
+
+    // Peer never answers: terminal, unclean, our code.
+    let closed = conn.handle_timeout(TestInstant(4_000_000)).unwrap();
+    assert_eq!(closed.code(), crate::frame::CloseCode::GoingAway);
+    assert!(!closed.clean());
+    assert!(conn.is_terminal());
+  }
+
+  #[test]
+  fn peer_echo_clears_the_close_deadline() {
+    use core::time::Duration;
+    let config = ConnectionConfig::new().with_close_timeout(Duration::from_secs(3));
+    let mut conn: Connection<TestInstant, Server> =
+      Connection::new(&Negotiated::none(), config, Server::new(), TestInstant(0));
+    conn.close(crate::frame::CloseCode::Normal, "").unwrap();
+    let mut out = [0u8; 16];
+    conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .unwrap();
+    assert!(conn.poll_timeout().is_some());
+
+    let mut payload = [0u8; 4];
+    let n = crate::frame::encode_close_payload(crate::frame::CloseCode::Normal, "", &mut payload)
+      .unwrap();
+    let mut echo = crate::connection::tests::masked_frame_payload(
+      crate::frame::Opcode::Close,
+      true,
+      &payload[..n],
+    );
+    {
+      let mut ev = conn.handle(TestInstant(1_000_000), &mut echo).unwrap();
+      // CloseReceived + Closed{clean: true}.
+      assert!(matches!(
+        ev.next(),
+        Some(crate::connection::Event::CloseReceived(_))
+      ));
+      assert!(matches!(ev.next(), Some(crate::connection::Event::Closed(c)) if c.clean()));
+      assert!(ev.next().is_none());
+    }
+    assert!(conn.is_terminal());
+    assert_eq!(conn.poll_timeout(), None);
   }
 }

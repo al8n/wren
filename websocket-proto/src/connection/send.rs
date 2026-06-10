@@ -57,6 +57,10 @@ pub(crate) struct SendState {
   /// Close frame queued by the protocol or the application.
   pub(crate) pending_close: Option<([u8; MAX_CONTROL_PAYLOAD], u8)>,
   pub(crate) close_sent: bool,
+  /// The close code from the first `queue_close` call (for `handle_timeout`).
+  pub(crate) queued_code: Option<CloseCode>,
+  /// A keepalive ping is pending (empty payload).
+  pub(crate) pending_ping: bool,
 }
 
 impl SendState {
@@ -65,6 +69,8 @@ impl SendState {
       message: SendMessageState::Idle,
       pending_close: None,
       close_sent: false,
+      queued_code: None,
+      pending_ping: false,
     }
   }
 
@@ -80,6 +86,7 @@ impl SendState {
     };
     if self.pending_close.is_none() {
       self.pending_close = Some((buf, u8::try_from(len).unwrap_or(0)));
+      self.queued_code = Some(code);
     }
   }
 }
@@ -157,11 +164,10 @@ where
     Ok(())
   }
 
-  /// Drains one queued protocol frame (close, then pong echo) into `out`.
-  /// Returns the byte count, or `None` when nothing is pending. `now` is
-  /// accepted for signature stability (keepalive lands in plan 4b).
+  /// Drains one queued protocol frame (close → pong echo → keepalive ping)
+  /// into `out`. Returns the byte count, or `None` when nothing is pending.
+  /// Arms `close_deadline` at the moment the close frame actually drains.
   pub fn poll_transmit(&mut self, now: I, out: &mut [u8]) -> Result<Option<usize>, EncodeError> {
-    let _ = now;
     // Close first: once it goes out, nothing else ever follows (§5.5.1).
     if !self.send.close_sent {
       if let Some((payload, len)) = self.send.pending_close {
@@ -175,6 +181,8 @@ where
         )?;
         self.send.close_sent = true;
         self.send.pending_close = None;
+        // Arm the close deadline NOW (at drain time, not at close() time).
+        self.close_deadline = now.checked_add_duration(self.config.close_timeout);
         return Ok(Some(n));
       }
     } else {
@@ -190,6 +198,12 @@ where
         out,
       )?;
       self.recv.pending_pong = None;
+      return Ok(Some(n));
+    }
+    // Keepalive ping (empty payload, no mask key for server; masked for client).
+    if self.send.pending_ping {
+      let n = self.write_frame(Opcode::Ping, true, false, &[], out)?;
+      self.send.pending_ping = false;
       return Ok(Some(n));
     }
     Ok(None)
