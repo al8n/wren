@@ -53,3 +53,6 @@ mod base64;
 
 #[allow(dead_code)]
 mod utf8;
+
+/// WebSocket frame codec — lossless RFC 6455 §5.2 parsing and serialization.
+pub mod frame;
