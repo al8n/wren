@@ -9,11 +9,26 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+rand_core = { version = "0.10", default-features = false }
 websocket-proto = { path = "..", features = ["std"] }
 
 [[bin]]
 name = "frame_decode"
 path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_request"
+path = "fuzz_targets/h1_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_response"
+path = "fuzz_targets/h1_response.rs"
 test = false
 doc = false
 bench = false

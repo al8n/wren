@@ -133,9 +133,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - name: Fuzz frame_decode (bounded smoke)
+      - name: Fuzz all targets (bounded smoke)
         working-directory: websocket-proto
-        run: cargo fuzz run frame_decode -- -runs=100000 -max_total_time=120
+        run: |
+          for target in $(cargo fuzz list); do
+            cargo fuzz run "$target" -- -runs=100000 -max_total_time=120
+          done
 
 # There is deliberately NO release-symbol panic scan: on current toolchains a
 # `pub fn` containing a guaranteed panic emits no symbols into the rlib at all
