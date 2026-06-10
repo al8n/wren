@@ -235,6 +235,14 @@ pub(crate) fn parse_head(input: &[u8]) -> Result<Parsed<'_>, HeadError> {
       )));
     }
     let value = rest.get(1..).unwrap_or("").trim_matches([' ', '\t']);
+    // RFC 9110 §5.5 restricts field content to VCHAR/SP/HTAB; reject the
+    // other control bytes (CR/LF were rejected line-wise above).
+    if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F) {
+      return Err(HeadError::Malformed(MalformedDetail::new(
+        offset,
+        "control byte in header value",
+      )));
+    }
     if !headers.push(name, value) {
       return Err(HeadError::TooManyHeaders(MAX_HEADERS));
     }
@@ -347,6 +355,17 @@ Sec-WebSocket-Version: 13\r\n\
       parse_head(b"GET / HTTP/1.1\r\na: \xFF\r\n\r\n").unwrap_err(),
       HeadError::Malformed(_)
     ));
+    // C0 control bytes in a value (NUL here) are rejected; HTAB inside
+    // field content is legal and stays.
+    assert!(matches!(
+      parse_head(b"GET / HTTP/1.1\r\na: b\x00c\r\n\r\n").unwrap_err(),
+      HeadError::Malformed(_)
+    ));
+    let head = match parse_head(b"GET / HTTP/1.1\r\na: b\tc\r\n\r\n").unwrap() {
+      Parsed::Complete(h) => h,
+      Parsed::NeedMore => panic!("complete"),
+    };
+    assert_eq!(head.headers().get("a"), Some("b\tc"));
   }
 
   #[test]
