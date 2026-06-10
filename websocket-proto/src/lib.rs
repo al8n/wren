@@ -56,3 +56,6 @@ mod utf8;
 
 /// WebSocket frame codec — lossless RFC 6455 §5.2 parsing and serialization.
 pub mod frame;
+
+/// Opening handshakes (RFC 6455 §4) and their completion type.
+pub mod handshake;
