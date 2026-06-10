@@ -24,11 +24,20 @@
 //!
 //! C0, C1, F5..=FF, and a continuation byte in lead position are invalid.
 
-/// A byte made the text invalid; `at` is the byte's index within the input
-/// slice passed to the [`Utf8Validator::feed`] call that detected it.
+/// A byte made the text invalid.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct InvalidUtf8 {
-  pub(crate) at: usize,
+  at: usize,
+}
+
+impl InvalidUtf8 {
+  /// Index of the offending byte within the input slice of the
+  /// [`Utf8Validator::feed`] call that detected it (chunk-relative, not
+  /// absolute within the message).
+  #[inline(always)]
+  pub(crate) const fn at(&self) -> usize {
+    self.at
+  }
 }
 
 /// Streaming UTF-8 validator. Feed payload chunks in arrival order; the
@@ -76,6 +85,12 @@ impl Utf8Validator {
   /// character boundary (the `&str`-sliceable part once any carried prefix
   /// is accounted for). Bytes past that boundary belong to an in-flight
   /// character continued on the next feed.
+  ///
+  /// After an error the in-flight state is unspecified: call [`reset`] before
+  /// reuse, and treat [`is_boundary`] as meaningless until then.
+  ///
+  /// [`reset`]: Utf8Validator::reset
+  /// [`is_boundary`]: Utf8Validator::is_boundary
   pub(crate) fn feed(&mut self, input: &[u8]) -> Result<usize, InvalidUtf8> {
     let mut complete = 0;
     for (i, &b) in input.iter().enumerate() {
@@ -121,7 +136,7 @@ mod tests {
   fn feed_all(chunks: &[&[u8]]) -> Result<(), usize> {
     let mut v = Utf8Validator::new();
     for chunk in chunks {
-      v.feed(chunk).map_err(|e| e.at)?;
+      v.feed(chunk).map_err(|e| e.at())?;
     }
     if v.is_boundary() {
       Ok(())
@@ -161,33 +176,37 @@ mod tests {
   fn invalid_sequences_fail_fast_at_the_offending_byte() {
     // Overlong "/" (C0 AF): C0 is never a valid lead.
     let mut v = Utf8Validator::new();
-    assert_eq!(v.feed(b"\xC0\xAF").unwrap_err().at, 0);
+    assert_eq!(v.feed(b"\xC0\xAF").unwrap_err().at(), 0);
 
     // Overlong NUL (E0 80 80): second byte must be A0..=BF.
     let mut v = Utf8Validator::new();
-    assert_eq!(v.feed(b"\xE0\x80\x80").unwrap_err().at, 1);
+    assert_eq!(v.feed(b"\xE0\x80\x80").unwrap_err().at(), 1);
 
     // CESU-8 surrogate (ED A0 80): second byte must be 80..=9F.
     let mut v = Utf8Validator::new();
-    assert_eq!(v.feed(b"\xED\xA0\x80").unwrap_err().at, 1);
+    assert_eq!(v.feed(b"\xED\xA0\x80").unwrap_err().at(), 1);
 
     // Above U+10FFFF (F4 90 80 80): second byte must be 80..=8F.
     let mut v = Utf8Validator::new();
-    assert_eq!(v.feed(b"\xF4\x90\x80\x80").unwrap_err().at, 1);
+    assert_eq!(v.feed(b"\xF4\x90\x80\x80").unwrap_err().at(), 1);
+
+    // Overlong (F0 80 ..): F0's second byte must be 90..=BF.
+    let mut v = Utf8Validator::new();
+    assert_eq!(v.feed(b"\xF0\x80\x80\x80").unwrap_err().at(), 1);
 
     // F5..FF are never valid leads.
     let mut v = Utf8Validator::new();
-    assert_eq!(v.feed(b"a\xF5").unwrap_err().at, 1);
+    assert_eq!(v.feed(b"a\xF5").unwrap_err().at(), 1);
 
     // A bare continuation byte is never a valid lead.
     let mut v = Utf8Validator::new();
-    assert_eq!(v.feed(b"\x80").unwrap_err().at, 0);
+    assert_eq!(v.feed(b"\x80").unwrap_err().at(), 0);
 
     // A lead followed by a non-continuation fails at the second byte —
     // including when the split hides it across feeds.
     let mut v = Utf8Validator::new();
     v.feed(b"\xC2").unwrap();
-    assert_eq!(v.feed(b"A").unwrap_err().at, 0);
+    assert_eq!(v.feed(b"A").unwrap_err().at(), 0);
   }
 
   #[test]
@@ -200,9 +219,63 @@ mod tests {
     assert!(v.is_boundary());
   }
 
+  #[test]
+  fn accepts_boundary_adjacent_valid_scalars() {
+    // The valid mirrors of every constrained bound in the table — the values
+    // a narrowed range would silently reject. Each row is self-checked
+    // against core::str so the table cannot rot.
+    let table: &[(&[u8], char)] = &[
+      (b"\xC2\x80", '\u{0080}'),           // first 2-byte
+      (b"\xDF\xBF", '\u{07FF}'),           // last 2-byte
+      (b"\xE0\xA0\x80", '\u{0800}'),       // first past E0's A0 bound
+      (b"\xED\x9F\xBF", '\u{D7FF}'),       // last before surrogates
+      (b"\xEE\x80\x80", '\u{E000}'),       // first after surrogates
+      (b"\xF0\x90\x80\x80", '\u{10000}'),  // first past F0's 90 bound
+      (b"\xF4\x8F\xBF\xBF", '\u{10FFFF}'), // last scalar; F4's 8F bound
+    ];
+    for &(bytes, ch) in table {
+      assert_eq!(
+        core::str::from_utf8(bytes).unwrap().chars().next(),
+        Some(ch)
+      );
+      let mut v = Utf8Validator::new();
+      assert_eq!(v.feed(bytes).unwrap(), bytes.len(), "{ch:?}");
+      assert!(v.is_boundary(), "{ch:?}");
+    }
+  }
+
   mod properties {
     use super::*;
-    use proptest::prelude::*;
+    use proptest::{prelude::*, test_runner::TestCaseError};
+
+    /// Single-shot verdict mapping shared by the oracle properties:
+    /// Ok ⇔ (no error AND ends at a boundary); a trailing incomplete char
+    /// (from_utf8 `error_len() == None`) is pending, not an error; on
+    /// invalid input the fail-fast index lands within the invalid sequence.
+    fn oracle_agrees(bytes: &[u8]) -> Result<(), TestCaseError> {
+      let mut v = Utf8Validator::new();
+      let ours = v.feed(bytes);
+      match core::str::from_utf8(bytes) {
+        Ok(_) => {
+          prop_assert!(ours.is_ok());
+          prop_assert!(v.is_boundary());
+          prop_assert_eq!(ours.unwrap(), bytes.len());
+        }
+        Err(e) => match e.error_len() {
+          None => {
+            prop_assert!(ours.is_ok());
+            prop_assert!(!v.is_boundary());
+            prop_assert_eq!(ours.unwrap(), e.valid_up_to());
+          }
+          Some(_) => {
+            let at = ours.unwrap_err().at();
+            prop_assert!(at >= e.valid_up_to());
+            prop_assert!(at <= e.valid_up_to() + 3);
+          }
+        },
+      }
+      Ok(())
+    }
 
     proptest! {
       /// Any valid string, chunked arbitrarily, validates with boundaries
@@ -239,35 +312,26 @@ mod tests {
         prop_assert_eq!(last_boundary, bytes.len());
       }
 
-      /// Single-shot verdict agrees with `core::str::from_utf8`:
-      /// Ok ⇔ (no error AND ends at a boundary); a trailing incomplete char
-      /// (from_utf8 `error_len() == None`) is pending, not an error.
+      /// Single-shot verdict agrees with `core::str::from_utf8` on
+      /// unconstrained random bytes.
       #[test]
       fn verdict_matches_core(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
-        let mut v = Utf8Validator::new();
-        let ours = v.feed(&bytes);
-        match core::str::from_utf8(&bytes) {
-          Ok(_) => {
-            prop_assert!(ours.is_ok());
-            prop_assert!(v.is_boundary());
-            prop_assert_eq!(ours.unwrap(), bytes.len());
-          }
-          Err(e) => match e.error_len() {
-            None => {
-              // Truncated final char: accepted so far, pending continuation.
-              prop_assert!(ours.is_ok());
-              prop_assert!(!v.is_boundary());
-              prop_assert_eq!(ours.unwrap(), e.valid_up_to());
-            }
-            Some(_) => {
-              let at = ours.unwrap_err().at;
-              // Fail-fast detection happens within the invalid sequence:
-              // at or just after `valid_up_to`, never beyond 3 bytes in.
-              prop_assert!(at >= e.valid_up_to());
-              prop_assert!(at <= e.valid_up_to() + 3);
-            }
-          },
-        }
+        oracle_agrees(&bytes)?;
+      }
+
+      /// Boundary-targeted oracle: a lead from every class (including the
+      /// invalid C0/C1/F5..=FF and bare continuations) followed by bytes
+      /// straddling the constrained bounds (8F/90/9F/A0). Plain random
+      /// bytes almost never exercise a range boundary — this generator
+      /// exists so a mutated bound is actually killed by the suite.
+      #[test]
+      fn boundary_targeted_verdict_matches_core(
+        lead in 0x80u8..=0xFF,
+        tail in proptest::collection::vec(0x70u8..=0xCF, 0..=3),
+      ) {
+        let mut seq = vec![lead];
+        seq.extend_from_slice(&tail);
+        oracle_agrees(&seq)?;
       }
     }
   }
