@@ -196,6 +196,9 @@ pub fn decode_close_payload(payload: &[u8]) -> Result<DecodedClose<'_>, ClosePay
 /// Encodes a close-frame body: the two-byte big-endian code followed by the
 /// reason. The result must fit a control frame (≤ 125 bytes), capping the
 /// reason at 123 bytes.
+///
+/// Like [`decode_close_payload`], the code's wire-validity is NOT policed
+/// here — callers check [`CloseCode::is_valid_on_wire`] before sending.
 pub fn encode_close_payload(
   code: CloseCode,
   reason: &str,
