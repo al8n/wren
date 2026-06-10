@@ -9,7 +9,7 @@
 
 mod close;
 // mod header;
-// mod mask;
+mod mask;
 mod opcode;
 
 pub use close::{
@@ -19,5 +19,5 @@ pub use close::{
 //   DecodeError, Decoded, DecodedHeader, EncodeError, FrameHeader, MoreNeeded,
 //   NonCanonicalLengthDetail,
 // };
-// pub use mask::mask;
+pub use mask::mask;
 pub use opcode::Opcode;
