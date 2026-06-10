@@ -45,3 +45,8 @@ pub use time::Instant;
 pub mod error;
 
 pub use error::BufferTooSmallDetail;
+
+// The allow(dead_code) markers come off when the handshake module (plan 3)
+// starts consuming these crate-private utilities.
+#[allow(dead_code)]
+mod base64;
