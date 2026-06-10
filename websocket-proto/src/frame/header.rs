@@ -108,6 +108,21 @@ impl FrameHeader {
   pub const fn payload_len(&self) -> u64 {
     self.payload_len
   }
+
+  /// The encoded header size in bytes (2–14) — exactly what [`encode`]
+  /// writes — without encoding. Lengths above the §5.2 maximum still report
+  /// the 8-byte form here; [`encode`] is where they fail.
+  ///
+  /// [`encode`]: FrameHeader::encode
+  pub const fn header_len(&self) -> usize {
+    let ext: usize = match self.payload_len {
+      0..=125 => 0,
+      126..=65535 => 2,
+      _ => 8,
+    };
+    let mask: usize = if self.mask.is_some() { 4 } else { 0 };
+    2usize.saturating_add(ext).saturating_add(mask)
+  }
 }
 
 /// Outcome of [`FrameHeader::decode`] on a (possibly partial) buffer.
@@ -329,6 +344,10 @@ impl FrameHeader {
   /// [`Decoded::Complete`] with the header and its size otherwise. Reserved
   /// opcodes and RSV bits parse losslessly; length canonicality is enforced
   /// here because it is wire grammar, not policy.
+  ///
+  /// A satisfied [`Decoded::Incomplete`] does not guarantee the completing
+  /// call returns [`Decoded::Complete`]: grammar errors (non-canonical or
+  /// oversized lengths) surface only once the bytes that prove them arrive.
   pub fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
     let (&b0, &b1) = match (buf.first(), buf.get(1)) {
       (None, _) => return Ok(Decoded::Incomplete(MoreNeeded { at_least: 2 })),
@@ -569,6 +588,27 @@ mod tests {
   }
 
   #[test]
+  fn header_len_matches_encode() {
+    let mut buf = [0u8; 14];
+    let key = Some([1, 2, 3, 4]);
+    for (len, mask) in [
+      (0u64, None),
+      (125, None),
+      (126, None),
+      (65535, key),
+      (65536, key),
+      (5, key),
+    ] {
+      let h = FrameHeader::new(Opcode::Binary, len).with_mask(mask);
+      assert_eq!(
+        h.header_len(),
+        h.encode(&mut buf).unwrap(),
+        "len={len} mask={mask:?}"
+      );
+    }
+  }
+
+  #[test]
   fn encode_picks_minimal_form_at_boundaries() {
     let mut buf = [0u8; 14];
     let n = FrameHeader::new(Opcode::Binary, 125)
@@ -696,6 +736,7 @@ mod tests {
           Decoded::Complete(d) => {
             prop_assert_eq!(d.header(), header);
             prop_assert_eq!(d.consumed(), n);
+            prop_assert_eq!(header.header_len(), n);
           }
           Decoded::Incomplete(_) => return Err(TestCaseError::fail("round trip incomplete")),
         }
