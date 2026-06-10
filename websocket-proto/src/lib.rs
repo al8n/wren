@@ -46,7 +46,6 @@ pub mod error;
 
 pub use error::BufferTooSmallDetail;
 
-#[allow(dead_code)]
 mod base64;
 
 #[allow(dead_code)]
