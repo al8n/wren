@@ -8,16 +8,15 @@
 //! encoding and a zero MSB on 64-bit lengths) and is enforced here.
 
 mod close;
-// mod header;
+mod header;
 mod mask;
 mod opcode;
 
 pub use close::{
   CloseCode, ClosePayloadError, DecodedClose, decode_close_payload, encode_close_payload,
 };
-// pub use header::{
-//   DecodeError, Decoded, DecodedHeader, EncodeError, FrameHeader, MoreNeeded,
-//   NonCanonicalLengthDetail,
-// };
+pub use header::{
+  DecodeError, Decoded, DecodedHeader, FrameHeader, MoreNeeded, NonCanonicalLengthDetail,
+};
 pub use mask::mask;
 pub use opcode::Opcode;
