@@ -565,6 +565,7 @@ name = "websocket-proto-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "rand_core",
  "websocket-proto",
 ]
 
