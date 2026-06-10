@@ -423,47 +423,42 @@ pub(crate) mod compress {
       self.inner.reset();
     }
 
+    /// One output window appended to `buf` per `compress` call. miniz_oxide
+    /// buffers compressed output internally and only emits as much as fits in
+    /// the supplied window, so each call drains at most this many bytes —
+    /// `compress_message` loops until the compressor reports it is fully
+    /// drained.
+    const WINDOW: usize = 8 * 1024;
+
     /// Compress `data` with a DEFLATE sync-flush, strip the trailing
     /// `00 00 FF FF` boundary, and return a slice into the internal scratch
     /// buffer. The slice is valid until the next call to `compress_message`.
     pub(crate) fn compress_message(&mut self, data: &[u8]) -> &[u8] {
       self.buf.clear();
 
-      // Feed all input without flushing.
+      // Phase 1 — feed all input (no flush). Loop until every input byte is
+      // consumed AND a call leaves the output window non-full: a full window
+      // means the compressor still has buffered output to hand us, so we must
+      // call again even after all input is consumed.
       let mut cursor = data;
       loop {
-        let base = self.buf.len();
-        // Reserve space; grow by at least 64 bytes.
-        let new_cap = base.saturating_add(data.len().saturating_add(128));
-        if self.buf.capacity() < new_cap {
-          self
-            .buf
-            .reserve(new_cap.saturating_sub(self.buf.capacity()));
-        }
-        // Extend with zeros to allow writing.
-        let window_size = 4096usize;
-        self.buf.resize(base.saturating_add(window_size), 0);
-        let Some(window) = self.buf.get_mut(base..) else {
-          break;
-        };
-        let (_status, consumed, written) =
-          compress(&mut self.inner, cursor, window, TDEFLFlush::None);
-        self.buf.truncate(base.saturating_add(written));
-        let rest = cursor.get(consumed..).unwrap_or(&[]);
-        cursor = rest;
-        if cursor.is_empty() {
+        let (consumed, written) = self.drive(cursor, TDEFLFlush::None);
+        cursor = cursor.get(consumed..).unwrap_or(&[]);
+        if cursor.is_empty() && written < Self::WINDOW {
           break;
         }
       }
 
-      // Sync-flush to emit the trailing `00 00 FF FF` block.
-      let base = self.buf.len();
-      self.buf.resize(base.saturating_add(512), 0);
-      let Some(window) = self.buf.get_mut(base..) else {
-        return &self.buf;
-      };
-      let (_status, _consumed, written) = compress(&mut self.inner, &[], window, TDEFLFlush::Sync);
-      self.buf.truncate(base.saturating_add(written));
+      // Phase 2 — sync-flush. Keep flushing until a call yields a partial (or
+      // empty) window: that signals the flush is fully drained. Leaving any
+      // buffered flush output behind would both truncate this frame and poison
+      // the next message's stream (context takeover reuses the compressor).
+      loop {
+        let (_consumed, written) = self.drive(&[], TDEFLFlush::Sync);
+        if written < Self::WINDOW {
+          break;
+        }
+      }
 
       // Strip the sync-flush boundary (RFC 7692 §7.2.1).
       if self.buf.ends_with(&SYNC_TAIL) {
@@ -472,6 +467,21 @@ pub(crate) mod compress {
       }
 
       &self.buf
+    }
+
+    /// One `compress` call into a freshly-appended `WINDOW`-sized region of
+    /// `buf`, truncated to the bytes actually written. Returns
+    /// `(input_consumed, output_written)`.
+    fn drive(&mut self, input: &[u8], flush: TDEFLFlush) -> (usize, usize) {
+      let base = self.buf.len();
+      self.buf.resize(base.saturating_add(Self::WINDOW), 0);
+      let Some(window) = self.buf.get_mut(base..) else {
+        self.buf.truncate(base);
+        return (input.len(), 0);
+      };
+      let (_status, consumed, written) = compress(&mut self.inner, input, window, flush);
+      self.buf.truncate(base.saturating_add(written));
+      (consumed, written)
     }
   }
 
@@ -831,6 +841,73 @@ mod deflate_tests {
       evs2[1],
       DrainEv::Text("the quick brown fox jumps over".into())
     );
+  }
+
+  /// Regression (Autobahn 12.1.*/13.1.*): compressed sends of LARGE,
+  /// INCOMPRESSIBLE payloads must round-trip through an *independent*
+  /// reference decoder, across many context-takeover messages.
+  ///
+  /// The original `compress_message` sized its sync-flush output window at a
+  /// fixed 512 bytes and exited the feed loop the moment all input was
+  /// consumed — so when the compressor still held buffered output (the common
+  /// case for incompressible data), the frame was silently truncated *and* the
+  /// leftover flush state poisoned every subsequent message in the takeover
+  /// stream. Our own inflater agreed with the broken encoder (same bug, both
+  /// sides), so this test decodes with a fresh `miniz_oxide` stream instead.
+  #[test]
+  fn large_incompressible_compressed_sends_round_trip_via_reference_decoder() {
+    use miniz_oxide::{
+      DataFormat, MZFlush,
+      inflate::stream::{InflateState, inflate},
+    };
+
+    // A 16 KiB payload that DEFLATE cannot shrink (LCG-spread bytes — high
+    // entropy at the byte level), matching the Autobahn 12.1.7 case size.
+    let mut data = vec![0u8; 16 * 1024];
+    let mut x: u32 = 0x1234_5678;
+    for b in &mut data {
+      x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      *b = (x >> 24) as u8;
+    }
+
+    let mut server = deflate_server(default_params());
+    // One reference inflate stream, context kept across messages (no Finish),
+    // mirroring a conformant peer with permessage-deflate context takeover.
+    let mut ref_state = InflateState::new_boxed(DataFormat::Raw);
+
+    for msg in 0..8 {
+      let mut wire = vec![0u8; 64 * 1024];
+      let n = server
+        .encode_binary_compressed(&data, &mut wire)
+        .expect("compressed send");
+      wire.truncate(n);
+
+      // Pull the (unmasked, server-role) compressed payload out of the frame.
+      let decoded = match FrameHeader::decode(&wire).expect("decode header") {
+        Decoded::Complete(d) => d,
+        _ => panic!("incomplete frame header"),
+      };
+      assert!(decoded.header().rsv1(), "msg {msg}: RSV1 must be set");
+      let mut payload = wire[decoded.consumed()..].to_vec();
+      // RFC 7692 §7.2.2: the sender stripped the sync tail; restore it.
+      payload.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
+
+      let mut out = vec![0u8; 64 * 1024];
+      let result = inflate(&mut ref_state, &payload, &mut out, MZFlush::None);
+      assert_eq!(
+        result.bytes_written,
+        data.len(),
+        "msg {msg}: reference decoder inflated {} bytes, expected {} (status {:?})",
+        result.bytes_written,
+        data.len(),
+        result.status,
+      );
+      assert_eq!(
+        &out[..result.bytes_written],
+        &data[..],
+        "msg {msg}: content"
+      );
+    }
   }
 }
 
