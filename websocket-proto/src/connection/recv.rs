@@ -87,9 +87,9 @@ pub(crate) struct RecvState {
   /// Additional pongs owed when several pings arrive before `poll_transmit`
   /// drains the first. RFC 6455 §5.5.3 permits answering only the most recent
   /// ping, so on the bare (`no_alloc`) tier we coalesce into `pending_pong`;
-  /// where `alloc` is available we echo every ping (Autobahn §2.10), bounding
+  /// where a heap is available we echo every ping (Autobahn §2.10), bounding
   /// the queue at one pong per inbound control frame in the current batch.
-  #[cfg(any(feature = "alloc", feature = "std"))]
+  #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
   pub(crate) pong_overflow: std::collections::VecDeque<([u8; MAX_CONTROL_PAYLOAD], u8)>,
   /// Close/ping/pong payload accumulator (control frames may split across
   /// reads).
@@ -113,7 +113,7 @@ impl RecvState {
       utf8: Utf8Validator::new(),
       text_carry: ([0; 4], 0),
       pending_pong: None,
-      #[cfg(any(feature = "alloc", feature = "std"))]
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       pong_overflow: std::collections::VecDeque::new(),
       control_buf: [0; MAX_CONTROL_PAYLOAD],
       control_len: 0,
@@ -922,10 +922,10 @@ where
     match opcode {
       Opcode::Ping => {
         // First ping fills the single slot; later pings in the same batch go to
-        // the overflow queue where `alloc` is available (so every ping gets a
+        // the overflow queue where a heap is available (so every ping gets a
         // pong — Autobahn §2.10). On the bare tier the slot simply coalesces to
         // the most recent ping, which RFC 6455 §5.5.3 expressly allows.
-        #[cfg(any(feature = "alloc", feature = "std"))]
+        #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
         if self.conn.recv.pending_pong.is_some() {
           self
             .conn
@@ -935,7 +935,7 @@ where
         } else {
           self.conn.recv.pending_pong = Some((payload_buf, len_u8));
         }
-        #[cfg(not(any(feature = "alloc", feature = "std")))]
+        #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
         {
           self.conn.recv.pending_pong = Some((payload_buf, len_u8));
         }

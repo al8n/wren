@@ -1,4 +1,4 @@
-//! Alloc-tier owned-message assembly over [`Connection`] events.
+//! Heap-tier owned-message assembly over [`Connection`] events.
 //!
 //! [`MessageAssembler`] folds the lending-iterator events from
 //! [`Connection::handle`] into complete owned [`Message`] values. It is a pure
@@ -10,23 +10,32 @@
 //! [`Connection`]: crate::connection::Connection
 //! [`Connection::handle`]: crate::connection::Connection::handle
 
-#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
 use std::{string::String, vec::Vec};
 
 use crate::connection::{Event, MessageKind};
 
-/// An owned assembled WebSocket message.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Message {
-  /// A complete text message (valid UTF-8 by construction).
-  Text(String),
-  /// A complete binary message.
-  Binary(Vec<u8>),
+cfg_heap! {
+  /// Owned text payload: [`smol_str::SmolStr`] on the `alloc`/`std` tiers,
+  /// `portable_atomic_util::Arc<str>` on `no-atomic`. O(1) clone on every tier.
+  pub type TextBuf = crate::backend::TextBufInner;
+  /// Owned binary payload: [`bytes::Bytes`] on the `alloc`/`std` tiers,
+  /// `portable_atomic_util::Arc<[u8]>` on `no-atomic`. O(1) clone on every tier.
+  pub type BinaryBuf = crate::backend::BinaryBufInner;
 }
 
-#[cfg(any(feature = "alloc", feature = "std"))]
+cfg_heap! {
+  /// An owned assembled WebSocket message.
+  #[derive(Debug, Clone, PartialEq, Eq)]
+  pub enum Message {
+    /// A complete text message (valid UTF-8 by construction).
+    Text(TextBuf),
+    /// A complete binary message.
+    Binary(BinaryBuf),
+  }
+}
+
+#[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
 impl Message {
   /// The [`MessageKind`] of this message.
   pub fn kind(&self) -> MessageKind {
@@ -50,39 +59,39 @@ impl Message {
   }
 }
 
-/// Errors from [`MessageAssembler::push`].
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum AssembleError {
-  /// The assembled message exceeded the configured `max_message_size`.
-  #[error("assembled message exceeded max_message_size")]
-  TooLarge,
+cfg_heap! {
+  /// Errors from [`MessageAssembler::push`].
+  #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+  pub enum AssembleError {
+    /// The assembled message exceeded the configured `max_message_size`.
+    #[error("assembled message exceeded max_message_size")]
+    TooLarge,
 
-  /// A [`Event::MessageStart`] arrived while a message was already in progress
-  /// (the protocol machine prevents this; this is a defensive guard).
-  #[error("MessageStart received while a message was already assembling")]
-  Desequenced,
+    /// A [`Event::MessageStart`] arrived while a message was already in progress
+    /// (the protocol machine prevents this; this is a defensive guard).
+    #[error("MessageStart received while a message was already assembling")]
+    Desequenced,
+  }
 }
 
-/// Folds connection events into complete owned [`Message`] values.
-///
-/// Feed events from [`Connection::handle`] into [`push`](MessageAssembler::push)
-/// one at a time. When a message is complete, `push` returns
-/// `Ok(Some(message))`; for all other events it returns `Ok(None)`.
-/// Control events (`Ping`, `Pong`, `CloseReceived`, `Closed`) are passed
-/// through as `Ok(None)` — route them separately before calling `push`.
-///
-/// [`Connection::handle`]: crate::connection::Connection::handle
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug)]
-pub struct MessageAssembler {
-  max_message_size: usize,
-  state: AssemblerState,
+cfg_heap! {
+  /// Folds connection events into complete owned [`Message`] values.
+  ///
+  /// Feed events from [`Connection::handle`] into
+  /// [`push`](MessageAssembler::push) one at a time. When a message is complete,
+  /// `push` returns `Ok(Some(message))`; for all other events it returns
+  /// `Ok(None)`. Control events (`Ping`, `Pong`, `CloseReceived`, `Closed`) are
+  /// passed through as `Ok(None)` — route them separately before calling `push`.
+  ///
+  /// [`Connection::handle`]: crate::connection::Connection::handle
+  #[derive(Debug)]
+  pub struct MessageAssembler {
+    max_message_size: usize,
+    state: AssemblerState,
+  }
 }
 
-#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
 #[derive(Debug)]
 enum AssemblerState {
   Idle,
@@ -90,7 +99,7 @@ enum AssemblerState {
   InBinary(Vec<u8>),
 }
 
-#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
 impl MessageAssembler {
   /// Creates a new assembler that rejects messages larger than
   /// `max_message_size` bytes.
@@ -160,8 +169,11 @@ impl MessageAssembler {
       Event::MessageEnd => {
         let finished = core::mem::replace(&mut self.state, AssemblerState::Idle);
         let msg = match finished {
-          AssemblerState::InText(s) => Message::Text(s),
-          AssemblerState::InBinary(b) => Message::Binary(b),
+          // Seal the owned accumulator into the cheap-clone backing: `Bytes`
+          // adopts the `Vec` in O(1); `SmolStr` copies once for text past its
+          // inline capacity (the no-atomic `Arc<str>` always allocates once).
+          AssemblerState::InText(s) => Message::Text(crate::backend::text_from_string(s)),
+          AssemblerState::InBinary(b) => Message::Binary(crate::backend::binary_from_vec(b)),
           AssemblerState::Idle => return Ok(None),
         };
         Ok(Some(msg))
@@ -239,7 +251,7 @@ mod tests {
     while let Some(ev) = events.next() {
       result = asm.push(&ev).unwrap();
     }
-    assert_eq!(result, Some(Message::Binary(data)));
+    assert_eq!(result, Some(Message::Binary(data.into())));
   }
 
   // ── T4-3: fragmented text assembly ────────────────────────────────────────
@@ -283,7 +295,7 @@ mod tests {
     }
     let mut expected = part1.clone();
     expected.extend_from_slice(&part2);
-    assert_eq!(results, [Message::Binary(expected)]);
+    assert_eq!(results, [Message::Binary(expected.into())]);
   }
 
   // ── T4-5: size cap returns TooLarge ───────────────────────────────────────
@@ -452,11 +464,11 @@ mod tests {
     assert_eq!(t.len(), 5);
     assert!(!t.is_empty());
 
-    let b = Message::Binary(vec![1, 2, 3]);
+    let b = Message::Binary(vec![1, 2, 3].into());
     assert_eq!(b.kind(), MessageKind::Binary);
     assert_eq!(b.len(), 3);
 
-    let empty = Message::Binary(vec![]);
+    let empty = Message::Binary(Vec::new().into());
     assert!(empty.is_empty());
   }
 }

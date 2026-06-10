@@ -3,21 +3,34 @@
 //! [`Negotiated`] is the sole gate into the connection state machine
 //! (plan 4): the h1 machines produce it from header bytes, and the RFC
 //! 8441/9220 `connect` types (plan 3b) produce it from header data. Its
-//! string storage follows the crate tiers: `SmolStr` under `alloc`,
-//! `heapless::String<64>` under `heapless`, absent on the bare tier
-//! (where a negotiated subprotocol cannot be retained and is reported as
-//! `None`).
+//! string storage follows the crate tiers: `SmolStr` under `alloc`/`std`,
+//! `portable_atomic_util::Arc<str>` under `no-atomic`, `heapless::String<64>`
+//! under `heapless`, absent on the bare tier (where a negotiated subprotocol
+//! cannot be retained and is reported as `None`).
 
-#[cfg(any(feature = "alloc", feature = "heapless"))]
+#[cfg(any(
+  feature = "alloc",
+  feature = "std",
+  feature = "heapless",
+  feature = "no-atomic"
+))]
 use crate::handshake::parser::is_token;
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
 /// Maximum retained subprotocol length on the `heapless` tier.
 pub const MAX_SUBPROTOCOL_LEN: usize = 64;
 
-#[cfg(feature = "alloc")]
+// `alloc`/`std` take precedence over `no-atomic`, and the `heapless` arm
+// excludes both heap flavors, so `--all-features` resolves to a single
+// consistent storage type (matching backend.rs's precedence).
+#[cfg(any(feature = "alloc", feature = "std"))]
 type SubprotocolString = smol_str::SmolStr;
-#[cfg(all(not(feature = "alloc"), feature = "heapless"))]
+#[cfg(all(feature = "no-atomic", not(any(feature = "alloc", feature = "std"))))]
+type SubprotocolString = portable_atomic_util::Arc<str>;
+#[cfg(all(
+  feature = "heapless",
+  not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
+))]
 type SubprotocolString = heapless::String<MAX_SUBPROTOCOL_LEN>;
 
 /// Errors validating negotiation inputs.
@@ -51,7 +64,12 @@ pub enum NegotiationError {
 /// or the handshake machines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Negotiated {
-  #[cfg(any(feature = "alloc", feature = "heapless"))]
+  #[cfg(any(
+    feature = "alloc",
+    feature = "std",
+    feature = "heapless",
+    feature = "no-atomic"
+  ))]
   subprotocol: Option<SubprotocolString>,
   #[cfg(feature = "deflate")]
   deflate: Option<DeflateParams>,
@@ -63,35 +81,48 @@ impl Negotiated {
   /// negotiation entirely.
   pub const fn none() -> Self {
     Self {
-      #[cfg(any(feature = "alloc", feature = "heapless"))]
+      #[cfg(any(
+        feature = "alloc",
+        feature = "std",
+        feature = "heapless",
+        feature = "no-atomic"
+      ))]
       subprotocol: None,
       #[cfg(feature = "deflate")]
       deflate: None,
     }
   }
 
-  /// A result carrying an agreed subprotocol (validated as a token and,
-  /// on bounded tiers, for retainable length).
-  #[cfg(any(feature = "alloc", feature = "heapless"))]
-  #[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "heapless"))))]
-  pub fn with_subprotocol(subprotocol: &str) -> Result<Self, NegotiationError> {
-    if !is_token(subprotocol) {
-      return Err(NegotiationError::InvalidSubprotocol);
+  cfg_storage! {
+    /// A result carrying an agreed subprotocol (validated as a token and,
+    /// on bounded tiers, for retainable length).
+    pub fn with_subprotocol(subprotocol: &str) -> Result<Self, NegotiationError> {
+      if !is_token(subprotocol) {
+        return Err(NegotiationError::InvalidSubprotocol);
+      }
+      let stored = Self::store(subprotocol)?;
+      Ok(Self {
+        subprotocol: Some(stored),
+        #[cfg(feature = "deflate")]
+        deflate: None,
+      })
     }
-    let stored = Self::store(subprotocol)?;
-    Ok(Self {
-      subprotocol: Some(stored),
-      #[cfg(feature = "deflate")]
-      deflate: None,
-    })
   }
 
-  #[cfg(feature = "alloc")]
+  #[cfg(any(feature = "alloc", feature = "std"))]
   fn store(s: &str) -> Result<SubprotocolString, NegotiationError> {
     Ok(smol_str::SmolStr::new(s))
   }
 
-  #[cfg(all(not(feature = "alloc"), feature = "heapless"))]
+  #[cfg(all(feature = "no-atomic", not(any(feature = "alloc", feature = "std"))))]
+  fn store(s: &str) -> Result<SubprotocolString, NegotiationError> {
+    Ok(SubprotocolString::from(s))
+  }
+
+  #[cfg(all(
+    feature = "heapless",
+    not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
+  ))]
   fn store(s: &str) -> Result<SubprotocolString, NegotiationError> {
     SubprotocolString::try_from(s).map_err(|_| NegotiationError::InvalidSubprotocol)
   }
@@ -99,11 +130,21 @@ impl Negotiated {
   /// The agreed subprotocol, when one was negotiated and the tier can
   /// retain it.
   pub fn subprotocol(&self) -> Option<&str> {
-    #[cfg(any(feature = "alloc", feature = "heapless"))]
+    #[cfg(any(
+      feature = "alloc",
+      feature = "std",
+      feature = "heapless",
+      feature = "no-atomic"
+    ))]
     {
       self.subprotocol.as_deref()
     }
-    #[cfg(not(any(feature = "alloc", feature = "heapless")))]
+    #[cfg(not(any(
+      feature = "alloc",
+      feature = "std",
+      feature = "heapless",
+      feature = "no-atomic"
+    )))]
     {
       None
     }

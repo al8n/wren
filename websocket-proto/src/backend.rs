@@ -13,11 +13,6 @@
 //! drop-in. Both buffers are sealed from owned accumulators via
 //! [`text_from_string`] / [`binary_from_vec`].
 
-// Staging: `message.rs` (the next task) is the sole consumer; these aliases land
-// in their own commit so the backend can be reviewed in isolation. The `Message`
-// rebuild removes this allow.
-#![allow(dead_code, unused_imports)]
-
 // `alloc`/`std` take precedence over `no-atomic` (matching negotiation.rs's
 // `SubprotocolString`), so `--all-features` (which turns on both) resolves to a
 // single, consistent atomic backend rather than mixing `Bytes`/`SmolStr` with

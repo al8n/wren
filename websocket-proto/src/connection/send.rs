@@ -281,12 +281,12 @@ where
         out,
       )?;
       // Refill the slot from the overflow queue so the next `poll_transmit`
-      // emits the following pong (every ping answered where `alloc` exists).
-      #[cfg(any(feature = "alloc", feature = "std"))]
+      // emits the following pong (every ping answered where a heap exists).
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       {
         self.recv.pending_pong = self.recv.pong_overflow.pop_front();
       }
-      #[cfg(not(any(feature = "alloc", feature = "std")))]
+      #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
       {
         self.recv.pending_pong = None;
       }

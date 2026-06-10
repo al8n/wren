@@ -74,14 +74,12 @@ pub mod connection;
 
 pub use connection::{Connection, ConnectionConfig};
 
-/// Alloc-tier owned-message assembly over connection events.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub mod message;
+cfg_heap! {
+  /// Heap-tier owned-message assembly over connection events.
+  pub mod message;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use message::{AssembleError, Message, MessageAssembler};
+  pub use message::{AssembleError, BinaryBuf, Message, MessageAssembler, TextBuf};
+}
 
 /// Internal hot-path accessors for the `no-panic` link-time test
 /// (`tests/no_panic.rs`). Gated behind `test-no-panic`, doc-hidden, and exempt
