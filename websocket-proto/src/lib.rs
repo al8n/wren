@@ -65,3 +65,12 @@ pub use negotiation::Negotiated;
 pub mod connection;
 
 pub use connection::{Connection, ConnectionConfig};
+
+/// Alloc-tier owned-message assembly over connection events.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub mod message;
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub use message::{AssembleError, Message, MessageAssembler};
