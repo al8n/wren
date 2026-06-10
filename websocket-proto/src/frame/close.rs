@@ -1,6 +1,7 @@
 //! Close status codes (RFC 6455 §7.4 + the IANA registry) and the close
 //! frame payload format (§5.5.1).
 
+use crate::{constants::MAX_CONTROL_PAYLOAD, error::BufferTooSmallDetail};
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
 /// A close status code. All `u16` values are representable; named variants
@@ -126,6 +127,106 @@ impl CloseCode {
   }
 }
 
+/// Errors decoding or encoding a close-frame payload (§5.5.1).
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
+#[unwrap(ref)]
+#[try_unwrap(ref)]
+#[non_exhaustive]
+pub enum ClosePayloadError {
+  /// The body was exactly one byte; a status code needs two (§5.5.1).
+  #[error("close payload is 1 byte; a status code needs 2")]
+  TruncatedCode,
+
+  /// The reason text after the status code was not valid UTF-8.
+  #[error("close reason is not valid UTF-8")]
+  InvalidReasonUtf8,
+
+  /// The reason would push the control payload past 125 bytes; the value
+  /// is the maximum reason length (123).
+  #[error("close reason too long: at most {0} bytes fit a control frame")]
+  ReasonTooLong(usize),
+
+  /// The output buffer cannot hold the encoded payload.
+  #[error("{0}")]
+  BufferTooSmall(BufferTooSmallDetail),
+}
+
+/// A decoded close payload, borrowing the reason from the input.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct DecodedClose<'a> {
+  code: CloseCode,
+  reason: &'a str,
+}
+
+impl<'a> DecodedClose<'a> {
+  /// The status code (synthetic [`CloseCode::NoStatusReceived`] when the
+  /// body was empty).
+  #[inline(always)]
+  pub const fn code(&self) -> CloseCode {
+    self.code
+  }
+
+  /// The UTF-8 close reason (empty when absent).
+  #[inline(always)]
+  pub const fn reason(&self) -> &'a str {
+    self.reason
+  }
+}
+
+/// Decodes a close-frame body (§5.5.1): empty ⇒ no status code; otherwise a
+/// two-byte big-endian code followed by an optional UTF-8 reason. The code's
+/// wire-validity is NOT policed here (the connection does that) — but the
+/// structure (length, UTF-8) is.
+pub fn decode_close_payload(payload: &[u8]) -> Result<DecodedClose<'_>, ClosePayloadError> {
+  match payload {
+    [] => Ok(DecodedClose {
+      code: CloseCode::NoStatusReceived,
+      reason: "",
+    }),
+    [_] => Err(ClosePayloadError::TruncatedCode),
+    [hi, lo, reason @ ..] => {
+      let code = CloseCode::from_u16(u16::from_be_bytes([*hi, *lo]));
+      let reason =
+        core::str::from_utf8(reason).map_err(|_| ClosePayloadError::InvalidReasonUtf8)?;
+      Ok(DecodedClose { code, reason })
+    }
+  }
+}
+
+/// Encodes a close-frame body: the two-byte big-endian code followed by the
+/// reason. The result must fit a control frame (≤ 125 bytes), capping the
+/// reason at 123 bytes.
+pub fn encode_close_payload(
+  code: CloseCode,
+  reason: &str,
+  out: &mut [u8],
+) -> Result<usize, ClosePayloadError> {
+  let reason_max = MAX_CONTROL_PAYLOAD.saturating_sub(2);
+  if reason.len() > reason_max {
+    return Err(ClosePayloadError::ReasonTooLong(reason_max));
+  }
+  let needed = reason.len().saturating_add(2);
+  let Some(out) = out.get_mut(..needed) else {
+    return Err(ClosePayloadError::BufferTooSmall(
+      BufferTooSmallDetail::new(needed, out.len()),
+    ));
+  };
+  let [hi, lo, rest @ ..] = out else {
+    return Err(ClosePayloadError::BufferTooSmall(
+      BufferTooSmallDetail::new(needed, 0),
+    ));
+  };
+  let [code_hi, code_lo] = code.as_u16().to_be_bytes();
+  *hi = code_hi;
+  *lo = code_lo;
+  // `rest.len() == reason.len()` by construction; zip is the statically
+  // panic-free spelling (`copy_from_slice` would panic on a mismatch).
+  for (dst, src) in rest.iter_mut().zip(reason.as_bytes()) {
+    *dst = *src;
+  }
+  Ok(needed)
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
@@ -203,5 +304,71 @@ mod tests {
     assert_eq!(CloseCode::ProtocolError.as_str(), "protocol error");
     assert_eq!(CloseCode::Other(4000).as_str(), "other");
     assert_eq!(CloseCode::MessageTooBig.to_string(), "message too big");
+  }
+
+  #[test]
+  fn close_payload_decode_per_5_5_1() {
+    // Empty payload — no code on the wire — maps to NoStatusReceived.
+    let d = decode_close_payload(b"").unwrap();
+    assert_eq!(d.code(), CloseCode::NoStatusReceived);
+    assert_eq!(d.reason(), "");
+
+    // Code only.
+    let d = decode_close_payload(&[0x03, 0xE8]).unwrap();
+    assert_eq!(d.code(), CloseCode::Normal);
+    assert_eq!(d.reason(), "");
+
+    // Code + UTF-8 reason.
+    let mut payload = vec![0x03, 0xE9];
+    payload.extend_from_slice("going héme".as_bytes());
+    let d = decode_close_payload(&payload).unwrap();
+    assert_eq!(d.code(), CloseCode::GoingAway);
+    assert_eq!(d.reason(), "going héme");
+
+    // One-byte payload is malformed (§5.5.1: if there is a body, the first
+    // two bytes MUST be the status code).
+    let err = decode_close_payload(&[0x03]).unwrap_err();
+    assert!(matches!(err, ClosePayloadError::TruncatedCode));
+
+    // Invalid UTF-8 in the reason is malformed.
+    let err = decode_close_payload(&[0x03, 0xE8, 0xFF, 0xFE]).unwrap_err();
+    assert!(matches!(err, ClosePayloadError::InvalidReasonUtf8));
+
+    // The code itself is decoded losslessly even when not wire-valid;
+    // policing is the connection's job.
+    let d = decode_close_payload(&[0x03, 0xED]).unwrap(); // 1005
+    assert_eq!(d.code(), CloseCode::NoStatusReceived);
+    assert!(!d.code().is_valid_on_wire());
+  }
+
+  #[test]
+  fn close_payload_encode_per_5_5_1() {
+    let mut buf = [0u8; 125];
+
+    let n = encode_close_payload(CloseCode::Normal, "", &mut buf).unwrap();
+    assert_eq!(&buf[..n], &[0x03, 0xE8]);
+
+    let n = encode_close_payload(CloseCode::GoingAway, "bye", &mut buf).unwrap();
+    assert_eq!(&buf[..n], &[0x03, 0xE9, b'b', b'y', b'e']);
+
+    // Round-trip.
+    let d = decode_close_payload(&buf[..n]).unwrap();
+    assert_eq!(d.code(), CloseCode::GoingAway);
+    assert_eq!(d.reason(), "bye");
+
+    // Reason too long for the 125-byte control limit (2 + 124 > 125).
+    let long = "x".repeat(124);
+    let err = encode_close_payload(CloseCode::Normal, &long, &mut buf).unwrap_err();
+    assert!(matches!(err, ClosePayloadError::ReasonTooLong(_)));
+
+    // Output buffer too small.
+    let mut tiny = [0u8; 3];
+    let err = encode_close_payload(CloseCode::Normal, "abc", &mut tiny).unwrap_err();
+    assert!(matches!(err, ClosePayloadError::BufferTooSmall(_)));
+
+    // 123-byte reason is the maximum and fits exactly.
+    let max = "y".repeat(123);
+    let n = encode_close_payload(CloseCode::Normal, &max, &mut buf).unwrap();
+    assert_eq!(n, 125);
   }
 }

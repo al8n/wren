@@ -12,10 +12,9 @@ mod close;
 // mod mask;
 mod opcode;
 
-pub use close::CloseCode;
-// pub use close::{
-//   ClosePayloadError, DecodedClose, decode_close_payload, encode_close_payload,
-// };
+pub use close::{
+  CloseCode, ClosePayloadError, DecodedClose, decode_close_payload, encode_close_payload,
+};
 // pub use header::{
 //   DecodeError, Decoded, DecodedHeader, EncodeError, FrameHeader, MoreNeeded,
 //   NonCanonicalLengthDetail,
