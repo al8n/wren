@@ -234,6 +234,7 @@ where
 pub(crate) mod tests {
   use super::{
     Connection, ConnectionConfig,
+    events::{Event, MessageKind},
     role::{Client, Role, Server},
   };
   use crate::{
@@ -241,6 +242,62 @@ pub(crate) mod tests {
     negotiation::Negotiated,
     time::testing::TestInstant,
   };
+
+  /// Owned summary of one event — shared by recv and property tests.
+  #[derive(Debug, PartialEq, Eq, Clone)]
+  pub(crate) enum Ev {
+    Start(MessageKind, bool),
+    Text(String),
+    Bin(Vec<u8>),
+    End,
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    CloseRecv(u16, String),
+    Closed(u16, bool),
+  }
+
+  /// Feeds `bytes` into `conn` and collects every event as owned `Ev`s.
+  pub(crate) fn drain(conn: &mut Connection<TestInstant, Server>, bytes: &[u8]) -> Vec<Ev> {
+    let mut data = bytes.to_vec();
+    let mut events = conn.handle(TestInstant(0), &mut data).unwrap();
+    let mut out = Vec::new();
+    while let Some(e) = events.next() {
+      out.push(match e {
+        Event::MessageStart(s) => Ev::Start(s.kind(), s.compressed()),
+        Event::TextChunk(t) => Ev::Text(format!("{}{}", t.prefix(), t.body())),
+        Event::BinaryChunk(b) => Ev::Bin(b.to_vec()),
+        Event::MessageEnd => Ev::End,
+        Event::Ping(p) => Ev::Ping(p.as_slice().to_vec()),
+        Event::Pong(p) => Ev::Pong(p.as_slice().to_vec()),
+        Event::CloseReceived(c) => Ev::CloseRecv(c.code().as_u16(), c.reason().to_string()),
+        Event::Closed(c) => Ev::Closed(c.code().as_u16(), c.clean()),
+      });
+    }
+    out
+  }
+
+  /// Folds adjacent Text/Bin chunks produced by split delivery.
+  pub(crate) fn fold_events(events: Vec<Ev>) -> Vec<Ev> {
+    let mut out: Vec<Ev> = Vec::new();
+    for e in events {
+      match (out.last_mut(), e) {
+        (Some(Ev::Text(acc)), Ev::Text(t)) => acc.push_str(&t),
+        (Some(Ev::Bin(acc)), Ev::Bin(b)) => acc.extend_from_slice(&b),
+        (_, e) => out.push(e),
+      }
+    }
+    out
+  }
+
+  /// A fresh server-role connection for testing.
+  pub(crate) fn server() -> Connection<TestInstant, Server> {
+    Connection::new(
+      &Negotiated::none(),
+      ConnectionConfig::default(),
+      Server::new(),
+      TestInstant(0),
+    )
+  }
 
   /// Builds one masked frame (client→server direction) into a `Vec`.
   pub(crate) fn masked_frame(opcode: Opcode, fin: bool, payload: &[u8]) -> Vec<u8> {
@@ -430,5 +487,142 @@ pub(crate) mod tests {
     }
     assert!(conn.is_terminal());
     assert_eq!(conn.poll_timeout(), None);
+  }
+
+  mod properties {
+    use super::*;
+    use crate::connection::role::Client;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+      Text(String),
+      Binary(Vec<u8>),
+      FragText(Vec<String>),
+      Ping(Vec<u8>),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+      prop_oneof![
+        ".{0,64}".prop_map(Op::Text),
+        proptest::collection::vec(any::<u8>(), 0..64).prop_map(Op::Binary),
+        proptest::collection::vec(".{0,16}", 1..4).prop_map(Op::FragText),
+        proptest::collection::vec(any::<u8>(), 0..32).prop_map(Op::Ping),
+      ]
+    }
+
+    fn encode_script(ops: &[Op]) -> Vec<u8> {
+      use crate::connection::send::FragmentKind;
+      let mut conn: Connection<TestInstant, Client<CountingRng>> = Connection::new(
+        &Negotiated::none(),
+        ConnectionConfig::default(),
+        Client::new(CountingRng(7)),
+        TestInstant(0),
+      );
+      let mut wire = Vec::new();
+      let mut buf = vec![0u8; 1 << 12];
+      for op in ops {
+        match op {
+          Op::Text(s) => {
+            let n = conn.encode_text(s, &mut buf).unwrap();
+            wire.extend_from_slice(&buf[..n]);
+          }
+          Op::Binary(b) => {
+            let n = conn.encode_binary(b, &mut buf).unwrap();
+            wire.extend_from_slice(&buf[..n]);
+          }
+          Op::FragText(parts) => {
+            for (i, part) in parts.iter().enumerate() {
+              let kind = if i == 0 {
+                FragmentKind::TextStart
+              } else {
+                FragmentKind::Continue
+              };
+              let fin = i == parts.len() - 1;
+              let n = conn
+                .encode_fragment(kind, fin, part.as_bytes(), &mut buf)
+                .unwrap();
+              wire.extend_from_slice(&buf[..n]);
+            }
+          }
+          Op::Ping(p) => {
+            let p = &p[..p.len().min(125)];
+            let n = conn.encode_ping(p, &mut buf).unwrap();
+            wire.extend_from_slice(&buf[..n]);
+          }
+        }
+      }
+      wire
+    }
+
+    fn run(srv: &mut Connection<TestInstant, Server>, pieces: &[&[u8]]) -> Vec<Ev> {
+      let mut out = Vec::new();
+      for piece in pieces {
+        out.extend(drain(srv, piece));
+      }
+      fold_events(out)
+    }
+
+    proptest! {
+      #[test]
+      fn split_anywhere_is_invariant(
+        ops in proptest::collection::vec(op_strategy(), 0..6),
+        cuts in proptest::collection::vec(any::<u16>(), 0..6),
+      ) {
+        let wire = encode_script(&ops);
+
+        let mut reference = server();
+        let expected = run(&mut reference, &[&wire]);
+
+        let mut points: Vec<usize> =
+          cuts.iter().map(|&c| usize::from(c) % (wire.len() + 1)).collect();
+        points.sort_unstable();
+        points.dedup();
+        let mut pieces: Vec<&[u8]> = Vec::new();
+        let mut start = 0;
+        for &p in &points {
+          pieces.push(&wire[start..p]);
+          start = p;
+        }
+        pieces.push(&wire[start..]);
+
+        let mut split_conn = server();
+        let got = run(&mut split_conn, &pieces);
+        prop_assert_eq!(got, expected);
+
+        // And the content matches the script.
+        let mut expected_content: Vec<Ev> = Vec::new();
+        for op in &ops {
+          match op {
+            Op::Text(s) => {
+              expected_content.push(Ev::Start(MessageKind::Text, false));
+              if !s.is_empty() {
+                expected_content.push(Ev::Text(s.clone()));
+              }
+              expected_content.push(Ev::End);
+            }
+            Op::FragText(parts) => {
+              expected_content.push(Ev::Start(MessageKind::Text, false));
+              let joined: String = parts.concat();
+              if !joined.is_empty() {
+                expected_content.push(Ev::Text(joined));
+              }
+              expected_content.push(Ev::End);
+            }
+            Op::Binary(b) => {
+              expected_content.push(Ev::Start(MessageKind::Binary, false));
+              if !b.is_empty() {
+                expected_content.push(Ev::Bin(b.clone()));
+              }
+              expected_content.push(Ev::End);
+            }
+            Op::Ping(p) => {
+              expected_content.push(Ev::Ping(p[..p.len().min(125)].to_vec()));
+            }
+          }
+        }
+        prop_assert_eq!(run(&mut server(), &[&wire]), expected_content);
+      }
+    }
   }
 }

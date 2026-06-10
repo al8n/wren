@@ -729,7 +729,11 @@ fn clamp_to_usize(remaining: u64, available: usize) -> usize {
 mod tests {
   use super::*;
   use crate::{
-    connection::{Connection, ConnectionConfig, role::Server},
+    connection::{
+      Connection, ConnectionConfig,
+      role::Server,
+      tests::{Ev, drain, fold_events, server},
+    },
     frame::{CloseCode, FrameHeader, Opcode, encode_close_payload, mask as apply_mask},
     negotiation::Negotiated,
     time::testing::TestInstant,
@@ -750,59 +754,8 @@ mod tests {
     out
   }
 
-  fn server() -> Connection<TestInstant, Server> {
-    Connection::new(
-      &Negotiated::none(),
-      ConnectionConfig::default(),
-      Server::new(),
-      TestInstant(0),
-    )
-  }
-
-  /// Drains every event of one handle() call into owned summaries.
-  #[derive(Debug, PartialEq, Eq)]
-  enum Ev {
-    Start(MessageKind, bool),
-    Text(String),
-    Bin(Vec<u8>),
-    End,
-    Ping(Vec<u8>),
-    Pong(Vec<u8>),
-    CloseRecv(u16, String),
-    Closed(u16, bool),
-  }
-
-  fn drain(conn: &mut Connection<TestInstant, Server>, bytes: &[u8]) -> Vec<Ev> {
-    let mut data = bytes.to_vec();
-    let mut events = conn.handle(TestInstant(0), &mut data).unwrap();
-    let mut out = Vec::new();
-    while let Some(e) = events.next() {
-      out.push(match e {
-        Event::MessageStart(s) => Ev::Start(s.kind(), s.compressed()),
-        Event::TextChunk(t) => Ev::Text(format!("{}{}", t.prefix(), t.body())),
-        Event::BinaryChunk(b) => Ev::Bin(b.to_vec()),
-        Event::MessageEnd => Ev::End,
-        Event::Ping(p) => Ev::Ping(p.as_slice().to_vec()),
-        Event::Pong(p) => Ev::Pong(p.as_slice().to_vec()),
-        Event::CloseReceived(c) => Ev::CloseRecv(c.code().as_u16(), c.reason().to_string()),
-        Event::Closed(c) => Ev::Closed(c.code().as_u16(), c.clean()),
-      });
-    }
-    out
-  }
-
-  /// Text/binary chunks may split arbitrarily — fold adjacent runs for
-  /// comparison.
   fn fold(events: Vec<Ev>) -> Vec<Ev> {
-    let mut out: Vec<Ev> = Vec::new();
-    for e in events {
-      match (out.last_mut(), e) {
-        (Some(Ev::Text(acc)), Ev::Text(t)) => acc.push_str(&t),
-        (Some(Ev::Bin(acc)), Ev::Bin(b)) => acc.extend_from_slice(&b),
-        (_, e) => out.push(e),
-      }
-    }
-    out
+    fold_events(events)
   }
 
   #[test]
