@@ -14,7 +14,6 @@ categories = ["network-programming", "no-std", "embedded", "web-programming::web
 default = ["std"]
 std = ["alloc", "thiserror/std", "smol_str/std", "bytes/std", "rand?/std", "rand?/thread_rng"]
 alloc = ["dep:smol_str", "dep:bytes"]
-heapless = ["dep:heapless"]
 deflate = ["alloc", "dep:miniz_oxide"]
 # `no-atomic`: the heap tier for cores WITHOUT native atomic CAS (Cortex-M0+ /
 # thumbv6m / RP2040). Same Message/Negotiated owned storage as `alloc`, but the
@@ -41,7 +40,6 @@ rand_core.workspace = true
 sha1.workspace = true
 smol_str = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
-heapless = { workspace = true, optional = true }
 miniz_oxide = { workspace = true, optional = true, features = ["with-alloc"] }
 rand = { workspace = true, optional = true, features = ["std_rng"] }
 portable-atomic = { workspace = true, optional = true }

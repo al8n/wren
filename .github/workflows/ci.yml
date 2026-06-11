@@ -50,7 +50,6 @@ jobs:
       - run: cargo clippy --workspace --all-features --tests -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features alloc -- -D warnings
-      - run: cargo clippy -p websocket-proto --no-default-features --features heapless -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features deflate -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features no-atomic -- -D warnings
 
@@ -100,7 +99,6 @@ jobs:
           targets: thumbv7em-none-eabihf, thumbv6m-none-eabi, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p websocket-proto --no-default-features --target thumbv7em-none-eabihf
-      - run: cargo check -p websocket-proto --no-default-features --features heapless --target thumbv7em-none-eabihf
       - run: cargo check -p websocket-proto --no-default-features --features alloc --target thumbv7em-none-eabihf
       - run: cargo check -p websocket-proto --no-default-features --features alloc,deflate --target thumbv7em-none-eabihf
       - run: cargo check -p websocket-proto --no-default-features --features alloc --target wasm32-unknown-unknown
@@ -109,11 +107,8 @@ jobs:
       # bytes' atomic refcount — cannot build there. The `no-atomic` feature
       # swaps the refcounted text / binary buffers onto `portable_atomic_util::Arc`
       # (CAS via a `critical-section` impl the final binary provides). thumbv7em
-      # above HAS atomics, so it does not exercise this path. `no-atomic` +
-      # `heapless` is additive; `no-atomic` outranks `heapless` and must resolve
-      # cleanly (no duplicate storage types).
+      # above HAS atomics, so it does not exercise this path.
       - run: cargo check -p websocket-proto --no-default-features --features no-atomic --target thumbv6m-none-eabi
-      - run: cargo check -p websocket-proto --no-default-features --features no-atomic,heapless --target thumbv6m-none-eabi
       # MUST-FAIL: `no-atomic` + `deflate` (without std) is a contradictory
       # combo — deflate's `alloc` dependency drags the atomic-CAS backends in,
       # defeating the tier. lib.rs raises a compile_error!; pin that it fires.

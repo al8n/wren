@@ -42,7 +42,7 @@ The first functional cycle of the Sans-I/O WebSocket protocol core. Highlights:
 - `alloc`-tier `MessageAssembler` folding events into owned `Message::{Text,
   Binary}`, carrying cheap-clone (`O(1)`) payloads — `smol_str::SmolStr` text and
   `bytes::Bytes` binary, exposed as the public `TextBuf` / `BinaryBuf` aliases;
-  bare `no_std` (no-alloc) and `heapless` tiers supported.
+  bare `no_std` (no-alloc) tier supported — the inline subprotocol storage retains negotiation results without any allocator.
 - `no-atomic` heap tier for cores without native atomic CAS (Cortex-M0+ /
   thumbv6m / RP2040): the same `Message` / `Negotiated` storage as `alloc`, but
   the refcounted text / binary buffers and negotiated subprotocol use

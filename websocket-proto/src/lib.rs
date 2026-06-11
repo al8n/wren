@@ -43,7 +43,7 @@ compile_error!(
    atomic `alloc` storage backend); drop one of the two features"
 );
 
-// `cfg_heap!` / `cfg_storage!` — declared first so they are in textual scope for
+// `cfg_heap!` — declared first so it is in textual scope for
 // every module below.
 #[macro_use]
 mod macros;

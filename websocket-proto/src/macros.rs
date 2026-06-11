@@ -9,13 +9,9 @@
 //! / `type`) and methods. Struct fields, function parameters, `match` arms and
 //! statements are not items, so a handful of those keep an explicit `#[cfg(...)]`.
 
-// Not every helper is invoked on every build — `cfg_storage` is only used where
-// the `heapless` tier also participates — so silence the unused-macro lint.
-#![allow(unused_macros)]
-
-// Items that need a heap allocator — the owned-storage (Message / Negotiated)
-// tier: `alloc`, `std`, or the `no-atomic` (portable-atomic) tier. Mirrors the
-// backend heap arms; deliberately excludes `heapless`.
+// Items that need a heap allocator — the owned-storage (Message) tier:
+// `alloc`, `std`, or the `no-atomic` (portable-atomic) tier. Mirrors the
+// backend heap arms.
 macro_rules! cfg_heap {
   ($($item:item)*) => {
     $(
@@ -23,31 +19,6 @@ macro_rules! cfg_heap {
       #[cfg_attr(
         docsrs,
         doc(cfg(any(feature = "alloc", feature = "std", feature = "no-atomic")))
-      )]
-      $item
-    )*
-  };
-}
-
-// Items available on *any* storage tier that can retain a subprotocol string:
-// the heap tiers (`alloc` / `std` / `no-atomic`) plus fixed-capacity `heapless`.
-macro_rules! cfg_storage {
-  ($($item:item)*) => {
-    $(
-      #[cfg(any(
-        feature = "alloc",
-        feature = "std",
-        feature = "heapless",
-        feature = "no-atomic"
-      ))]
-      #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-          feature = "alloc",
-          feature = "std",
-          feature = "heapless",
-          feature = "no-atomic"
-        )))
       )]
       $item
     )*
