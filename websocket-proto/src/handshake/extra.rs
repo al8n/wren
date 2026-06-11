@@ -118,14 +118,14 @@ impl<'s, 'a> ExtraHeaders<'s, 'a> {
     self.entries.is_empty()
   }
 
-  /// Validates the checks both roles share: each name is a token and no value
-  /// contains CR or LF. Returns the offending reason on the first failure.
+  /// Validates the checks both roles share: each name is a token and each
+  /// value fits the RFC 9110 §5.5 field-value grammar (HTAB / SP / VCHAR /
+  /// obs-text — no C0 control except HTAB, no DEL). Returns the offending
+  /// reason on the first failure.
   ///
-  /// This mirrors the inbound parser's CR/LF rejection but deliberately does
-  /// **not** reject the other C0 control bytes the parser screens on receive —
-  /// outbound extra-header values have only ever been CR/LF-checked, and this
-  /// keeps that contract. The client's managed-name collision check is applied
-  /// separately, on the client side only.
+  /// This mirrors the inbound parser's screening exactly: a value the crate
+  /// refuses to PARSE must not be one it will EMIT, or a conforming peer or
+  /// intermediary may reject — or worse, reinterpret — the handshake.
   pub(crate) fn validate(&self) -> Result<(), &'static str> {
     if self.overflowed {
       return Err("extra headers exceeded the builder capacity");
@@ -134,8 +134,8 @@ impl<'s, 'a> ExtraHeaders<'s, 'a> {
       if !is_token(name) {
         return Err("extra header name is not a token");
       }
-      if value.bytes().any(|b| b == b'\r' || b == b'\n') {
-        return Err("extra header value contains CR/LF");
+      if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F) {
+        return Err("extra header value contains control bytes");
       }
     }
     Ok(())
