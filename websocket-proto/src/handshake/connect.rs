@@ -79,6 +79,12 @@ pub enum ConnectRequestError {
   #[error("malformed sec-websocket-protocol offer list")]
   MalformedSubprotocols,
 
+  /// The request carried an h1-only upgrade field (`Connection`, `Upgrade`,
+  /// `Sec-WebSocket-Key`, …) that RFC 8441 §5 / RFC 9113 §8.2.2 forbid on
+  /// this transport.
+  #[error("h1-only header forbidden on an extended CONNECT")]
+  ForbiddenHeader,
+
   /// `sec-websocket-version` missing.
   #[error("missing sec-websocket-version")]
   MissingVersion,
@@ -171,7 +177,9 @@ impl<'a> ConnectRequest<'a> {
   /// a deflate offer is present. No allocation: any deflate value is rendered
   /// once into the view.
   pub fn headers(&self) -> Result<ConnectRequestHeaders<'a>, ConnectRequestError> {
-    if self.authority.is_empty() || self.authority.bytes().any(|b| b == b'\r' || b == b'\n') {
+    // Same bar as the h1 client's Host: an authority admits no whitespace,
+    // controls, or DEL (RFC 3986 §3.2).
+    if self.authority.is_empty() || self.authority.bytes().any(|b| b < 0x21 || b == 0x7F) {
       return Err(ConnectRequestError::InvalidField("authority"));
     }
     // Shared RFC 3986 path-and-query grammar — also rejects a raw `#`
@@ -452,6 +460,24 @@ pub fn validate_connect_request<'a>(
       return Err(ConnectRequestError::UnsupportedVersion);
     }
     Some(_) => {}
+  }
+  // RFC 8441 §5: the h1 upgrade machinery has no place on this transport —
+  // Sec-WebSocket-Key/Accept are not used, and HTTP/2 (RFC 9113 §8.2.2) /
+  // HTTP/3 treat connection-specific fields as malformed outright. A strict
+  // gate rejects them rather than trusting the adapter to have filtered.
+  const FORBIDDEN: &[&str] = &[
+    "connection",
+    "upgrade",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "sec-websocket-key",
+    "sec-websocket-accept",
+  ];
+  for (name, _) in headers {
+    if FORBIDDEN.iter().any(|f| name.eq_ignore_ascii_case(f)) {
+      return Err(ConnectRequestError::ForbiddenHeader);
+    }
   }
   // Mirror of the h1 server's offer-list rule: non-token or repeated
   // elements fail the gate; empty elements are ignored (RFC 9110 §5.6.1.2).
@@ -738,6 +764,41 @@ mod tests {
         .headers()
         .is_ok()
     );
+  }
+
+  /// Regression (Codex R13): RFC 8441 §5 / RFC 9113 §8.2.2 — h1 upgrade
+  /// machinery and connection-specific fields are forbidden on this
+  /// transport; the strict gate rejects them itself.
+  #[test]
+  fn connect_gate_rejects_h1_only_headers() {
+    let base: &[(&str, &str)] = &[
+      (":method", "CONNECT"),
+      (":protocol", "websocket"),
+      (":scheme", "https"),
+      (":path", "/chat"),
+      (":authority", "h"),
+      ("sec-websocket-version", "13"),
+    ];
+    for (name, value) in [
+      ("connection", "Upgrade"),
+      ("Upgrade", "websocket"),
+      ("keep-alive", "timeout=5"),
+      ("proxy-connection", "keep-alive"),
+      ("transfer-encoding", "chunked"),
+      ("sec-websocket-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
+      ("sec-websocket-accept", "x"),
+    ] {
+      let headers: Vec<(&str, &str)> = base.iter().copied().chain([(name, value)]).collect();
+      assert!(
+        matches!(
+          validate_connect_request(&headers).unwrap_err(),
+          ConnectRequestError::ForbiddenHeader
+        ),
+        "{name}"
+      );
+    }
+    // The clean request still passes.
+    assert!(validate_connect_request(base).is_ok());
   }
 
   /// Regression (Codex R10): the CONNECT gate validates offer lists like the
