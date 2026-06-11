@@ -4,7 +4,7 @@
 //! machines produce it from header bytes, and the RFC 8441/9220 `connect`
 //! types produce it from header data. The module is **allocation-free on
 //! every tier** — the subprotocol lives in an inline buffer capped at
-//! [`MAX_SUBPROTOCOL_LEN`] bytes (registered subprotocol names are short
+//! [`MAX_SUBPROTOCOL_LEN`](crate::negotiation::MAX_SUBPROTOCOL_LEN) bytes (registered subprotocol names are short
 //! tokens; the longest in the IANA registry is well under half the cap), so
 //! [`Negotiated`] is `Copy` and fully available on the bare `no_std` tier.
 

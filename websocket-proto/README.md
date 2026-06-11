@@ -63,7 +63,10 @@ The bare `no_std`, no-`alloc` tier compiles with `--no-default-features`.
 After the HTTP/1.1 upgrade completes, build a [`Connection`] from the
 [`Negotiated`] result and run a `handle` → assemble → echo → drain loop. A
 [`MessageAssembler`] folds the lending events into owned [`Message`]s
-(`alloc`); drivers that prefer streaming can consume the events directly.
+(`alloc`); the allocator-free [`SliceAssembler`] folds them into a
+caller-provided buffer and yields a borrowed [`MessageRef`] on every tier
+(including the bare `no_std` build); drivers that prefer streaming can consume
+the events directly.
 
 ```rust,no_run
 # // Doctests compile with whatever features the test run enables; this one
@@ -215,6 +218,8 @@ Copyright (c) 2026 Al Liu.
 [`Instant`]: https://docs.rs/websocket-proto/latest/websocket_proto/time/trait.Instant.html
 [`Message`]: https://docs.rs/websocket-proto/latest/websocket_proto/message/enum.Message.html
 [`MessageAssembler`]: https://docs.rs/websocket-proto/latest/websocket_proto/message/struct.MessageAssembler.html
+[`SliceAssembler`]: https://docs.rs/websocket-proto/latest/websocket_proto/message/struct.SliceAssembler.html
+[`MessageRef`]: https://docs.rs/websocket-proto/latest/websocket_proto/message/enum.MessageRef.html
 [`Negotiated`]: https://docs.rs/websocket-proto/latest/websocket_proto/negotiation/struct.Negotiated.html
 [`ClientHandshake::handle`]: https://docs.rs/websocket-proto/latest/websocket_proto/handshake/h1/struct.ClientHandshake.html#method.handle
 [`Client`]: https://docs.rs/websocket-proto/latest/websocket_proto/connection/role/struct.Client.html

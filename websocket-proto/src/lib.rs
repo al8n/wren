@@ -86,11 +86,13 @@ pub mod connection;
 
 pub use connection::{Connection, ConnectionConfig};
 
-cfg_heap! {
-  /// Heap-tier owned-message assembly over connection events.
-  pub mod message;
+/// Message assembly over connection events.
+pub mod message;
 
-  pub use message::{AssembleError, BinaryBuf, Message, MessageAssembler, TextBuf};
+pub use message::{AssembleError, MessageRef, SliceAssembler};
+
+cfg_heap! {
+  pub use message::{BinaryBuf, Message, MessageAssembler, TextBuf};
 }
 
 /// Internal hot-path accessors for the `no-panic` link-time test
