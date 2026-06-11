@@ -195,13 +195,11 @@ impl<'a> ClientHandshake<'a> {
     if options.host.is_empty() || options.host.bytes().any(|b| b == b'\r' || b == b'\n') {
       return Err(invalid("host empty or contains CR/LF"));
     }
-    if !options.path.starts_with('/')
-      || options
-        .path
-        .bytes()
-        .any(|b| b == b'\r' || b == b'\n' || b == b' ')
-    {
-      return Err(invalid("path must be origin-form without spaces or CR/LF"));
+    // Full RFC 3986 path-and-query grammar (shared with the server gate):
+    // rejects whitespace/controls AND a raw `#` — RFC 6455 §3 says the
+    // resource name MUST NOT carry a fragment (escape literal `#` as %23).
+    if !crate::handshake::parser::is_valid_path_and_query(options.path) {
+      return Err(invalid("path is not a valid origin-form resource name"));
     }
     // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique.
     for (i, proto) in options.subprotocols.iter().enumerate() {

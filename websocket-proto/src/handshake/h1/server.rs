@@ -89,14 +89,25 @@ pub enum ServerHandshakeError {
 pub struct RequestView<'a> {
   head: Head<'a>,
   path: &'a str,
+  query: Option<&'a str>,
   host: &'a str,
   key: &'a str,
 }
 
 impl<'a> RequestView<'a> {
-  /// The request target (origin-form path + query, verbatim).
+  /// The /resource name/'s path component (always `/`-leading; `/` when the
+  /// target's path was empty). The query rides separately in
+  /// [`query`](Self::query) — the two are split because the absolute-form
+  /// `http://host?q` target's resource name `/?q` contains a slash RFC 6455
+  /// §3 constructs rather than one on the wire, so no single borrowed slice
+  /// can carry it.
   pub const fn path(&self) -> &'a str {
     self.path
+  }
+
+  /// The query component (bytes after `?`), when the target carried one.
+  pub const fn query(&self) -> Option<&'a str> {
+    self.query
   }
 
   /// The Host header value.
@@ -288,7 +299,7 @@ impl ServerHandshake {
     if version != "HTTP/1.1" || parts.next().is_some() || target.is_empty() {
       return Err(ServerHandshakeError::NotHttp11);
     }
-    let Some(target) = request_target_resource(target) else {
+    let Some((path, query)) = request_target_resource(target) else {
       return Err(ServerHandshakeError::InvalidTarget);
     };
 
@@ -348,7 +359,8 @@ impl ServerHandshake {
 
     Ok(ServerProgress::Request(RequestView {
       head,
-      path: target,
+      path,
+      query,
       host,
       key,
     }))
@@ -437,37 +449,59 @@ impl ServerHandshake {
   }
 }
 
-/// Validates the request target and returns the /resource name/ (path +
-/// query) it carries. RFC 6455 §4.2.1.1 admits TWO target shapes: origin-form
-/// (`/chat`) or "an absolute HTTP/HTTPS URI containing the resource name" —
-/// and RFC 9112 §3.2.2 separately requires origin servers to accept
-/// absolute-form, so a strict leading-`/` gate would reject conforming
-/// (typically proxied) clients. Whitespace, control bytes, and DEL never
-/// appear in a valid request-target (RFC 9112 §3.2 grammar).
-fn request_target_resource(target: &str) -> Option<&str> {
-  if target.bytes().any(|b| b < 0x21 || b == 0x7F) {
-    return None;
+/// Validates the request target and splits it into the /resource name/'s
+/// path and query components — each individually borrowable, which is why
+/// the view exposes them separately (the `http://h?q` shape's resource name
+/// `/?q` has a SYNTHESIZED slash no single borrowed slice can carry).
+///
+/// RFC 6455 §4.2.1.1 admits TWO target shapes: origin-form (`/chat`) or "an
+/// absolute HTTP/HTTPS URI containing the resource name" — and RFC 9112
+/// §3.2.2 separately requires origin servers to accept absolute-form, so a
+/// strict leading-`/` gate would reject conforming (typically proxied)
+/// clients. Both shapes are validated against the RFC 3986 path grammar via
+/// [`parser::is_valid_path_and_query`] (rejecting raw `#`: §3 requires %23).
+fn request_target_resource(target: &str) -> Option<(&str, Option<&str>)> {
+  fn split_pq(pq: &str) -> Option<(&str, Option<&str>)> {
+    if !parser::is_valid_path_and_query(pq) {
+      return None;
+    }
+    match pq.split_once('?') {
+      None => Some((pq, None)),
+      Some((path, query)) => {
+        let path = if path.is_empty() { "/" } else { path };
+        Some((path, Some(query)))
+      }
+    }
   }
+  // `split_once('?')` on the path side can only yield an empty path for a
+  // leading `?`, which `is_valid_path_and_query` already rejects — the
+  // `"/"` fallback above is for the ABSOLUTE shapes below.
   if target.starts_with('/') {
-    return Some(target);
+    return split_pq(target);
   }
   // Absolute-form: case-insensitive http/https scheme (RFC 3986 §3.1), a
-  // non-empty authority, then the resource name from the first `/`.
+  // non-empty authority, then the resource name. An empty path reads as
+  // `/` (RFC 6455 §3) whether or not a query follows.
   let rest = ["http://", "https://"].iter().find_map(|scheme| {
     target
       .get(..scheme.len())
       .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
       .and_then(|_| target.get(scheme.len()..))
   })?;
+  if rest.bytes().any(|b| b < 0x21 || b == 0x7F || b == b'#') {
+    return None;
+  }
   match rest.find(['/', '?']) {
-    // "http://host" → resource name "/" (RFC 6455 §3: empty path reads "/").
-    None if !rest.is_empty() => Some("/"),
-    // A query with no path ("http://h?x") would need a SYNTHESIZED leading
-    // slash we cannot borrow; reject the degenerate spelling (no real
-    // WebSocket client emits it). An empty authority is malformed outright.
+    // "http://host" → "/", no query.
+    None if !rest.is_empty() => Some(("/", None)),
     Some(i) if i > 0 => {
       let resource = rest.get(i..)?;
-      resource.starts_with('/').then_some(resource)
+      match resource.strip_prefix('?') {
+        // "http://host?q" → resource name "/?q" (RFC 6455 §3 constructs the
+        // slash) — exposed as path "/" + the borrowed query.
+        Some(query) => parser::is_valid_query(query).then_some(("/", Some(query))),
+        None => split_pq(resource),
+      }
     }
     _ => None,
   }
@@ -608,7 +642,14 @@ Sec-WebSocket-Version: 13\r\n\
       "server.example.com:80",
       "/\tadmin",
       "/a\x01b",
-      "http://h?x=1",
+      // Raw `#` introduces a fragment — RFC 6455 §3: fragments MUST NOT be
+      // used; a literal `#` must arrive as %23. Both target forms.
+      "/chat#frag",
+      "http://h/chat#frag",
+      "http://h?x=#",
+      // Malformed percent-escapes and an empty-authority absolute.
+      "/chat%2",
+      "/chat%zz",
       "http://?x",
       "ftp://h/chat",
     ] {
@@ -623,12 +664,16 @@ Sec-WebSocket-Version: 13\r\n\
     }
 
     // Accepted shapes: absolute-form yields the embedded resource name;
-    // a path-less absolute URI reads as "/" (RFC 6455 §3); the scheme is
-    // case-insensitive (RFC 3986 §3.1).
-    for (good, want) in [
-      ("http://server.example.com/chat?x=1", "/chat?x=1"),
-      ("HTTPS://server.example.com", "/"),
-      ("/chat", "/chat"),
+    // a path-less absolute URI reads as "/" (RFC 6455 §3) — INCLUDING the
+    // query-only spelling `http://h?q`, whose resource name `/?q` carries a
+    // constructed slash (Codex R12: previously rejected as degenerate);
+    // the scheme is case-insensitive (RFC 3986 §3.1).
+    for (good, want_path, want_query) in [
+      ("http://server.example.com/chat?x=1", "/chat", Some("x=1")),
+      ("http://server.example.com?token=1", "/", Some("token=1")),
+      ("HTTPS://server.example.com", "/", None),
+      ("/chat", "/chat", None),
+      ("/chat?x=%23", "/chat", Some("x=%23")),
     ] {
       let req = replaced(
         "GET /chat HTTP/1.1\r\n",
@@ -638,7 +683,8 @@ Sec-WebSocket-Version: 13\r\n\
         ServerProgress::Request(v) => v,
         ServerProgress::NeedMore => panic!("complete"),
       };
-      assert_eq!(v.path(), want, "{good:?}");
+      assert_eq!(v.path(), want_path, "{good:?}");
+      assert_eq!(v.query(), want_query, "{good:?}");
     }
   }
 
@@ -1026,19 +1072,39 @@ Sec-WebSocket-Version: 13\r\n\
     );
   }
 
-  // The outbound validation mirrors the inbound parser's CR/LF rejection but
-  // deliberately does NOT screen the other C0 control bytes (only CR/LF have
-  // ever been rejected outbound). A bare control byte passes through.
+  /// Regression (Codex R12): outbound extra-header values follow the
+  /// RFC 9110 §5.5 field-value grammar — C0 controls (except HTAB) and DEL
+  /// are rejected at encode time, exactly mirroring what the inbound parser
+  /// screens. HTAB and obs-text stay legal.
   #[test]
-  fn extra_header_value_with_non_crlf_control_is_allowed() {
+  fn extra_header_value_control_bytes_are_rejected() {
     let v = view(GOOD);
     let mut buf = [0u8; 512];
-    let accept = Accept::new().with_extra_headers(&[("X-Bell", "a\x07b")]);
+    for bad in [
+      [("X-Bell", "a\x07b")],
+      [("X-Nul", "a\0b")],
+      [("X-Del", "a\x7Fb")],
+    ] {
+      let accept = Accept::new().with_extra_headers(&bad);
+      assert!(
+        matches!(
+          ServerHandshake::new()
+            .encode_response(&v, &accept, &mut buf)
+            .unwrap_err(),
+          ServerHandshakeError::InvalidResponseOption("extra header value contains control bytes")
+        ),
+        "{bad:?}"
+      );
+    }
+
+    // HTAB (legal field-value byte) and obs-text (0x80+) still pass.
+    let accept = Accept::new().with_extra_headers(&[("X-Tab", "a\tb"), ("X-Obs", "café")]);
     let (n, _) = ServerHandshake::new()
       .encode_response(&v, &accept, &mut buf)
       .unwrap();
     let resp = core::str::from_utf8(&buf[..n]).unwrap();
-    assert!(resp.contains("\r\nX-Bell: a\x07b\r\n"), "{resp:?}");
+    assert!(resp.contains("\r\nX-Tab: a\tb\r\n"), "{resp:?}");
+    assert!(resp.contains("\r\nX-Obs: café\r\n"), "{resp:?}");
   }
 
   #[test]

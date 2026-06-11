@@ -163,6 +163,56 @@ pub(crate) fn is_token(s: &str) -> bool {
   !s.is_empty() && s.bytes().all(is_token_byte)
 }
 
+/// RFC 3986 `pchar` byte (plus `/`): what may appear literally in a URI
+/// path segment. Everything else — including `#`, which RFC 6455 §3 says
+/// MUST be percent-encoded in a resource name — must arrive `%XX`-escaped.
+const fn is_path_byte(b: u8) -> bool {
+  matches!(b,
+    // unreserved
+    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+    // sub-delims
+    | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+    // pchar extras + segment separator
+    | b':' | b'@' | b'/')
+}
+
+/// Validates a WebSocket /resource name/'s path-and-query string against the
+/// RFC 3986 grammar RFC 6455 §3 builds on: a leading `/`, `pchar`/`/` bytes
+/// in the path, `pchar`/`/`/`?` bytes after the first `?`, and `%` only as
+/// `%XX` percent-escapes. Fragments are not part of a resource name — a raw
+/// `#` "MUST be escaped as %23" (§3) — so `#` is rejected in both parts.
+pub(crate) fn is_valid_path_and_query(s: &str) -> bool {
+  s.starts_with('/') && valid_pq_bytes(s.bytes(), false)
+}
+
+/// Validates bare query bytes (everything after the `?`) under the same
+/// grammar — for the absolute-form `http://host?q` shape, whose resource
+/// name `/?q` is assembled positionally rather than borrowed.
+pub(crate) fn is_valid_query(s: &str) -> bool {
+  valid_pq_bytes(s.bytes(), true)
+}
+
+fn valid_pq_bytes(bytes: impl Iterator<Item = u8>, mut in_query: bool) -> bool {
+  let mut pending_hex: u8 = 0;
+  for b in bytes {
+    if pending_hex > 0 {
+      if !b.is_ascii_hexdigit() {
+        return false;
+      }
+      pending_hex = pending_hex.saturating_sub(1);
+      continue;
+    }
+    match b {
+      b'%' => pending_hex = 2,
+      b'?' if !in_query => in_query = true,
+      b'?' => {} // additional `?` is legal query data (RFC 3986 §3.4)
+      _ if is_path_byte(b) => {}
+      _ => return false,
+    }
+  }
+  pending_hex == 0
+}
+
 /// Splits a comma-separated list value into its non-empty, OWS-trimmed
 /// elements. RFC 9110 §5.6.1.2: "a recipient MUST parse and ignore a
 /// reasonable number of empty list elements" — EVERY list consumer in the

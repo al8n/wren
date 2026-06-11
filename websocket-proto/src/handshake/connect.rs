@@ -174,12 +174,9 @@ impl<'a> ConnectRequest<'a> {
     if self.authority.is_empty() || self.authority.bytes().any(|b| b == b'\r' || b == b'\n') {
       return Err(ConnectRequestError::InvalidField("authority"));
     }
-    if !self.path.starts_with('/')
-      || self
-        .path
-        .bytes()
-        .any(|b| b == b'\r' || b == b'\n' || b == b' ')
-    {
+    // Shared RFC 3986 path-and-query grammar — also rejects a raw `#`
+    // (RFC 6455 §3: a resource name carries no fragment; escape as %23).
+    if !crate::handshake::parser::is_valid_path_and_query(self.path) {
       return Err(ConnectRequestError::InvalidField("path"));
     }
     // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique.
@@ -427,12 +424,12 @@ pub fn validate_connect_request<'a>(
   if !scheme_ok {
     return Err(ConnectRequestError::NotHttpScheme);
   }
-  // Origin-form (mirrors the request builder's own rule): leading `/`, no
-  // SP, no CR/LF — `/bad path` is not a request-target.
+  // Origin-form under the shared RFC 3986 path-and-query grammar (also
+  // rejects a raw `#`: RFC 6455 §3 forbids fragments in resource names).
   let path_ok = count(":path") == 1
-    && view.get(":path").is_some_and(|p| {
-      p.starts_with('/') && !p.bytes().any(|b| b == b' ' || b == b'\r' || b == b'\n')
-    });
+    && view
+      .get(":path")
+      .is_some_and(crate::handshake::parser::is_valid_path_and_query);
   if !path_ok {
     return Err(ConnectRequestError::InvalidPath);
   }
