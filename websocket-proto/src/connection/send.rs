@@ -319,7 +319,9 @@ where
 
   /// Lifecycle + fragmentation-sequencing check WITHOUT payload validation.
   /// Used by the compressed-send path, whose payload bytes are a DEFLATE stream
-  /// (validated post-inflation on the receive side), never raw UTF-8.
+  /// (validated post-inflation on the receive side), never raw UTF-8 — hence
+  /// the gate: without `deflate` it has no caller.
+  #[cfg(feature = "deflate")]
   fn check_data_send(&self, starting: bool) -> Result<(), EncodeError> {
     if !matches!(self.lifecycle, Lifecycle::Open) {
       return Err(EncodeError::Closing);
