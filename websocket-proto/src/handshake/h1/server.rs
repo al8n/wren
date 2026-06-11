@@ -9,11 +9,10 @@ use crate::{
   },
   negotiation::{Negotiated, NegotiationError},
 };
-use derive_more::{IsVariant, TryUnwrap, Unwrap};
+use derive_more::{IsVariant, TryUnwrap};
 
 /// Errors from the server handshake (parsing, validation, encoding).
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum ServerHandshakeError {
@@ -28,6 +27,11 @@ pub enum ServerHandshakeError {
   /// The request was not HTTP/1.1.
   #[error("handshake request must be HTTP/1.1")]
   NotHttp11,
+
+  /// The request target was neither origin-form nor an absolute http/https
+  /// URI (RFC 6455 §4.2.1.1), or contained whitespace/control bytes.
+  #[error("request target is not a websocket resource name")]
+  InvalidTarget,
 
   /// No (single, non-empty) Host header.
   #[error("handshake request must carry a Host header")]
@@ -148,8 +152,7 @@ impl<'a> RequestView<'a> {
 // variant carries no data, so the size difference is expected and intentional
 // — boxing would require `alloc`, which is unavailable on the bare tier.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, IsVariant, Unwrap, TryUnwrap)]
-#[unwrap(ref)]
+#[derive(Debug, IsVariant, TryUnwrap)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum ServerProgress<'a> {
@@ -285,6 +288,9 @@ impl ServerHandshake {
     if version != "HTTP/1.1" || parts.next().is_some() || target.is_empty() {
       return Err(ServerHandshakeError::NotHttp11);
     }
+    let Some(target) = request_target_resource(target) else {
+      return Err(ServerHandshakeError::InvalidTarget);
+    };
 
     let headers = head.headers();
     if headers.count("host") != 1 {
@@ -431,6 +437,42 @@ impl ServerHandshake {
   }
 }
 
+/// Validates the request target and returns the /resource name/ (path +
+/// query) it carries. RFC 6455 §4.2.1.1 admits TWO target shapes: origin-form
+/// (`/chat`) or "an absolute HTTP/HTTPS URI containing the resource name" —
+/// and RFC 9112 §3.2.2 separately requires origin servers to accept
+/// absolute-form, so a strict leading-`/` gate would reject conforming
+/// (typically proxied) clients. Whitespace, control bytes, and DEL never
+/// appear in a valid request-target (RFC 9112 §3.2 grammar).
+fn request_target_resource(target: &str) -> Option<&str> {
+  if target.bytes().any(|b| b < 0x21 || b == 0x7F) {
+    return None;
+  }
+  if target.starts_with('/') {
+    return Some(target);
+  }
+  // Absolute-form: case-insensitive http/https scheme (RFC 3986 §3.1), a
+  // non-empty authority, then the resource name from the first `/`.
+  let rest = ["http://", "https://"].iter().find_map(|scheme| {
+    target
+      .get(..scheme.len())
+      .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+      .and_then(|_| target.get(scheme.len()..))
+  })?;
+  match rest.find(['/', '?']) {
+    // "http://host" → resource name "/" (RFC 6455 §3: empty path reads "/").
+    None if !rest.is_empty() => Some("/"),
+    // A query with no path ("http://h?x") would need a SYNTHESIZED leading
+    // slash we cannot borrow; reject the degenerate spelling (no real
+    // WebSocket client emits it). An empty authority is malformed outright.
+    Some(i) if i > 0 => {
+      let resource = rest.get(i..)?;
+      resource.starts_with('/').then_some(resource)
+    }
+    _ => None,
+  }
+}
+
 // Separate helpers (not immediately-invoked closures: that trips
 // `clippy::redundant_closure_call`).
 fn write_accept_response(
@@ -546,6 +588,58 @@ Sec-WebSocket-Version: 13\r\n\
     );
     let v = view(raw.as_bytes());
     assert_eq!(v.host(), "server.example.com");
+  }
+
+  /// Regression (Codex R11): the request target must be a websocket
+  /// /resource name/ — origin-form, or an absolute http/https URI
+  /// (RFC 6455 §4.2.1.1 admits BOTH; rejecting absolute-form would fail
+  /// conforming proxied clients, so that half of the review's
+  /// recommendation is deliberately not taken).
+  #[test]
+  fn request_targets_are_validated() {
+    let hs = ServerHandshake::new();
+
+    // Rejected shapes: bare token, asterisk-form, authority-form,
+    // tab/control bytes inside the target, query-without-path absolutes,
+    // empty-authority absolutes, non-http schemes.
+    for bad in [
+      "websocket",
+      "*",
+      "server.example.com:80",
+      "/\tadmin",
+      "/a\x01b",
+      "http://h?x=1",
+      "http://?x",
+      "ftp://h/chat",
+    ] {
+      let req = replaced("GET /chat HTTP/1.1\r\n", &format!("GET {bad} HTTP/1.1\r\n"));
+      assert!(
+        matches!(
+          hs.handle(&req).unwrap_err(),
+          ServerHandshakeError::InvalidTarget
+        ),
+        "{bad:?}"
+      );
+    }
+
+    // Accepted shapes: absolute-form yields the embedded resource name;
+    // a path-less absolute URI reads as "/" (RFC 6455 §3); the scheme is
+    // case-insensitive (RFC 3986 §3.1).
+    for (good, want) in [
+      ("http://server.example.com/chat?x=1", "/chat?x=1"),
+      ("HTTPS://server.example.com", "/"),
+      ("/chat", "/chat"),
+    ] {
+      let req = replaced(
+        "GET /chat HTTP/1.1\r\n",
+        &format!("GET {good} HTTP/1.1\r\n"),
+      );
+      let v = match hs.handle(&req).unwrap() {
+        ServerProgress::Request(v) => v,
+        ServerProgress::NeedMore => panic!("complete"),
+      };
+      assert_eq!(v.path(), want, "{good:?}");
+    }
   }
 
   /// Regression (Codex R10): the offer list is `1#token` with unique
