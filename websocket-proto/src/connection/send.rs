@@ -29,6 +29,15 @@ pub enum EncodeError {
   #[error("fragmentation sequence violation")]
   FragmentSequence,
 
+  /// Outbound text payload bytes are not valid UTF-8 (RFC 6455 §8.1). A single
+  /// fragment may legally end mid-codepoint (§5.6 splits a character across
+  /// frames), but the assembled message must be valid: a `fin` fragment is
+  /// rejected unless it lands on a character boundary. The fragmentation state
+  /// is left unchanged, so the caller may retry the same fragment with
+  /// corrected bytes.
+  #[error("outbound text payload is not valid UTF-8")]
+  InvalidUtf8,
+
   /// The close handshake is underway (or done); data sends are over.
   #[error("connection is closing or closed")]
   Closing,
@@ -52,12 +61,20 @@ pub enum EncodeError {
 }
 
 /// Outbound fragmentation state.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+///
+/// Text carries the streaming UTF-8 validator (the same one the receive path
+/// uses) across the fragments of one message: §5.6 lets a fragment end
+/// mid-codepoint, so only the assembled message must be valid, and the
+/// incremental validator is exactly the right shape — feed each fragment, and
+/// require a character boundary at `fin`.
+#[derive(Debug, Clone)]
 pub(crate) enum SendMessageState {
   /// Between messages.
   Idle,
-  /// Inside a message.
-  InMessage,
+  /// Inside a text message, validating its payload bytes as UTF-8.
+  InText(crate::utf8::Utf8Validator),
+  /// Inside a binary message (arbitrary bytes; no validation).
+  InBinary,
 }
 
 #[derive(Debug)]
@@ -186,7 +203,11 @@ where
     payload: &mut [u8],
   ) -> Result<EncodedHeader, EncodeError> {
     let (opcode, starting) = kind.into_parts();
-    self.check_data_send(starting)?;
+    // Validate (lifecycle, sequencing, and outbound text UTF-8) BEFORE writing
+    // any header bytes or masking the payload in place: on rejection the
+    // payload buffer stays byte-identical and the fragmentation state unchanged,
+    // so the caller can retry the same fragment with corrected bytes.
+    let next = self.plan_data_send(opcode, starting, fin, payload)?;
 
     let key = self.role.next_mask();
     let header = FrameHeader::new(opcode, u64::try_from(payload.len()).unwrap_or(u64::MAX))
@@ -207,11 +228,7 @@ where
     if let Some(k) = key {
       mask(payload, k, 0);
     }
-    self.send.message = if fin {
-      SendMessageState::Idle
-    } else {
-      SendMessageState::InMessage
-    };
+    self.send.message = next;
     Ok(EncodedHeader {
       buf,
       len: u8::try_from(len).unwrap_or(0),
@@ -301,17 +318,92 @@ where
     Ok(None)
   }
 
-  /// Shared lifecycle + fragmentation-sequencing prologue for the data
-  /// encoders.
+  /// Lifecycle + fragmentation-sequencing check WITHOUT payload validation.
+  /// Used by the compressed-send path, whose payload bytes are a DEFLATE stream
+  /// (validated post-inflation on the receive side), never raw UTF-8.
   fn check_data_send(&self, starting: bool) -> Result<(), EncodeError> {
     if !matches!(self.lifecycle, Lifecycle::Open) {
       return Err(EncodeError::Closing);
     }
-    match (starting, self.send.message) {
+    match (starting, &self.send.message) {
       (true, SendMessageState::Idle) => Ok(()),
-      (false, SendMessageState::InMessage) => Ok(()),
+      (false, SendMessageState::InText(_) | SendMessageState::InBinary) => Ok(()),
       _ => Err(EncodeError::FragmentSequence),
     }
+  }
+
+  /// Computes the fragmentation state to commit AFTER a (plaintext) data frame
+  /// is successfully written, validating lifecycle, sequencing, and — for text
+  /// — that the payload keeps the assembled message valid UTF-8 (RFC 6455
+  /// §8.1). Reads state only; the caller commits the returned state once all
+  /// fallible work (the write, and for `prepare_fragment` the in-place mask)
+  /// has succeeded, so a rejected send leaves the fragmentation state — and the
+  /// payload buffer — untouched for a retry.
+  ///
+  /// §5.6 allows a single fragment to split a codepoint, so a non-`fin`
+  /// fragment may end mid-character; only a `fin` fragment must land on a
+  /// character boundary.
+  fn plan_data_send(
+    &self,
+    opcode: Opcode,
+    starting: bool,
+    fin: bool,
+    payload: &[u8],
+  ) -> Result<SendMessageState, EncodeError> {
+    if !matches!(self.lifecycle, Lifecycle::Open) {
+      return Err(EncodeError::Closing);
+    }
+    match (starting, &self.send.message) {
+      (true, SendMessageState::Idle) => {
+        if matches!(opcode, Opcode::Text) {
+          let mut validator = crate::utf8::Utf8Validator::new();
+          Self::validate_text_fragment(&mut validator, fin, payload)?;
+          Ok(if fin {
+            SendMessageState::Idle
+          } else {
+            SendMessageState::InText(validator)
+          })
+        } else {
+          Ok(if fin {
+            SendMessageState::Idle
+          } else {
+            SendMessageState::InBinary
+          })
+        }
+      }
+      (false, SendMessageState::InText(validator)) => {
+        let mut validator = validator.clone();
+        Self::validate_text_fragment(&mut validator, fin, payload)?;
+        Ok(if fin {
+          SendMessageState::Idle
+        } else {
+          SendMessageState::InText(validator)
+        })
+      }
+      (false, SendMessageState::InBinary) => Ok(if fin {
+        SendMessageState::Idle
+      } else {
+        SendMessageState::InBinary
+      }),
+      _ => Err(EncodeError::FragmentSequence),
+    }
+  }
+
+  /// Feeds one text fragment's bytes through the message's UTF-8 validator. A
+  /// `fin` fragment additionally requires a character boundary (the message
+  /// may not end mid-codepoint).
+  fn validate_text_fragment(
+    validator: &mut crate::utf8::Utf8Validator,
+    fin: bool,
+    payload: &[u8],
+  ) -> Result<(), EncodeError> {
+    if validator.feed(payload).is_err() {
+      return Err(EncodeError::InvalidUtf8);
+    }
+    if fin && !validator.is_boundary() {
+      return Err(EncodeError::InvalidUtf8);
+    }
+    Ok(())
   }
 
   fn encode_data(
@@ -322,13 +414,9 @@ where
     payload: &[u8],
     out: &mut [u8],
   ) -> Result<usize, EncodeError> {
-    self.check_data_send(starting)?;
+    let next = self.plan_data_send(opcode, starting, fin, payload)?;
     let n = self.write_frame(opcode, fin, false, payload, out)?;
-    self.send.message = if fin {
-      SendMessageState::Idle
-    } else {
-      SendMessageState::InMessage
-    };
+    self.send.message = next;
     Ok(n)
   }
 
@@ -1210,6 +1298,135 @@ mod tests {
     conn
       .prepare_fragment(FragmentKind::Continue, true, &mut p)
       .unwrap();
+  }
+
+  /// RFC 6455 §5.6: a fragment may split a codepoint — only the assembled
+  /// message must be valid UTF-8. "é" (0xC3 0xA9) sent as TextStart(0xC3,
+  /// fin=false) + Continue(0xA9, fin=true) is LEGAL and must keep working.
+  #[test]
+  fn text_fragments_may_split_mid_codepoint() {
+    let mut conn = server();
+    let mut out = [0u8; 32];
+    conn
+      .encode_fragment(FragmentKind::TextStart, false, &[0xC3], &mut out)
+      .expect("a lead byte alone is a legal non-final fragment");
+    conn
+      .encode_fragment(FragmentKind::Continue, true, &[0xA9], &mut out)
+      .expect("the continuation completes 'é' on a boundary");
+
+    // The message reassembles to valid UTF-8 ("é") through a peer's recv path.
+    use crate::connection::tests::{Ev, drain, fold_events, masked_frame, server as ref_server};
+    let mut srv = ref_server();
+    let start = masked_frame(crate::frame::Opcode::Text, false, &[0xC3]);
+    let cont = masked_frame(crate::frame::Opcode::Continuation, true, &[0xA9]);
+    let mut evs = drain(&mut srv, &start);
+    evs.extend(drain(&mut srv, &cont));
+    assert_eq!(
+      fold_events(evs),
+      [
+        Ev::Start(crate::connection::MessageKind::Text, false),
+        Ev::Text("é".into()),
+        Ev::End,
+      ]
+    );
+  }
+
+  /// Invalid UTF-8 text bytes are rejected, and the fragmentation state is left
+  /// unchanged: a failed START stays Idle (a fresh start still works); a failed
+  /// CONTINUE stays in the text message (a valid continue still works).
+  #[test]
+  fn invalid_utf8_text_fragment_is_rejected() {
+    let mut out = [0u8; 32];
+
+    // Failed START → still Idle: a following valid TextStart succeeds.
+    let mut conn = server();
+    assert!(matches!(
+      conn.encode_fragment(FragmentKind::TextStart, true, &[0xFF], &mut out),
+      Err(EncodeError::InvalidUtf8)
+    ));
+    conn
+      .encode_text("recovered", &mut out)
+      .expect("a failed start left the connection Idle");
+
+    // Failed CONTINUE → still InText: a following valid continue succeeds and
+    // closes the message cleanly.
+    let mut conn = server();
+    conn
+      .encode_fragment(FragmentKind::TextStart, false, b"ab", &mut out)
+      .unwrap();
+    assert!(matches!(
+      conn.encode_fragment(FragmentKind::Continue, false, &[0xFF], &mut out),
+      Err(EncodeError::InvalidUtf8)
+    ));
+    conn
+      .encode_fragment(FragmentKind::Continue, true, b"cd", &mut out)
+      .expect("the failed continue left the text message in progress");
+    // Message done: a new message may start.
+    conn.encode_text("next", &mut out).unwrap();
+  }
+
+  /// A `fin` fragment that ends mid-codepoint is rejected (the message may not
+  /// end mid-character), but the state is preserved so the remaining byte may
+  /// be sent to finish the codepoint.
+  #[test]
+  fn fin_mid_codepoint_is_rejected() {
+    let mut conn = server();
+    let mut out = [0u8; 32];
+    // Start "é" but stop after the lead byte.
+    conn
+      .encode_fragment(FragmentKind::TextStart, false, &[0xC3], &mut out)
+      .unwrap();
+    // fin on the lead byte alone (empty continuation) leaves a character in
+    // flight → rejected.
+    assert!(matches!(
+      conn.encode_fragment(FragmentKind::Continue, true, &[], &mut out),
+      Err(EncodeError::InvalidUtf8)
+    ));
+    // State preserved: supplying the trailing byte with fin completes "é".
+    conn
+      .encode_fragment(FragmentKind::Continue, true, &[0xA9], &mut out)
+      .expect("the rejected fin left the in-flight codepoint intact");
+  }
+
+  /// `prepare_fragment` must reject invalid outbound text BEFORE it masks the
+  /// payload in place: on rejection the buffer is byte-identical (unmasked).
+  #[test]
+  fn prepare_fragment_validates_before_masking() {
+    let mut conn = client();
+    let mut payload = [0xFFu8, 0x00, 0xC0];
+    let before = payload;
+    assert!(matches!(
+      conn.prepare_fragment(FragmentKind::TextStart, true, &mut payload),
+      Err(EncodeError::InvalidUtf8)
+    ));
+    assert_eq!(payload, before, "rejected payload must be left unmasked");
+
+    // And the fragmentation state is untouched: a valid whole text send works.
+    let mut out = [0u8; 32];
+    conn
+      .encode_text("ok", &mut out)
+      .expect("a rejected prepare_fragment left the connection Idle");
+  }
+
+  /// Binary fragments carry arbitrary bytes — no UTF-8 constraint (§5.6 only
+  /// governs text).
+  #[test]
+  fn binary_fragments_accept_arbitrary_bytes() {
+    let mut conn = server();
+    let mut out = [0u8; 32];
+    conn
+      .encode_fragment(FragmentKind::BinaryStart, false, &[0xFF, 0xFE], &mut out)
+      .expect("binary start accepts non-UTF-8 bytes");
+    conn
+      .encode_fragment(FragmentKind::Continue, true, &[0x80, 0xC0], &mut out)
+      .expect("binary continuation accepts non-UTF-8 bytes");
+
+    // prepare_fragment (client) masks arbitrary binary bytes without validation.
+    let mut conn = client();
+    let mut payload = [0xFFu8, 0xC0];
+    conn
+      .prepare_fragment(FragmentKind::BinaryStart, true, &mut payload)
+      .expect("binary prepare_fragment accepts non-UTF-8 bytes");
   }
 
   #[test]
