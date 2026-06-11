@@ -420,9 +420,15 @@ impl ServerHandshake {
         rejection.status,
       ));
     }
-    if rejection.reason.bytes().any(|b| b == b'\r' || b == b'\n') {
+    // reason-phrase grammar = HTAB / SP / VCHAR / obs-text (RFC 9112 §4):
+    // the same field-value control screen the extra headers get.
+    if rejection
+      .reason
+      .bytes()
+      .any(|b| (b < 0x20 && b != b'\t') || b == 0x7F)
+    {
       return Err(ServerHandshakeError::InvalidResponseOption(
-        "reason contains CR/LF",
+        "reason contains control bytes",
       ));
     }
     rejection
@@ -1069,6 +1075,31 @@ Sec-WebSocket-Version: 13\r\n\
       ServerHandshake::new()
         .encode_rejection(&bad, &mut buf)
         .is_err()
+    );
+  }
+
+  /// Regression (Codex R13): the managed rejection reason-phrase gets the
+  /// same control screen as the extras (RFC 9112 §4 grammar) — not just
+  /// CR/LF.
+  #[test]
+  fn rejection_reason_control_bytes_are_rejected() {
+    let mut buf = [0u8; 256];
+    for bad in ["For\x07bidden", "For\0bidden", "For\x7Fbidden"] {
+      assert!(
+        matches!(
+          ServerHandshake::new().encode_rejection(&Rejection::new(403, bad), &mut buf),
+          Err(ServerHandshakeError::InvalidResponseOption(
+            "reason contains control bytes"
+          ))
+        ),
+        "{bad:?}"
+      );
+    }
+    // SP and HTAB are legal reason-phrase bytes.
+    assert!(
+      ServerHandshake::new()
+        .encode_rejection(&Rejection::new(403, "Not\tToday Friend"), &mut buf)
+        .is_ok()
     );
   }
 

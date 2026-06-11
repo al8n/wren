@@ -192,8 +192,11 @@ impl<'a> ClientHandshake<'a> {
   ) -> Result<Self, ClientHandshakeError> {
     let invalid =
       |what: &'static str| ClientHandshakeError::InvalidOptions(InvalidOptionsDetail::new(what));
-    if options.host.is_empty() || options.host.bytes().any(|b| b == b'\r' || b == b'\n') {
-      return Err(invalid("host empty or contains CR/LF"));
+    // An authority admits no whitespace, controls, or DEL (RFC 3986 §3.2 /
+    // RFC 9110 §5.5) — the managed `Host:` field must pass the same bar the
+    // extra-header values do, or the crate emits an invalid handshake.
+    if options.host.is_empty() || options.host.bytes().any(|b| b < 0x21 || b == 0x7F) {
+      return Err(invalid("host empty or contains whitespace/control bytes"));
     }
     // Full RFC 3986 path-and-query grammar (shared with the server gate):
     // rejects whitespace/controls AND a raw `#` — RFC 6455 §3 says the
@@ -494,6 +497,29 @@ mod tests {
     ));
     let cased = ClientOptions::new("h", "/").with_subprotocols(&["chat", "CHAT"]);
     assert!(ClientHandshake::new(cased, &mut CountingRng(0)).is_ok());
+
+    // Regression (Codex R13): the managed Host field gets the same
+    // control-byte screen as the extra headers — BEL/NUL/DEL/SP/HTAB in
+    // the host would put an invalid handshake on the wire.
+    for bad_host in ["h\x07st", "h\0st", "h\x7Fst", "h st", "h\tst"] {
+      assert!(
+        matches!(
+          ClientHandshake::new(ClientOptions::new(bad_host, "/"), &mut CountingRng(0)).unwrap_err(),
+          ClientHandshakeError::InvalidOptions(_)
+        ),
+        "{bad_host:?}"
+      );
+    }
+
+    // Regression (Codex R12 class): a raw `#` in the path is a fragment —
+    // RFC 6455 §3 forbids it (escape as %23).
+    let frag = ClientOptions::new("h", "/chat#frag");
+    assert!(matches!(
+      ClientHandshake::new(frag, &mut CountingRng(0)).unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
+    let escaped = ClientOptions::new("h", "/chat%23frag");
+    assert!(ClientHandshake::new(escaped, &mut CountingRng(0)).is_ok());
   }
 
   #[test]
