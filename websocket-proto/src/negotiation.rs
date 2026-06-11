@@ -611,6 +611,11 @@ mod deflate {
   #[derive(Debug, Copy, Clone, PartialEq, Eq)]
   pub struct DeflateResponse {
     params: DeflateParams,
+    /// The offer carried `server_max_window_bits`, so the response MUST
+    /// echo the parameter (RFC 7692 §7.1.2.1: acceptance is BY inclusion)
+    /// — even when the agreed value is the 15 default, or a strict client
+    /// (ours included) correctly fails the handshake on the omission.
+    echo_server_max_window_bits: bool,
     echo_client_max_window_bits: bool,
   }
 
@@ -635,7 +640,7 @@ mod deflate {
       if self.params.client_no_context_takeover {
         w.push(b"; client_no_context_takeover")?;
       }
-      if self.params.server_max_window_bits != 15 {
+      if self.echo_server_max_window_bits || self.params.server_max_window_bits != 15 {
         w.push(b"; server_max_window_bits=")?;
         w.push(two_digit(self.params.server_max_window_bits).as_slice())?;
       }
@@ -685,6 +690,7 @@ mod deflate {
           params,
           DeflateResponse {
             params,
+            echo_server_max_window_bits: p.server_max_window_bits.is_some(),
             echo_client_max_window_bits: echo,
           },
         ));
@@ -806,6 +812,51 @@ mod deflate_tests {
     let p =
       parse_deflate_response("permessage-deflate; server_max_window_bits=11", &offer).unwrap();
     assert_eq!(p.server_max_window_bits(), 11);
+  }
+
+  /// Regression (Codex R13): an explicit `server_max_window_bits=15` offer
+  /// must be ECHOED in the response — RFC 7692 §7.1.2.1 says a server
+  /// accepts the parameter BY including it, and our own client parser
+  /// rightly fails on the omission. Before the fix, a websocket-proto
+  /// server accepting a websocket-proto client's explicit-15 offer
+  /// produced a response that same client rejected (self-interop failure).
+  #[test]
+  fn explicit_server_window_bits_15_round_trips() {
+    let offer = DeflateOffer::new().with_server_max_window_bits(Some(15));
+    let mut offer_buf = [0u8; 160];
+    let n = offer.write(&mut offer_buf).unwrap();
+    let offer_value = core::str::from_utf8(&offer_buf[..n]).unwrap();
+
+    let (params, response) =
+      accept_deflate_offer([offer_value].into_iter(), &ServerDeflateConfig::new()).unwrap();
+    assert_eq!(params.server_max_window_bits(), 15);
+
+    let mut resp_buf = [0u8; 160];
+    let n = response.write(&mut resp_buf).unwrap();
+    let resp_value = core::str::from_utf8(&resp_buf[..n]).unwrap();
+    assert!(
+      resp_value.contains("server_max_window_bits=15"),
+      "{resp_value}"
+    );
+
+    // The strict client parser accepts its own server's response.
+    let agreed = parse_deflate_response(resp_value, &offer).unwrap();
+    assert_eq!(agreed.server_max_window_bits(), 15);
+
+    // An offer WITHOUT the parameter still gets no echo (it is illegal to
+    // introduce a parameter the offer did not carry).
+    let plain = DeflateOffer::new();
+    let mut buf = [0u8; 160];
+    let n = plain.write(&mut buf).unwrap();
+    let plain_value = core::str::from_utf8(&buf[..n]).unwrap();
+    let (_, response) =
+      accept_deflate_offer([plain_value].into_iter(), &ServerDeflateConfig::new()).unwrap();
+    let n = response.write(&mut resp_buf).unwrap();
+    let resp_value = core::str::from_utf8(&resp_buf[..n]).unwrap();
+    assert!(
+      !resp_value.contains("server_max_window_bits"),
+      "{resp_value}"
+    );
   }
 
   #[test]
