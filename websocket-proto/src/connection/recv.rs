@@ -996,7 +996,14 @@ where
   /// Queues the failure close, transitions to Terminal, and produces the
   /// terminal event. Stops consuming the rest of the input.
   fn fail(&mut self, code: CloseCode) -> Event<'a> {
-    if !matches!(self.conn.lifecycle, Lifecycle::CloseSent) {
+    // Only a close that actually went out (drained by `poll_transmit`)
+    // suppresses the failure close. A close that is merely QUEUED — `close()`
+    // ran but the driver has not drained yet — is superseded: the failure
+    // code is what must reach the wire, or the peer would see a benign close
+    // for a connection we are failing.
+    if !self.conn.send.close_sent {
+      self.conn.send.pending_close = None;
+      self.conn.send.queued_code = None;
       self.conn.send.queue_close(code, "");
     }
     self.conn.lifecycle = Lifecycle::Terminal;
@@ -1445,6 +1452,73 @@ mod tests {
     assert_eq!(
       drain(&mut conn, &bytes),
       [Ev::CloseRecv(1005, "".into()), Ev::Closed(1005, true)]
+    );
+  }
+
+  /// Regression (Codex R4): a protocol failure arriving AFTER `close()` but
+  /// BEFORE the queued close drains must put the FAILURE code on the wire —
+  /// only a close that actually went out suppresses the failure close.
+  #[test]
+  fn failure_supersedes_a_queued_but_unsent_close() {
+    let mut conn = server();
+    conn.close(crate::frame::CloseCode::Normal, "bye").unwrap();
+    // No poll_transmit drain: the Normal close is queued, not sent.
+
+    // A malformed inbound frame (unmasked client frame) fails the connection.
+    let header = FrameHeader::new(Opcode::Text, 2);
+    let mut bytes = vec![0u8; 8];
+    let n = header.encode(&mut bytes).unwrap();
+    bytes.truncate(n);
+    bytes.extend(b"hi");
+    let got = drain(&mut conn, &bytes);
+    assert_eq!(got, [Ev::Closed(1002, false)]);
+
+    // The wire close must carry 1002, not the stale queued 1000.
+    let mut out = [0u8; 32];
+    let n = conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("failure close pending");
+    assert_eq!(out[0], 0x88);
+    assert_eq!(
+      &out[2..4],
+      &[0x03, 0xEA],
+      "the failure code 1002 must reach the wire"
+    );
+    let _ = n;
+    assert!(
+      conn
+        .poll_transmit(TestInstant(0), &mut out)
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  /// Companion to the supersede rule: once the close has actually DRAINED,
+  /// a later failure must NOT emit a second close frame.
+  #[test]
+  fn failure_after_a_sent_close_emits_no_second_close() {
+    let mut conn = server();
+    conn.close(crate::frame::CloseCode::Normal, "").unwrap();
+    let mut out = [0u8; 32];
+    conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("close drains");
+
+    let header = FrameHeader::new(Opcode::Text, 1);
+    let mut bytes = vec![0u8; 8];
+    let n = header.encode(&mut bytes).unwrap();
+    bytes.truncate(n);
+    bytes.extend(b"x");
+    let got = drain(&mut conn, &bytes);
+    assert_eq!(got, [Ev::Closed(1002, false)]);
+    assert!(
+      conn
+        .poll_transmit(TestInstant(0), &mut out)
+        .unwrap()
+        .is_none(),
+      "nothing may follow a sent close"
     );
   }
 
