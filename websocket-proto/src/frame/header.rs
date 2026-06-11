@@ -1,7 +1,7 @@
 //! Frame header (RFC 6455 §5.2): incremental decode and canonical encode.
 
 use crate::{error::BufferTooSmallDetail, frame::Opcode};
-use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
+use derive_more::{Display, IsVariant, TryUnwrap};
 
 /// A parsed (or to-be-encoded) frame header. RSV bits and reserved opcodes
 /// are carried losslessly; the connection layer applies policy.
@@ -126,8 +126,7 @@ impl FrameHeader {
 }
 
 /// Outcome of [`FrameHeader::decode`] on a (possibly partial) buffer.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap)]
-#[unwrap(ref)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant, TryUnwrap)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum Decoded {
@@ -216,8 +215,7 @@ impl NonCanonicalLengthDetail {
 }
 
 /// Errors decoding a frame header.
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum DecodeError {
@@ -234,8 +232,7 @@ pub enum DecodeError {
 }
 
 /// Errors encoding a frame header.
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum EncodeError {

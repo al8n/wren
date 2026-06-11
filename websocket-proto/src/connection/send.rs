@@ -8,11 +8,10 @@ use crate::{
   frame::{CloseCode, FrameHeader, Opcode, encode_close_payload, mask},
   time::Instant,
 };
-use derive_more::{IsVariant, TryUnwrap, Unwrap};
+use derive_more::{IsVariant, TryUnwrap};
 
 /// Errors from the application-send encoders.
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum EncodeError {

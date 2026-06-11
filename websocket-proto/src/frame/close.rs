@@ -2,14 +2,13 @@
 //! frame payload format (§5.5.1).
 
 use crate::{constants::MAX_CONTROL_PAYLOAD, error::BufferTooSmallDetail};
-use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
+use derive_more::{Display, IsVariant, TryUnwrap};
 
 /// A close status code. All `u16` values are representable; named variants
 /// cover the RFC 6455 §7.4.1 / IANA-registered codes, and [`CloseCode::Other`]
 /// carries everything else losslessly (including the application range
 /// 3000–4999).
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Display, IsVariant, Unwrap, TryUnwrap)]
-#[unwrap(ref)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Display, IsVariant, TryUnwrap)]
 #[try_unwrap(ref)]
 #[display("{}", self.as_str())]
 #[non_exhaustive]
@@ -128,8 +127,7 @@ impl CloseCode {
 }
 
 /// Errors decoding or encoding a close-frame payload (§5.5.1).
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum ClosePayloadError {

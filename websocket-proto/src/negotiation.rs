@@ -9,7 +9,7 @@
 //! [`Negotiated`] is `Copy` and fully available on the bare `no_std` tier.
 
 use crate::handshake::parser::is_token;
-use derive_more::{IsVariant, TryUnwrap, Unwrap};
+use derive_more::{IsVariant, TryUnwrap};
 
 /// Maximum retained subprotocol length, on every tier. Longer offers are
 /// rejected as [`NegotiationError::InvalidSubprotocol`].
@@ -45,8 +45,7 @@ impl SubprotocolBuf {
 }
 
 /// Errors validating negotiation inputs.
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum NegotiationError {

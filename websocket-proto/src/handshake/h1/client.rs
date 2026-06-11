@@ -10,7 +10,7 @@ use crate::{
   },
   negotiation::{Negotiated, NegotiationError},
 };
-use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
+use derive_more::{Display, IsVariant, TryUnwrap};
 use rand_core::Rng as RngCore;
 
 /// Detail payload: which handshake option was rejected and why.
@@ -34,8 +34,7 @@ impl InvalidOptionsDetail {
 }
 
 /// Errors from the client handshake (configuration, encoding, validation).
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum ClientHandshakeError {
@@ -135,8 +134,7 @@ impl<'a> ClientOptions<'a> {
 }
 
 /// Outcome of feeding response bytes to [`ClientHandshake::handle`].
-#[derive(Debug, IsVariant, Unwrap, TryUnwrap)]
-#[unwrap(ref)]
+#[derive(Debug, IsVariant, TryUnwrap)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum ClientProgress {

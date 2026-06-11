@@ -14,7 +14,7 @@ use crate::{
   handshake::parser::is_token,
   negotiation::{Negotiated, NegotiationError},
 };
-use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
+use derive_more::{Display, IsVariant, TryUnwrap};
 
 /// Upper bound on a rendered `Sec-WebSocket-Extensions` value — the same bound
 /// the deflate offer/response renderers are sized against. Both views hold one
@@ -44,8 +44,7 @@ impl Scheme {
 }
 
 /// Errors building or validating an extended-CONNECT request.
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum ConnectRequestError {
@@ -100,8 +99,7 @@ pub enum ConnectRequestError {
 
 /// Errors validating an extended-CONNECT response (client side). These fail
 /// the WebSocket connection.
-#[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum ConnectResponseError {

@@ -1,13 +1,12 @@
 //! Frame opcode (RFC 6455 §5.2) with a lossless escape for reserved values.
 
-use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
+use derive_more::{Display, IsVariant, TryUnwrap};
 
 /// A frame opcode. The four-bit wire values 0x3–0x7 and 0xB–0xF are reserved
 /// by RFC 6455; they parse losslessly as [`Opcode::Reserved`] and protocol
 /// policy (failing the connection with 1002) is applied by the connection
 /// state machine, not this codec.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Display, IsVariant, Unwrap, TryUnwrap)]
-#[unwrap(ref)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Display, IsVariant, TryUnwrap)]
 #[try_unwrap(ref)]
 #[display("{}", self.as_str())]
 #[non_exhaustive]
