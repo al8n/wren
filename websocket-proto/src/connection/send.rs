@@ -407,6 +407,20 @@ pub(crate) mod compress {
   /// appends; these are stripped before putting the compressed bytes on the wire.
   const SYNC_TAIL: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
 
+  /// A safe upper bound on the sync-flushed DEFLATE output for `len` input
+  /// bytes. DEFLATE's worst case is stored (uncompressed) blocks: 5 bytes of
+  /// header per 65 535-byte block, plus a handful of bytes for the final
+  /// bit-alignment and the (stripped) sync-flush boundary. The generous
+  /// per-message slack keeps this bound safe across miniz_oxide's block
+  /// placement choices; the regression tests pin it against incompressible
+  /// (uniformly random) payloads.
+  pub(crate) const fn worst_case_len(len: usize) -> usize {
+    let blocks = len.div_euclid(65_535).saturating_add(1);
+    len
+      .saturating_add(blocks.saturating_mul(5))
+      .saturating_add(64)
+  }
+
   /// Outbound compressor plus its scratch output buffer. Boxed inside
   /// `SendState` so the large internal state does not inflate the struct.
   pub(crate) struct CompressorBox {
@@ -573,6 +587,22 @@ where
 
     // Lifecycle + sequencing check (whole message → starting=true).
     self.check_data_send(true)?;
+
+    // TRANSACTIONALITY: every fallible check must precede the compressor
+    // mutation. Under context takeover the compressor's sliding window is
+    // shared peer-visible state — once `compress_message` runs, the message
+    // is committed to that history, and a retry after a late failure would
+    // compress against bytes the peer's inflater never received. So the
+    // output buffer is preflighted against the worst-case encoded size; the
+    // actual frame is then guaranteed to fit and `write_frame` cannot fail.
+    let needed_worst =
+      crate::constants::MAX_FRAME_HEADER.saturating_add(compress::worst_case_len(payload.len()));
+    if out.len() < needed_worst {
+      return Err(EncodeError::BufferTooSmall(BufferTooSmallDetail::new(
+        needed_worst,
+        out.len(),
+      )));
+    }
 
     // Determine whether to reset the compressor for this message.
     let no_takeover = if Ro::EXPECT_MASKED_INBOUND {
@@ -915,6 +945,84 @@ mod deflate_tests {
         &out[..result.bytes_written],
         &data[..],
         "msg {msg}: content"
+      );
+    }
+  }
+
+  /// Regression (Codex R1): a compressed send rejected for a too-small output
+  /// buffer must NOT advance the compressor's context-takeover history — the
+  /// retry with an adequate buffer must produce a stream a conformant peer
+  /// inflater (which never saw the failed attempt) still decodes.
+  #[test]
+  fn buffer_too_small_compressed_send_is_retry_safe() {
+    use miniz_oxide::{
+      DataFormat, MZFlush,
+      inflate::stream::{InflateState, inflate},
+    };
+
+    let mut server = deflate_server(default_params());
+    let mut ref_state = InflateState::new_boxed(DataFormat::Raw);
+
+    let mut decode = |wire: &[u8], expect: &[u8], label: &str| {
+      let decoded = match FrameHeader::decode(wire).expect("decode header") {
+        Decoded::Complete(d) => d,
+        _ => panic!("incomplete frame header"),
+      };
+      let mut payload = wire[decoded.consumed()..].to_vec();
+      payload.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
+      let mut out = vec![0u8; 4096];
+      let result = inflate(&mut ref_state, &payload, &mut out, MZFlush::None);
+      assert_eq!(result.bytes_written, expect.len(), "{label}: length");
+      assert_eq!(&out[..result.bytes_written], expect, "{label}: content");
+    };
+
+    // Seed the takeover history with one successful message.
+    let mut wire = vec![0u8; 1024];
+    let n = server
+      .encode_text_compressed("first message", &mut wire)
+      .unwrap();
+    decode(&wire[..n], b"first message", "seed");
+
+    // Fail a send on buffer size — repeatedly, to prove no cumulative damage.
+    for _ in 0..3 {
+      let mut tiny = [0u8; 8];
+      let err = server
+        .encode_text_compressed("second message", &mut tiny)
+        .unwrap_err();
+      assert!(matches!(err, EncodeError::BufferTooSmall(_)));
+    }
+
+    // Retry with room: the reference inflater (which saw only the seed) must
+    // decode this and a follow-up cleanly — proving the failed attempts left
+    // no trace in the shared compression context.
+    let n = server
+      .encode_text_compressed("second message", &mut wire)
+      .unwrap();
+    decode(&wire[..n], b"second message", "retry");
+    let n = server
+      .encode_text_compressed("third message", &mut wire)
+      .unwrap();
+    decode(&wire[..n], b"third message", "follow-up");
+  }
+
+  /// `worst_case_len` must dominate the actual sync-flushed output for
+  /// incompressible inputs at and around block boundaries.
+  #[test]
+  fn worst_case_len_bounds_actual_output() {
+    let mut compressor = compress::CompressorBox::new();
+    let mut x: u32 = 0x9E37_79B9;
+    for len in [0usize, 1, 64, 4096, 65_534, 65_535, 65_536, 131_072] {
+      let mut data = vec![0u8; len];
+      for b in &mut data {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *b = (x >> 24) as u8;
+      }
+      compressor.reset();
+      let actual = compressor.compress_message(&data).len();
+      let bound = compress::worst_case_len(len);
+      assert!(
+        actual <= bound,
+        "len {len}: actual {actual} > bound {bound}"
       );
     }
   }
