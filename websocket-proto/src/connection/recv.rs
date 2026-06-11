@@ -293,8 +293,25 @@ pub(crate) mod inflate {
 /// Each [`next`](Events::next) event borrows the cursor and is valid only
 /// until the following `next()` call; fold it into owned storage before
 /// advancing. Drop the cursor (or drain it) before calling `handle` again.
+///
+/// Dropping the cursor EARLY is safe: `Drop` runs the unread tail through
+/// the state machine so the connection never desynchronizes — control
+/// frames are still answered, the close handshake still progresses, and
+/// protocol violations still fail the connection. What early drop discards
+/// is the borrowed DATA events themselves (the chunks the caller chose not
+/// to read); a driver that needs every byte must drain with
+/// `while let Some(event) = events.next()`.
+// The struct-level bounds are STRUCTURAL (an exception to the
+// bounds-on-methods convention): `Drop` must be implemented for exactly the
+// struct's generics, and the drain it performs needs the same `Instant`/
+// `Role` capabilities as `next` — a bound-free `Events` cannot exist anyway
+// (`handle` is the only constructor and requires both).
 #[derive(Debug)]
-pub struct Events<'a, 'c, I, Ro> {
+pub struct Events<'a, 'c, I, Ro>
+where
+  I: Instant,
+  Ro: Role,
+{
   pub(crate) conn: &'c mut Connection<I, Ro>,
   /// The unconsumed tail of the input. `None` only transiently while a step
   /// splits it; always `Some` between `next` calls.
@@ -303,6 +320,23 @@ pub struct Events<'a, 'c, I, Ro> {
   pub(crate) pending_message_end: bool,
   /// A terminal `Closed` owed after a `CloseReceived` was yielded.
   pub(crate) pending_closed: Option<Closed>,
+}
+
+impl<I, Ro> Drop for Events<'_, '_, I, Ro>
+where
+  I: Instant,
+  Ro: Role,
+{
+  fn drop(&mut self) {
+    // Regression (Codex R20): an early-dropped cursor used to discard the
+    // unread tail while the frame state had already advanced past its
+    // header — the machine then waited forever for payload bytes the
+    // transport will never resend. Draining here keeps the PROTOCOL
+    // consistent on every drop path; only the data views are lost, which
+    // dropping the cursor opts into. (`next` makes progress on every call
+    // — it consumes input or returns `None` — so this terminates.)
+    while self.next().is_some() {}
+  }
 }
 
 impl<I, Ro> Connection<I, Ro>
@@ -1519,6 +1553,45 @@ mod tests {
         .unwrap()
         .is_none(),
       "nothing may follow a sent close"
+    );
+  }
+
+  /// Regression (Codex R20): dropping the cursor after the FIRST event of a
+  /// complete frame must not desynchronize the machine — `Drop` drains the
+  /// unread tail for its protocol effects, so a ping later in the same read
+  /// is still answered and the next `handle` call starts at a frame
+  /// boundary instead of waiting for payload bytes the transport will never
+  /// resend.
+  #[test]
+  fn dropping_events_mid_read_keeps_the_machine_in_sync() {
+    let mut conn = server();
+
+    // One read containing a complete masked text frame AND a masked ping.
+    let mut bytes = frame(Opcode::Text, true, false, b"hello");
+    bytes.extend(frame(Opcode::Ping, true, false, b"pp"));
+
+    {
+      let mut events = conn.handle(TestInstant(0), &mut bytes).unwrap();
+      let first = events.next().expect("first event");
+      assert!(matches!(first, Event::MessageStart { .. }));
+      // Drop with the text payload, MessageEnd, AND the ping unread.
+    }
+
+    // The dropped tail was still processed: the ping got its echo queued.
+    let mut out = [0u8; 32];
+    let n = conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("pong queued by the drained tail");
+    assert_eq!(out[0], 0x8A, "pong opcode");
+    assert_eq!(&out[2..n], b"pp");
+
+    // And the machine is at a frame boundary: a fresh read parses cleanly.
+    let bytes = frame(Opcode::Text, true, false, b"again");
+    let got = drain(&mut conn, &bytes);
+    assert!(
+      matches!(got.first(), Some(Ev::Start(..))),
+      "next read must start a fresh message, got {got:?}"
     );
   }
 

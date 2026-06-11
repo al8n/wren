@@ -627,11 +627,15 @@ mod tests {
     let mut asm = assembler(4);
 
     let mut wire = text_frame("12345", true); // 5 > 4 ⇒ TooLarge
-    let mut events = conn.handle(TestInstant(0), &mut wire).unwrap();
     let mut saw_too_large = false;
-    while let Some(ev) = events.next() {
-      if matches!(asm.push(&ev), Err(AssembleError::TooLarge)) {
-        saw_too_large = true;
+    {
+      // Scoped: `Events` carries a `Drop` impl, so a shadowed cursor would
+      // hold its `&mut conn` borrow until end of function.
+      let mut events = conn.handle(TestInstant(0), &mut wire).unwrap();
+      while let Some(ev) = events.next() {
+        if matches!(asm.push(&ev), Err(AssembleError::TooLarge)) {
+          saw_too_large = true;
+        }
       }
     }
     assert!(saw_too_large);
@@ -895,11 +899,15 @@ mod tests {
     let mut asm = SliceAssembler::new(&mut buf);
 
     let mut wire = text_frame("12345", true); // 5 > 4
-    let mut events = conn.handle(TestInstant(0), &mut wire).unwrap();
     let mut saw_too_large = false;
-    while let Some(ev) = events.next() {
-      if matches!(asm.push(&ev), Err(AssembleError::TooLarge)) {
-        saw_too_large = true;
+    {
+      // Scoped: `Events` carries a `Drop` impl, so a shadowed cursor would
+      // hold its `&mut conn` borrow until end of function.
+      let mut events = conn.handle(TestInstant(0), &mut wire).unwrap();
+      while let Some(ev) = events.next() {
+        if matches!(asm.push(&ev), Err(AssembleError::TooLarge)) {
+          saw_too_large = true;
+        }
       }
     }
     assert!(saw_too_large, "expected TooLarge at the cap");
