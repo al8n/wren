@@ -87,8 +87,10 @@ pub(crate) struct RecvState {
   /// Additional pongs owed when several pings arrive before `poll_transmit`
   /// drains the first. RFC 6455 §5.5.3 permits answering only the most recent
   /// ping, so on the bare (`no_alloc`) tier we coalesce into `pending_pong`;
-  /// where a heap is available we echo every ping (Autobahn §2.10), bounding
-  /// the queue at one pong per inbound control frame in the current batch.
+  /// where a heap is available we echo every ping (Autobahn §2.10) up to
+  /// [`MAX_PENDING_PONGS`] — past that, the OLDEST queued echo is shed (the
+  /// §5.5.3 most-recent rule makes shedding conformant), so a ping flood
+  /// cannot grow memory without bound.
   #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
   pub(crate) pong_overflow: std::collections::VecDeque<([u8; MAX_CONTROL_PAYLOAD], u8)>,
   /// Close/ping/pong payload accumulator (control frames may split across
@@ -923,10 +925,17 @@ where
       Opcode::Ping => {
         // First ping fills the single slot; later pings in the same batch go to
         // the overflow queue where a heap is available (so every ping gets a
-        // pong — Autobahn §2.10). On the bare tier the slot simply coalesces to
-        // the most recent ping, which RFC 6455 §5.5.3 expressly allows.
+        // pong — Autobahn §2.10). The queue is CAPPED: once it is full, the
+        // oldest queued echo is shed so a peer flooding pings faster than the
+        // application drains `poll_transmit` cannot grow memory without bound —
+        // RFC 6455 §5.5.3 expressly allows answering only the most recent
+        // ping, so shedding older echoes is conformant. On the bare tier the
+        // single slot simply coalesces to the most recent ping.
         #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
         if self.conn.recv.pending_pong.is_some() {
+          if self.conn.recv.pong_overflow.len() >= MAX_PENDING_PONGS {
+            self.conn.recv.pong_overflow.pop_front();
+          }
           self
             .conn
             .recv
@@ -1060,6 +1069,14 @@ fn control_cap() -> u64 {
 }
 
 const MAX_CONTROL_PAYLOAD_U8: u8 = 125;
+
+/// Cap on the pong-echo overflow queue (heap tiers): one pending slot plus
+/// this many queued echoes bounds a ping flood at ~2 KiB of retained payload
+/// while still answering every ping of any realistic batch (Autobahn §2.10
+/// sends ten). Past the cap the oldest echo is shed — conformant per RFC 6455
+/// §5.5.3, which lets an endpoint answer only the most recent ping.
+#[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+const MAX_PENDING_PONGS: usize = 16;
 
 /// Widens a `usize` to `u64` (lossless on supported targets; the saturating
 /// fallback keeps the no-narrowing lint wall satisfied uniformly).

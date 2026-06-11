@@ -1338,4 +1338,57 @@ mod tests {
     }
     assert_eq!(got, payloads, "every ping must be answered, in order");
   }
+
+  /// Regression (Codex R2): a ping FLOOD must not grow memory without bound.
+  /// Past the overflow cap the oldest queued echoes are shed (RFC 6455 §5.5.3
+  /// lets an endpoint answer only the most recent ping), so draining after a
+  /// 100-ping flood yields a bounded pong count whose LAST echo answers the
+  /// LAST ping.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  #[test]
+  fn ping_flood_beyond_the_cap_sheds_oldest_and_stays_bounded() {
+    use crate::frame::{Opcode, mask as apply_mask};
+    let mut conn = server();
+
+    let key = [1, 3, 5, 7];
+    let mut bytes = Vec::new();
+    let payloads: Vec<Vec<u8>> = (0..100).map(|i| format!("p{i:03}").into_bytes()).collect();
+    for p in &payloads {
+      let h = FrameHeader::new(Opcode::Ping, p.len() as u64).with_mask(Some(key));
+      let mut f = vec![0u8; h.header_len() + p.len()];
+      let n = h.encode(&mut f).unwrap();
+      f[n..].copy_from_slice(p);
+      apply_mask(&mut f[n..], key, 0);
+      bytes.extend(f);
+    }
+
+    {
+      let mut events = conn.handle(TestInstant(0), &mut bytes).unwrap();
+      while events.next().is_some() {}
+    }
+
+    let mut out = [0u8; 64];
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    while let Some(n) = conn.poll_transmit(TestInstant(0), &mut out).unwrap() {
+      let decoded = match FrameHeader::decode(&out[..n]).unwrap() {
+        Decoded::Complete(d) => d,
+        _ => panic!("incomplete pong frame"),
+      };
+      assert_eq!(decoded.header().opcode(), Opcode::Pong);
+      got.push(out[decoded.consumed()..n].to_vec());
+    }
+
+    // Bounded: one pending slot + the capped overflow queue.
+    assert!(
+      got.len() <= 17,
+      "flood must shed past the cap; drained {} pongs",
+      got.len()
+    );
+    // The most recent ping is always answered (§5.5.3), and answered last.
+    assert_eq!(
+      got.last().map(Vec::as_slice),
+      Some(b"p099".as_slice()),
+      "the newest ping's echo must survive the shed"
+    );
+  }
 }
