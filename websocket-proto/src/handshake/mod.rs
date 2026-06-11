@@ -20,9 +20,7 @@ pub use parser::{HeadError, MalformedDetail};
 
 pub mod h1;
 
-cfg_heap! {
-  pub mod connect;
-}
+pub mod connect;
 
 use crate::{constants, error::BufferTooSmallDetail};
 use sha1::{Digest, Sha1};
