@@ -367,24 +367,7 @@ impl<'a> ClientHandshake<'a> {
         if !offered || !is_token(chosen) {
           return Err(ClientHandshakeError::SubprotocolNotOffered);
         }
-        #[cfg(any(
-          feature = "alloc",
-          feature = "std",
-          feature = "heapless",
-          feature = "no-atomic"
-        ))]
-        {
-          Negotiated::with_subprotocol(chosen)?
-        }
-        #[cfg(not(any(
-          feature = "alloc",
-          feature = "std",
-          feature = "heapless",
-          feature = "no-atomic"
-        )))]
-        {
-          Negotiated::none()
-        }
+        Negotiated::with_subprotocol(chosen)?
       }
     };
 

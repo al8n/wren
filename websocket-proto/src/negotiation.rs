@@ -1,37 +1,48 @@
 //! Negotiation results shared by every handshake transport.
 //!
-//! [`Negotiated`] is the sole gate into the connection state machine
-//! (plan 4): the h1 machines produce it from header bytes, and the RFC
-//! 8441/9220 `connect` types (plan 3b) produce it from header data. Its
-//! string storage follows the crate tiers: `SmolStr` under `alloc`/`std`,
-//! `portable_atomic_util::Arc<str>` under `no-atomic`, `heapless::String<64>`
-//! under `heapless`, absent on the bare tier (where a negotiated subprotocol
-//! cannot be retained and is reported as `None`).
+//! [`Negotiated`] is the sole gate into the connection state machine: the h1
+//! machines produce it from header bytes, and the RFC 8441/9220 `connect`
+//! types produce it from header data. The module is **allocation-free on
+//! every tier** — the subprotocol lives in an inline buffer capped at
+//! [`MAX_SUBPROTOCOL_LEN`] bytes (registered subprotocol names are short
+//! tokens; the longest in the IANA registry is well under half the cap), so
+//! [`Negotiated`] is `Copy` and fully available on the bare `no_std` tier.
 
-#[cfg(any(
-  feature = "alloc",
-  feature = "std",
-  feature = "heapless",
-  feature = "no-atomic"
-))]
 use crate::handshake::parser::is_token;
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
-/// Maximum retained subprotocol length on the `heapless` tier.
+/// Maximum retained subprotocol length, on every tier. Longer offers are
+/// rejected as [`NegotiationError::InvalidSubprotocol`].
 pub const MAX_SUBPROTOCOL_LEN: usize = 64;
 
-// `alloc`/`std` take precedence over `no-atomic`, and the `heapless` arm
-// excludes both heap flavors, so `--all-features` resolves to a single
-// consistent storage type (matching backend.rs's precedence).
-#[cfg(any(feature = "alloc", feature = "std"))]
-type SubprotocolString = smol_str::SmolStr;
-#[cfg(all(feature = "no-atomic", not(any(feature = "alloc", feature = "std"))))]
-type SubprotocolString = portable_atomic_util::Arc<str>;
-#[cfg(all(
-  feature = "heapless",
-  not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
-))]
-type SubprotocolString = heapless::String<MAX_SUBPROTOCOL_LEN>;
+/// Inline subprotocol storage (token bytes + length). Tokens are ASCII by
+/// the RFC 9110 grammar, so the stored bytes are always valid UTF-8.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct SubprotocolBuf {
+  buf: [u8; MAX_SUBPROTOCOL_LEN],
+  len: u8,
+}
+
+impl SubprotocolBuf {
+  fn try_from_str(s: &str) -> Result<Self, NegotiationError> {
+    if s.len() > MAX_SUBPROTOCOL_LEN {
+      return Err(NegotiationError::InvalidSubprotocol);
+    }
+    let mut buf = [0u8; MAX_SUBPROTOCOL_LEN];
+    for (d, b) in buf.iter_mut().zip(s.as_bytes()) {
+      *d = *b;
+    }
+    Ok(Self {
+      buf,
+      len: u8::try_from(s.len()).unwrap_or(0),
+    })
+  }
+
+  fn as_str(&self) -> &str {
+    let bytes = self.buf.get(..usize::from(self.len)).unwrap_or(&[]);
+    core::str::from_utf8(bytes).unwrap_or("")
+  }
+}
 
 /// Errors validating negotiation inputs.
 #[derive(Debug, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
@@ -39,8 +50,8 @@ type SubprotocolString = heapless::String<MAX_SUBPROTOCOL_LEN>;
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum NegotiationError {
-  /// A subprotocol was empty, not an RFC 9110 token, or (on the `heapless`
-  /// tier) longer than [`MAX_SUBPROTOCOL_LEN`].
+  /// A subprotocol was empty, not an RFC 9110 token, or longer than
+  /// [`MAX_SUBPROTOCOL_LEN`].
   #[error("invalid or unretainable subprotocol")]
   InvalidSubprotocol,
 
@@ -61,16 +72,10 @@ pub enum NegotiationError {
 
 /// The agreed handshake outcome: what the connection machine is configured
 /// from. Construct via [`Negotiated::none`] (no subprotocol, no extensions)
-/// or the handshake machines.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// or the handshake machines. Inline storage — `Copy`, every tier.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct Negotiated {
-  #[cfg(any(
-    feature = "alloc",
-    feature = "std",
-    feature = "heapless",
-    feature = "no-atomic"
-  ))]
-  subprotocol: Option<SubprotocolString>,
+  subprotocol: Option<SubprotocolBuf>,
   #[cfg(feature = "deflate")]
   deflate: Option<DeflateParams>,
 }
@@ -81,73 +86,28 @@ impl Negotiated {
   /// negotiation entirely.
   pub const fn none() -> Self {
     Self {
-      #[cfg(any(
-        feature = "alloc",
-        feature = "std",
-        feature = "heapless",
-        feature = "no-atomic"
-      ))]
       subprotocol: None,
       #[cfg(feature = "deflate")]
       deflate: None,
     }
   }
 
-  cfg_storage! {
-    /// A result carrying an agreed subprotocol (validated as a token and,
-    /// on bounded tiers, for retainable length).
-    pub fn with_subprotocol(subprotocol: &str) -> Result<Self, NegotiationError> {
-      if !is_token(subprotocol) {
-        return Err(NegotiationError::InvalidSubprotocol);
-      }
-      let stored = Self::store(subprotocol)?;
-      Ok(Self {
-        subprotocol: Some(stored),
-        #[cfg(feature = "deflate")]
-        deflate: None,
-      })
+  /// A result carrying an agreed subprotocol (validated as a token of at
+  /// most [`MAX_SUBPROTOCOL_LEN`] bytes).
+  pub fn with_subprotocol(subprotocol: &str) -> Result<Self, NegotiationError> {
+    if !is_token(subprotocol) {
+      return Err(NegotiationError::InvalidSubprotocol);
     }
+    Ok(Self {
+      subprotocol: Some(SubprotocolBuf::try_from_str(subprotocol)?),
+      #[cfg(feature = "deflate")]
+      deflate: None,
+    })
   }
 
-  #[cfg(any(feature = "alloc", feature = "std"))]
-  fn store(s: &str) -> Result<SubprotocolString, NegotiationError> {
-    Ok(smol_str::SmolStr::new(s))
-  }
-
-  #[cfg(all(feature = "no-atomic", not(any(feature = "alloc", feature = "std"))))]
-  fn store(s: &str) -> Result<SubprotocolString, NegotiationError> {
-    Ok(SubprotocolString::from(s))
-  }
-
-  #[cfg(all(
-    feature = "heapless",
-    not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
-  ))]
-  fn store(s: &str) -> Result<SubprotocolString, NegotiationError> {
-    SubprotocolString::try_from(s).map_err(|_| NegotiationError::InvalidSubprotocol)
-  }
-
-  /// The agreed subprotocol, when one was negotiated and the tier can
-  /// retain it.
+  /// The agreed subprotocol, when one was negotiated.
   pub fn subprotocol(&self) -> Option<&str> {
-    #[cfg(any(
-      feature = "alloc",
-      feature = "std",
-      feature = "heapless",
-      feature = "no-atomic"
-    ))]
-    {
-      self.subprotocol.as_deref()
-    }
-    #[cfg(not(any(
-      feature = "alloc",
-      feature = "std",
-      feature = "heapless",
-      feature = "no-atomic"
-    )))]
-    {
-      None
-    }
+    self.subprotocol.as_ref().map(SubprotocolBuf::as_str)
   }
 
   /// The agreed permessage-deflate parameters, when negotiated.
@@ -908,6 +868,25 @@ mod tests {
       Negotiated::with_subprotocol("").unwrap_err(),
       NegotiationError::InvalidSubprotocol
     ));
+  }
+
+  #[test]
+  fn subprotocol_cap_is_uniform_across_tiers() {
+    // Exactly at the cap: retained.
+    let max = "a".repeat(MAX_SUBPROTOCOL_LEN);
+    let n = Negotiated::with_subprotocol(&max).unwrap();
+    assert_eq!(n.subprotocol(), Some(max.as_str()));
+
+    // One past the cap: rejected on EVERY tier (inline storage).
+    let over = "a".repeat(MAX_SUBPROTOCOL_LEN + 1);
+    assert!(matches!(
+      Negotiated::with_subprotocol(&over).unwrap_err(),
+      NegotiationError::InvalidSubprotocol
+    ));
+
+    // Negotiated is Copy now — a copy observes the same subprotocol.
+    let copied = n;
+    assert_eq!(copied.subprotocol(), n.subprotocol());
   }
 
   #[test]
