@@ -215,12 +215,14 @@ proptest! {
 
     let chosen = (!offered.is_empty()).then(|| offered[pick.index(offered.len())]);
     let accept = ConnectAccept::new().with_subprotocol(chosen);
-    let accept_headers = accept.headers().expect("our acceptance encodes");
+    let (accept_headers, server_negotiated) =
+      accept.headers_for(&view).expect("our acceptance encodes");
     let accept_pairs: Vec<(&str, &str)> = accept_headers.iter().collect();
 
     let negotiated =
       validate_connect_response(&accept_pairs, &request).expect("our response validates");
     prop_assert_eq!(negotiated.subprotocol(), chosen);
+    prop_assert_eq!(server_negotiated.subprotocol(), chosen);
   }
 }
 

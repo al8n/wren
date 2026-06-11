@@ -193,10 +193,17 @@ impl<'a> ConnectRequest<'a> {
     if !crate::handshake::parser::is_valid_path_and_query(self.path) {
       return Err(ConnectRequestError::InvalidField("path"));
     }
-    // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique.
+    // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique — and
+    // must fit [`Negotiated`]'s inline storage, or a conforming peer
+    // SELECTING the offer would fail our own retention (self-interop).
     for (i, proto) in self.subprotocols.iter().enumerate() {
       if !is_token(proto) {
         return Err(ConnectRequestError::InvalidField("subprotocol"));
+      }
+      if proto.len() > crate::negotiation::MAX_SUBPROTOCOL_LEN {
+        return Err(ConnectRequestError::InvalidField(
+          "subprotocol exceeds the retainable length",
+        ));
       }
       if self
         .subprotocols
@@ -538,9 +545,9 @@ impl<'a> ConnectAccept<'a> {
     }
   }
 
-  /// Echo a subprotocol (must be one the client offered; validated by the
-  /// caller via [`ConnectRequestView::subprotocols`] +
-  /// [`crate::negotiation::select_subprotocol`]).
+  /// Echo a subprotocol (must be one the client offered —
+  /// [`headers_for`](Self::headers_for) enforces it against the validated
+  /// request, exactly like the h1 server's `encode_response`).
   #[must_use]
   pub const fn with_subprotocol(mut self, subprotocol: Option<&'a str>) -> Self {
     self.subprotocol = subprotocol;
@@ -560,17 +567,33 @@ impl<'a> ConnectAccept<'a> {
     self
   }
 
-  /// Validates and returns a borrowed [`ConnectAcceptHeaders`] view. The
-  /// view's [`iter`](ConnectAcceptHeaders::iter) emits an optional
-  /// `("sec-websocket-protocol", _)` then an optional
+  /// Validates the accept AGAINST THE REQUEST and returns the borrowed
+  /// [`ConnectAcceptHeaders`] view plus the [`Negotiated`] result — the same
+  /// contract as the h1 server's `encode_response`. A selected subprotocol
+  /// must be one the (already-validated) request offered; an unbound accept
+  /// surface could otherwise emit an RFC 6455 §4.2.2-invalid response and
+  /// leave the application configured by convention instead of by the
+  /// validated result. The view's [`iter`](ConnectAcceptHeaders::iter) emits
+  /// an optional `("sec-websocket-protocol", _)` then an optional
   /// `("sec-websocket-extensions", _)`. No allocation: any deflate value is
   /// rendered once into the view.
-  pub fn headers(&self) -> Result<ConnectAcceptHeaders<'a>, ConnectRequestError> {
-    if let Some(proto) = self.subprotocol
-      && !is_token(proto)
-    {
-      return Err(ConnectRequestError::InvalidField("subprotocol"));
-    }
+  pub fn headers_for(
+    &self,
+    request: &ConnectRequestView<'_>,
+  ) -> Result<(ConnectAcceptHeaders<'a>, Negotiated), ConnectAcceptError> {
+    let negotiated = match self.subprotocol {
+      None => Negotiated::none(),
+      Some(chosen) => {
+        // Offers were token-validated and deduplicated by the gate;
+        // membership (case-SENSITIVE, §11.5) is the remaining bind.
+        if !request.subprotocols().any(|offer| offer == chosen) {
+          return Err(ConnectAcceptError::SubprotocolNotOffered);
+        }
+        Negotiated::with_subprotocol(chosen)?
+      }
+    };
+    #[cfg(feature = "deflate")]
+    let negotiated = negotiated.with_deflate(self.deflate.map(|r| r.params()));
 
     #[cfg(feature = "deflate")]
     let extensions = match &self.deflate {
@@ -579,21 +602,42 @@ impl<'a> ConnectAccept<'a> {
         let mut buf = [0u8; EXT_BUF_LEN];
         let n = response
           .write(&mut buf)
-          .map_err(|_| ConnectRequestError::InvalidField("deflate response too long"))?;
+          .map_err(|_| ConnectAcceptError::ResponseTooLong)?;
         Some((buf, n))
       }
     };
 
-    Ok(ConnectAcceptHeaders {
-      subprotocol: self.subprotocol,
-      #[cfg(feature = "deflate")]
-      extensions,
-    })
+    Ok((
+      ConnectAcceptHeaders {
+        subprotocol: self.subprotocol,
+        #[cfg(feature = "deflate")]
+        extensions,
+      },
+      negotiated,
+    ))
   }
 }
 
+/// Errors binding a [`ConnectAccept`] to its request.
+#[derive(Debug, Clone, Eq, PartialEq, IsVariant, TryUnwrap, thiserror::Error)]
+#[try_unwrap(ref)]
+#[non_exhaustive]
+pub enum ConnectAcceptError {
+  /// The accept named a subprotocol the request did not offer.
+  #[error("accepted subprotocol was not offered")]
+  SubprotocolNotOffered,
+
+  /// The rendered deflate response exceeds the inline buffer.
+  #[error("deflate response too long")]
+  ResponseTooLong,
+
+  /// Retaining the negotiation result failed.
+  #[error("{0}")]
+  Negotiation(#[from] NegotiationError),
+}
+
 /// A borrowed, allocation-free view of an extended-CONNECT response's header
-/// list. Produced by [`ConnectAccept::headers`]; iterate with
+/// list. Produced by [`ConnectAccept::headers_for`]; iterate with
 /// [`iter`](Self::iter).
 #[derive(Debug, Clone)]
 pub struct ConnectAcceptHeaders<'a> {
@@ -797,6 +841,26 @@ mod tests {
         .with_subprotocols(&["chat", "CHAT"])
         .headers()
         .is_ok()
+    );
+
+    // Regression (Codex R18): an offer past `Negotiated`'s inline storage
+    // would make a conforming peer's SELECTION fail our own retention —
+    // reject it at the emitter. 64 fits; 65 does not.
+    let at_cap = "a".repeat(crate::negotiation::MAX_SUBPROTOCOL_LEN);
+    let over_cap = "a".repeat(crate::negotiation::MAX_SUBPROTOCOL_LEN + 1);
+    let offers_ok: &[&str] = &[at_cap.as_str()];
+    let offers_over: &[&str] = &[over_cap.as_str()];
+    assert!(
+      ConnectRequest::new(Scheme::Https, "h", "/")
+        .with_subprotocols(offers_ok)
+        .headers()
+        .is_ok()
+    );
+    assert!(
+      ConnectRequest::new(Scheme::Https, "h", "/")
+        .with_subprotocols(offers_over)
+        .headers()
+        .is_err()
     );
   }
 
@@ -1298,11 +1362,24 @@ mod tests {
 
   #[test]
   fn accept_and_client_validation_round_trip() {
-    let accept = ConnectAccept::new().with_subprotocol(Some("chat"));
-    let headers = accept.headers().unwrap();
-    assert_eq!(find(headers.iter(), "sec-websocket-protocol"), Some("chat"));
-
     let req = ConnectRequest::new(Scheme::Https, "h", "/").with_subprotocols(&["chat"]);
+    let request_headers = req.headers().unwrap();
+    let request_pairs: Vec<(&str, &str)> = request_headers.iter().collect();
+    let view = validate_connect_request(&request_pairs).unwrap();
+
+    let accept = ConnectAccept::new().with_subprotocol(Some("chat"));
+    let (headers, server_negotiated) = accept.headers_for(&view).unwrap();
+    assert_eq!(find(headers.iter(), "sec-websocket-protocol"), Some("chat"));
+    assert_eq!(server_negotiated.subprotocol(), Some("chat"));
+
+    // Regression (Codex R18): the accept is BOUND to the request — an
+    // unoffered selection is an error here, not wire bytes.
+    let unoffered = ConnectAccept::new().with_subprotocol(Some("nope"));
+    assert!(matches!(
+      unoffered.headers_for(&view).unwrap_err(),
+      ConnectAcceptError::SubprotocolNotOffered
+    ));
+
     let response: Vec<(&str, &str)> = headers.iter().collect();
     let negotiated = validate_connect_response(&response, &req).unwrap();
     assert_eq!(negotiated.subprotocol(), Some("chat"));
@@ -1340,7 +1417,8 @@ mod tests {
     let (params, response) =
       accept_deflate_offer(view.extensions(), &ServerDeflateConfig::new()).unwrap();
     let accept = ConnectAccept::new().with_deflate(Some(response));
-    let response_headers = accept.headers().unwrap();
+    let (response_headers, server_negotiated) = accept.headers_for(&view).unwrap();
+    assert_eq!(server_negotiated.deflate(), Some(params));
 
     // Client side: validate the response.
     let resp: Vec<(&str, &str)> = response_headers.iter().collect();

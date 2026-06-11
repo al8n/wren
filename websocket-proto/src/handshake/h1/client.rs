@@ -203,10 +203,16 @@ impl<'a> ClientHandshake<'a> {
     if !crate::handshake::parser::is_valid_path_and_query(options.path) {
       return Err(invalid("path is not a valid origin-form resource name"));
     }
-    // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique.
+    // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique — and
+    // must fit [`Negotiated`]'s inline storage, or a conforming server
+    // SELECTING the offer would fail our own response validation
+    // (self-interop).
     for (i, proto) in options.subprotocols.iter().enumerate() {
       if !is_token(proto) {
         return Err(invalid("subprotocol is not a token"));
+      }
+      if proto.len() > crate::negotiation::MAX_SUBPROTOCOL_LEN {
+        return Err(invalid("subprotocol exceeds the retainable length"));
       }
       if options
         .subprotocols
@@ -496,6 +502,29 @@ mod tests {
     ));
     let cased = ClientOptions::new("h", "/").with_subprotocols(&["chat", "CHAT"]);
     assert!(ClientHandshake::new(cased, &mut CountingRng(0)).is_ok());
+
+    // Regression (Codex R18): offers past `Negotiated`'s inline storage are
+    // rejected at the emitter — a conforming server SELECTING the 65-byte
+    // offer would otherwise fail our own response validation. 64 fits.
+    let at_cap = "a".repeat(crate::negotiation::MAX_SUBPROTOCOL_LEN);
+    let over_cap = "a".repeat(crate::negotiation::MAX_SUBPROTOCOL_LEN + 1);
+    let ok: &[&str] = &[at_cap.as_str()];
+    let over: &[&str] = &[over_cap.as_str()];
+    assert!(
+      ClientHandshake::new(
+        ClientOptions::new("h", "/").with_subprotocols(ok),
+        &mut CountingRng(0)
+      )
+      .is_ok()
+    );
+    assert!(matches!(
+      ClientHandshake::new(
+        ClientOptions::new("h", "/").with_subprotocols(over),
+        &mut CountingRng(0)
+      )
+      .unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
 
     // Regression (Codex R13+R14): the managed Host field is a full RFC 3986
     // authority — control bytes, whitespace, AND URI delimiters are all
