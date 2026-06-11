@@ -666,6 +666,52 @@ mod deflate {
     }
   }
 
+  /// Server-side bind (the extension twin of the subprotocol-membership
+  /// rule): whether `response` is a conforming grant for SOME
+  /// permessage-deflate offer among `header_values`. Reuses the client-side
+  /// response rules verbatim — each raw offer entry is re-synthesized as a
+  /// [`DeflateOffer`] and the rendered grant must satisfy
+  /// [`parse_deflate_response`] against one of them — so a `DeflateResponse`
+  /// minted for a DIFFERENT request (or no request) can never be emitted for
+  /// one that did not offer compatible parameters.
+  pub(crate) fn response_matches_offer<'a>(
+    header_values: impl Iterator<Item = &'a str>,
+    response: &DeflateResponse,
+  ) -> bool {
+    let mut rendered = [0u8; 160];
+    let Ok(n) = response.write(&mut rendered) else {
+      return false;
+    };
+    let Ok(value) = core::str::from_utf8(rendered.get(..n).unwrap_or(&[])) else {
+      return false;
+    };
+    for header_value in header_values {
+      for entry in crate::handshake::parser::list_elements(header_value) {
+        let Some((name, params)) = parse_entry(entry) else {
+          continue;
+        };
+        if name != "permessage-deflate" {
+          continue;
+        }
+        let Some(p) = collect_params(params, false) else {
+          continue;
+        };
+        let offer = DeflateOffer {
+          server_no_context_takeover: p.server_no_context_takeover,
+          client_no_context_takeover: p.client_no_context_takeover,
+          server_max_window_bits: p.server_max_window_bits,
+          client_max_window_bits: p.client_max_window_bits,
+          offer_client_max_window_bits: p.client_max_window_bits.is_some()
+            || p.client_max_window_bits_valueless,
+        };
+        if parse_deflate_response(value, &offer).is_ok() {
+          return true;
+        }
+      }
+    }
+    false
+  }
+
   /// Server-side: scans the client's offer list (across repeated
   /// `Sec-WebSocket-Extensions` headers, comma-separated alternatives) and
   /// accepts the FIRST valid `permessage-deflate` offer, returning the
@@ -714,6 +760,8 @@ mod deflate {
   }
 }
 
+#[cfg(feature = "deflate")]
+pub(crate) use deflate::response_matches_offer;
 #[cfg(feature = "deflate")]
 #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
 pub use deflate::{

@@ -68,6 +68,12 @@ pub enum ServerHandshakeError {
   #[error("malformed Sec-WebSocket-Protocol offer list")]
   MalformedSubprotocols,
 
+  /// The accept carried a deflate grant the request's offers cannot
+  /// legalize (RFC 6455 §4.2.2 /extensions/: only offered extensions may be
+  /// granted).
+  #[error("granted extension was not offered")]
+  ExtensionNotOffered,
+
   /// Rejection status must be a client/server error or redirect (300–599),
   /// not a success code.
   #[error("rejection status {0} is not in 300..=599")]
@@ -415,6 +421,16 @@ impl ServerHandshake {
       .validate_no_managed_collision(&[])
       .map_err(ServerHandshakeError::InvalidResponseOption)?;
 
+    // The deflate grant is request-bound exactly like the subprotocol: a
+    // `DeflateResponse` minted for a different request (or none) must not
+    // be emitted for one whose offers cannot legalize it — the peer would
+    // receive compressed RSV1 frames it never negotiated.
+    #[cfg(feature = "deflate")]
+    if let Some(response) = &accept.deflate
+      && !crate::negotiation::response_matches_offer(request.extensions(), response)
+    {
+      return Err(ServerHandshakeError::ExtensionNotOffered);
+    }
     #[cfg(feature = "deflate")]
     let negotiated = negotiated.with_deflate(accept.deflate.map(|r| r.params()));
 
@@ -1275,6 +1291,42 @@ Sec-WebSocket-Version: 13\r\n\
       "{resp}"
     );
     assert_eq!(negotiated.deflate(), Some(params));
+
+    // Regression (Codex R19): the grant is REQUEST-BOUND — replaying the
+    // DeflateResponse onto a request with NO deflate offer is an error, not
+    // an RSV1 surprise for the peer.
+    let plain = view(GOOD);
+    let replay = Accept::new().with_deflate(Some(response));
+    assert!(matches!(
+      ServerHandshake::new()
+        .encode_response(&plain, &replay, &mut buf)
+        .unwrap_err(),
+      ServerHandshakeError::ExtensionNotOffered
+    ));
+
+    // Param-level binding: a grant whose params the request's offer cannot
+    // legalize is rejected too — not just the no-offer case. A response
+    // carrying client_max_window_bits=10 (minted from an offer that
+    // declared it) is illegal against a bare permessage-deflate offer
+    // (§7.1.2.2: MUST NOT include it when the offer lacked the param).
+    let cmwb_raw = String::from_utf8(GOOD.to_vec()).unwrap().replace(
+      "Sec-WebSocket-Version: 13\r\n",
+      "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits=10\r\n",
+    );
+    let cmwb_view = view(cmwb_raw.as_bytes());
+    let (_, cmwb_response) = accept_deflate_offer(cmwb_view.extensions(), &config).unwrap();
+    let bare_raw = String::from_utf8(GOOD.to_vec()).unwrap().replace(
+      "Sec-WebSocket-Version: 13\r\n",
+      "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n",
+    );
+    let bare = view(bare_raw.as_bytes());
+    let replay = Accept::new().with_deflate(Some(cmwb_response));
+    assert!(matches!(
+      ServerHandshake::new()
+        .encode_response(&bare, &replay, &mut buf)
+        .unwrap_err(),
+      ServerHandshakeError::ExtensionNotOffered
+    ));
 
     // Declining: no header, no deflate.
     let accept = Accept::new();

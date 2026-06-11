@@ -592,6 +592,15 @@ impl<'a> ConnectAccept<'a> {
         Negotiated::with_subprotocol(chosen)?
       }
     };
+    // The deflate grant is request-bound exactly like the subprotocol: a
+    // `DeflateResponse` minted for a different request (or none) must not
+    // be emitted for one whose offers cannot legalize it.
+    #[cfg(feature = "deflate")]
+    if let Some(response) = &self.deflate
+      && !crate::negotiation::response_matches_offer(request.extensions(), response)
+    {
+      return Err(ConnectAcceptError::ExtensionNotOffered);
+    }
     #[cfg(feature = "deflate")]
     let negotiated = negotiated.with_deflate(self.deflate.map(|r| r.params()));
 
@@ -626,6 +635,11 @@ pub enum ConnectAcceptError {
   /// The accept named a subprotocol the request did not offer.
   #[error("accepted subprotocol was not offered")]
   SubprotocolNotOffered,
+
+  /// The accept carried a deflate grant the request's offers cannot
+  /// legalize.
+  #[error("granted extension was not offered")]
+  ExtensionNotOffered,
 
   /// The rendered deflate response exceeds the inline buffer.
   #[error("deflate response too long")]
@@ -1419,6 +1433,18 @@ mod tests {
     let accept = ConnectAccept::new().with_deflate(Some(response));
     let (response_headers, server_negotiated) = accept.headers_for(&view).unwrap();
     assert_eq!(server_negotiated.deflate(), Some(params));
+
+    // Regression (Codex R19): replaying the grant onto a request with NO
+    // deflate offer fails the bind.
+    let plain_req = ConnectRequest::new(Scheme::Https, "h", "/");
+    let plain_headers = plain_req.headers().unwrap();
+    let plain_pairs: Vec<(&str, &str)> = plain_headers.iter().collect();
+    let plain_view = validate_connect_request(&plain_pairs).unwrap();
+    let replay = ConnectAccept::new().with_deflate(Some(response));
+    assert!(matches!(
+      replay.headers_for(&plain_view).unwrap_err(),
+      ConnectAcceptError::ExtensionNotOffered
+    ));
 
     // Client side: validate the response.
     let resp: Vec<(&str, &str)> = response_headers.iter().collect();
