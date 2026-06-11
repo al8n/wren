@@ -380,9 +380,63 @@ mod deflate {
     }
   }
 
-  /// Parses a window-bits value: 1–2 plain digits, canonical (no leading
-  /// zero), in 8..=15.
-  fn parse_bits(value: &str) -> Option<u8> {
+  /// A parameter value after quoted-string unescaping (RFC 6455 §9.1 allows
+  /// `token | quoted-string`; the unescaped form must itself be a token).
+  /// Inline storage: every legal permessage-deflate value is 1–2 digits;
+  /// the slack absorbs escaped spellings without allocating.
+  struct UnquotedValue {
+    buf: [u8; 8],
+    len: usize,
+  }
+
+  impl UnquotedValue {
+    fn as_str(&self) -> &str {
+      let bytes = self.buf.get(..self.len).unwrap_or(&[]);
+      core::str::from_utf8(bytes).unwrap_or("")
+    }
+  }
+
+  /// Resolves a raw parameter value to its token form: a bare token passes
+  /// through; a quoted-string (RFC 6455 §9.1) is unescaped (quoted-pair:
+  /// `\X` → `X`) and the result must be a non-empty token. `None` =
+  /// malformed (unterminated quote, trailing backslash, non-token content,
+  /// or longer than any legal permessage-deflate value).
+  fn unquote_value(raw: &str) -> Option<UnquotedValue> {
+    let mut out = UnquotedValue {
+      buf: [0u8; 8],
+      len: 0,
+    };
+    let inner = match raw.strip_prefix('"') {
+      None => raw,
+      Some(rest) => rest.strip_suffix('"')?,
+    };
+    let quoted = raw.len() != inner.len();
+    let mut escape = false;
+    for b in inner.bytes() {
+      if escape {
+        escape = false;
+      } else if b == b'\\' && quoted {
+        escape = true;
+        continue;
+      } else if b == b'"' {
+        // A bare interior quote is malformed in both spellings.
+        return None;
+      }
+      let slot = out.buf.get_mut(out.len)?;
+      *slot = b;
+      out.len = out.len.saturating_add(1);
+    }
+    if escape {
+      return None; // trailing backslash
+    }
+    crate::handshake::parser::is_token(out.as_str()).then_some(out)
+  }
+
+  /// Parses a window-bits value (token or quoted-string spelling): 1–2 plain
+  /// digits after unescaping, canonical (no leading zero), in 8..=15.
+  fn parse_bits(raw: &str) -> Option<u8> {
+    let unquoted = unquote_value(raw)?;
+    let value = unquoted.as_str();
     if value.len() > 2 || value.starts_with('0') || !value.bytes().all(|b| b.is_ascii_digit()) {
       return None;
     }
@@ -451,10 +505,14 @@ mod deflate {
     value: &str,
     offer: &DeflateOffer,
   ) -> Result<DeflateParams, NegotiationError> {
-    // The response must contain exactly one extension entry.
-    let mut entries = value.split(',');
-    let entry = entries.next().unwrap_or("").trim_matches([' ', '\t']);
-    if entries.next().is_some() || entry.is_empty() {
+    // The response must contain exactly one extension entry. Empty list
+    // elements (a stray comma) are ignored per RFC 9110 §5.6.1.2 — only a
+    // second NON-EMPTY entry is a mismatch.
+    let mut entries = crate::handshake::parser::list_elements(value);
+    let Some(entry) = entries.next() else {
+      return Err(NegotiationError::ExtensionMismatch);
+    };
+    if entries.next().is_some() {
       return Err(NegotiationError::ExtensionMismatch);
     }
     let Some((name, params)) = parse_entry(entry) else {
@@ -602,11 +660,7 @@ mod deflate {
     config: &ServerDeflateConfig,
   ) -> Option<(DeflateParams, DeflateResponse)> {
     for value in header_values {
-      for entry in value.split(',') {
-        let entry = entry.trim_matches([' ', '\t']);
-        if entry.is_empty() {
-          continue;
-        }
+      for entry in crate::handshake::parser::list_elements(value) {
         let Some((name, params)) = parse_entry(entry) else {
           continue;
         };
@@ -763,7 +817,9 @@ mod deflate_tests {
       "permessage-deflate; server_max_window_bits", // valueless where value required
       "permessage-deflate; server_max_window_bits=7", // out of range
       "permessage-deflate; server_max_window_bits=16", // out of range
-      "permessage-deflate; server_max_window_bits=\"12\"", // quoted
+      "permessage-deflate; server_max_window_bits=\"12", // unterminated quote
+      "permessage-deflate; server_max_window_bits=\"12\\\"", // trailing escape
+      "permessage-deflate; server_max_window_bits=\"\"", // empty quoted value
       "permessage-deflate; client_max_window_bits=08", // leading zero (not DIGIT canonical)
       "permessage-deflate; unknown_param",          // unknown
       "permessage-deflate; client_no_context_takeover; client_no_context_takeover", // dup
@@ -773,6 +829,26 @@ mod deflate_tests {
     ] {
       assert!(parse_deflate_response(bad, &offer).is_err(), "{bad}");
     }
+
+    // Regression (Codex R10): RFC 6455 §9.1 lets a parameter value be a
+    // quoted-string whose unescaped form is a token — a conforming peer may
+    // send server_max_window_bits="10" and must not lose the negotiation.
+    let p =
+      parse_deflate_response("permessage-deflate; server_max_window_bits=\"10\"", &offer).unwrap();
+    assert_eq!(p.server_max_window_bits(), 10);
+    // Quoted-pair unescaping: "1\2" unescapes to 12.
+    let p = parse_deflate_response(
+      "permessage-deflate; client_max_window_bits=\"1\\2\"",
+      &offer,
+    )
+    .unwrap();
+    assert_eq!(p.client_max_window_bits(), 12);
+
+    // Regression (audit G2): empty list elements are ignored, not fatal
+    // (RFC 9110 §5.6.1.2) — a stray comma around the single entry is fine,
+    // while a second NON-EMPTY entry stays a mismatch (tested above).
+    assert!(parse_deflate_response("permessage-deflate,", &offer).is_ok());
+    assert!(parse_deflate_response(", permessage-deflate", &offer).is_ok());
 
     // server_max_window_bits above what we requested.
     let capped = DeflateOffer::new().with_server_max_window_bits(Some(10));
