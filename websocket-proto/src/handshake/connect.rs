@@ -393,6 +393,11 @@ pub fn validate_connect_request<'a>(
   if count(":method") != 1 || view.get(":method") != Some("CONNECT") {
     return Err(ConnectRequestError::NotConnect);
   }
+  // Case-INSENSITIVE deliberately: `:protocol` carries an HTTP upgrade
+  // token (RFC 8441 §4), and RFC 9110 §7.8 says "recipients SHOULD use
+  // case-insensitive comparison when matching each protocol-name to
+  // supported protocols" — exact matching would reject a conforming peer.
+  // (Contrast subprotocols, whose §11.5 registry is case-sensitive.)
   let protocol_ok = count(":protocol") == 1
     && view
       .get(":protocol")
@@ -411,7 +416,12 @@ pub fn validate_connect_request<'a>(
   if !scheme_ok {
     return Err(ConnectRequestError::NotHttpScheme);
   }
-  let path_ok = count(":path") == 1 && view.get(":path").is_some_and(|p| p.starts_with('/'));
+  // Origin-form (mirrors the request builder's own rule): leading `/`, no
+  // SP, no CR/LF — `/bad path` is not a request-target.
+  let path_ok = count(":path") == 1
+    && view.get(":path").is_some_and(|p| {
+      p.starts_with('/') && !p.bytes().any(|b| b == b' ' || b == b'\r' || b == b'\n')
+    });
   if !path_ok {
     return Err(ConnectRequestError::InvalidPath);
   }
@@ -770,6 +780,20 @@ mod tests {
       );
     }
 
+    // Pinned contract: `:protocol` matching is case-INSENSITIVE — it carries
+    // an HTTP upgrade token, and RFC 9110 §7.8 says recipients SHOULD use
+    // case-insensitive comparison when matching protocol-names. A conforming
+    // peer sending `WebSocket` must not be rejected.
+    let mixed: &[(&str, &str)] = &[
+      (":method", "CONNECT"),
+      (":protocol", "WebSocket"),
+      (":scheme", "https"),
+      (":path", "/chat"),
+      (":authority", "h"),
+      ("sec-websocket-version", "13"),
+    ];
+    assert!(validate_connect_request(mixed).is_ok());
+
     // RFC 8441 §4: the target pseudo-headers are mandatory with :protocol —
     // missing, repeated, or invalid scheme/path/authority fail the gate.
     const GATED: [(&str, &str); 2] = [(":method", "CONNECT"), (":protocol", "websocket")];
@@ -818,6 +842,17 @@ mod tests {
         &[
           (":scheme", "https"),
           (":path", "nope"),
+          (":authority", "h"),
+          ("sec-websocket-version", "13"),
+        ],
+        "path",
+      ),
+      // Regression (Codex R9): a leading `/` is not enough — `/bad path`
+      // is not a request-target (origin-form admits no SP).
+      (
+        &[
+          (":scheme", "https"),
+          (":path", "/bad path"),
           (":authority", "h"),
           ("sec-websocket-version", "13"),
         ],
