@@ -114,7 +114,11 @@ impl<'a> RequestView<'a> {
     self.query
   }
 
-  /// The Host header value.
+  /// The EFFECTIVE authority: for an absolute-form request target this is
+  /// the target's embedded authority — RFC 9112 §3.2.2 requires an origin
+  /// server to ignore the Host field in that case — otherwise the Host
+  /// header value. Routing and origin policy should use this, never the raw
+  /// Host header.
   pub const fn host(&self) -> &'a str {
     self.host
   }
@@ -303,7 +307,7 @@ impl ServerHandshake {
     if version != "HTTP/1.1" || parts.next().is_some() || target.is_empty() {
       return Err(ServerHandshakeError::NotHttp11);
     }
-    let Some((path, query)) = request_target_resource(target) else {
+    let Some((path, query, target_authority)) = request_target_resource(target) else {
       return Err(ServerHandshakeError::InvalidTarget);
     };
 
@@ -320,6 +324,11 @@ impl ServerHandshake {
     if !parser::is_valid_authority(host) {
       return Err(ServerHandshakeError::InvalidHost);
     }
+    // RFC 9112 §3.2.2: with an absolute-form target, an origin server MUST
+    // ignore the Host field and use the target's authority — otherwise a
+    // proxy-form request could be routed/authorized as one host while its
+    // target names another.
+    let host = target_authority.unwrap_or(host);
 
     // RFC 9110 §5.3: repeated field lines are one comma-joined list, so the
     // token may arrive in ANY occurrence (proxies split lists across lines).
@@ -467,24 +476,33 @@ impl ServerHandshake {
 /// Validates the request target and splits it into the /resource name/'s
 /// path and query components — each individually borrowable, which is why
 /// the view exposes them separately (the `http://h?q` shape's resource name
-/// `/?q` has a SYNTHESIZED slash no single borrowed slice can carry).
+/// `/?q` has a SYNTHESIZED slash no single borrowed slice can carry) — plus
+/// the EMBEDDED AUTHORITY when the target is absolute-form. The caller must
+/// use that authority as the effective host: RFC 9112 §3.2.2 says an origin
+/// server receiving absolute-form "MUST ignore the received Host header
+/// field (if any) and instead use the host information of the
+/// request-target" — validating it and then routing by Host would let the
+/// two diverge.
 ///
 /// RFC 6455 §4.2.1.1 admits TWO target shapes: origin-form (`/chat`) or "an
 /// absolute HTTP/HTTPS URI containing the resource name" — and RFC 9112
 /// §3.2.2 separately requires origin servers to accept absolute-form, so a
 /// strict leading-`/` gate would reject conforming (typically proxied)
 /// clients. Both shapes are validated against the RFC 3986 path grammar via
-/// [`parser::is_valid_path_and_query`] (rejecting raw `#`: §3 requires %23).
-fn request_target_resource(target: &str) -> Option<(&str, Option<&str>)> {
-  fn split_pq(pq: &str) -> Option<(&str, Option<&str>)> {
+/// [`parser::is_valid_path_and_query`] (rejecting raw `#`: §3 requires %23);
+/// an absolute-form authority passes the same validator the Host gate uses.
+type TargetParts<'a> = (&'a str, Option<&'a str>, Option<&'a str>);
+
+fn request_target_resource(target: &str) -> Option<TargetParts<'_>> {
+  fn split_pq<'a>(pq: &'a str, authority: Option<&'a str>) -> Option<TargetParts<'a>> {
     if !parser::is_valid_path_and_query(pq) {
       return None;
     }
     match pq.split_once('?') {
-      None => Some((pq, None)),
+      None => Some((pq, None, authority)),
       Some((path, query)) => {
         let path = if path.is_empty() { "/" } else { path };
-        Some((path, Some(query)))
+        Some((path, Some(query), authority))
       }
     }
   }
@@ -492,7 +510,7 @@ fn request_target_resource(target: &str) -> Option<(&str, Option<&str>)> {
   // leading `?`, which `is_valid_path_and_query` already rejects — the
   // `"/"` fallback above is for the ABSOLUTE shapes below.
   if target.starts_with('/') {
-    return split_pq(target);
+    return split_pq(target, None);
   }
   // Absolute-form: case-insensitive http/https scheme (RFC 3986 §3.1), a
   // GRAMMAR-CHECKED authority (the same validator the Host gate uses — an
@@ -507,7 +525,7 @@ fn request_target_resource(target: &str) -> Option<(&str, Option<&str>)> {
   })?;
   match rest.find(['/', '?']) {
     // "http://host" → "/", no query.
-    None => parser::is_valid_authority(rest).then_some(("/", None)),
+    None => parser::is_valid_authority(rest).then_some(("/", None, Some(rest))),
     Some(i) => {
       let authority = rest.get(..i)?;
       if !parser::is_valid_authority(authority) {
@@ -517,8 +535,8 @@ fn request_target_resource(target: &str) -> Option<(&str, Option<&str>)> {
       match resource.strip_prefix('?') {
         // "http://host?q" → resource name "/?q" (RFC 6455 §3 constructs the
         // slash) — exposed as path "/" + the borrowed query.
-        Some(query) => parser::is_valid_query(query).then_some(("/", Some(query))),
-        None => split_pq(resource),
+        Some(query) => parser::is_valid_query(query).then_some(("/", Some(query), Some(authority))),
+        None => split_pq(resource, Some(authority)),
       }
     }
   }
@@ -720,6 +738,43 @@ Sec-WebSocket-Version: 13\r\n\
   /// recipient to parse and ignore a reasonable number of empty list
   /// elements (this part deliberately diverges from the review's
   /// reject-empties recommendation, with the citation).
+  #[test]
+  fn absolute_form_authority_is_the_effective_host() {
+    // Regression (Codex R16): RFC 9112 §3.2.2 — with an absolute-form
+    // target, the target's authority IS the effective host and the Host
+    // field is ignored; otherwise `GET http://admin.example/ws` with
+    // `Host: public.example` would be routed/authorized as public.example.
+    let hs = ServerHandshake::new();
+    let req = replaced(
+      "GET /chat HTTP/1.1\r\n",
+      "GET http://admin.example/ws HTTP/1.1\r\n",
+    );
+    let v = match hs.handle(&req).unwrap() {
+      ServerProgress::Request(v) => v,
+      _ => panic!("complete"),
+    };
+    assert_eq!(v.host(), "admin.example", "target authority wins");
+    assert_eq!(v.path(), "/ws");
+
+    // Same-authority absolute-form agrees trivially.
+    let req = replaced(
+      "GET /chat HTTP/1.1\r\n",
+      "GET http://server.example.com/chat HTTP/1.1\r\n",
+    );
+    let v = match hs.handle(&req).unwrap() {
+      ServerProgress::Request(v) => v,
+      _ => panic!("complete"),
+    };
+    assert_eq!(v.host(), "server.example.com");
+
+    // Origin-form keeps using the Host header.
+    let v = match hs.handle(GOOD).unwrap() {
+      ServerProgress::Request(v) => v,
+      _ => panic!("complete"),
+    };
+    assert_eq!(v.host(), "server.example.com");
+  }
+
   #[test]
   fn host_values_are_grammar_checked() {
     // Regression (Codex R14): the server gate validates Host as an RFC 3986
