@@ -163,6 +163,17 @@ impl<'s, 'a> ExtraHeaders<'s, 'a> {
 /// assert_eq!(headers.len(), 2);
 /// ```
 ///
+/// Borrowing the builder is the ONLY conversion path — there is no public
+/// slice accessor, so the overflow flag cannot be laundered away by passing
+/// raw pairs:
+///
+/// ```compile_fail
+/// use websocket_proto::handshake::ExtraHeadersBuilder;
+///
+/// let b = ExtraHeadersBuilder::new().with_header("A", "1");
+/// let _ = b.entries(); // crate-private — borrow `&b` instead
+/// ```
+///
 /// [`with_header`]: ExtraHeadersBuilder::with_header
 #[derive(Debug, Copy, Clone)]
 pub struct ExtraHeadersBuilder<'a, const N: usize = 16> {
@@ -209,8 +220,12 @@ impl<'a, const N: usize> ExtraHeadersBuilder<'a, N> {
     self
   }
 
-  /// The pairs added so far.
-  pub fn entries(&self) -> &[(&'a str, &'a str)] {
+  /// The pairs added so far. Crate-private on purpose: a public slice
+  /// accessor would let `with_extra_headers(builder.entries())` route
+  /// through the slice `From` impl and silently launder away the overflow
+  /// flag — the ONLY public builder→`ExtraHeaders` path is borrowing the
+  /// builder itself, which preserves it.
+  pub(crate) fn entries(&self) -> &[(&'a str, &'a str)] {
     self.entries.get(..self.len).unwrap_or(&[])
   }
 
