@@ -817,6 +817,13 @@ mod tests {
       "[::1]x",
       "[]",
       "",
+      // Regression (Codex R15): a bracket is an IP-LITERAL, not a byte
+      // soup — dotted-quads and over-compressed colons are not addresses.
+      "[127.0.0.1]",
+      "[::::]",
+      "[1:2:3:4:5:6:7:8:9]",
+      "[12345::]",
+      "[1:2:3:4:5:6:7:8::]",
     ] {
       // Inbound gate.
       let headers = base(bad);
@@ -843,6 +850,13 @@ mod tests {
       "[::1]:8080",
       "[2001:db8::1]",
       "%41.com",
+      // Regression (Codex R15): real RFC 3986 IP-literals all pass —
+      // full-length IPv6, IPv4-mapped tails, and IPvFuture.
+      "[1:2:3:4:5:6:7:8]",
+      "[::ffff:127.0.0.1]",
+      "[1:2:3:4:5:6:7.7.7.7]",
+      "[v1.a]",
+      "[1:2:3:4:5:6:7::]",
     ] {
       let headers = base(good);
       assert!(validate_connect_request(&headers).is_ok(), "{good:?}");

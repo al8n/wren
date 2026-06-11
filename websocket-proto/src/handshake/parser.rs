@@ -206,16 +206,14 @@ const fn is_reg_name_byte(b: u8) -> bool {
 /// not a URL — `/`, `?`, `#`, `@`, whitespace, and controls are all out.
 pub(crate) fn is_valid_authority(s: &str) -> bool {
   let port = match s.strip_prefix('[') {
-    // IP-literal: hex / `:` / `.` covers IPv6 incl. IPv4-mapped forms.
+    // IP-literal: a real IPv6address or IPvFuture (RFC 3986 §3.2.2) — a
+    // byte filter is not enough (`[127.0.0.1]` and `[::::]` are not
+    // addresses; `[v1.a]` is).
     Some(rest) => {
       let Some((lit, after)) = rest.split_once(']') else {
         return false;
       };
-      if lit.is_empty()
-        || !lit
-          .bytes()
-          .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
-      {
+      if !is_valid_ipv6(lit) && !is_valid_ipvfuture(lit) {
         return false;
       }
       if after.is_empty() {
@@ -259,6 +257,96 @@ pub(crate) fn is_valid_authority(s: &str) -> bool {
   };
   // `port = *DIGIT` — empty is grammatically legal ("example.com:").
   port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// RFC 3986 `IPv6address`: up to 8 16-bit hex groups, at most one `::`
+/// compression (standing for one or more zero groups), optionally an
+/// IPv4 dotted-quad as the last two groups.
+fn is_valid_ipv6(s: &str) -> bool {
+  let (head, tail, compressed) = match s.split_once("::") {
+    Some((head, tail)) => {
+      if tail.contains("::") {
+        return false; // a second `::`
+      }
+      (head, tail, true)
+    }
+    None => (s, "", false),
+  };
+  // Counts the h16 groups in one side; a trailing dotted-quad counts as 2.
+  let count_groups = |part: &str, v4_may_end: bool| -> Option<usize> {
+    if part.is_empty() {
+      return Some(0);
+    }
+    let mut n = 0usize;
+    let mut groups = part.split(':').peekable();
+    while let Some(group) = groups.next() {
+      let last = groups.peek().is_none();
+      if group.is_empty() {
+        return None; // `:` at an edge, or `:::`
+      }
+      if last && v4_may_end && group.contains('.') {
+        if !is_valid_ipv4(group) {
+          return None;
+        }
+        n = n.saturating_add(2);
+      } else {
+        if group.len() > 4 || !group.bytes().all(|b| b.is_ascii_hexdigit()) {
+          return None;
+        }
+        n = n.saturating_add(1);
+      }
+    }
+    Some(n)
+  };
+  // Without compression the dotted-quad (if any) ends the whole address —
+  // i.e. it sits at the end of `head`; with compression it ends `tail`.
+  let Some(head_groups) = count_groups(head, !compressed) else {
+    return false;
+  };
+  let Some(tail_groups) = count_groups(tail, true) else {
+    return false;
+  };
+  let total = head_groups.saturating_add(tail_groups);
+  if compressed {
+    total <= 7 // `::` expands to at least one more group
+  } else {
+    total == 8
+  }
+}
+
+/// RFC 3986 `dec-octet` ×4: 0–255, no leading zeros.
+fn is_valid_ipv4(s: &str) -> bool {
+  let mut octets = 0usize;
+  for octet in s.split('.') {
+    octets = octets.saturating_add(1);
+    if octet.is_empty()
+      || octet.len() > 3
+      || !octet.bytes().all(|b| b.is_ascii_digit())
+      || (octet.len() > 1 && octet.starts_with('0'))
+    {
+      return false;
+    }
+    match octet.parse::<u16>() {
+      Ok(v) if v <= 255 => {}
+      _ => return false,
+    }
+  }
+  octets == 4
+}
+
+/// RFC 3986 `IPvFuture`: `v` 1*HEXDIG `.` 1*(unreserved / sub-delims / ":")
+/// (ABNF literals are case-insensitive, so `V` matches too).
+fn is_valid_ipvfuture(s: &str) -> bool {
+  let Some(rest) = s.strip_prefix(['v', 'V']) else {
+    return false;
+  };
+  let Some((version, tail)) = rest.split_once('.') else {
+    return false;
+  };
+  !version.is_empty()
+    && version.bytes().all(|b| b.is_ascii_hexdigit())
+    && !tail.is_empty()
+    && tail.bytes().all(|b| is_reg_name_byte(b) || b == b':')
 }
 
 fn valid_pq_bytes(bytes: impl Iterator<Item = u8>, mut in_query: bool) -> bool {

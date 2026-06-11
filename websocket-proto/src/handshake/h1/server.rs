@@ -495,21 +495,24 @@ fn request_target_resource(target: &str) -> Option<(&str, Option<&str>)> {
     return split_pq(target);
   }
   // Absolute-form: case-insensitive http/https scheme (RFC 3986 §3.1), a
-  // non-empty authority, then the resource name. An empty path reads as
-  // `/` (RFC 6455 §3) whether or not a query follows.
+  // GRAMMAR-CHECKED authority (the same validator the Host gate uses — an
+  // absolute-form target with a malformed port or userinfo is not a valid
+  // http URI), then the resource name. An empty path reads as `/`
+  // (RFC 6455 §3) whether or not a query follows.
   let rest = ["http://", "https://"].iter().find_map(|scheme| {
     target
       .get(..scheme.len())
       .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
       .and_then(|_| target.get(scheme.len()..))
   })?;
-  if rest.bytes().any(|b| b < 0x21 || b == 0x7F || b == b'#') {
-    return None;
-  }
   match rest.find(['/', '?']) {
     // "http://host" → "/", no query.
-    None if !rest.is_empty() => Some(("/", None)),
-    Some(i) if i > 0 => {
+    None => parser::is_valid_authority(rest).then_some(("/", None)),
+    Some(i) => {
+      let authority = rest.get(..i)?;
+      if !parser::is_valid_authority(authority) {
+        return None;
+      }
       let resource = rest.get(i..)?;
       match resource.strip_prefix('?') {
         // "http://host?q" → resource name "/?q" (RFC 6455 §3 constructs the
@@ -518,7 +521,6 @@ fn request_target_resource(target: &str) -> Option<(&str, Option<&str>)> {
         None => split_pq(resource),
       }
     }
-    _ => None,
   }
 }
 
@@ -667,6 +669,14 @@ Sec-WebSocket-Version: 13\r\n\
       "/chat%zz",
       "http://?x",
       "ftp://h/chat",
+      // Regression (Codex R15): the absolute-form AUTHORITY is grammar-
+      // checked too — bad port, userinfo, multi-colon, unterminated
+      // bracket, and non-address bracket forms all fail.
+      "http://example.com:bad/chat",
+      "http://u@h/chat",
+      "http://a:b:c/chat",
+      "http://[::1/chat",
+      "http://[127.0.0.1]/chat",
     ] {
       let req = replaced("GET /chat HTTP/1.1\r\n", &format!("GET {bad} HTTP/1.1\r\n"));
       assert!(
@@ -687,6 +697,7 @@ Sec-WebSocket-Version: 13\r\n\
       ("http://server.example.com/chat?x=1", "/chat", Some("x=1")),
       ("http://server.example.com?token=1", "/", Some("token=1")),
       ("HTTPS://server.example.com", "/", None),
+      ("http://[::1]:8080/chat", "/chat", None),
       ("/chat", "/chat", None),
       ("/chat?x=%23", "/chat", Some("x=%23")),
     ] {
