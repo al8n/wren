@@ -398,22 +398,36 @@ impl<'a> ConnectRequestView<'a> {
 
 /// RFC 8441 §5: the h1 upgrade machinery has no place on this transport —
 /// Sec-WebSocket-Key/Accept are not used, and HTTP/2 (RFC 9113 §8.2.2) /
-/// HTTP/3 treat connection-specific fields as malformed outright. Both
-/// validators (request gate AND response check) reject the class rather
-/// than trusting the adapter to have filtered.
-fn has_forbidden_h1_field(headers: &[(&str, &str)]) -> bool {
+/// HTTP/3 treat connection-specific fields as malformed outright (incl.
+/// `HTTP2-Settings`, an h1-upgrade artifact). The ONE exception: `TE` may
+/// appear in REQUESTS carrying exactly `trailers` — any other value, or any
+/// `TE` in a response, is malformed. Both validators (request gate AND
+/// response check) reject the class rather than trusting the adapter to
+/// have filtered.
+fn has_forbidden_h1_field(headers: &[(&str, &str)], te_trailers_ok: bool) -> bool {
   const FORBIDDEN: &[&str] = &[
     "connection",
     "upgrade",
     "keep-alive",
     "proxy-connection",
     "transfer-encoding",
+    "http2-settings",
     "sec-websocket-key",
     "sec-websocket-accept",
   ];
-  headers
-    .iter()
-    .any(|(name, _)| FORBIDDEN.iter().any(|f| name.eq_ignore_ascii_case(f)))
+  headers.iter().any(|(name, value)| {
+    if FORBIDDEN.iter().any(|f| name.eq_ignore_ascii_case(f)) {
+      return true;
+    }
+    if name.eq_ignore_ascii_case("te") {
+      // RFC 9113 §8.2.2: "MUST NOT contain any value other than 'trailers'".
+      return !(te_trailers_ok
+        && value
+          .trim_matches([' ', '\t'])
+          .eq_ignore_ascii_case("trailers"));
+    }
+    false
+  })
 }
 
 /// Server-side validation of an extended-CONNECT header list. STRICT: this is
@@ -489,7 +503,7 @@ pub fn validate_connect_request<'a>(
     }
     Some(_) => {}
   }
-  if has_forbidden_h1_field(headers) {
+  if has_forbidden_h1_field(headers, true) {
     return Err(ConnectRequestError::ForbiddenHeader);
   }
   // Mirror of the h1 server's offer-list rule: non-token or repeated
@@ -670,7 +684,7 @@ pub fn validate_connect_response(
   // Symmetric with the request gate: h1-only and connection-specific
   // fields are just as forbidden on the response (RFC 8441 §5 /
   // RFC 9113 §8.2.2).
-  if has_forbidden_h1_field(headers) {
+  if has_forbidden_h1_field(headers, false) {
     return Err(ConnectResponseError::ForbiddenHeader);
   }
 
@@ -865,6 +879,60 @@ mod tests {
           .headers()
           .is_ok(),
         "{good:?}"
+      );
+    }
+  }
+
+  /// Regression (Codex R17): `HTTP2-Settings` is an h1-upgrade artifact and
+  /// `TE` may only appear in REQUESTS as exactly `trailers`
+  /// (RFC 9113 §8.2.2) — anything else fails either gate.
+  #[test]
+  fn te_and_http2_settings_are_screened() {
+    let base: &[(&str, &str)] = &[
+      (":method", "CONNECT"),
+      (":protocol", "websocket"),
+      (":scheme", "https"),
+      (":path", "/chat"),
+      (":authority", "h"),
+      ("sec-websocket-version", "13"),
+    ];
+    let with = |name: &'static str, value: &'static str| -> Vec<(&'static str, &'static str)> {
+      base.iter().copied().chain([(name, value)]).collect()
+    };
+
+    // Request side: TE is legal ONLY as exactly `trailers`.
+    let ok = with("te", "trailers");
+    assert!(validate_connect_request(&ok).is_ok());
+    let ok = with("TE", " Trailers\t");
+    assert!(validate_connect_request(&ok).is_ok());
+    for (name, value) in [
+      ("te", "gzip"),
+      ("te", "trailers, deflate"),
+      ("http2-settings", "AAMAAABkAAQAoAAAAAIAAAAA"),
+    ] {
+      let headers = with(name, value);
+      assert!(
+        matches!(
+          validate_connect_request(&headers).unwrap_err(),
+          ConnectRequestError::ForbiddenHeader
+        ),
+        "{name}: {value}"
+      );
+    }
+
+    // Response side: TE never belongs, even as `trailers`.
+    let req = ConnectRequest::new(Scheme::Https, "h", "/");
+    for (name, value) in [
+      ("te", "trailers"),
+      ("http2-settings", "AAMAAABkAAQAoAAAAAIAAAAA"),
+    ] {
+      let response: &[(&str, &str)] = &[(name, value)];
+      assert!(
+        matches!(
+          validate_connect_response(response, &req).unwrap_err(),
+          ConnectResponseError::ForbiddenHeader
+        ),
+        "{name}"
       );
     }
   }
