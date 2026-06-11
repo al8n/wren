@@ -62,6 +62,19 @@ pub enum ConnectRequestError {
   #[error(":protocol is not exactly one websocket")]
   NotWebSocket,
 
+  /// `:scheme` missing, repeated, or not `http`/`https` (RFC 8441 §4 makes
+  /// the target pseudo-headers mandatory alongside `:protocol`).
+  #[error(":scheme is not exactly one http or https")]
+  NotHttpScheme,
+
+  /// `:path` missing, repeated, or not an origin-form target.
+  #[error(":path is not exactly one origin-form target")]
+  InvalidPath,
+
+  /// `:authority` missing, repeated, or empty.
+  #[error(":authority is not exactly one non-empty value")]
+  InvalidAuthority,
+
   /// `sec-websocket-version` missing.
   #[error("missing sec-websocket-version")]
   MissingVersion,
@@ -386,6 +399,26 @@ pub fn validate_connect_request<'a>(
       .is_some_and(|p| p.eq_ignore_ascii_case("websocket"));
   if !protocol_ok {
     return Err(ConnectRequestError::NotWebSocket);
+  }
+  // RFC 8441 §4: with `:protocol`, the target pseudo-headers are mandatory —
+  // a CONNECT with no scheme/path/authority has nothing to bootstrap a
+  // WebSocket onto, and a gate that passed it would push routing and origin
+  // policy onto optional-`None` checks in application code.
+  let scheme_ok = count(":scheme") == 1
+    && view
+      .get(":scheme")
+      .is_some_and(|s| s == "http" || s == "https");
+  if !scheme_ok {
+    return Err(ConnectRequestError::NotHttpScheme);
+  }
+  let path_ok = count(":path") == 1 && view.get(":path").is_some_and(|p| p.starts_with('/'));
+  if !path_ok {
+    return Err(ConnectRequestError::InvalidPath);
+  }
+  let authority_ok =
+    count(":authority") == 1 && view.get(":authority").is_some_and(|a| !a.is_empty());
+  if !authority_ok {
+    return Err(ConnectRequestError::InvalidAuthority);
   }
   // Singleton, like the pseudo-headers above: an ambiguous repeated version
   // (which another layer might combine or read differently) must not pass
@@ -737,50 +770,136 @@ mod tests {
       );
     }
 
-    // Version must be 13 (and is required) — checked after the gate.
-    let bad: &[(&str, &str)] = &[
-      (":method", "CONNECT"),
-      (":protocol", "websocket"),
-      ("sec-websocket-version", "12"),
+    // RFC 8441 §4: the target pseudo-headers are mandatory with :protocol —
+    // missing, repeated, or invalid scheme/path/authority fail the gate.
+    const GATED: [(&str, &str); 2] = [(":method", "CONNECT"), (":protocol", "websocket")];
+    let with_gate = |rest: &[(&'static str, &'static str)]| -> Vec<(&'static str, &'static str)> {
+      GATED.iter().chain(rest).copied().collect()
+    };
+    for (rest, expect) in [
+      // :scheme missing / duplicated / not http(s).
+      (
+        &[
+          (":path", "/c"),
+          (":authority", "h"),
+          ("sec-websocket-version", "13"),
+        ] as &[_],
+        "scheme",
+      ),
+      (
+        &[
+          (":scheme", "https"),
+          (":scheme", "https"),
+          (":path", "/c"),
+          (":authority", "h"),
+          ("sec-websocket-version", "13"),
+        ],
+        "scheme",
+      ),
+      (
+        &[
+          (":scheme", "ftp"),
+          (":path", "/c"),
+          (":authority", "h"),
+          ("sec-websocket-version", "13"),
+        ],
+        "scheme",
+      ),
+      // :path missing / non-origin-form.
+      (
+        &[
+          (":scheme", "https"),
+          (":authority", "h"),
+          ("sec-websocket-version", "13"),
+        ],
+        "path",
+      ),
+      (
+        &[
+          (":scheme", "https"),
+          (":path", "nope"),
+          (":authority", "h"),
+          ("sec-websocket-version", "13"),
+        ],
+        "path",
+      ),
+      // :authority missing / empty.
+      (
+        &[
+          (":scheme", "https"),
+          (":path", "/c"),
+          ("sec-websocket-version", "13"),
+        ],
+        "authority",
+      ),
+      (
+        &[
+          (":scheme", "https"),
+          (":path", "/c"),
+          (":authority", ""),
+          ("sec-websocket-version", "13"),
+        ],
+        "authority",
+      ),
+    ] {
+      let headers = with_gate(rest);
+      let err = validate_connect_request(&headers).unwrap_err();
+      let matched = match expect {
+        "scheme" => matches!(err, ConnectRequestError::NotHttpScheme),
+        "path" => matches!(err, ConnectRequestError::InvalidPath),
+        _ => matches!(err, ConnectRequestError::InvalidAuthority),
+      };
+      assert!(matched, "{rest:?} → {err:?}");
+    }
+
+    // Version must be 13 (and is required) — checked after the target gate.
+    const TARGET: [(&str, &str); 3] = [
+      (":scheme", "https"),
+      (":path", "/chat"),
+      (":authority", "h"),
     ];
+    let with_target = |rest: &[(&'static str, &'static str)]| -> Vec<(&'static str, &'static str)> {
+      GATED
+        .iter()
+        .chain(TARGET.iter())
+        .chain(rest)
+        .copied()
+        .collect()
+    };
+    let bad = with_target(&[("sec-websocket-version", "12")]);
     assert!(matches!(
-      validate_connect_request(bad).unwrap_err(),
+      validate_connect_request(&bad).unwrap_err(),
       ConnectRequestError::UnsupportedVersion
     ));
-    let missing: &[(&str, &str)] = &[(":method", "CONNECT"), (":protocol", "websocket")];
+    let missing = with_target(&[]);
     assert!(matches!(
-      validate_connect_request(missing).unwrap_err(),
+      validate_connect_request(&missing).unwrap_err(),
       ConnectRequestError::MissingVersion
     ));
 
     // The version header is a singleton: a repeat is ambiguous and fails the
     // gate — even when every occurrence says 13, and regardless of order.
-    for dup in [
+    for rest in [
       &[
-        (":method", "CONNECT"),
-        (":protocol", "websocket"),
         ("sec-websocket-version", "13"),
         ("sec-websocket-version", "13"),
-      ] as &[(&str, &str)],
+      ] as &[_],
       &[
-        (":method", "CONNECT"),
-        (":protocol", "websocket"),
         ("sec-websocket-version", "13"),
         ("sec-websocket-version", "12"),
       ],
       &[
-        (":method", "CONNECT"),
-        (":protocol", "websocket"),
         ("sec-websocket-version", "12"),
         ("sec-websocket-version", "13"),
       ],
     ] {
+      let dup = with_target(rest);
       assert!(
         matches!(
-          validate_connect_request(dup).unwrap_err(),
+          validate_connect_request(&dup).unwrap_err(),
           ConnectRequestError::DuplicateVersion
         ),
-        "{dup:?}"
+        "{rest:?}"
       );
     }
   }
