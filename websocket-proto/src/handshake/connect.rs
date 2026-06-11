@@ -43,8 +43,13 @@ pub enum ConnectRequestError {
   #[error("invalid connect request field: {0}")]
   InvalidField(&'static str),
 
-  /// `:protocol` was present but not `websocket`.
-  #[error(":protocol is not websocket")]
+  /// `:method` missing, repeated, or not `CONNECT` (RFC 8441 §4 requires the
+  /// extended CONNECT method).
+  #[error(":method is not exactly one CONNECT")]
+  NotConnect,
+
+  /// `:protocol` missing, repeated, or not `websocket`.
+  #[error(":protocol is not exactly one websocket")]
   NotWebSocket,
 
   /// `sec-websocket-version` missing.
@@ -239,16 +244,30 @@ impl<'a> ConnectRequestView<'a> {
   }
 }
 
-/// Server-side validation of an extended-CONNECT header list. Pseudo-headers
-/// are validated only when present (the H2/H3 stack normally enforces
-/// `:method`/`:protocol` before this layer sees the request).
+/// Server-side validation of an extended-CONNECT header list. STRICT: this is
+/// usable as the WebSocket gate on its own — it requires exactly one
+/// `:method` of `CONNECT` (case-sensitive, RFC 9110 §9.1) and exactly one
+/// `:protocol` of `websocket` (RFC 8441 §4 / RFC 9220 §3), so a plain CONNECT
+/// or an ordinary request can never be mistaken for a WebSocket handshake,
+/// even when the H2/H3 stack passes pseudo-headers through unchecked.
 pub fn validate_connect_request<'a>(
   headers: &'a [(&'a str, &'a str)],
 ) -> Result<ConnectRequestView<'a>, ConnectRequestError> {
   let view = ConnectRequestView { headers };
-  if let Some(protocol) = view.get(":protocol")
-    && !protocol.eq_ignore_ascii_case("websocket")
-  {
+  let count = |name: &str| {
+    headers
+      .iter()
+      .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+      .count()
+  };
+  if count(":method") != 1 || view.get(":method") != Some("CONNECT") {
+    return Err(ConnectRequestError::NotConnect);
+  }
+  let protocol_ok = count(":protocol") == 1
+    && view
+      .get(":protocol")
+      .is_some_and(|p| p.eq_ignore_ascii_case("websocket"));
+  if !protocol_ok {
     return Err(ConnectRequestError::NotWebSocket);
   }
   match view.get("sec-websocket-version") {
@@ -452,26 +471,61 @@ mod tests {
     let offers: Vec<&str> = view.subprotocols().collect();
     assert_eq!(offers, ["chat", "superchat"]);
 
-    // Version must be 13 when present (and is required).
-    let bad: &[(&str, &str)] = &[("sec-websocket-version", "12")];
+    // STRICT gate: missing or wrong :method fails before anything else.
+    for bad in [
+      &[("sec-websocket-version", "13")] as &[(&str, &str)],
+      &[(":method", "GET"), (":protocol", "websocket"), ("sec-websocket-version", "13")],
+      &[(":method", "connect"), (":protocol", "websocket"), ("sec-websocket-version", "13")],
+      &[
+        (":method", "CONNECT"),
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        ("sec-websocket-version", "13"),
+      ],
+    ] {
+      assert!(
+        matches!(
+          validate_connect_request(bad).unwrap_err(),
+          ConnectRequestError::NotConnect
+        ),
+        "{bad:?}"
+      );
+    }
+
+    // STRICT gate: :protocol must be exactly one `websocket`.
+    for bad in [
+      &[(":method", "CONNECT"), ("sec-websocket-version", "13")] as &[(&str, &str)],
+      &[(":method", "CONNECT"), (":protocol", "webtransport"), ("sec-websocket-version", "13")],
+      &[
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        (":protocol", "websocket"),
+        ("sec-websocket-version", "13"),
+      ],
+    ] {
+      assert!(
+        matches!(
+          validate_connect_request(bad).unwrap_err(),
+          ConnectRequestError::NotWebSocket
+        ),
+        "{bad:?}"
+      );
+    }
+
+    // Version must be 13 (and is required) — checked after the gate.
+    let bad: &[(&str, &str)] = &[
+      (":method", "CONNECT"),
+      (":protocol", "websocket"),
+      ("sec-websocket-version", "12"),
+    ];
     assert!(matches!(
       validate_connect_request(bad).unwrap_err(),
       ConnectRequestError::UnsupportedVersion
     ));
-    let missing: &[(&str, &str)] = &[(":method", "CONNECT")];
+    let missing: &[(&str, &str)] = &[(":method", "CONNECT"), (":protocol", "websocket")];
     assert!(matches!(
       validate_connect_request(missing).unwrap_err(),
       ConnectRequestError::MissingVersion
-    ));
-
-    // Pseudo-headers are validated only when present.
-    let wrong_protocol: &[(&str, &str)] = &[
-      (":protocol", "webtransport"),
-      ("sec-websocket-version", "13"),
-    ];
-    assert!(matches!(
-      validate_connect_request(wrong_protocol).unwrap_err(),
-      ConnectRequestError::NotWebSocket
     ));
   }
 
