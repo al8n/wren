@@ -498,8 +498,20 @@ mod deflate {
       }
     };
 
+    // RFC 7692 §7.1.1.1: the server AGREES to a requested
+    // server_no_context_takeover by echoing the parameter — omission means
+    // it was not granted, and a server that then reuses its window would
+    // desync our per-message-reset inflater mid-stream. Strict, like the
+    // server_max_window_bits absence check above.
+    if offer.server_no_context_takeover && !p.server_no_context_takeover {
+      return Err(NegotiationError::ExtensionMismatch);
+    }
+
     Ok(DeflateParams {
-      server_no_context_takeover: p.server_no_context_takeover || offer.server_no_context_takeover,
+      // Response-derived: the wire decides what the server committed to.
+      server_no_context_takeover: p.server_no_context_takeover,
+      // §7.1.1.2: OUR offer declaration is a unilateral promise (binding
+      // whether or not echoed); the server's echo additionally demands it.
       client_no_context_takeover: p.client_no_context_takeover || offer.client_no_context_takeover,
       server_max_window_bits: server_bits,
       client_max_window_bits: client_bits,
@@ -771,6 +783,30 @@ mod deflate_tests {
     // Our requested server cap silently ignored (param absent) → mismatch.
     let capped = DeflateOffer::new().with_server_max_window_bits(Some(10));
     assert!(parse_deflate_response("permessage-deflate", &capped).is_err());
+
+    // Regression (Codex R8): a requested server_no_context_takeover that the
+    // response does NOT echo was not granted (RFC 7692 §7.1.1.1) — accepting
+    // it would desync our per-message-reset inflater against a server that
+    // keeps its window. Echoed, it is granted.
+    let want_reset = DeflateOffer::new().with_server_no_context_takeover(true);
+    assert!(matches!(
+      parse_deflate_response("permessage-deflate", &want_reset).unwrap_err(),
+      NegotiationError::ExtensionMismatch
+    ));
+    let p = parse_deflate_response(
+      "permessage-deflate; server_no_context_takeover",
+      &want_reset,
+    )
+    .unwrap();
+    assert!(p.server_no_context_takeover());
+    // Unrequested but echoed: the server self-restricts — fine, and the
+    // negotiated flag is response-derived.
+    let p = parse_deflate_response(
+      "permessage-deflate; server_no_context_takeover",
+      &DeflateOffer::new(),
+    )
+    .unwrap();
+    assert!(p.server_no_context_takeover());
 
     // client_max_window_bits in the response when our offer disabled it.
     let no_cmwb = DeflateOffer::new().without_client_max_window_bits();
