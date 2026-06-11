@@ -67,6 +67,10 @@ pub enum NegotiationError {
   /// A window-bits value outside 8..=15 at configuration time.
   #[error("window bits must be within 8..=15")]
   InvalidWindowBits,
+
+  /// The output buffer cannot hold the rendered extension value.
+  #[error("{0}")]
+  BufferTooSmall(crate::error::BufferTooSmallDetail),
 }
 
 /// The agreed handshake outcome: what the connection machine is configured
@@ -269,13 +273,23 @@ mod deflate {
       Ok(())
     }
 
-    /// Writes the offer as a `Sec-WebSocket-Extensions` value.
-    pub fn write(&self, out: &mut [u8]) -> Result<usize, BufferTooSmallDetail> {
+    /// Writes the offer as a `Sec-WebSocket-Extensions` value. Validates
+    /// first: an out-of-range window-bits config is an
+    /// [`NegotiationError::InvalidWindowBits`] error here, never wire bytes
+    /// — emitting `server_max_window_bits=7` would be rejected by this
+    /// crate's own acceptor (and any conforming peer), so the public
+    /// emitter refuses to produce it.
+    pub fn write(&self, out: &mut [u8]) -> Result<usize, NegotiationError> {
+      self.validate()?;
       let mut w = WriteCursor::new(out);
-      self.write_to(&mut w)?;
+      self
+        .write_to(&mut w)
+        .map_err(NegotiationError::BufferTooSmall)?;
       Ok(w.written())
     }
 
+    /// Crate-internal render path; the h1/CONNECT builders run
+    /// [`validate`](Self::validate) before reaching it.
     pub(crate) fn write_to(&self, w: &mut WriteCursor<'_>) -> Result<(), BufferTooSmallDetail> {
       w.push(b"permessage-deflate")?;
       if self.server_no_context_takeover {
@@ -812,6 +826,31 @@ mod deflate_tests {
     let p =
       parse_deflate_response("permessage-deflate; server_max_window_bits=11", &offer).unwrap();
     assert_eq!(p.server_max_window_bits(), 11);
+  }
+
+  /// Regression (Codex R17): the PUBLIC offer emitter refuses out-of-range
+  /// window bits — `server_max_window_bits=7` on the wire would be rejected
+  /// by this crate's own acceptor, so it must be an error, not bytes.
+  #[test]
+  fn out_of_range_offer_cannot_be_emitted() {
+    let mut buf = [0u8; 160];
+    for bad in [
+      DeflateOffer::new().with_server_max_window_bits(Some(7)),
+      DeflateOffer::new().with_server_max_window_bits(Some(16)),
+      DeflateOffer::new().with_client_max_window_bits(Some(255)),
+    ] {
+      assert!(matches!(
+        bad.write(&mut buf).unwrap_err(),
+        NegotiationError::InvalidWindowBits
+      ));
+    }
+    // In-range offers still render.
+    assert!(
+      DeflateOffer::new()
+        .with_server_max_window_bits(Some(8))
+        .write(&mut buf)
+        .is_ok()
+    );
   }
 
   /// Regression (Codex R13): an explicit `server_max_window_bits=15` offer

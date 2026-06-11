@@ -90,11 +90,14 @@ fn extras_strategy() -> impl Strategy<Value = Vec<(String, String)>> {
 #[cfg(feature = "deflate")]
 fn offer_strategy() -> impl Strategy<Value = websocket_proto::negotiation::DeflateOffer> {
   use websocket_proto::negotiation::DeflateOffer;
+  // DELIBERATELY includes out-of-range bits (0..=20): the property asserts
+  // the public emitter REFUSES those configs (Codex R17 found the previous
+  // in-range-only strategy never sampled the unvalidated write path).
   (
     any::<bool>(),
     any::<bool>(),
-    proptest::option::of(8u8..=15),
-    proptest::option::of(8u8..=15),
+    proptest::option::of(0u8..=20),
+    proptest::option::of(0u8..=20),
     any::<bool>(),
   )
     .prop_map(|(snct, cnct, server_bits, client_bits, offer_cmwb)| {
@@ -239,6 +242,11 @@ proptest! {
     };
 
     let mut offer_buf = [0u8; 160];
+    // An invalid config must be an ERROR at the emitter, never wire bytes.
+    if offer.validate().is_err() {
+      prop_assert!(offer.write(&mut offer_buf).is_err());
+      return Ok(());
+    }
     let n = offer.write(&mut offer_buf).expect("offer renders");
     let offer_value = core::str::from_utf8(&offer_buf[..n]).unwrap();
 
