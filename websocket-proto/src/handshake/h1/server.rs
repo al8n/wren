@@ -55,6 +55,11 @@ pub enum ServerHandshakeError {
   #[error("accepted subprotocol was not offered")]
   SubprotocolNotOffered,
 
+  /// A `Sec-WebSocket-Protocol` offer element was not an RFC 9110 token, or
+  /// the list repeated an element (RFC 6455 §4.1 requires unique offers).
+  #[error("malformed Sec-WebSocket-Protocol offer list")]
+  MalformedSubprotocols,
+
   /// Rejection status must be a client/server error or redirect (300–599),
   /// not a success code.
   #[error("rejection status {0} is not in 300..=599")]
@@ -107,15 +112,14 @@ impl<'a> RequestView<'a> {
   }
 
   /// The client's subprotocol offers in order, across repeated
-  /// `Sec-WebSocket-Protocol` headers and comma lists.
+  /// `Sec-WebSocket-Protocol` headers and comma lists. Every element was
+  /// token-validated and deduplicated during [`ServerHandshake::handle`].
   pub fn subprotocols(&self) -> impl Iterator<Item = &'a str> + '_ {
     self
       .head
       .headers()
       .get_all("sec-websocket-protocol")
-      .flat_map(|v| v.split(','))
-      .map(|s| s.trim_matches([' ', '\t']))
-      .filter(|s| !s.is_empty())
+      .flat_map(parser::list_elements)
   }
 
   /// Any request header by name (ASCII case-insensitive) — for cookie,
@@ -315,6 +319,25 @@ impl ServerHandshake {
 
     if headers.get("sec-websocket-version") != Some(constants::WEBSOCKET_VERSION) {
       return Err(ServerHandshakeError::UnsupportedVersion);
+    }
+
+    // RFC 6455 §4.2.1.8: the offer list is `1#token` whose elements the
+    // client MUST keep unique (§4.1 item 10) — a non-token element or a
+    // repeat makes the handshake invalid and processing stops (§4.2.1).
+    // EMPTY elements are ignored, not rejected: RFC 9110 §5.6.1.2 requires
+    // a recipient to parse and ignore a reasonable number of empty list
+    // elements (`list_elements` filters them).
+    let offers = || {
+      headers
+        .get_all("sec-websocket-protocol")
+        .flat_map(parser::list_elements)
+    };
+    let mut seen = 0usize;
+    for offer in offers() {
+      if !is_token(offer) || offers().take(seen).any(|prev| prev == offer) {
+        return Err(ServerHandshakeError::MalformedSubprotocols);
+      }
+      seen = seen.saturating_add(1);
     }
 
     Ok(ServerProgress::Request(RequestView {
@@ -523,6 +546,66 @@ Sec-WebSocket-Version: 13\r\n\
     );
     let v = view(raw.as_bytes());
     assert_eq!(v.host(), "server.example.com");
+  }
+
+  /// Regression (Codex R10): the offer list is `1#token` with unique
+  /// elements — a non-token element or a repeat fails the handshake. Empty
+  /// elements are IGNORED, not rejected: RFC 9110 §5.6.1.2 requires a
+  /// recipient to parse and ignore a reasonable number of empty list
+  /// elements (this part deliberately diverges from the review's
+  /// reject-empties recommendation, with the citation).
+  #[test]
+  fn malformed_subprotocol_offers_fail_the_handshake() {
+    let hs = ServerHandshake::new();
+
+    // Non-token element ("bad token" has a space).
+    let bad = replaced(
+      "Sec-WebSocket-Protocol: chat, superchat\r\n",
+      "Sec-WebSocket-Protocol: bad token, admin\r\n",
+    );
+    assert!(matches!(
+      hs.handle(&bad).unwrap_err(),
+      ServerHandshakeError::MalformedSubprotocols
+    ));
+
+    // Duplicate element, including across repeated headers.
+    let dup = replaced(
+      "Sec-WebSocket-Protocol: chat, superchat\r\n",
+      "Sec-WebSocket-Protocol: chat, chat\r\n",
+    );
+    assert!(matches!(
+      hs.handle(&dup).unwrap_err(),
+      ServerHandshakeError::MalformedSubprotocols
+    ));
+    let dup = replaced(
+      "Sec-WebSocket-Protocol: chat, superchat\r\n",
+      "Sec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: chat\r\n",
+    );
+    assert!(matches!(
+      hs.handle(&dup).unwrap_err(),
+      ServerHandshakeError::MalformedSubprotocols
+    ));
+
+    // Empty elements are ignored per RFC 9110 §5.6.1.2; the remaining
+    // offer list is valid and negotiable.
+    let stray = replaced(
+      "Sec-WebSocket-Protocol: chat, superchat\r\n",
+      "Sec-WebSocket-Protocol: , admin\r\n",
+    );
+    let v = match hs.handle(&stray).unwrap() {
+      ServerProgress::Request(v) => v,
+      ServerProgress::NeedMore => panic!("complete"),
+    };
+    let offers: Vec<&str> = v.subprotocols().collect();
+    assert_eq!(offers, ["admin"]);
+
+    // Case-only difference is NOT a duplicate (subprotocols are
+    // case-sensitive per RFC 6455 §11.5).
+    let cased = replaced(
+      "Sec-WebSocket-Protocol: chat, superchat\r\n",
+      "Sec-WebSocket-Protocol: chat, CHAT\r\n",
+    );
+    assert!(hs.handle(&cased).is_ok());
   }
 
   #[test]

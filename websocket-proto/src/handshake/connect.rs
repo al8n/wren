@@ -75,6 +75,11 @@ pub enum ConnectRequestError {
   #[error(":authority is not exactly one non-empty value")]
   InvalidAuthority,
 
+  /// A `sec-websocket-protocol` offer element was not an RFC 9110 token, or
+  /// the list repeated an element (RFC 6455 §4.1 requires unique offers).
+  #[error("malformed sec-websocket-protocol offer list")]
+  MalformedSubprotocols,
+
   /// `sec-websocket-version` missing.
   #[error("missing sec-websocket-version")]
   MissingVersion,
@@ -179,9 +184,17 @@ impl<'a> ConnectRequest<'a> {
     {
       return Err(ConnectRequestError::InvalidField("path"));
     }
-    for proto in self.subprotocols {
+    // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique.
+    for (i, proto) in self.subprotocols.iter().enumerate() {
       if !is_token(proto) {
         return Err(ConnectRequestError::InvalidField("subprotocol"));
+      }
+      if self
+        .subprotocols
+        .get(..i)
+        .is_some_and(|prev| prev.contains(proto))
+      {
+        return Err(ConnectRequestError::InvalidField("duplicate subprotocol"));
       }
     }
 
@@ -350,15 +363,15 @@ impl<'a> ConnectRequestView<'a> {
     self.get(name)
   }
 
-  /// Subprotocol offers across repeated headers and comma lists.
+  /// Subprotocol offers across repeated headers and comma lists. Every
+  /// element was token-validated and deduplicated during
+  /// [`validate_connect_request`].
   pub fn subprotocols(&self) -> impl Iterator<Item = &'a str> + '_ {
     self
       .headers
       .iter()
       .filter(|(n, _)| n.eq_ignore_ascii_case("sec-websocket-protocol"))
-      .flat_map(|(_, v)| v.split(','))
-      .map(|s| s.trim_matches([' ', '\t']))
-      .filter(|s| !s.is_empty())
+      .flat_map(|(_, v)| crate::handshake::parser::list_elements(v))
   }
 
   /// Raw `sec-websocket-extensions` values for
@@ -444,6 +457,16 @@ pub fn validate_connect_request<'a>(
       return Err(ConnectRequestError::UnsupportedVersion);
     }
     Some(_) => {}
+  }
+  // Mirror of the h1 server's offer-list rule: non-token or repeated
+  // elements fail the gate; empty elements are ignored (RFC 9110 §5.6.1.2).
+  let offers = || view.subprotocols();
+  let mut seen = 0usize;
+  for offer in offers() {
+    if !is_token(offer) || offers().take(seen).any(|prev| prev == offer) {
+      return Err(ConnectRequestError::MalformedSubprotocols);
+    }
+    seen = seen.saturating_add(1);
   }
   Ok(view)
 }
@@ -707,6 +730,72 @@ mod tests {
         .headers()
         .is_err()
     );
+    // RFC 6455 §4.1 item 10: offers MUST be unique (case-sensitively).
+    assert!(
+      ConnectRequest::new(Scheme::Https, "h", "/")
+        .with_subprotocols(&["chat", "chat"])
+        .headers()
+        .is_err()
+    );
+    assert!(
+      ConnectRequest::new(Scheme::Https, "h", "/")
+        .with_subprotocols(&["chat", "CHAT"])
+        .headers()
+        .is_ok()
+    );
+  }
+
+  /// Regression (Codex R10): the CONNECT gate validates offer lists like the
+  /// h1 server — non-token or repeated elements fail; empty elements are
+  /// ignored per RFC 9110 §5.6.1.2.
+  #[test]
+  fn connect_gate_validates_subprotocol_offers() {
+    let base: &[(&str, &str)] = &[
+      (":method", "CONNECT"),
+      (":protocol", "websocket"),
+      (":scheme", "https"),
+      (":path", "/chat"),
+      (":authority", "h"),
+      ("sec-websocket-version", "13"),
+    ];
+    let with_offers = |value: &'static str| -> Vec<(&'static str, &'static str)> {
+      base
+        .iter()
+        .copied()
+        .chain([("sec-websocket-protocol", value)])
+        .collect()
+    };
+
+    for bad in ["bad token, admin", "chat, chat"] {
+      let headers = with_offers(bad);
+      assert!(
+        matches!(
+          validate_connect_request(&headers).unwrap_err(),
+          ConnectRequestError::MalformedSubprotocols
+        ),
+        "{bad}"
+      );
+    }
+
+    // Empty elements ignored; the rest negotiable.
+    let headers = with_offers(", admin");
+    let view = validate_connect_request(&headers).unwrap();
+    let offers: Vec<&str> = view.subprotocols().collect();
+    assert_eq!(offers, ["admin"]);
+
+    // Duplicate across repeated headers is still a repeat.
+    let headers: Vec<(&str, &str)> = base
+      .iter()
+      .copied()
+      .chain([
+        ("sec-websocket-protocol", "chat"),
+        ("sec-websocket-protocol", "chat"),
+      ])
+      .collect();
+    assert!(matches!(
+      validate_connect_request(&headers).unwrap_err(),
+      ConnectRequestError::MalformedSubprotocols
+    ));
   }
 
   #[test]

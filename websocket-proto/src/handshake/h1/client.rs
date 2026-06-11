@@ -205,9 +205,17 @@ impl<'a> ClientHandshake<'a> {
     {
       return Err(invalid("path must be origin-form without spaces or CR/LF"));
     }
-    for proto in options.subprotocols {
+    // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique.
+    for (i, proto) in options.subprotocols.iter().enumerate() {
       if !is_token(proto) {
         return Err(invalid("subprotocol is not a token"));
+      }
+      if options
+        .subprotocols
+        .get(..i)
+        .is_some_and(|prev| prev.contains(proto))
+      {
+        return Err(invalid("duplicate subprotocol offer"));
       }
     }
     options.extra_headers.validate().map_err(invalid)?;
@@ -481,6 +489,15 @@ mod tests {
       ClientHandshake::new(badproto, &mut CountingRng(0)).unwrap_err(),
       ClientHandshakeError::InvalidOptions(_)
     ));
+    // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique
+    // (case-sensitively — "CHAT" is a different identifier per §11.5).
+    let dup = ClientOptions::new("h", "/").with_subprotocols(&["chat", "chat"]);
+    assert!(matches!(
+      ClientHandshake::new(dup, &mut CountingRng(0)).unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
+    let cased = ClientOptions::new("h", "/").with_subprotocols(&["chat", "CHAT"]);
+    assert!(ClientHandshake::new(cased, &mut CountingRng(0)).is_ok());
   }
 
   #[test]

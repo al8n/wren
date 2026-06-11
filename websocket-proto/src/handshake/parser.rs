@@ -163,12 +163,22 @@ pub(crate) fn is_token(s: &str) -> bool {
   !s.is_empty() && s.bytes().all(is_token_byte)
 }
 
+/// Splits a comma-separated list value into its non-empty, OWS-trimmed
+/// elements. RFC 9110 §5.6.1.2: "a recipient MUST parse and ignore a
+/// reasonable number of empty list elements" — EVERY list consumer in the
+/// crate routes through here, so the empty-element rule lives in exactly one
+/// place instead of being rediscovered per open-coded `split(',')`.
+pub(crate) fn list_elements(value: &str) -> impl Iterator<Item = &str> {
+  value
+    .split(',')
+    .map(|item| item.trim_matches([' ', '\t']))
+    .filter(|item| !item.is_empty())
+}
+
 /// Whether a comma-separated token list contains `token`
 /// (ASCII case-insensitive, OWS-tolerant) — e.g. `Connection: keep-alive, Upgrade`.
 pub(crate) fn token_list_contains(value: &str, token: &str) -> bool {
-  value
-    .split(',')
-    .any(|item| item.trim_matches([' ', '\t']).eq_ignore_ascii_case(token))
+  list_elements(value).any(|item| item.eq_ignore_ascii_case(token))
 }
 
 /// Parses one head from the front of `input`.
