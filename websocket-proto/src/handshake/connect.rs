@@ -66,6 +66,11 @@ pub enum ConnectRequestError {
   #[error("missing sec-websocket-version")]
   MissingVersion,
 
+  /// `sec-websocket-version` appeared more than once — ambiguous, since
+  /// another layer might combine or pick a different occurrence.
+  #[error("sec-websocket-version must appear exactly once")]
+  DuplicateVersion,
+
   /// `sec-websocket-version` present but not 13.
   #[error("unsupported sec-websocket-version (only 13)")]
   UnsupportedVersion,
@@ -381,6 +386,14 @@ pub fn validate_connect_request<'a>(
       .is_some_and(|p| p.eq_ignore_ascii_case("websocket"));
   if !protocol_ok {
     return Err(ConnectRequestError::NotWebSocket);
+  }
+  // Singleton, like the pseudo-headers above: an ambiguous repeated version
+  // (which another layer might combine or read differently) must not pass
+  // the gate — h1's duplicate-singleton rejection, mirrored.
+  match count("sec-websocket-version") {
+    0 => return Err(ConnectRequestError::MissingVersion),
+    1 => {}
+    _ => return Err(ConnectRequestError::DuplicateVersion),
   }
   match view.get("sec-websocket-version") {
     None => return Err(ConnectRequestError::MissingVersion),
@@ -742,6 +755,37 @@ mod tests {
       validate_connect_request(missing).unwrap_err(),
       ConnectRequestError::MissingVersion
     ));
+
+    // The version header is a singleton: a repeat is ambiguous and fails the
+    // gate — even when every occurrence says 13, and regardless of order.
+    for dup in [
+      &[
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-version", "13"),
+      ] as &[(&str, &str)],
+      &[
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-version", "12"),
+      ],
+      &[
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        ("sec-websocket-version", "12"),
+        ("sec-websocket-version", "13"),
+      ],
+    ] {
+      assert!(
+        matches!(
+          validate_connect_request(dup).unwrap_err(),
+          ConnectRequestError::DuplicateVersion
+        ),
+        "{dup:?}"
+      );
+    }
   }
 
   #[test]
