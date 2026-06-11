@@ -48,6 +48,7 @@ portable-atomic-util = { workspace = true, optional = true }
 [dev-dependencies]
 base64 = "0.22"
 proptest = "1"
+rand_core.workspace = true
 no-panic = "0.1"
 
 [[example]]
