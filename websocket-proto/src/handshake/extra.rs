@@ -140,7 +140,37 @@ impl<'s, 'a> ExtraHeaders<'s, 'a> {
     }
     Ok(())
   }
+
+  /// Rejects entries whose names collide with the handshake-managed headers
+  /// (minus `exempt`, ASCII case-insensitive). A colliding extra would put
+  /// bytes on the wire that contradict the machine's own negotiation state —
+  /// e.g. an extra `Sec-WebSocket-Extensions` granting deflate the returned
+  /// [`Negotiated`](crate::negotiation::Negotiated) knows nothing about.
+  pub(crate) fn validate_no_managed_collision(&self, exempt: &[&str]) -> Result<(), &'static str> {
+    for (name, _) in self.entries {
+      let managed = MANAGED.iter().any(|m| name.eq_ignore_ascii_case(m));
+      let exempted = exempt.iter().any(|e| name.eq_ignore_ascii_case(e));
+      if managed && !exempted {
+        return Err("extra header collides with a managed header");
+      }
+    }
+    Ok(())
+  }
 }
+
+/// Headers the handshake machines manage themselves; caller extras must not
+/// collide (the wire would contradict the negotiation state). Shared by both
+/// roles.
+pub(crate) const MANAGED: &[&str] = &[
+  "host",
+  "upgrade",
+  "connection",
+  "sec-websocket-key",
+  "sec-websocket-version",
+  "sec-websocket-protocol",
+  "sec-websocket-extensions",
+  "sec-websocket-accept",
+];
 
 /// An incremental, allocation-free builder for [`ExtraHeaders`]: a bounded
 /// inline list of `(name, value)` pairs.

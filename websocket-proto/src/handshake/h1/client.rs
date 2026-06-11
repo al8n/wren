@@ -13,18 +13,6 @@ use crate::{
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 use rand_core::Rng as RngCore;
 
-/// Headers this machine manages itself; user extra headers must not collide.
-const MANAGED: &[&str] = &[
-  "host",
-  "upgrade",
-  "connection",
-  "sec-websocket-key",
-  "sec-websocket-version",
-  "sec-websocket-protocol",
-  "sec-websocket-extensions",
-  "sec-websocket-accept",
-];
-
 /// Detail payload: which handshake option was rejected and why.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Display)]
 #[display("invalid handshake option: {what}")]
@@ -222,14 +210,11 @@ impl<'a> ClientHandshake<'a> {
         return Err(invalid("subprotocol is not a token"));
       }
     }
-    // Token + CR/LF checks are shared with the server; the managed-name
-    // collision check is the client's alone.
     options.extra_headers.validate().map_err(invalid)?;
-    for (name, _) in options.extra_headers.iter() {
-      if MANAGED.iter().any(|m| name.eq_ignore_ascii_case(m)) {
-        return Err(invalid("extra header collides with a managed header"));
-      }
-    }
+    options
+      .extra_headers
+      .validate_no_managed_collision(&[])
+      .map_err(invalid)?;
     #[cfg(feature = "deflate")]
     if let Some(offer) = &options.deflate {
       offer

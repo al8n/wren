@@ -185,10 +185,11 @@ impl<'a> Accept<'a> {
     self
   }
 
-  /// Additional response headers. CR/LF and non-token names are rejected
-  /// at encode time; collisions with the managed handshake headers are NOT
-  /// policed (unlike the client side) — duplicating e.g.
-  /// `Sec-WebSocket-Accept` here is the caller's own foot-gun.
+  /// Additional response headers. CR/LF, non-token names, and collisions
+  /// with the handshake-managed headers are all rejected at encode time —
+  /// a colliding extra (e.g. `Sec-WebSocket-Extensions`) would grant
+  /// capabilities on the wire that the returned
+  /// [`Negotiated`](crate::negotiation::Negotiated) does not carry.
   #[must_use]
   pub fn with_extra_headers(mut self, extra_headers: impl Into<ExtraHeaders<'a, 'a>>) -> Self {
     self.extra_headers = extra_headers.into();
@@ -346,6 +347,14 @@ impl ServerHandshake {
       .extra_headers
       .validate()
       .map_err(ServerHandshakeError::InvalidResponseOption)?;
+    // No managed collisions: an extra `Sec-WebSocket-Extensions` /
+    // `Sec-WebSocket-Protocol` would grant capabilities ON THE WIRE that the
+    // returned `Negotiated` does not carry — the peer then compresses or
+    // assumes a subprotocol against a connection configured for neither.
+    accept
+      .extra_headers
+      .validate_no_managed_collision(&[])
+      .map_err(ServerHandshakeError::InvalidResponseOption)?;
 
     #[cfg(feature = "deflate")]
     let negotiated = negotiated.with_deflate(accept.deflate.map(|r| r.params()));
@@ -378,6 +387,16 @@ impl ServerHandshake {
     rejection
       .extra_headers
       .validate()
+      .map_err(ServerHandshakeError::InvalidResponseOption)?;
+    // Managed collisions are rejected here too — `encode_rejection` writes
+    // its own `Connection: close`, and a spoofed `Sec-WebSocket-Accept`
+    // could dress a rejection up as an acceptance. `Sec-WebSocket-Version`
+    // is exempt: a rejection legitimately advertises the supported version
+    // (RFC 6455 §4.2.2's 426 answer — see `Rejection::unsupported_version`),
+    // and no `Negotiated` exists on this path to contradict.
+    rejection
+      .extra_headers
+      .validate_no_managed_collision(&["sec-websocket-version"])
       .map_err(ServerHandshakeError::InvalidResponseOption)?;
 
     let mut status = [0u8; 3];
@@ -764,20 +783,69 @@ Sec-WebSocket-Version: 13\r\n\
     ));
   }
 
-  // The server, unlike the client, does NOT police collisions with the headers
-  // it manages itself — duplicating a managed name is the caller's foot-gun.
+  /// Regression (Codex R9): a managed-name extra would put bytes on the wire
+  /// that contradict the returned `Negotiated` — an extra
+  /// `Sec-WebSocket-Extensions: permessage-deflate` makes the peer compress
+  /// against a connection configured without deflate. All managed names are
+  /// rejected on the accept path.
   #[test]
-  fn accept_allows_managed_name_collisions() {
+  fn accept_rejects_managed_name_collisions() {
     let v = view(GOOD);
     let mut buf = [0u8; 512];
-    let accept = Accept::new().with_extra_headers(&[("Sec-WebSocket-Accept", "spoof")]);
-    let (n, _) = ServerHandshake::new()
-      .encode_response(&v, &accept, &mut buf)
+    for bad in [
+      [("Sec-WebSocket-Accept", "spoof")],
+      [("Sec-WebSocket-Extensions", "permessage-deflate")],
+      [("Sec-WebSocket-Protocol", "chat")],
+      [("Upgrade", "h2c")],
+      [("Connection", "close")],
+    ] {
+      let accept = Accept::new().with_extra_headers(&bad);
+      assert!(
+        matches!(
+          ServerHandshake::new()
+            .encode_response(&v, &accept, &mut buf)
+            .unwrap_err(),
+          ServerHandshakeError::InvalidResponseOption(
+            "extra header collides with a managed header"
+          )
+        ),
+        "{bad:?}"
+      );
+    }
+  }
+
+  /// Rejections police managed names too (a spoofed `Sec-WebSocket-Accept`
+  /// could dress a rejection up as an acceptance) — but
+  /// `Sec-WebSocket-Version` is exempt: the RFC 6455 §4.2.2 wrong-version
+  /// answer carries it, and no `Negotiated` exists on the rejection path.
+  #[test]
+  fn rejection_polices_managed_names_except_version() {
+    let mut buf = [0u8; 256];
+
+    // The 426 preset (which sets Sec-WebSocket-Version) still works.
+    let n = ServerHandshake::new()
+      .encode_rejection(&Rejection::unsupported_version(), &mut buf)
       .unwrap();
-    let resp = core::str::from_utf8(&buf[..n]).unwrap();
     assert!(
-      resp.contains("\r\nSec-WebSocket-Accept: spoof\r\n"),
-      "{resp}"
+      core::str::from_utf8(&buf[..n])
+        .unwrap()
+        .contains("\r\nSec-WebSocket-Version: 13\r\n")
+    );
+
+    // Other managed names are rejected.
+    let bad =
+      Rejection::new(403, "Forbidden").with_extra_headers(&[("Sec-WebSocket-Accept", "spoof")]);
+    assert!(matches!(
+      ServerHandshake::new()
+        .encode_rejection(&bad, &mut buf)
+        .unwrap_err(),
+      ServerHandshakeError::InvalidResponseOption("extra header collides with a managed header")
+    ));
+    let bad = Rejection::new(403, "Forbidden").with_extra_headers(&[("Upgrade", "h2c")]);
+    assert!(
+      ServerHandshake::new()
+        .encode_rejection(&bad, &mut buf)
+        .is_err()
     );
   }
 
