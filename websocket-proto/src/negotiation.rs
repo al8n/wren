@@ -639,13 +639,14 @@ pub use deflate::{
 /// Server-side helper: the first of the CLIENT's offers (in client order)
 /// that the server supports. Returns `None` when there is no overlap —
 /// the server then accepts without a subprotocol.
+///
+/// Matching is case-SENSITIVE: RFC 6455 §11.5 registers subprotocol
+/// identifiers as case-sensitive (unlike `Upgrade`/`Connection` tokens).
 pub fn select_subprotocol<'a>(
   offered: impl IntoIterator<Item = &'a str>,
   supported: &[&str],
 ) -> Option<&'a str> {
-  offered
-    .into_iter()
-    .find(|offer| supported.iter().any(|s| s.eq_ignore_ascii_case(offer)))
+  offered.into_iter().find(|offer| supported.contains(offer))
 }
 
 #[cfg(all(test, feature = "std", feature = "deflate"))]
@@ -868,6 +869,15 @@ mod tests {
       Negotiated::with_subprotocol("").unwrap_err(),
       NegotiationError::InvalidSubprotocol
     ));
+  }
+
+  #[test]
+  fn subprotocol_matching_is_case_sensitive() {
+    // RFC 6455 §11.5: subprotocol identifiers are case-sensitive — `CHAT`
+    // is NOT the offered `chat`.
+    assert_eq!(select_subprotocol(["chat"], &["CHAT"]), None);
+    assert_eq!(select_subprotocol(["CHAT"], &["chat"]), None);
+    assert_eq!(select_subprotocol(["chat"], &["chat"]), Some("chat"));
   }
 
   #[test]

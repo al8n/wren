@@ -356,11 +356,7 @@ impl<'a> ClientHandshake<'a> {
     let negotiated = match headers.get("sec-websocket-protocol") {
       None => Negotiated::none(),
       Some(chosen) => {
-        let offered = self
-          .options
-          .subprotocols
-          .iter()
-          .any(|p| p.eq_ignore_ascii_case(chosen));
+        let offered = self.options.subprotocols.iter().any(|p| *p == chosen);
         if !offered || !is_token(chosen) {
           return Err(ClientHandshakeError::SubprotocolNotOffered);
         }
@@ -603,6 +599,19 @@ mod tests {
     assert!(matches!(
       hs.handle(resp).unwrap_err(),
       ClientHandshakeError::AcceptMismatch
+    ));
+  }
+
+  #[test]
+  fn subprotocol_selection_is_case_sensitive() {
+    // RFC 6455 §11.5: identifiers are case-sensitive. The client offered
+    // "chat"/"superchat"; a server selecting "CHAT" selected something we
+    // never offered.
+    let hs = handshake();
+    let resp = response_for(&hs, "Sec-WebSocket-Protocol: CHAT\r\n");
+    assert!(matches!(
+      hs.handle(&resp).unwrap_err(),
+      ClientHandshakeError::SubprotocolNotOffered
     ));
   }
 

@@ -574,10 +574,7 @@ pub fn validate_connect_response(
   let mut negotiated = match get("sec-websocket-protocol") {
     None => Negotiated::none(),
     Some(chosen) => {
-      let offered = request
-        .subprotocols
-        .iter()
-        .any(|p| p.eq_ignore_ascii_case(chosen));
+      let offered = request.subprotocols.iter().any(|p| *p == chosen);
       if !offered || !is_token(chosen) {
         return Err(ConnectResponseError::SubprotocolNotOffered);
       }
@@ -816,6 +813,13 @@ mod tests {
     // A subprotocol we didn't offer fails.
     let response: &[(&str, &str)] = &[("sec-websocket-protocol", "nope")];
     assert!(validate_connect_response(response, &req).is_err());
+
+    // Case matters (RFC 6455 §11.5): "CHAT" is not the offered "chat".
+    let response: &[(&str, &str)] = &[("sec-websocket-protocol", "CHAT")];
+    assert!(matches!(
+      validate_connect_response(response, &req).unwrap_err(),
+      ConnectResponseError::SubprotocolNotOffered
+    ));
 
     // No subprotocol → none negotiated.
     let response: &[(&str, &str)] = &[];

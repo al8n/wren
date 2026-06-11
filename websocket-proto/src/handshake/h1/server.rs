@@ -335,9 +335,7 @@ impl ServerHandshake {
     let negotiated = match accept.subprotocol {
       None => Negotiated::none(),
       Some(chosen) => {
-        let offered = request
-          .subprotocols()
-          .any(|o| o.eq_ignore_ascii_case(chosen));
+        let offered = request.subprotocols().any(|o| o == chosen);
         if !offered || !is_token(chosen) {
           return Err(ServerHandshakeError::SubprotocolNotOffered);
         }
@@ -629,6 +627,15 @@ Sec-WebSocket-Version: 13\r\n\
     let v = view(GOOD);
     let mut buf = [0u8; 512];
     let accept = Accept::new().with_subprotocol(Some("nope"));
+    assert!(matches!(
+      ServerHandshake::new()
+        .encode_response(&v, &accept, &mut buf)
+        .unwrap_err(),
+      ServerHandshakeError::SubprotocolNotOffered
+    ));
+
+    // Case matters (RFC 6455 §11.5): the client offered "chat", not "CHAT".
+    let accept = Accept::new().with_subprotocol(Some("CHAT"));
     assert!(matches!(
       ServerHandshake::new()
         .encode_response(&v, &accept, &mut buf)
