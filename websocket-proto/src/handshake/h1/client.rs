@@ -101,7 +101,7 @@ pub struct ClientOptions<'a> {
   host: &'a str,
   path: &'a str,
   subprotocols: &'a [&'a str],
-  extra_headers: ExtraHeaders<'a>,
+  extra_headers: ExtraHeaders<'a, 'a>,
   #[cfg(feature = "deflate")]
   deflate: Option<crate::negotiation::DeflateOffer>,
 }
@@ -114,7 +114,7 @@ impl<'a> ClientOptions<'a> {
       host,
       path,
       subprotocols: &[],
-      extra_headers: ExtraHeaders::new(&[]),
+      extra_headers: ExtraHeaders::new(),
       #[cfg(feature = "deflate")]
       deflate: None,
     }
@@ -131,8 +131,8 @@ impl<'a> ClientOptions<'a> {
   /// tokens, must not collide with the managed handshake headers, and
   /// values must not contain CR/LF.
   #[must_use]
-  pub const fn with_extra_headers(mut self, extra_headers: ExtraHeaders<'a>) -> Self {
-    self.extra_headers = extra_headers;
+  pub fn with_extra_headers(mut self, extra_headers: impl Into<ExtraHeaders<'a, 'a>>) -> Self {
+    self.extra_headers = extra_headers.into();
     self
   }
 
@@ -356,7 +356,7 @@ impl<'a> ClientHandshake<'a> {
     let negotiated = match headers.get("sec-websocket-protocol") {
       None => Negotiated::none(),
       Some(chosen) => {
-        let offered = self.options.subprotocols.iter().any(|p| *p == chosen);
+        let offered = self.options.subprotocols.contains(&chosen);
         if !offered || !is_token(chosen) {
           return Err(ClientHandshakeError::SubprotocolNotOffered);
         }
@@ -426,7 +426,7 @@ mod tests {
   fn handshake() -> ClientHandshake<'static> {
     let options = ClientOptions::new("server.example.com", "/chat")
       .with_subprotocols(&["chat", "superchat"])
-      .with_extra_headers(ExtraHeaders::new(&[("Origin", "http://example.com")]));
+      .with_extra_headers(&[("Origin", "http://example.com")]);
     ClientHandshake::new(options, &mut CountingRng(0)).unwrap()
   }
 
@@ -473,14 +473,12 @@ mod tests {
 
   #[test]
   fn options_reject_header_injection_and_reserved_names() {
-    let bad = ClientOptions::new("h", "/")
-      .with_extra_headers(ExtraHeaders::new(&[("X-Evil", "a\r\nX-Injected: b")]));
+    let bad = ClientOptions::new("h", "/").with_extra_headers(&[("X-Evil", "a\r\nX-Injected: b")]);
     assert!(matches!(
       ClientHandshake::new(bad, &mut CountingRng(0)).unwrap_err(),
       ClientHandshakeError::InvalidOptions(_)
     ));
-    let reserved = ClientOptions::new("h", "/")
-      .with_extra_headers(ExtraHeaders::new(&[("Sec-WebSocket-Key", "x")]));
+    let reserved = ClientOptions::new("h", "/").with_extra_headers(&[("Sec-WebSocket-Key", "x")]);
     assert!(matches!(
       ClientHandshake::new(reserved, &mut CountingRng(0)).unwrap_err(),
       ClientHandshakeError::InvalidOptions(_)

@@ -574,7 +574,7 @@ pub fn validate_connect_response(
   let mut negotiated = match get("sec-websocket-protocol") {
     None => Negotiated::none(),
     Some(chosen) => {
-      let offered = request.subprotocols.iter().any(|p| *p == chosen);
+      let offered = request.subprotocols.contains(&chosen);
       if !offered || !is_token(chosen) {
         return Err(ConnectResponseError::SubprotocolNotOffered);
       }

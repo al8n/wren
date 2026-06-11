@@ -161,7 +161,7 @@ pub enum ServerProgress<'a> {
 #[derive(Debug, Copy, Clone, Default)]
 pub struct Accept<'a> {
   subprotocol: Option<&'a str>,
-  extra_headers: ExtraHeaders<'a>,
+  extra_headers: ExtraHeaders<'a, 'a>,
   #[cfg(feature = "deflate")]
   deflate: Option<crate::negotiation::DeflateResponse>,
 }
@@ -171,7 +171,7 @@ impl<'a> Accept<'a> {
   pub const fn new() -> Self {
     Self {
       subprotocol: None,
-      extra_headers: ExtraHeaders::new(&[]),
+      extra_headers: ExtraHeaders::new(),
       #[cfg(feature = "deflate")]
       deflate: None,
     }
@@ -190,8 +190,8 @@ impl<'a> Accept<'a> {
   /// policed (unlike the client side) — duplicating e.g.
   /// `Sec-WebSocket-Accept` here is the caller's own foot-gun.
   #[must_use]
-  pub const fn with_extra_headers(mut self, extra_headers: ExtraHeaders<'a>) -> Self {
-    self.extra_headers = extra_headers;
+  pub fn with_extra_headers(mut self, extra_headers: impl Into<ExtraHeaders<'a, 'a>>) -> Self {
+    self.extra_headers = extra_headers.into();
     self
   }
 
@@ -215,7 +215,7 @@ impl<'a> Accept<'a> {
 pub struct Rejection<'a> {
   status: u16,
   reason: &'a str,
-  extra_headers: ExtraHeaders<'a>,
+  extra_headers: ExtraHeaders<'a, 'a>,
 }
 
 impl<'a> Rejection<'a> {
@@ -225,7 +225,7 @@ impl<'a> Rejection<'a> {
     Self {
       status,
       reason,
-      extra_headers: ExtraHeaders::new(&[]),
+      extra_headers: ExtraHeaders::new(),
     }
   }
 
@@ -235,14 +235,14 @@ impl<'a> Rejection<'a> {
     Self {
       status: 426,
       reason: "Upgrade Required",
-      extra_headers: ExtraHeaders::new(&[("Sec-WebSocket-Version", "13")]),
+      extra_headers: ExtraHeaders::from_entries(&[("Sec-WebSocket-Version", "13")]),
     }
   }
 
   /// Additional response headers.
   #[must_use]
-  pub const fn with_extra_headers(mut self, extra_headers: ExtraHeaders<'a>) -> Self {
-    self.extra_headers = extra_headers;
+  pub fn with_extra_headers(mut self, extra_headers: impl Into<ExtraHeaders<'a, 'a>>) -> Self {
+    self.extra_headers = extra_headers.into();
     self
   }
 }
@@ -674,10 +674,7 @@ Sec-WebSocket-Version: 13\r\n\
   fn accept_emits_extra_headers() {
     let v = view(GOOD);
     let mut buf = [0u8; 512];
-    let accept = Accept::new().with_extra_headers(ExtraHeaders::new(&[
-      ("X-Trace-Id", "abc123"),
-      ("Server", "wren"),
-    ]));
+    let accept = Accept::new().with_extra_headers(&[("X-Trace-Id", "abc123"), ("Server", "wren")]);
     let (n, _) = ServerHandshake::new()
       .encode_response(&v, &accept, &mut buf)
       .unwrap();
@@ -687,11 +684,50 @@ Sec-WebSocket-Version: 13\r\n\
   }
 
   #[test]
+  fn extra_headers_builder_round_trips_and_overflows_loudly() {
+    use crate::handshake::ExtraHeadersBuilder;
+
+    // Incrementally-built headers reach the wire like slice-built ones.
+    let v = view(GOOD);
+    let mut buf = [0u8; 512];
+    let headers = ExtraHeadersBuilder::new()
+      .with_header("X-Trace-Id", "abc123")
+      .with_header("Server", "wren");
+    assert_eq!(headers.len(), 2);
+    assert!(!headers.is_full());
+    let accept = Accept::new().with_extra_headers(&headers);
+    let (n, _) = ServerHandshake::new()
+      .encode_response(&v, &accept, &mut buf)
+      .unwrap();
+    let resp = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(resp.contains("\r\nX-Trace-Id: abc123\r\n"), "{resp}");
+    assert!(resp.contains("\r\nServer: wren\r\n"), "{resp}");
+
+    // Past the capacity nothing is dropped silently: the overflow flag is
+    // set and the handshake fails loudly at encode time.
+    let mut overflowing = ExtraHeadersBuilder::<2>::with_capacity();
+    overflowing = overflowing.with_header("A", "1").with_header("B", "2");
+    assert!(overflowing.is_full());
+    assert!(!overflowing.overflowed());
+    overflowing = overflowing.with_header("C", "3");
+    assert!(overflowing.overflowed());
+    assert_eq!(overflowing.len(), 2, "the overflowing pair is not stored");
+
+    let accept = Accept::new().with_extra_headers(&overflowing);
+    assert!(matches!(
+      ServerHandshake::new()
+        .encode_response(&v, &accept, &mut buf)
+        .unwrap_err(),
+      ServerHandshakeError::InvalidResponseOption("extra headers exceeded the builder capacity")
+    ));
+  }
+
+  #[test]
   fn accept_rejects_bad_extra_headers() {
     let v = view(GOOD);
     let mut buf = [0u8; 512];
 
-    let bad_name = Accept::new().with_extra_headers(ExtraHeaders::new(&[("bad name", "x")]));
+    let bad_name = Accept::new().with_extra_headers(&[("bad name", "x")]);
     assert!(matches!(
       ServerHandshake::new()
         .encode_response(&v, &bad_name, &mut buf)
@@ -699,7 +735,7 @@ Sec-WebSocket-Version: 13\r\n\
       ServerHandshakeError::InvalidResponseOption(_)
     ));
 
-    let crlf = Accept::new().with_extra_headers(ExtraHeaders::new(&[("X-Evil", "a\r\nX: b")]));
+    let crlf = Accept::new().with_extra_headers(&[("X-Evil", "a\r\nX: b")]);
     assert!(matches!(
       ServerHandshake::new()
         .encode_response(&v, &crlf, &mut buf)
@@ -712,16 +748,14 @@ Sec-WebSocket-Version: 13\r\n\
   fn rejection_emits_and_validates_extra_headers() {
     let mut buf = [0u8; 256];
 
-    let r = Rejection::new(403, "Forbidden")
-      .with_extra_headers(ExtraHeaders::new(&[("Retry-After", "30")]));
+    let r = Rejection::new(403, "Forbidden").with_extra_headers(&[("Retry-After", "30")]);
     let n = ServerHandshake::new()
       .encode_rejection(&r, &mut buf)
       .unwrap();
     let resp = core::str::from_utf8(&buf[..n]).unwrap();
     assert!(resp.contains("\r\nRetry-After: 30\r\n"), "{resp}");
 
-    let bad = Rejection::new(403, "Forbidden")
-      .with_extra_headers(ExtraHeaders::new(&[("X-Evil", "a\r\nX: b")]));
+    let bad = Rejection::new(403, "Forbidden").with_extra_headers(&[("X-Evil", "a\r\nX: b")]);
     assert!(matches!(
       ServerHandshake::new()
         .encode_rejection(&bad, &mut buf)
@@ -736,8 +770,7 @@ Sec-WebSocket-Version: 13\r\n\
   fn accept_allows_managed_name_collisions() {
     let v = view(GOOD);
     let mut buf = [0u8; 512];
-    let accept =
-      Accept::new().with_extra_headers(ExtraHeaders::new(&[("Sec-WebSocket-Accept", "spoof")]));
+    let accept = Accept::new().with_extra_headers(&[("Sec-WebSocket-Accept", "spoof")]);
     let (n, _) = ServerHandshake::new()
       .encode_response(&v, &accept, &mut buf)
       .unwrap();
@@ -755,7 +788,7 @@ Sec-WebSocket-Version: 13\r\n\
   fn extra_header_value_with_non_crlf_control_is_allowed() {
     let v = view(GOOD);
     let mut buf = [0u8; 512];
-    let accept = Accept::new().with_extra_headers(ExtraHeaders::new(&[("X-Bell", "a\x07b")]));
+    let accept = Accept::new().with_extra_headers(&[("X-Bell", "a\x07b")]);
     let (n, _) = ServerHandshake::new()
       .encode_response(&v, &accept, &mut buf)
       .unwrap();
@@ -770,7 +803,7 @@ Sec-WebSocket-Version: 13\r\n\
     assert_eq!(empty.len(), 0);
     assert_eq!(empty.iter().count(), 0);
 
-    let two = ExtraHeaders::new(&[("A", "1"), ("B", "2")]);
+    let two = ExtraHeaders::from(&[("A", "1"), ("B", "2")]);
     assert!(!two.is_empty());
     assert_eq!(two.len(), 2);
     let collected: Vec<(&str, &str)> = two.iter().collect();

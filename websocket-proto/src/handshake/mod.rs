@@ -20,7 +20,7 @@ pub use parser::{HeadError, MalformedDetail};
 
 mod extra;
 
-pub use extra::ExtraHeaders;
+pub use extra::{ExtraHeaders, ExtraHeadersBuilder};
 
 pub mod h1;
 
