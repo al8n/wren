@@ -192,11 +192,10 @@ impl<'a> ClientHandshake<'a> {
   ) -> Result<Self, ClientHandshakeError> {
     let invalid =
       |what: &'static str| ClientHandshakeError::InvalidOptions(InvalidOptionsDetail::new(what));
-    // An authority admits no whitespace, controls, or DEL (RFC 3986 §3.2 /
-    // RFC 9110 §5.5) — the managed `Host:` field must pass the same bar the
-    // extra-header values do, or the crate emits an invalid handshake.
-    if options.host.is_empty() || options.host.bytes().any(|b| b < 0x21 || b == 0x7F) {
-      return Err(invalid("host empty or contains whitespace/control bytes"));
+    // A `Host:` value is an RFC 3986 authority (RFC 9110 §7.2), not a free
+    // string — URI delimiters, whitespace, and controls are all invalid.
+    if !crate::handshake::parser::is_valid_authority(options.host) {
+      return Err(invalid("host is not a valid authority"));
     }
     // Full RFC 3986 path-and-query grammar (shared with the server gate):
     // rejects whitespace/controls AND a raw `#` — RFC 6455 §3 says the
@@ -498,10 +497,12 @@ mod tests {
     let cased = ClientOptions::new("h", "/").with_subprotocols(&["chat", "CHAT"]);
     assert!(ClientHandshake::new(cased, &mut CountingRng(0)).is_ok());
 
-    // Regression (Codex R13): the managed Host field gets the same
-    // control-byte screen as the extra headers — BEL/NUL/DEL/SP/HTAB in
-    // the host would put an invalid handshake on the wire.
-    for bad_host in ["h\x07st", "h\0st", "h\x7Fst", "h st", "h\tst"] {
+    // Regression (Codex R13+R14): the managed Host field is a full RFC 3986
+    // authority — control bytes, whitespace, AND URI delimiters are all
+    // invalid (a Host is not a URL).
+    for bad_host in [
+      "h\x07st", "h\0st", "h\x7Fst", "h st", "h\tst", "h/chat", "h?x", "h#f", "u@h", "a:b:c",
+    ] {
       assert!(
         matches!(
           ClientHandshake::new(ClientOptions::new(bad_host, "/"), &mut CountingRng(0)).unwrap_err(),

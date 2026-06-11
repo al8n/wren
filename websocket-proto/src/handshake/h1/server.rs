@@ -37,6 +37,10 @@ pub enum ServerHandshakeError {
   #[error("handshake request must carry a Host header")]
   MissingHost,
 
+  /// The Host value is not an RFC 3986 authority (RFC 9110 §7.2).
+  #[error("Host is not a valid authority")]
+  InvalidHost,
+
   /// `Upgrade`/`Connection` did not contain the required tokens.
   #[error("request is not a websocket upgrade")]
   NotAnUpgrade,
@@ -310,6 +314,11 @@ impl ServerHandshake {
     let host = headers.get("host").unwrap_or("");
     if host.is_empty() {
       return Err(ServerHandshakeError::MissingHost);
+    }
+    // §4.2.1.2 requires the server's authority — grammar-checked, so the
+    // application's routing/origin policy never sees a non-authority Host.
+    if !parser::is_valid_authority(host) {
+      return Err(ServerHandshakeError::InvalidHost);
     }
 
     // RFC 9110 §5.3: repeated field lines are one comma-joined list, so the
@@ -700,6 +709,27 @@ Sec-WebSocket-Version: 13\r\n\
   /// recipient to parse and ignore a reasonable number of empty list
   /// elements (this part deliberately diverges from the review's
   /// reject-empties recommendation, with the citation).
+  #[test]
+  fn host_values_are_grammar_checked() {
+    // Regression (Codex R14): the server gate validates Host as an RFC 3986
+    // authority before exposing it to routing/origin policy.
+    let hs = ServerHandshake::new();
+    for bad in ["h/chat", "h?x", "h#f", "u@h", "h st", "a:b:c", "[::1"] {
+      let req = replaced("Host: server.example.com\r\n", &format!("Host: {bad}\r\n"));
+      assert!(
+        matches!(
+          hs.handle(&req).unwrap_err(),
+          ServerHandshakeError::InvalidHost
+        ),
+        "{bad:?}"
+      );
+    }
+    for good in ["server.example.com:8080", "[::1]:9001", "10.0.0.1"] {
+      let req = replaced("Host: server.example.com\r\n", &format!("Host: {good}\r\n"));
+      assert!(hs.handle(&req).is_ok(), "{good:?}");
+    }
+  }
+
   #[test]
   fn malformed_subprotocol_offers_fail_the_handshake() {
     let hs = ServerHandshake::new();

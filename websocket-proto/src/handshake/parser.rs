@@ -192,6 +192,75 @@ pub(crate) fn is_valid_query(s: &str) -> bool {
   valid_pq_bytes(s.bytes(), true)
 }
 
+/// RFC 3986 §3.2.2 `reg-name` byte: unreserved / sub-delims (pct-escapes
+/// handled by the caller). URI delimiters (`/ ? # @ :`) are NOT host bytes.
+const fn is_reg_name_byte(b: u8) -> bool {
+  matches!(b,
+    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+    | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=')
+}
+
+/// Validates a `Host:` / `:authority` value against the RFC 3986 §3.2.2
+/// authority grammar (no userinfo, per RFC 9110 §7.2): a `reg-name` or a
+/// bracketed IP-literal, then an optional `":" *DIGIT` port. An authority is
+/// not a URL — `/`, `?`, `#`, `@`, whitespace, and controls are all out.
+pub(crate) fn is_valid_authority(s: &str) -> bool {
+  let port = match s.strip_prefix('[') {
+    // IP-literal: hex / `:` / `.` covers IPv6 incl. IPv4-mapped forms.
+    Some(rest) => {
+      let Some((lit, after)) = rest.split_once(']') else {
+        return false;
+      };
+      if lit.is_empty()
+        || !lit
+          .bytes()
+          .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+      {
+        return false;
+      }
+      if after.is_empty() {
+        return true;
+      }
+      let Some(port) = after.strip_prefix(':') else {
+        return false;
+      };
+      port
+    }
+    // reg-name [":" port] — a reg-name carries no `:`, so the LAST colon
+    // starts the port and any earlier colon fails the byte check below.
+    None => {
+      let (host, port) = match s.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => (s, ""),
+      };
+      if host.is_empty() {
+        return false;
+      }
+      let mut pending_hex: u8 = 0;
+      for b in host.bytes() {
+        if pending_hex > 0 {
+          if !b.is_ascii_hexdigit() {
+            return false;
+          }
+          pending_hex = pending_hex.saturating_sub(1);
+          continue;
+        }
+        match b {
+          b'%' => pending_hex = 2,
+          _ if is_reg_name_byte(b) => {}
+          _ => return false,
+        }
+      }
+      if pending_hex > 0 {
+        return false;
+      }
+      port
+    }
+  };
+  // `port = *DIGIT` — empty is grammatically legal ("example.com:").
+  port.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn valid_pq_bytes(bytes: impl Iterator<Item = u8>, mut in_query: bool) -> bool {
   let mut pending_hex: u8 = 0;
   for b in bytes {

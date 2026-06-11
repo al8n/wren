@@ -122,6 +122,12 @@ pub enum ConnectResponseError {
   #[error("duplicate singleton response header")]
   DuplicateHeader,
 
+  /// The response carried an h1-only upgrade field (`Connection`,
+  /// `Upgrade`, `Sec-WebSocket-Accept`, …) that RFC 8441 §5 /
+  /// RFC 9113 §8.2.2 forbid on this transport.
+  #[error("h1-only header forbidden on an extended CONNECT response")]
+  ForbiddenHeader,
+
   /// Negotiation storage/grammar failure.
   #[error("{0}")]
   Negotiation(#[from] NegotiationError),
@@ -177,9 +183,9 @@ impl<'a> ConnectRequest<'a> {
   /// a deflate offer is present. No allocation: any deflate value is rendered
   /// once into the view.
   pub fn headers(&self) -> Result<ConnectRequestHeaders<'a>, ConnectRequestError> {
-    // Same bar as the h1 client's Host: an authority admits no whitespace,
-    // controls, or DEL (RFC 3986 §3.2).
-    if self.authority.is_empty() || self.authority.bytes().any(|b| b < 0x21 || b == 0x7F) {
+    // Same bar as the h1 client's Host: an `:authority` is an RFC 3986
+    // authority, not a free string.
+    if !crate::handshake::parser::is_valid_authority(self.authority) {
       return Err(ConnectRequestError::InvalidField("authority"));
     }
     // Shared RFC 3986 path-and-query grammar — also rejects a raw `#`
@@ -390,6 +396,26 @@ impl<'a> ConnectRequestView<'a> {
   }
 }
 
+/// RFC 8441 §5: the h1 upgrade machinery has no place on this transport —
+/// Sec-WebSocket-Key/Accept are not used, and HTTP/2 (RFC 9113 §8.2.2) /
+/// HTTP/3 treat connection-specific fields as malformed outright. Both
+/// validators (request gate AND response check) reject the class rather
+/// than trusting the adapter to have filtered.
+fn has_forbidden_h1_field(headers: &[(&str, &str)]) -> bool {
+  const FORBIDDEN: &[&str] = &[
+    "connection",
+    "upgrade",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "sec-websocket-key",
+    "sec-websocket-accept",
+  ];
+  headers
+    .iter()
+    .any(|(name, _)| FORBIDDEN.iter().any(|f| name.eq_ignore_ascii_case(f)))
+}
+
 /// Server-side validation of an extended-CONNECT header list. STRICT: this is
 /// usable as the WebSocket gate on its own — it requires exactly one
 /// `:method` of `CONNECT` (case-sensitive, RFC 9110 §9.1) and exactly one
@@ -441,8 +467,10 @@ pub fn validate_connect_request<'a>(
   if !path_ok {
     return Err(ConnectRequestError::InvalidPath);
   }
-  let authority_ok =
-    count(":authority") == 1 && view.get(":authority").is_some_and(|a| !a.is_empty());
+  let authority_ok = count(":authority") == 1
+    && view
+      .get(":authority")
+      .is_some_and(crate::handshake::parser::is_valid_authority);
   if !authority_ok {
     return Err(ConnectRequestError::InvalidAuthority);
   }
@@ -461,23 +489,8 @@ pub fn validate_connect_request<'a>(
     }
     Some(_) => {}
   }
-  // RFC 8441 §5: the h1 upgrade machinery has no place on this transport —
-  // Sec-WebSocket-Key/Accept are not used, and HTTP/2 (RFC 9113 §8.2.2) /
-  // HTTP/3 treat connection-specific fields as malformed outright. A strict
-  // gate rejects them rather than trusting the adapter to have filtered.
-  const FORBIDDEN: &[&str] = &[
-    "connection",
-    "upgrade",
-    "keep-alive",
-    "proxy-connection",
-    "transfer-encoding",
-    "sec-websocket-key",
-    "sec-websocket-accept",
-  ];
-  for (name, _) in headers {
-    if FORBIDDEN.iter().any(|f| name.eq_ignore_ascii_case(f)) {
-      return Err(ConnectRequestError::ForbiddenHeader);
-    }
+  if has_forbidden_h1_field(headers) {
+    return Err(ConnectRequestError::ForbiddenHeader);
   }
   // Mirror of the h1 server's offer-list rule: non-token or repeated
   // elements fail the gate; empty elements are ignored (RFC 9110 §5.6.1.2).
@@ -654,6 +667,13 @@ pub fn validate_connect_response(
       .find_map(|(n, v)| n.eq_ignore_ascii_case(name).then_some(*v))
   };
 
+  // Symmetric with the request gate: h1-only and connection-specific
+  // fields are just as forbidden on the response (RFC 8441 §5 /
+  // RFC 9113 §8.2.2).
+  if has_forbidden_h1_field(headers) {
+    return Err(ConnectResponseError::ForbiddenHeader);
+  }
+
   if count("sec-websocket-protocol") > 1 {
     return Err(ConnectResponseError::DuplicateHeader);
   }
@@ -764,6 +784,102 @@ mod tests {
         .headers()
         .is_ok()
     );
+  }
+
+  /// Regression (Codex R14): `Host:`/`:authority` values are RFC 3986
+  /// authorities — URI delimiters, whitespace, controls, and malformed
+  /// IP-literals/ports fail BOTH the builders and the gates; valid
+  /// reg-names, ports, and bracketed IPv6 forms pass.
+  #[test]
+  fn authorities_are_grammar_checked() {
+    let base = |authority: &'static str| -> Vec<(&'static str, &'static str)> {
+      vec![
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        (":scheme", "https"),
+        (":path", "/chat"),
+        (":authority", authority),
+        ("sec-websocket-version", "13"),
+      ]
+    };
+    for bad in [
+      "example.com/chat",
+      "example.com?x",
+      "example.com#frag",
+      "user@example.com",
+      "ex am.com",
+      "ex\tam.com",
+      "ex\x07am.com",
+      "ex\x7Fam.com",
+      "a:b:c",
+      "example.com:8x",
+      "[::1",
+      "[::1]x",
+      "[]",
+      "",
+    ] {
+      // Inbound gate.
+      let headers = base(bad);
+      assert!(
+        matches!(
+          validate_connect_request(&headers).unwrap_err(),
+          ConnectRequestError::InvalidAuthority
+        ),
+        "gate accepted {bad:?}"
+      );
+      // Outbound builder.
+      assert!(
+        ConnectRequest::new(Scheme::Https, bad, "/")
+          .headers()
+          .is_err(),
+        "builder accepted {bad:?}"
+      );
+    }
+    for good in [
+      "example.com",
+      "example.com:8080",
+      "example.com:",
+      "10.0.0.1:443",
+      "[::1]:8080",
+      "[2001:db8::1]",
+      "%41.com",
+    ] {
+      let headers = base(good);
+      assert!(validate_connect_request(&headers).is_ok(), "{good:?}");
+      assert!(
+        ConnectRequest::new(Scheme::Https, good, "/")
+          .headers()
+          .is_ok(),
+        "{good:?}"
+      );
+    }
+  }
+
+  /// Regression (Codex R14): the response check is symmetric with the
+  /// request gate — h1-only fields fail `validate_connect_response` too.
+  #[test]
+  fn connect_response_rejects_h1_only_headers() {
+    let req = ConnectRequest::new(Scheme::Https, "h", "/");
+    for (name, value) in [
+      ("connection", "Upgrade"),
+      ("Upgrade", "websocket"),
+      ("keep-alive", "timeout=5"),
+      ("proxy-connection", "keep-alive"),
+      ("transfer-encoding", "chunked"),
+      ("sec-websocket-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
+      ("sec-websocket-accept", "x"),
+    ] {
+      let response: &[(&str, &str)] = &[(name, value)];
+      assert!(
+        matches!(
+          validate_connect_response(response, &req).unwrap_err(),
+          ConnectResponseError::ForbiddenHeader
+        ),
+        "{name}"
+      );
+    }
+    // A clean (empty) response still validates.
+    assert!(validate_connect_response(&[], &req).is_ok());
   }
 
   /// Regression (Codex R13): RFC 8441 §5 / RFC 9113 §8.2.2 — h1 upgrade
