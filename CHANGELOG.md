@@ -33,7 +33,10 @@ The first functional cycle of the Sans-I/O WebSocket protocol core. Highlights:
 
 - HTTP/1.1 opening handshake for both roles (RFC 6455 §4): stateless re-parsing
   request/response validators, subprotocol selection, and permessage-deflate
-  offer/accept.
+  offer/accept. Caller-supplied extra headers are passed as an `ExtraHeaders`
+  newtype (`ClientOptions` / `Accept` / `Rejection`), with shared token + CR/LF
+  validation; the client additionally rejects names that collide with the
+  headers it manages.
 - RFC 8441 / RFC 9220 negotiation surfaces (the header-data form of the same
   negotiation for WebSocket over HTTP/2 and HTTP/3).
 

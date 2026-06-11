@@ -4,7 +4,7 @@ use crate::{
   constants,
   error::BufferTooSmallDetail,
   handshake::{
-    WriteCursor, accept_value,
+    ExtraHeaders, WriteCursor, accept_value,
     parser::{self, Head, HeadError, Parsed, is_token, token_list_contains},
   },
   negotiation::{Negotiated, NegotiationError},
@@ -161,7 +161,7 @@ pub enum ServerProgress<'a> {
 #[derive(Debug, Copy, Clone, Default)]
 pub struct Accept<'a> {
   subprotocol: Option<&'a str>,
-  extra_headers: &'a [(&'a str, &'a str)],
+  extra_headers: ExtraHeaders<'a>,
   #[cfg(feature = "deflate")]
   deflate: Option<crate::negotiation::DeflateResponse>,
 }
@@ -171,7 +171,7 @@ impl<'a> Accept<'a> {
   pub const fn new() -> Self {
     Self {
       subprotocol: None,
-      extra_headers: &[],
+      extra_headers: ExtraHeaders::new(&[]),
       #[cfg(feature = "deflate")]
       deflate: None,
     }
@@ -190,7 +190,7 @@ impl<'a> Accept<'a> {
   /// policed (unlike the client side) — duplicating e.g.
   /// `Sec-WebSocket-Accept` here is the caller's own foot-gun.
   #[must_use]
-  pub const fn with_extra_headers(mut self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
+  pub const fn with_extra_headers(mut self, extra_headers: ExtraHeaders<'a>) -> Self {
     self.extra_headers = extra_headers;
     self
   }
@@ -215,7 +215,7 @@ impl<'a> Accept<'a> {
 pub struct Rejection<'a> {
   status: u16,
   reason: &'a str,
-  extra_headers: &'a [(&'a str, &'a str)],
+  extra_headers: ExtraHeaders<'a>,
 }
 
 impl<'a> Rejection<'a> {
@@ -225,7 +225,7 @@ impl<'a> Rejection<'a> {
     Self {
       status,
       reason,
-      extra_headers: &[],
+      extra_headers: ExtraHeaders::new(&[]),
     }
   }
 
@@ -235,13 +235,13 @@ impl<'a> Rejection<'a> {
     Self {
       status: 426,
       reason: "Upgrade Required",
-      extra_headers: &[("Sec-WebSocket-Version", "13")],
+      extra_headers: ExtraHeaders::new(&[("Sec-WebSocket-Version", "13")]),
     }
   }
 
   /// Additional response headers.
   #[must_use]
-  pub const fn with_extra_headers(mut self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
+  pub const fn with_extra_headers(mut self, extra_headers: ExtraHeaders<'a>) -> Self {
     self.extra_headers = extra_headers;
     self
   }
@@ -344,7 +344,10 @@ impl ServerHandshake {
         Negotiated::with_subprotocol(chosen)?
       }
     };
-    validate_extras(accept.extra_headers)?;
+    accept
+      .extra_headers
+      .validate()
+      .map_err(ServerHandshakeError::InvalidResponseOption)?;
 
     #[cfg(feature = "deflate")]
     let negotiated = negotiated.with_deflate(accept.deflate.map(|r| r.params()));
@@ -374,7 +377,10 @@ impl ServerHandshake {
         "reason contains CR/LF",
       ));
     }
-    validate_extras(rejection.extra_headers)?;
+    rejection
+      .extra_headers
+      .validate()
+      .map_err(ServerHandshakeError::InvalidResponseOption)?;
 
     let mut status = [0u8; 3];
     encode_status(rejection.status, &mut status);
@@ -406,7 +412,7 @@ fn write_accept_response(
     response.write_to(w)?;
     w.push(b"\r\n")?;
   }
-  for (name, value) in accept.extra_headers {
+  for (name, value) in accept.extra_headers.iter() {
     w.push(name.as_bytes())?;
     w.push(b": ")?;
     w.push(value.as_bytes())?;
@@ -425,7 +431,7 @@ fn write_rejection(
   w.push(b" ")?;
   w.push(rejection.reason.as_bytes())?;
   w.push(b"\r\nConnection: close\r\n")?;
-  for (name, value) in rejection.extra_headers {
+  for (name, value) in rejection.extra_headers.iter() {
     w.push(name.as_bytes())?;
     w.push(b": ")?;
     w.push(value.as_bytes())?;
@@ -440,22 +446,6 @@ fn encode_status(status: u16, out: &mut [u8; 3]) {
   *d0 = b'0'.wrapping_add(u8::try_from(status.div_euclid(100).rem_euclid(10)).unwrap_or(0));
   *d1 = b'0'.wrapping_add(u8::try_from(status.div_euclid(10).rem_euclid(10)).unwrap_or(0));
   *d2 = b'0'.wrapping_add(u8::try_from(status.rem_euclid(10)).unwrap_or(0));
-}
-
-fn validate_extras(extras: &[(&str, &str)]) -> Result<(), ServerHandshakeError> {
-  for (name, value) in extras {
-    if !is_token(name) {
-      return Err(ServerHandshakeError::InvalidResponseOption(
-        "extra header name is not a token",
-      ));
-    }
-    if value.bytes().any(|b| b == b'\r' || b == b'\n') {
-      return Err(ServerHandshakeError::InvalidResponseOption(
-        "extra header value contains CR/LF",
-      ));
-    }
-  }
-  Ok(())
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -671,6 +661,113 @@ Sec-WebSocket-Version: 13\r\n\
         .unwrap_err(),
       ServerHandshakeError::InvalidRejectionStatus(200)
     ));
+  }
+
+  #[test]
+  fn accept_emits_extra_headers() {
+    let v = view(GOOD);
+    let mut buf = [0u8; 512];
+    let accept = Accept::new().with_extra_headers(ExtraHeaders::new(&[
+      ("X-Trace-Id", "abc123"),
+      ("Server", "wren"),
+    ]));
+    let (n, _) = ServerHandshake::new()
+      .encode_response(&v, &accept, &mut buf)
+      .unwrap();
+    let resp = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(resp.contains("\r\nX-Trace-Id: abc123\r\n"), "{resp}");
+    assert!(resp.contains("\r\nServer: wren\r\n"), "{resp}");
+  }
+
+  #[test]
+  fn accept_rejects_bad_extra_headers() {
+    let v = view(GOOD);
+    let mut buf = [0u8; 512];
+
+    let bad_name = Accept::new().with_extra_headers(ExtraHeaders::new(&[("bad name", "x")]));
+    assert!(matches!(
+      ServerHandshake::new()
+        .encode_response(&v, &bad_name, &mut buf)
+        .unwrap_err(),
+      ServerHandshakeError::InvalidResponseOption(_)
+    ));
+
+    let crlf = Accept::new().with_extra_headers(ExtraHeaders::new(&[("X-Evil", "a\r\nX: b")]));
+    assert!(matches!(
+      ServerHandshake::new()
+        .encode_response(&v, &crlf, &mut buf)
+        .unwrap_err(),
+      ServerHandshakeError::InvalidResponseOption(_)
+    ));
+  }
+
+  #[test]
+  fn rejection_emits_and_validates_extra_headers() {
+    let mut buf = [0u8; 256];
+
+    let r = Rejection::new(403, "Forbidden")
+      .with_extra_headers(ExtraHeaders::new(&[("Retry-After", "30")]));
+    let n = ServerHandshake::new()
+      .encode_rejection(&r, &mut buf)
+      .unwrap();
+    let resp = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(resp.contains("\r\nRetry-After: 30\r\n"), "{resp}");
+
+    let bad = Rejection::new(403, "Forbidden")
+      .with_extra_headers(ExtraHeaders::new(&[("X-Evil", "a\r\nX: b")]));
+    assert!(matches!(
+      ServerHandshake::new()
+        .encode_rejection(&bad, &mut buf)
+        .unwrap_err(),
+      ServerHandshakeError::InvalidResponseOption(_)
+    ));
+  }
+
+  // The server, unlike the client, does NOT police collisions with the headers
+  // it manages itself — duplicating a managed name is the caller's foot-gun.
+  #[test]
+  fn accept_allows_managed_name_collisions() {
+    let v = view(GOOD);
+    let mut buf = [0u8; 512];
+    let accept =
+      Accept::new().with_extra_headers(ExtraHeaders::new(&[("Sec-WebSocket-Accept", "spoof")]));
+    let (n, _) = ServerHandshake::new()
+      .encode_response(&v, &accept, &mut buf)
+      .unwrap();
+    let resp = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(
+      resp.contains("\r\nSec-WebSocket-Accept: spoof\r\n"),
+      "{resp}"
+    );
+  }
+
+  // The outbound validation mirrors the inbound parser's CR/LF rejection but
+  // deliberately does NOT screen the other C0 control bytes (only CR/LF have
+  // ever been rejected outbound). A bare control byte passes through.
+  #[test]
+  fn extra_header_value_with_non_crlf_control_is_allowed() {
+    let v = view(GOOD);
+    let mut buf = [0u8; 512];
+    let accept = Accept::new().with_extra_headers(ExtraHeaders::new(&[("X-Bell", "a\x07b")]));
+    let (n, _) = ServerHandshake::new()
+      .encode_response(&v, &accept, &mut buf)
+      .unwrap();
+    let resp = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(resp.contains("\r\nX-Bell: a\x07b\r\n"), "{resp:?}");
+  }
+
+  #[test]
+  fn extra_headers_accessors() {
+    let empty = ExtraHeaders::default();
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
+    assert_eq!(empty.iter().count(), 0);
+
+    let two = ExtraHeaders::new(&[("A", "1"), ("B", "2")]);
+    assert!(!two.is_empty());
+    assert_eq!(two.len(), 2);
+    let collected: Vec<(&str, &str)> = two.iter().collect();
+    assert_eq!(collected, [("A", "1"), ("B", "2")]);
   }
 
   #[cfg(feature = "deflate")]

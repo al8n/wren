@@ -18,6 +18,10 @@ pub(crate) mod parser;
 
 pub use parser::{HeadError, MalformedDetail};
 
+mod extra;
+
+pub use extra::ExtraHeaders;
+
 pub mod h1;
 
 pub mod connect;

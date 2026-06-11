@@ -5,7 +5,7 @@ use crate::{
   constants,
   error::BufferTooSmallDetail,
   handshake::{
-    WriteCursor, accept_value,
+    ExtraHeaders, WriteCursor, accept_value,
     parser::{self, HeadError, Parsed, is_token, token_list_contains},
   },
   negotiation::{Negotiated, NegotiationError},
@@ -101,7 +101,7 @@ pub struct ClientOptions<'a> {
   host: &'a str,
   path: &'a str,
   subprotocols: &'a [&'a str],
-  extra_headers: &'a [(&'a str, &'a str)],
+  extra_headers: ExtraHeaders<'a>,
   #[cfg(feature = "deflate")]
   deflate: Option<crate::negotiation::DeflateOffer>,
 }
@@ -114,7 +114,7 @@ impl<'a> ClientOptions<'a> {
       host,
       path,
       subprotocols: &[],
-      extra_headers: &[],
+      extra_headers: ExtraHeaders::new(&[]),
       #[cfg(feature = "deflate")]
       deflate: None,
     }
@@ -131,7 +131,7 @@ impl<'a> ClientOptions<'a> {
   /// tokens, must not collide with the managed handshake headers, and
   /// values must not contain CR/LF.
   #[must_use]
-  pub const fn with_extra_headers(mut self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
+  pub const fn with_extra_headers(mut self, extra_headers: ExtraHeaders<'a>) -> Self {
     self.extra_headers = extra_headers;
     self
   }
@@ -222,15 +222,12 @@ impl<'a> ClientHandshake<'a> {
         return Err(invalid("subprotocol is not a token"));
       }
     }
-    for (name, value) in options.extra_headers {
-      if !is_token(name) {
-        return Err(invalid("extra header name is not a token"));
-      }
+    // Token + CR/LF checks are shared with the server; the managed-name
+    // collision check is the client's alone.
+    options.extra_headers.validate().map_err(invalid)?;
+    for (name, _) in options.extra_headers.iter() {
       if MANAGED.iter().any(|m| name.eq_ignore_ascii_case(m)) {
         return Err(invalid("extra header collides with a managed header"));
-      }
-      if value.bytes().any(|b| b == b'\r' || b == b'\n') {
-        return Err(invalid("extra header value contains CR/LF"));
       }
     }
     #[cfg(feature = "deflate")]
@@ -293,7 +290,7 @@ impl<'a> ClientHandshake<'a> {
       offer.write_to(w)?;
       w.push(b"\r\n")?;
     }
-    for (name, value) in self.options.extra_headers {
+    for (name, value) in self.options.extra_headers.iter() {
       w.push(name.as_bytes())?;
       w.push(b": ")?;
       w.push(value.as_bytes())?;
@@ -433,7 +430,7 @@ mod tests {
   fn handshake() -> ClientHandshake<'static> {
     let options = ClientOptions::new("server.example.com", "/chat")
       .with_subprotocols(&["chat", "superchat"])
-      .with_extra_headers(&[("Origin", "http://example.com")]);
+      .with_extra_headers(ExtraHeaders::new(&[("Origin", "http://example.com")]));
     ClientHandshake::new(options, &mut CountingRng(0)).unwrap()
   }
 
@@ -480,12 +477,14 @@ mod tests {
 
   #[test]
   fn options_reject_header_injection_and_reserved_names() {
-    let bad = ClientOptions::new("h", "/").with_extra_headers(&[("X-Evil", "a\r\nX-Injected: b")]);
+    let bad = ClientOptions::new("h", "/")
+      .with_extra_headers(ExtraHeaders::new(&[("X-Evil", "a\r\nX-Injected: b")]));
     assert!(matches!(
       ClientHandshake::new(bad, &mut CountingRng(0)).unwrap_err(),
       ClientHandshakeError::InvalidOptions(_)
     ));
-    let reserved = ClientOptions::new("h", "/").with_extra_headers(&[("Sec-WebSocket-Key", "x")]);
+    let reserved = ClientOptions::new("h", "/")
+      .with_extra_headers(ExtraHeaders::new(&[("Sec-WebSocket-Key", "x")]));
     assert!(matches!(
       ClientHandshake::new(reserved, &mut CountingRng(0)).unwrap_err(),
       ClientHandshakeError::InvalidOptions(_)
