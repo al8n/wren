@@ -366,13 +366,9 @@ where
     }
 
     loop {
+      // Terminal also covers the peer-close case (RFC 6455 §1.4): the rest of
+      // the input is ignored — no further frames are expected after a close.
       if self.conn.is_terminal() {
-        return None;
-      }
-      // Discard inbound data after the peer's close (RFC 6455 §1.4 — no
-      // further frames are expected; anything that arrives is ignored).
-      if matches!(self.conn.lifecycle, Lifecycle::PeerClosed) {
-        self.data = None;
         return None;
       }
 
@@ -974,7 +970,14 @@ where
         }
         // Peer echo clears the close deadline (handshake complete).
         self.conn.close_deadline = None;
-        self.conn.lifecycle = Lifecycle::PeerClosed;
+        // Terminal IMMEDIATELY (on the connection, not the cursor): a consumer
+        // that handles `CloseReceived` and drops the cursor without asking for
+        // the trailing `Closed` event must still observe `is_terminal()` and
+        // get `HandleError::Terminal` on the next feed — otherwise the
+        // connection wedges in a never-terminal limbo. The in-flight cursor
+        // still delivers `Closed` because `pending_closed` is popped before
+        // the terminal check in `next`.
+        self.conn.lifecycle = Lifecycle::Terminal;
 
         let mut reason_buf = [0u8; MAX_CONTROL_PAYLOAD];
         let rbytes = decoded.reason().as_bytes();
@@ -1443,6 +1446,51 @@ mod tests {
       drain(&mut conn, &bytes),
       [Ev::CloseRecv(1005, "".into()), Ev::Closed(1005, true)]
     );
+  }
+
+  /// Regression (Codex R3): a consumer that handles `CloseReceived` and DROPS
+  /// the cursor without asking for the trailing `Closed` event must still
+  /// observe a terminal connection — the clean-close transition lives on the
+  /// connection, not the cursor.
+  #[test]
+  fn dropping_events_after_close_received_is_still_terminal() {
+    let mut conn = server();
+    let mut payload = [0u8; 16];
+    let n = encode_close_payload(CloseCode::Normal, "bye", &mut payload).unwrap();
+    let mut bytes = frame(Opcode::Close, true, false, &payload[..n]);
+
+    {
+      let mut events = conn.handle(TestInstant(0), &mut bytes).unwrap();
+      assert!(matches!(events.next(), Some(Event::CloseReceived(_))));
+      // Drop WITHOUT consuming the pending `Closed`.
+    }
+    assert!(
+      conn.is_terminal(),
+      "early cursor drop must not strand the lifecycle"
+    );
+    assert_eq!(conn.poll_timeout(), None);
+
+    // The close echo still drains, exactly once.
+    let mut out = [0u8; 32];
+    let n = conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("close echo pending");
+    assert_eq!(out[0], 0x88, "echo is a close frame");
+    let _ = n;
+    assert!(
+      conn
+        .poll_transmit(TestInstant(0), &mut out)
+        .unwrap()
+        .is_none()
+    );
+
+    // Feeding a terminal connection is a caller error.
+    let mut more = [0u8; 1];
+    assert!(matches!(
+      conn.handle(TestInstant(0), &mut more).unwrap_err(),
+      HandleError::Terminal
+    ));
   }
 
   #[cfg(feature = "deflate")]

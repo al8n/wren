@@ -144,9 +144,9 @@ pub(crate) enum Lifecycle {
   Open,
   /// We sent (queued) a close; awaiting the peer's echo.
   CloseSent,
-  /// Peer's close received (echo queued); inbound is drained/discarded.
-  PeerClosed,
-  /// Terminal: close exchange finished or the connection failed.
+  /// Terminal: close exchange finished (the peer's close makes the
+  /// connection terminal at once — the echo is queued for `poll_transmit`)
+  /// or the connection failed.
   Terminal,
 }
 
