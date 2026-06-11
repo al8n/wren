@@ -31,6 +31,18 @@ extern crate alloc as std;
 #[cfg(feature = "std")]
 extern crate std;
 
+// `deflate` implies `alloc`, whose `bytes`/`smol_str` backends require native
+// atomic CAS — the exact capability the `no-atomic` tier exists to avoid. The
+// combination would silently select the atomic backend and either fail to
+// build on the CAS-less target or violate the tier guarantee, so it is a hard
+// error. (`std` is exempt: `--all-features` runs on hosts, where the atomic
+// backend wins by the documented precedence and `no-atomic` is inert.)
+#[cfg(all(feature = "no-atomic", feature = "deflate", not(feature = "std")))]
+compile_error!(
+  "feature `no-atomic` is incompatible with `deflate` (permessage-deflate needs the \
+   atomic `alloc` storage backend); drop one of the two features"
+);
+
 // `cfg_heap!` / `cfg_storage!` — declared first so they are in textual scope for
 // every module below.
 #[macro_use]

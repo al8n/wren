@@ -114,6 +114,10 @@ jobs:
       # cleanly (no duplicate storage types).
       - run: cargo check -p websocket-proto --no-default-features --features no-atomic --target thumbv6m-none-eabi
       - run: cargo check -p websocket-proto --no-default-features --features no-atomic,heapless --target thumbv6m-none-eabi
+      # MUST-FAIL: `no-atomic` + `deflate` (without std) is a contradictory
+      # combo — deflate's `alloc` dependency drags the atomic-CAS backends in,
+      # defeating the tier. lib.rs raises a compile_error!; pin that it fires.
+      - run: "! cargo check -p websocket-proto --no-default-features --features no-atomic,deflate 2>/dev/null"
 
   miri:
     runs-on: ubuntu-latest

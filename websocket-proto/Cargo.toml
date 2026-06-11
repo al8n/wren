@@ -22,7 +22,8 @@ deflate = ["alloc", "dep:miniz_oxide"]
 # via `portable-atomic` + a `critical-section` impl provided by the final
 # binary) instead of smol_str's `alloc::sync::Arc` + `bytes`. Pick one heap
 # tier; `deflate` is NOT available here (it requires `alloc`, which drags in the
-# `smol_str` / `bytes` crates that need native CAS).
+# `smol_str` / `bytes` crates that need native CAS) — combining the two without
+# `std` is a `compile_error!` (see lib.rs), and CI pins that the combo fails.
 no-atomic = [
   "dep:portable-atomic",
   "dep:portable-atomic-util",
