@@ -674,6 +674,10 @@ mod deflate {
   /// [`parse_deflate_response`] against one of them — so a `DeflateResponse`
   /// minted for a DIFFERENT request (or no request) can never be emitted for
   /// one that did not offer compatible parameters.
+  // `single_use_lifetimes` false-positive: anonymous lifetimes in `impl
+  // Trait` argument position are unstable (E0658), so the once-used
+  // lifetime must be named.
+  #[allow(single_use_lifetimes)]
   pub(crate) fn response_matches_offer<'a>(
     header_values: impl Iterator<Item = &'a str>,
     response: &DeflateResponse,
@@ -719,6 +723,10 @@ mod deflate {
   /// the extension" (omit the response header) — malformed or unknown
   /// offers are skipped, not fatal (§7.1.1: the server simply doesn't
   /// accept them).
+  // `single_use_lifetimes` false-positive: anonymous lifetimes in `impl
+  // Trait` argument position are unstable (E0658), so the once-used
+  // lifetime must be named.
+  #[allow(single_use_lifetimes)]
   pub fn accept_deflate_offer<'a>(
     header_values: impl Iterator<Item = &'a str>,
     config: &ServerDeflateConfig,
