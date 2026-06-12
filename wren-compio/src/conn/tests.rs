@@ -336,6 +336,117 @@ async fn close_echo_flushes_before_buffered_data_delivery() {
 }
 
 #[compio::test]
+async fn write_half_close_flushes_despite_buffered_messages() {
+  let (mut client, server) = pair();
+  let (mut sread, mut swrite) = server.split();
+  // Two buffered messages: the pump reads both into `ready` in one pass.
+  client.send_text("a").await.unwrap();
+  client.send_text("b").await.unwrap();
+  let m = sread.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("a".into()));
+  // Close while "b" is still buffered.
+  let closer = compio_runtime::spawn(async move {
+    swrite.close(CloseCode::Normal, "done").await.unwrap();
+    swrite
+  });
+  compio::time::sleep(std::time::Duration::from_millis(10)).await;
+  // The reader takes ONE more message and stops polling. The Close must
+  // have been flushed before that delivery — the closer may not hang.
+  let m = sread.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("b".into()));
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the close must flush before buffered delivery")
+    .unwrap();
+  // The client indeed observes the close without further server polls.
+  assert!(client.next().await.is_none());
+  assert_eq!(client.closed().unwrap().code(), CloseCode::Normal);
+}
+
+#[compio::test]
+async fn peer_close_echo_flushes_behind_a_parked_batch() {
+  use std::future::Future;
+
+  // Bounded pipe so a cancelled 64 KiB send leaves a parked batch.
+  let (c, s) = duplex_with_capacity(4 * 1024);
+  let negotiated = Negotiated::none();
+  let mut client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(200)),
+    Vec::new(),
+  );
+  let mut server = WebSocket::<ServerRole, _>::server(
+    s.into_duplex(),
+    &negotiated,
+    &crate::options::AcceptOptions::default(),
+    Vec::new(),
+  );
+  {
+    let payload = vec![0xBB_u8; 64 * 1024];
+    let mut fut = Box::pin(server.send_binary(&payload));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  client.send_text("data").await.unwrap();
+  // The client closes and pumps in its own task (it also drains the
+  // server's 64 KiB batch, which precedes the echo on the wire).
+  let closer =
+    compio_runtime::spawn(async move { client.close(CloseCode::Normal, "bye").await.unwrap() });
+  compio::time::sleep(std::time::Duration::from_millis(10)).await;
+  // One server poll: the parked batch and the echo behind it must both
+  // flush before "data" is delivered.
+  let m = server.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("data".into()));
+  let closed = compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the close completes without further server polls")
+    .unwrap();
+  assert!(closed.clean(), "echo arrived before the close deadline");
+  assert!(server.next().await.is_none());
+}
+
+#[compio::test]
+async fn close_deadline_survives_inbound_flood() {
+  let (client, mut server) = pair_with(
+    crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(100)),
+    crate::options::AcceptOptions::default(),
+  );
+  // The server floods data and NEVER pumps its reads, so the client's
+  // Close is never echoed; the client's deadline must still fire while
+  // its pump keeps receiving messages.
+  //
+  // Liveness smoke for the up-front overdue-timer check: over a real
+  // socket a flood keeps the read arm permanently ready (arrival is
+  // concurrent with processing) and would starve the parked timer; the
+  // cooperative in-memory pipe always drains to empty before parking, so
+  // this test cannot reproduce the starvation itself — it pins that the
+  // deadline bounds close() under sustained inbound traffic.
+  let flood = compio_runtime::spawn(async move {
+    loop {
+      if server.send_text("spam").await.is_err() {
+        break;
+      }
+      compio::time::sleep(std::time::Duration::from_micros(200)).await;
+    }
+  });
+  let closed = compio::time::timeout(
+    std::time::Duration::from_secs(2),
+    client.close(CloseCode::Normal, "bye"),
+  )
+  .await
+  .expect("the close deadline must bound the handshake under flood")
+  .unwrap();
+  assert!(!closed.clean(), "no echo: the deadline close is unclean");
+  drop(flood.await);
+}
+
+#[compio::test]
 async fn write_error_poisons_the_connection() {
   // The transport accepts 4 KiB, fails one write, then recovers — like a
   // socket whose send buffer hiccups after a partial frame went out.
