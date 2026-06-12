@@ -904,23 +904,27 @@ mod deflate_tests {
   /// window constraint).
   #[test]
   fn outbound_bits_below_15_returns_compression_unavailable() {
-    // Negotiate server_max_window_bits=10; the SERVER's outbound direction uses
-    // server_max_window_bits, so bits=10 < 15 → CompressionUnavailable.
-    let (params, _) = accept_deflate_offer(
-      ["permessage-deflate; server_max_window_bits=10"].into_iter(),
-      &ServerDeflateConfig::new(),
+    // Our SERVER now declines sub-15 server-window offers outright (Codex
+    // R22), so server-side params can no longer carry them — but a CLIENT
+    // can still end up capped below 15: its valueless client_max_window_bits
+    // hint lets a remote server pick e.g. 10. The client's outbound
+    // direction uses client_max_window_bits → CompressionUnavailable.
+    let offer = crate::negotiation::DeflateOffer::new();
+    let params = crate::negotiation::parse_deflate_response(
+      "permessage-deflate; client_max_window_bits=10",
+      &offer,
     )
-    .expect("offer must be accepted");
-    assert_eq!(params.server_max_window_bits(), 10);
+    .expect("a remote server may pick a smaller client window");
+    assert_eq!(params.client_max_window_bits(), 10);
 
-    let mut server = deflate_server(params);
+    let mut client = deflate_client(params);
     let mut out = [0u8; 128];
     assert!(matches!(
-      server.encode_text_compressed("hello", &mut out),
+      client.encode_text_compressed("hello", &mut out),
       Err(EncodeError::CompressionUnavailable)
     ));
     assert!(matches!(
-      server.encode_binary_compressed(b"hi", &mut out),
+      client.encode_binary_compressed(b"hi", &mut out),
       Err(EncodeError::CompressionUnavailable)
     ));
   }

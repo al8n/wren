@@ -185,6 +185,11 @@ pub(crate) mod inflate {
     /// the full 32 KiB dictionary, which correctly decodes any stream a peer
     /// produced under an equal-or-smaller window. The negotiated bits matter
     /// only on the SEND side.
+    /// (Deliberate, reviewed: RFC 7692 §7.1.2 places the window limit on
+    /// the SENDER; no receiver-side rejection of over-distance references
+    /// is required, and with a fixed 32 KiB window the cap's memory
+    /// benefit is structurally absent — a violating peer is tolerated the
+    /// way obs-text is, while every conforming stream decodes exactly.)
     pub(crate) fn new() -> Box<Self> {
       Box::new(Self {
         state: InflateState::new_boxed(DataFormat::Raw),
@@ -1010,6 +1015,12 @@ where
       Opcode::Close => {
         let decoded = match decode_close_payload(payload.as_slice()) {
           Ok(d) => d,
+          // A malformed-UTF-8 REASON is invalid payload DATA (1007) — the
+          // same failure class as invalid text, RFC 6455 §8.1 — while the
+          // structural shapes (a one-byte code) stay protocol errors (1002).
+          Err(crate::frame::ClosePayloadError::InvalidReasonUtf8) => {
+            return Err(CloseCode::InvalidFramePayload);
+          }
           Err(_) => return Err(CloseCode::ProtocolError),
         };
         let code = decoded.code();
@@ -1368,6 +1379,24 @@ mod tests {
       conn.handle(TestInstant(0), &mut more).unwrap_err(),
       HandleError::Terminal
     ));
+  }
+
+  /// Regression (Codex R22): a close frame with a VALID two-byte code but a
+  /// malformed-UTF-8 reason fails as invalid payload DATA (1007), the same
+  /// class as invalid text — only the STRUCTURAL close-payload shapes (a
+  /// one-byte code) are protocol errors (1002).
+  #[test]
+  fn invalid_utf8_close_reason_fails_1007() {
+    let mut conn = server();
+    // Code 1000 + invalid reason byte.
+    let payload = [0x03, 0xE8, 0xFF];
+    let got = drain(&mut conn, &frame(Opcode::Close, true, false, &payload));
+    assert_eq!(got, [Ev::Closed(1007, false)]);
+
+    // The one-byte structural shape stays 1002.
+    let mut conn = server();
+    let got = drain(&mut conn, &frame(Opcode::Close, true, false, &[0x03]));
+    assert_eq!(got, [Ev::Closed(1002, false)]);
   }
 
   #[test]

@@ -735,6 +735,20 @@ mod deflate {
           continue;
         };
 
+        // An offer demanding server_max_window_bits below 15 caps OUR
+        // compressor — which miniz_oxide cannot bound (the same limit that
+        // makes outbound sub-15 windows CompressionUnavailable on send).
+        // Granting it would negotiate deflate and then fail every
+        // compressed send, so DECLINE the offer instead (§7.1.1 skip):
+        // the handshake completes without the extension. The peer-side
+        // caps (client_max_window_bits, and server bits on the CLIENT)
+        // bind the PEER'S compressor — RFC 7692 §7.1.2 places the limit
+        // on the sender, no receiver enforcement is required, and our
+        // fixed 32 KiB inflater decodes any conforming-or-narrower stream.
+        if p.server_max_window_bits.is_some_and(|bits| bits < 15) {
+          continue;
+        }
+
         let params = DeflateParams {
           server_no_context_takeover: p.server_no_context_takeover
             || config.server_no_context_takeover,
@@ -908,6 +922,36 @@ mod deflate_tests {
   /// server accepting a websocket-proto client's explicit-15 offer
   /// produced a response that same client rejected (self-interop failure).
   #[test]
+  fn sub_15_server_window_offers_are_declined() {
+    // Regression (Codex R22): an offer demanding `server_max_window_bits`
+    // BELOW 15 caps a compressor miniz_oxide cannot bound — granting it
+    // would negotiate deflate whose every compressed send fails, so the
+    // server DECLINES (no extension) instead. A later acceptable
+    // alternative in the same list is still granted.
+    let config = ServerDeflateConfig::new();
+    assert!(
+      accept_deflate_offer(
+        ["permessage-deflate; server_max_window_bits=10"].into_iter(),
+        &config
+      )
+      .is_none()
+    );
+    let (params, _) = accept_deflate_offer(
+      ["permessage-deflate; server_max_window_bits=10, permessage-deflate"].into_iter(),
+      &config,
+    )
+    .unwrap();
+    assert_eq!(params.server_max_window_bits(), 15);
+    assert!(
+      accept_deflate_offer(
+        ["permessage-deflate; server_max_window_bits=15"].into_iter(),
+        &config
+      )
+      .is_some()
+    );
+  }
+
+  #[test]
   fn explicit_server_window_bits_15_round_trips() {
     let offer = DeflateOffer::new().with_server_max_window_bits(Some(15));
     let mut offer_buf = [0u8; 160];
@@ -1042,17 +1086,18 @@ mod deflate_tests {
     assert!(accept_deflate_offer(["permessage-deflate; bogus"].into_iter(), &config).is_none());
     assert!(accept_deflate_offer([].into_iter(), &config).is_none());
 
-    // The server honors client-requested takeover/window restrictions.
-    let value = "permessage-deflate; server_no_context_takeover; server_max_window_bits=10";
+    // The server honors client-requested takeover restrictions and echoes
+    // an explicit (honorable, =15) window demand.
+    let value = "permessage-deflate; server_no_context_takeover; server_max_window_bits=15";
     let (params, response) = accept_deflate_offer([value].into_iter(), &config).unwrap();
     assert!(params.server_no_context_takeover());
-    assert_eq!(params.server_max_window_bits(), 10);
+    assert_eq!(params.server_max_window_bits(), 15);
     let mut buf = [0u8; 256];
     let n = response.write(&mut buf).unwrap();
     let s = core::str::from_utf8(&buf[..n]).unwrap();
     assert!(s.starts_with("permessage-deflate"));
     assert!(s.contains("server_no_context_takeover"));
-    assert!(s.contains("server_max_window_bits=10"));
+    assert!(s.contains("server_max_window_bits=15"));
 
     // A config that demands client_no_context_takeover emits it even when
     // the client didn't declare it.
@@ -1074,7 +1119,7 @@ mod deflate_tests {
     // and both sides land on identical DeflateParams.
     let offer = DeflateOffer::new()
       .with_server_no_context_takeover(true)
-      .with_server_max_window_bits(Some(11));
+      .with_server_max_window_bits(Some(15));
     let mut offer_buf = [0u8; 256];
     let n = offer.write(&mut offer_buf).unwrap();
     let offer_value = core::str::from_utf8(&offer_buf[..n]).unwrap();

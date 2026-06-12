@@ -255,9 +255,18 @@ proptest! {
     let config = ServerDeflateConfig::new()
       .with_require_client_no_context_takeover(require_cnct)
       .with_server_no_context_takeover(server_snct);
+    let accepted = accept_deflate_offer([offer_value].into_iter(), &config);
+    // A sub-15 server-window demand is DECLINED (Codex R22: miniz cannot
+    // bound its compressor, so granting would break every compressed send)
+    // — the handshake then proceeds without the extension.
+    if offer_value.contains("server_max_window_bits=")
+      && !offer_value.contains("server_max_window_bits=15")
+    {
+      prop_assert!(accepted.is_none(), "{offer_value}");
+      return Ok(());
+    }
     let (server_params, response) =
-      accept_deflate_offer([offer_value].into_iter(), &config)
-        .expect("our server accepts every offer we can render");
+      accepted.expect("our server accepts every honorable offer we can render");
 
     let mut resp_buf = [0u8; 160];
     let n = response.write(&mut resp_buf).expect("response renders");
