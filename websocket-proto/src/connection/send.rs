@@ -135,6 +135,15 @@ pub enum FragmentKind {
 }
 
 impl FragmentKind {
+  /// Stable lowercase name.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::TextStart => "text_start",
+      Self::BinaryStart => "binary_start",
+      Self::Continue => "continue",
+    }
+  }
+
   /// The wire opcode plus whether this fragment STARTS a message.
   const fn into_parts(self) -> (Opcode, bool) {
     match self {
