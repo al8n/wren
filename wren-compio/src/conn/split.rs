@@ -132,9 +132,9 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WriteHalf<Ro, S> {
       }
       inner.conn.close(code, reason)?;
     }
-    // Empty marker frame: the pump processes the queue right after the
-    // protocol-transmit drain, so its `Written` transition means the Close
-    // (drained in the same pass) reached the wire.
+    // Empty marker frame: the pump coalesces the queue and the protocol
+    // transmits into one write, so its `Written` transition means the write
+    // that also carried the Close frame reached the wire.
     self.enqueue(Vec::new()).await
   }
 

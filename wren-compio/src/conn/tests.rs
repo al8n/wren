@@ -112,14 +112,52 @@ async fn split_writer_sends_while_reader_pumps() {
     while let Some(result) = sread.next().await {
       result.unwrap();
     }
+    sread
   });
   for i in 0..10u32 {
     let m = client.next().await.unwrap().unwrap();
     assert_eq!(m, Message::Text(format!("msg-{i}").into()));
   }
   drop(writer.await);
-  drop(client); // EOF wakes the reader task's parked read
-  let _ = reader.await;
+  // A clean close lets the reader loop run to `None` without errors; the
+  // join surfaces any panic the loop hit on the way.
+  let closed = client.close(CloseCode::Normal, "done").await.unwrap();
+  assert!(closed.clean());
+  let sread = reader.await.unwrap();
+  assert!(sread.closed().unwrap().clean());
+}
+
+#[compio::test]
+async fn cancelled_send_flushes_before_close() {
+  use std::future::Future;
+
+  let (mut client, server) = pair();
+  let (mut sread, mut swrite) = server.split();
+  let reader = compio_runtime::spawn(async move {
+    while let Some(result) = sread.next().await {
+      result.unwrap();
+    }
+    sread
+  });
+  // Cancel a send after its first poll: the frame is already enqueued but
+  // no task awaits it any more.
+  {
+    let mut fut = Box::pin(swrite.send_text("zombie"));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  swrite.close(CloseCode::Normal, "done").await.unwrap();
+  // The orphaned frame still precedes the Close on the wire (RFC 6455
+  // §5.5.1: no data frames after the Close).
+  let m = client.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("zombie".into()));
+  assert!(client.next().await.is_none());
+  assert!(client.closed().unwrap().clean());
+  let sread = reader.await.unwrap();
+  assert!(sread.closed().unwrap().clean());
 }
 
 #[compio::test]
