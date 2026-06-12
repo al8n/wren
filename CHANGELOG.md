@@ -1,5 +1,21 @@
 # UNRELEASED
 
+## `wren-compio` + `wren-trace` — cycle 2 (first async driver)
+
+- **`wren-compio`**: compio-native (io_uring / IOCP / kqueue, thread-per-core)
+  WebSocket driver over `websocket-proto`. Client (`connect` over `ws://` /
+  `wss://`, or `client` over any stream) and server (`accept` over any
+  stream). One direct connection object — no background task: `next()` pumps
+  reads, keepalive/close timers, pong echoes, and queued writes. `split()`
+  yields read/write halves for ANY stream type (no `Clone` bound) via a
+  doorbell-flushed outbound queue; a split writer's sends progress while the
+  read half is polled. Features: `tls` (compio-tls + rustls/ring, webpki
+  roots by default, full `TlsConnector` override), `deflate` (transparent
+  inflate on receive, `send_*_compressed` senders), `tracing`.
+- **`wren-trace`**: the family's zero-cost tracing shim — `tracing`-or-noop
+  diagnostic and span macros whose disabled form type-checks but never
+  evaluates its arguments.
+
 ## `websocket-proto` — cycle 1 (Sans-I/O core)
 
 The first functional cycle of the Sans-I/O WebSocket protocol core. Highlights:

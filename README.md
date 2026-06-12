@@ -30,10 +30,10 @@ The crates split protocol logic from I/O, mirroring the `quinn` layering:
 | [`websocket-proto`](websocket-proto) | Sans-I/O protocol state machines (`no_std`-capable, panic-free) |
 | `wren` *(planned)* | batteries-included facade (core + default driver) |
 | `wren-reactor` *(planned)* | runtime-agnostic async h1 driver (`tokio` & `smol`) |
-| `wren-compio` *(planned)* | `compio` (thread-per-core) async h1 driver |
+| [`wren-compio`](wren-compio) | `compio` (thread-per-core) async h1 driver — client + server, `tls`/`deflate` |
 | `wren-h2` *(planned)* | RFC 8441 driver over the `h2` crate |
 | `wren-h3` *(planned)* | RFC 9220 driver over `quinn` |
-| `wren-trace` *(planned)* | observability shim |
+| [`wren-trace`](wren-trace) | zero-cost tracing shim |
 
 ## License
 
