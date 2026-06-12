@@ -37,25 +37,35 @@ jobs:
         run: |
           cargo install tokeit --force
       
-      - name: Count total lines of code
+      - name: Count lines of code (workspace total + each crate)
         run: |
-          tokeit --lang rust
+          set -euo pipefail
+          tokeit
+          mv tokeit.json loc-wren.json
+          for c in websocket-proto; do
+            ( cd "$c" && tokeit )
+            mv "$c/tokeit.json" "loc-$c.json"
+          done
       # Publish only from main: PR runs would overwrite the badge gist with
-      # branch stats, and fork PRs have no GIST_PAT secret at all.
-      - name: Upload total loc to GitHub Gist
+      # branch stats, and fork PRs have no GIST_PAT secret at all. Every file
+      # goes in ONE gist PATCH — per-crate requests trip GitHub's secondary
+      # rate limit.
+      - name: Upload all loc to the gist in one request
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GIST_PAT }}
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync('tokeit.json', 'utf8');
             const gistId = '327b2a8aef9003246e45c6e47fe63937';
-            await github.rest.gists.update({
-              gist_id: gistId,
-              files: {
-                "websockit": {
-                  content: output
-                }
-              }
-            });
+            // Gist file name -> LoC json. `wren` is the workspace total; the
+            // rest are per-crate. These names match the LoC badge URLs in the
+            // crate READMEs (…/raw/<name>).
+            const crates = ['websocket-proto'];
+            const files = {
+              wren: { content: fs.readFileSync('loc-wren.json', 'utf8') },
+            };
+            for (const c of crates) {
+              files[c] = { content: fs.readFileSync(`loc-${c}.json`, 'utf8') };
+            }
+            await github.rest.gists.update({ gist_id: gistId, files });
