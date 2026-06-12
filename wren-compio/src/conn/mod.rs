@@ -78,6 +78,9 @@ pub(crate) struct PendingWrite {
   bytes: Vec<u8>,
   cursor: usize,
   states: Vec<Rc<Cell<FrameState>>>,
+  /// The batch contains a Close frame; flushing it settles
+  /// `Inner::close_pending`.
+  carries_close: bool,
 }
 
 pub(crate) struct Inner<Ro, S> {
@@ -96,6 +99,12 @@ pub(crate) struct Inner<Ro, S> {
   /// flushed.
   pending_write: Option<PendingWrite>,
   closed: Option<Closed>,
+  /// A Close frame is owed to the wire (queued locally via `close`, or
+  /// the echo the protocol queued for a received Close) and has not been
+  /// flushed yet. While set, the pump withholds buffered messages —
+  /// otherwise a caller that stops polling after a returned message
+  /// leaves the peer (or a parked `WriteHalf::close`) waiting forever.
+  close_pending: bool,
   /// Set on the first write-path failure. A failed batch may have left a
   /// partial frame on the wire, so everything after it is refused with
   /// this kind rather than splicing fresh frames into a corrupt stream.
@@ -195,6 +204,7 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
         outbound: VecDeque::new(),
         pending_write: None,
         closed: None,
+        close_pending: false,
         poisoned: None,
         read_half_alive: true,
         is_split: false,
@@ -288,6 +298,7 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
       if inner.closed.is_none() {
         debug!(code = ?code, reason, "starting close handshake");
         inner.conn.close(code, reason)?;
+        inner.close_pending = true;
       }
     }
     loop {
@@ -414,6 +425,9 @@ async fn drive_pending_write<Ro, S: Duplex>(
       for state in &pending.states {
         state.set(FrameState::Written);
       }
+      if pending.carries_close {
+        io.inner.borrow_mut().close_pending = false;
+      }
       doorbell.notify(usize::MAX);
       Ok(())
     }
@@ -458,6 +472,7 @@ async fn send_frame<Ro: role::Role, S: Duplex>(
             bytes,
             cursor: 0,
             states: Vec::new(),
+            carries_close: false,
           });
         }
         None => return Ok(()),
@@ -493,7 +508,18 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       if let Some(kind) = guard.poisoned {
         return Some(Err(Error::Io(kind.into())));
       }
-      let mut just_closed = false;
+      // Settle overdue protocol timers up front: returned ready messages
+      // skip the parked select below, so under a steady inbound flood the
+      // close deadline (and the keepalive) would otherwise never run.
+      {
+        let now = Instant::now();
+        if guard.conn.poll_timeout().is_some_and(|at| at <= now)
+          && let Some(closed) = guard.conn.handle_timeout(now)
+        {
+          debug!(clean = closed.clean(), "close deadline elapsed");
+          guard.closed = Some(closed);
+        }
+      }
       if guard.closed.is_none() && !guard.pending_input.is_empty() {
         let mut input = std::mem::take(&mut guard.pending_input);
         let inner_mut = &mut *guard;
@@ -508,7 +534,8 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
               if let Event::Closed(closed) = &event {
                 debug!(code = ?closed.code(), clean = closed.clean(), "connection closed");
                 inner_mut.closed = Some(*closed);
-                just_closed = true;
+                // The protocol just queued the close echo.
+                inner_mut.close_pending = true;
               }
               match inner_mut.assembler.push(&event) {
                 Ok(Some(message)) => inner_mut.ready.push_back(message),
@@ -521,14 +548,16 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         }
         // All input is consumed by the cursor (drop-drains).
       }
-      // Hold buffered messages back while the close echo is not yet on
-      // the wire (just queued by the protocol, or parked in a batch a
-      // cancelled call left behind): a caller may stop polling after a
-      // returned message, and the peer would wait on its echo forever
-      // (RFC 6455 §5.5.1 wants it sent "as soon as practical"). Once the
-      // echo is out, buffered pre-close messages still deliver.
-      let echo_pending = guard.closed.is_some() && (just_closed || guard.pending_write.is_some());
-      if !echo_pending && let Some(message) = guard.ready.pop_front() {
+      // Hold buffered messages back while a Close is owed to the wire —
+      // queued locally by close(), or the echo the protocol queued for
+      // the peer's Close: a caller may stop polling after a returned
+      // message, leaving the peer (or a parked WriteHalf::close) waiting
+      // forever (RFC 6455 §5.5.1 wants the echo sent "as soon as
+      // practical"). Once it is out, buffered pre-close messages still
+      // deliver.
+      if !guard.close_pending
+        && let Some(message) = guard.ready.pop_front()
+      {
         return Some(Ok(message));
       }
     }
@@ -560,7 +589,12 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
             bytes,
             cursor: 0,
             states,
+            carries_close: guard.close_pending,
           });
+        } else if guard.close_pending {
+          // Nothing left to transmit: the owed Close is already on the
+          // wire (e.g. the peer echoed a close we flushed earlier).
+          guard.close_pending = false;
         }
       }
       guard.conn.poll_timeout()
