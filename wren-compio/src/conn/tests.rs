@@ -492,30 +492,26 @@ async fn pong_flushes_before_buffered_data_delivery() {
 
 #[compio::test]
 async fn close_budget_starts_at_flush_not_at_batching() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
   // Bounded pipe; 64 KiB of queued data and the Close coalesce into ONE
-  // batch, which stalls on backpressure far past the close budget. The
-  // protocol arms its deadline when the Close drains into the batch —
-  // the driver must re-anchor it at flush, or a prompt peer echo is
-  // misreported as a deadline failure.
+  // carrying batch. The protocol arms its deadline when the Close drains
+  // into the batch (t≈0); the raw peer drains at t≈100ms (a slow flush,
+  // within the flush bound) and echoes at t≈250ms — past the protocol's
+  // 200ms deadline but within flush+budget. Without the driver
+  // re-anchoring the budget at flush, the echo is misreported unclean.
   let (c, s) = duplex_with_capacity(4 * 1024);
   let negotiated = Negotiated::none();
   let client = WebSocket::<ClientRole, _>::client(
     c.into_duplex(),
     &negotiated,
     &crate::options::ClientOptions::default()
-      .with_close_timeout(std::time::Duration::from_millis(100)),
-    Vec::new(),
-  );
-  let mut server = WebSocket::<ServerRole, _>::server(
-    s.into_duplex(),
-    &negotiated,
-    &crate::options::AcceptOptions::default(),
+      .with_close_timeout(std::time::Duration::from_millis(200)),
     Vec::new(),
   );
   let (mut cread, mut cwrite) = client.split();
   // Enqueue 64 KiB without waiting for delivery (cancel after the first
-  // poll: the frame stays queued), then close — both coalesce into one
-  // carrying batch.
+  // poll: the frame stays queued), then close — one carrying batch.
   {
     use std::future::Future;
     let payload = vec![0xDD_u8; 64 * 1024];
@@ -535,15 +531,25 @@ async fn close_budget_starts_at_flush_not_at_batching() {
     }
     cread
   });
-  // Hold the peer back well past the budget: the carrying batch cannot
-  // flush, so the budget must not be running yet.
-  compio::time::sleep(std::time::Duration::from_millis(250)).await;
-  // The peer drains everything and echoes promptly.
-  let server_task = compio_runtime::spawn(async move {
-    while let Some(m) = server.next().await {
-      m.unwrap();
+  // The raw peer: drains from t≈100ms on, echoes a bare unmasked
+  // Close(1000) frame at t≈250ms.
+  let (mut sr, mut sw) = s.split();
+  let drainer = compio_runtime::spawn(async move {
+    compio::time::sleep(std::time::Duration::from_millis(100)).await;
+    loop {
+      let compio_buf::BufResult(res, _buf) = sr.read(Vec::with_capacity(16 * 1024)).await;
+      match res {
+        Ok(0) | Err(_) => break,
+        Ok(_) => {}
+      }
     }
-    assert!(server.closed().unwrap().clean());
+  });
+  let echoer = compio_runtime::spawn(async move {
+    compio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let frame = vec![0x88, 0x02, 0x03, 0xE8]; // FIN Close, len 2, code 1000
+    let compio_buf::BufResult(res, _buf) = sw.write(frame).await;
+    res.unwrap();
+    sw
   });
   compio::time::timeout(std::time::Duration::from_secs(2), closer)
     .await
@@ -555,9 +561,62 @@ async fn close_budget_starts_at_flush_not_at_batching() {
     .unwrap();
   assert!(
     cread.closed().unwrap().clean(),
-    "a prompt echo after a backpressured flush is clean"
+    "an echo within flush+budget is clean"
   );
-  server_task.await.unwrap();
+  drop(echoer.await);
+  drop(drainer.await);
+}
+
+#[compio::test]
+async fn close_times_out_when_the_peer_never_drains() {
+  use std::future::Future;
+
+  // The peer stops reading entirely: the carrying batch can never flush.
+  // close_timeout must still bound the handshake — the flush phase gets
+  // the budget, then everything fails and the transport tears down.
+  let (c, _wedged_peer) = duplex_with_capacity(4 * 1024);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(100)),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  {
+    let payload = vec![0xEE_u8; 64 * 1024];
+    let mut fut = Box::pin(cwrite.send_binary(&payload));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "bye").await });
+  let reader = compio_runtime::spawn(async move {
+    while let Some(m) = cread.next().await {
+      m.unwrap();
+    }
+    cread
+  });
+  let close_err = compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the close resolves within the budget")
+    .unwrap()
+    .unwrap_err();
+  assert!(
+    matches!(&close_err, Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+    "the parked closer fails with the timeout, got {close_err:?}"
+  );
+  let cread = compio::time::timeout(std::time::Duration::from_secs(2), reader)
+    .await
+    .expect("the reader observes the outcome")
+    .unwrap();
+  assert!(
+    !cread.closed().unwrap().clean(),
+    "a never-draining peer is an unclean close"
+  );
 }
 
 #[compio::test]

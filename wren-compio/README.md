@@ -77,6 +77,13 @@ the read half's pump flushes the queue. **A split writer's sends progress
 only while the read half is being polled** — the same "keep polling"
 contract the timers have (and the same contract tungstenite documents).
 
+The flip side of one pump: outbound and inbound share it. A large queued
+write headed for a slow-reading peer is flushed before already-buffered
+inbound messages are handed out, so delivery can wait on that drain
+(bounded by the peer's read pace, like any backpressured write). Workload
+shapes that need full independence of the two directions are what the
+planned reactor driver is for.
+
 ## Cancellation safety
 
 `next()` and every send are safe to race in a `select!` or wrap in a
