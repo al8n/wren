@@ -12,7 +12,19 @@ categories = ["network-programming", "no-std", "embedded", "web-programming::web
 
 [features]
 default = ["std"]
-std = ["alloc", "thiserror/std", "smol_str/std", "bytes/std", "rand?/std", "rand?/thread_rng"]
+# `std` and `alloc` are INDEPENDENT: in std mode the real `std` crate already
+# provides everything `alloc` does, so the flag is not implied — each feature
+# layers the heap deps and their matching feature itself (heap items are gated
+# `any(std, alloc, no-atomic)` accordingly).
+std = [
+  "dep:smol_str",
+  "dep:bytes",
+  "thiserror/std",
+  "smol_str/std",
+  "bytes/std",
+  "rand?/std",
+  "rand?/thread_rng",
+]
 alloc = ["dep:smol_str", "dep:bytes"]
 deflate = ["alloc", "dep:miniz_oxide"]
 # `no-atomic`: the heap tier for cores WITHOUT native atomic CAS (Cortex-M0+ /
