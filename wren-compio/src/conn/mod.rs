@@ -26,6 +26,7 @@ use websocket_proto::{
   frame::CloseCode,
   message::{Message, MessageAssembler},
 };
+use wren_trace::{debug, trace, warn};
 
 use crate::{
   error::Error,
@@ -198,7 +199,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, text.len(), |conn, out| {
       conn.encode_text(text, out)
     })?;
-    send_frame(&self.inner, &self.doorbell, frame).await
+    send_frame(&self.inner, frame).await
   }
 
   /// Sends a whole binary message.
@@ -206,7 +207,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, data.len(), |conn, out| {
       conn.encode_binary(data, out)
     })?;
-    send_frame(&self.inner, &self.doorbell, frame).await
+    send_frame(&self.inner, frame).await
   }
 
   /// Sends a Ping (the peer's Pong is consumed internally).
@@ -214,7 +215,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, payload.len(), |conn, out| {
       conn.encode_ping(payload, out)
     })?;
-    send_frame(&self.inner, &self.doorbell, frame).await
+    send_frame(&self.inner, frame).await
   }
 
   /// Sends a whole text message compressed with permessage-deflate.
@@ -229,7 +230,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, text.len() * 2, |conn, out| {
       conn.encode_text_compressed(text, out)
     })?;
-    send_frame(&self.inner, &self.doorbell, frame).await
+    send_frame(&self.inner, frame).await
   }
 
   /// Sends a whole binary message compressed with permessage-deflate.
@@ -239,24 +240,35 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, data.len() * 2, |conn, out| {
       conn.encode_binary_compressed(data, out)
     })?;
-    send_frame(&self.inner, &self.doorbell, frame).await
+    send_frame(&self.inner, frame).await
   }
 
   /// Starts the close handshake, drives it to completion (peer echo or the
   /// close deadline), tears the transport down, and reports the outcome.
   ///
   /// Data messages arriving while the close handshake runs are discarded.
+  /// A peer that drops the transport without echoing the Close surfaces as
+  /// the transport error (commonly `UnexpectedEof`); waiting out such peers
+  /// is what [`ClientOptions::with_close_timeout`] bounds.
+  ///
+  /// [`ClientOptions::with_close_timeout`]: crate::ClientOptions::with_close_timeout
   pub async fn close(self, code: CloseCode, reason: &str) -> Result<Closed, Error> {
     {
       let mut inner = self.inner.borrow_mut();
       if inner.closed.is_none() {
+        debug!(code = ?code, reason, "starting close handshake");
         inner.conn.close(code, reason)?;
       }
     }
     loop {
       match next_message(&self.inner, &self.doorbell).await {
         Some(Ok(_discarded)) => continue,
-        Some(Err(e)) => return Err(e),
+        Some(Err(e)) => {
+          // Still shut the write side down (TLS close_notify / TCP FIN):
+          // without it the peer may wait on a clean EOF forever.
+          teardown(&self.inner).await;
+          return Err(e);
+        }
         None => break,
       }
     }
@@ -303,50 +315,23 @@ fn encode_with<Ro: role::Role, S>(
   Ok(buf)
 }
 
-/// Unsplit direct write, or enqueue-and-wait when split.
+/// Direct write of one encoded frame. Only reachable unsplit — `split()`
+/// consumes the `WebSocket`, and the halves enqueue through the doorbell
+/// instead — so the stream is guaranteed parked in `Inner`.
 async fn send_frame<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static>(
   inner: &Rc<RefCell<Inner<Ro, S>>>,
-  doorbell: &Rc<Doorbell>,
   frame: Vec<u8>,
 ) -> Result<(), Error> {
-  let is_split = inner.borrow().is_split;
-  if !is_split {
-    // Single owner: the stream is guaranteed parked in `Inner`.
-    let mut stream = take_stream(inner)?;
-    // compio-io contract: `write_all` may only fill a buffering stream's
-    // internal buffer (TLS records); `flush` puts the bytes on the wire.
-    let mut result = stream.write_all(frame).await.0;
-    if result.is_ok() {
-      result = stream.flush().await;
-    }
-    inner.borrow_mut().stream = Some(stream);
-    return result.map_err(Error::from);
+  debug_assert!(!inner.borrow().is_split);
+  let mut stream = take_stream(inner)?;
+  // compio-io contract: `write_all` may only fill a buffering stream's
+  // internal buffer (TLS records); `flush` puts the bytes on the wire.
+  let mut result = stream.write_all(frame).await.0;
+  if result.is_ok() {
+    result = stream.flush().await;
   }
-  let state = Rc::new(Cell::new(FrameState::Queued));
-  {
-    let mut guard = inner.borrow_mut();
-    if !guard.read_half_alive {
-      return Err(Error::ReadHalfGone);
-    }
-    guard.outbound.push_back(OutboundFrame {
-      bytes: frame,
-      state: state.clone(),
-    });
-  }
-  doorbell.notify(usize::MAX);
-  loop {
-    match state.get() {
-      FrameState::Queued => {}
-      FrameState::Written => return Ok(()),
-      FrameState::Failed(kind) => return Err(Error::Io(kind.into())),
-      FrameState::Orphaned => return Err(Error::ReadHalfGone),
-    }
-    let listener = doorbell.listen();
-    if state.get() != FrameState::Queued {
-      continue;
-    }
-    listener.await;
-  }
+  inner.borrow_mut().stream = Some(stream);
+  result.map_err(Error::from)
 }
 
 fn take_stream<Ro, S>(inner: &Rc<RefCell<Inner<Ro, S>>>) -> Result<S, Error> {
@@ -360,13 +345,14 @@ fn take_stream<Ro, S>(inner: &Rc<RefCell<Inner<Ro, S>>>) -> Result<S, Error> {
 }
 
 /// Tears the transport down after the close handshake (or on abandonment):
-/// best-effort write-side shutdown (TLS close_notify / TCP FIN).
+/// best-effort write-side shutdown (TLS close_notify / TCP FIN), then drop.
+/// Consuming the stream makes repeated calls no-ops.
 async fn teardown<Ro, S: AsyncRead + AsyncWrite + 'static>(inner: &Rc<RefCell<Inner<Ro, S>>>) {
   let Some(mut stream) = inner.borrow_mut().stream.take() else {
     return;
   };
+  trace!("shutting the transport down");
   let _ = stream.shutdown().await;
-  inner.borrow_mut().stream = Some(stream);
 }
 
 /// The shared pump: drives the connection until a data message completes,
@@ -377,16 +363,14 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
 ) -> Option<Result<Message, Error>> {
   loop {
     // Phase 1 (borrow): feed pending input through the state machine.
+    // Buffered `ready` messages drain even after the close is recorded
+    // (they arrived before the peer's Close); new input does not.
     {
       let mut guard = inner.borrow_mut();
       if let Some(message) = guard.ready.pop_front() {
         return Some(Ok(message));
       }
-      let drained_close = guard.closed.is_some() && guard.outbound.is_empty();
-      if drained_close {
-        return None;
-      }
-      if !guard.pending_input.is_empty() {
+      if guard.closed.is_none() && !guard.pending_input.is_empty() {
         let mut input = std::mem::take(&mut guard.pending_input);
         let inner_mut = &mut *guard;
         let now = Instant::now();
@@ -398,6 +382,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
                 inner_mut.pings_seen += 1;
               }
               if let Event::Closed(closed) = &event {
+                debug!(code = ?closed.code(), clean = closed.clean(), "connection closed");
                 inner_mut.closed = Some(*closed);
               }
               match inner_mut.assembler.push(&event) {
@@ -416,10 +401,18 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
       }
     }
 
-    // Phase 2 (borrow): coalesce protocol transmits + queued writer frames.
+    // Phase 2 (borrow): coalesce queued writer frames + protocol transmits.
+    // Queue first: a writer frame was encoded before any Close the protocol
+    // may have queued since, and data frames must precede the Close on the
+    // wire (RFC 6455 §5.5.1).
     let (coalesced, states, deadline) = {
       let mut guard = inner.borrow_mut();
       let mut coalesced: Vec<u8> = Vec::new();
+      let mut states = Vec::new();
+      while let Some(frame) = guard.outbound.pop_front() {
+        coalesced.extend_from_slice(&frame.bytes);
+        states.push(frame.state);
+      }
       let mut scratch = [0u8; TRANSMIT_SCRATCH];
       let now = Instant::now();
       loop {
@@ -428,11 +421,6 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
           Ok(None) => break,
           Err(e) => return Some(Err(e.into())),
         }
-      }
-      let mut states = Vec::new();
-      while let Some(frame) = guard.outbound.pop_front() {
-        coalesced.extend_from_slice(&frame.bytes);
-        states.push(frame.state);
       }
       (coalesced, states, guard.conn.poll_timeout())
     };
@@ -458,6 +446,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
           continue; // re-settle: the close frame may have just gone out
         }
         Err(e) => {
+          warn!(error = %e, "transport write failed");
           let kind = e.kind();
           for state in &states {
             state.set(FrameState::Failed(kind));
@@ -468,8 +457,13 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
       }
     }
 
-    // Terminal re-check after transmit drain.
+    // Terminal check — reached only when phase 2 found NOTHING left to
+    // write (a non-empty coalesce loops back through phase 1 instead), so
+    // a recorded close here means echo, queue, and marker are all on the
+    // wire. The single `None` producer: shut the transport down (TLS
+    // close_notify / TCP FIN) — the split path tears down through here too.
     if inner.borrow().closed.is_some() {
+      teardown(inner).await;
       return None;
     }
 
@@ -504,11 +498,13 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
       Park::Read(BufResult(Ok(0), _buf)) => {
         // Phase 1/3 already return `None` whenever `closed` is recorded, so
         // a parked read only resolves to EOF while the connection is open.
+        debug!("transport EOF before the close handshake completed");
         return Some(Err(Error::Io(std::io::Error::from(
           std::io::ErrorKind::UnexpectedEof,
         ))));
       }
-      Park::Read(BufResult(Ok(_n), buf)) => {
+      Park::Read(BufResult(Ok(n), buf)) => {
+        trace!(bytes = n, "transport read");
         inner.borrow_mut().pending_input.extend_from_slice(&buf);
       }
       Park::Read(BufResult(Err(e), _buf)) => return Some(Err(Error::Io(e))),
@@ -516,6 +512,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
         let mut guard = inner.borrow_mut();
         let now = Instant::now();
         if let Some(closed) = guard.conn.handle_timeout(now) {
+          debug!(clean = closed.clean(), "close deadline elapsed");
           guard.closed = Some(closed);
         }
       }
