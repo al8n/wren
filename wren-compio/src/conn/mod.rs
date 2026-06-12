@@ -508,18 +508,6 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       if let Some(kind) = guard.poisoned {
         return Some(Err(Error::Io(kind.into())));
       }
-      // Settle overdue protocol timers up front: returned ready messages
-      // skip the parked select below, so under a steady inbound flood the
-      // close deadline (and the keepalive) would otherwise never run.
-      {
-        let now = Instant::now();
-        if guard.conn.poll_timeout().is_some_and(|at| at <= now)
-          && let Some(closed) = guard.conn.handle_timeout(now)
-        {
-          debug!(clean = closed.clean(), "close deadline elapsed");
-          guard.closed = Some(closed);
-        }
-      }
       if guard.closed.is_none() && !guard.pending_input.is_empty() {
         let mut input = std::mem::take(&mut guard.pending_input);
         let inner_mut = &mut *guard;
@@ -547,6 +535,20 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
           Err(e) => return Some(Err(e.into())),
         }
         // All input is consumed by the cursor (drop-drains).
+      }
+      // Settle overdue protocol timers on every pass — AFTER the input
+      // feed, so an echo that already arrived beats the deadline clock
+      // (wall time may have advanced while the future sat unpolled), but
+      // BEFORE message delivery, so a steady inbound flood of ready
+      // messages cannot starve the close deadline or the keepalive.
+      {
+        let now = Instant::now();
+        if guard.conn.poll_timeout().is_some_and(|at| at <= now)
+          && let Some(closed) = guard.conn.handle_timeout(now)
+        {
+          debug!(clean = closed.clean(), "close deadline elapsed");
+          guard.closed = Some(closed);
+        }
       }
       // Hold buffered messages back while a Close is owed to the wire —
       // queued locally by close(), or the echo the protocol queued for

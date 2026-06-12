@@ -411,6 +411,35 @@ async fn peer_close_echo_flushes_behind_a_parked_batch() {
 }
 
 #[compio::test]
+async fn delayed_poll_keeps_a_prompt_echo_clean() {
+  use std::future::Future;
+
+  let (client, mut server) = pair_with(
+    crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(50)),
+    crate::options::AcceptOptions::default(),
+  );
+  // Drive the close until its Close frame is out and it parks.
+  let mut close_fut = Box::pin(client.close(CloseCode::Normal, "bye"));
+  futures_util::future::poll_fn(|cx| {
+    assert!(close_fut.as_mut().poll(cx).is_pending());
+    std::task::Poll::Ready(())
+  })
+  .await;
+  // The peer echoes PROMPTLY (well within the deadline)…
+  assert!(server.next().await.is_none());
+  assert!(server.closed().unwrap().clean());
+  // …but the closer is not polled again until after the deadline. The
+  // echo is already buffered: wall time alone must not turn it unclean.
+  compio::time::sleep(std::time::Duration::from_millis(120)).await;
+  let closed = close_fut.await.unwrap();
+  assert!(
+    closed.clean(),
+    "a prompt echo beats the deadline clock even when polled late"
+  );
+}
+
+#[compio::test]
 async fn close_deadline_survives_inbound_flood() {
   let (client, mut server) = pair_with(
     crate::options::ClientOptions::default()
