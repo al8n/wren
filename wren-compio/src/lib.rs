@@ -2,6 +2,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
+// Staged: consumed by `connect`/`accept` later in the cycle.
+#[allow(dead_code)]
+mod conn;
 mod error;
 // Staged: consumed by `connect`/`accept` later in the cycle.
 #[allow(dead_code)]
@@ -10,6 +13,9 @@ mod options;
 // Staged: consumed by `connect` later in the cycle.
 #[allow(dead_code)]
 mod url;
+
+pub use conn::{ClientRole, ReadHalf, ServerRole, WebSocket, WriteHalf};
+pub use websocket_proto::{Negotiated, connection::Closed, frame::CloseCode, message::Message};
 
 #[cfg(test)]
 mod duplex;
