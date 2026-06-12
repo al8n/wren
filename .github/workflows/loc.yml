@@ -40,7 +40,10 @@ jobs:
       - name: Count total lines of code
         run: |
           tokeit --lang rust
+      # Publish only from main: PR runs would overwrite the badge gist with
+      # branch stats, and fork PRs have no GIST_PAT secret at all.
       - name: Upload total loc to GitHub Gist
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GIST_PAT }}
