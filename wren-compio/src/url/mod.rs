@@ -19,14 +19,27 @@ pub(crate) struct WsUrl<'a> {
 
 impl<'a> WsUrl<'a> {
   pub(crate) fn parse(url: &'a str) -> Result<Self, ConnectError> {
-    let (tls, rest) = if let Some(r) = url.strip_prefix("ws://") {
+    // Schemes are case-insensitive (RFC 3986 §3.1).
+    let (tls, rest) = if let Some(r) = strip_scheme(url, "ws://") {
       (false, r)
-    } else if let Some(r) = url.strip_prefix("wss://") {
+    } else if let Some(r) = strip_scheme(url, "wss://") {
       (true, r)
     } else {
       return Err(ConnectError::UnsupportedScheme);
     };
-    let (authority, path_and_query) = match rest.find('/') {
+    // Checked on the whole remainder: a `#` with no path would otherwise
+    // land in the authority and corrupt the Host header.
+    if rest.contains('#') {
+      return Err(ConnectError::InvalidUrl("fragments are not allowed"));
+    }
+    let (authority, path_and_query) = match rest.find(['/', '?']) {
+      // A query with no path has no `/` to split on; the request target
+      // would need an allocation (`/?query`), so ask for the explicit form.
+      Some(i) if rest.as_bytes().get(i) == Some(&b'?') => {
+        return Err(ConnectError::InvalidUrl(
+          "query without a path; write /?query",
+        ));
+      }
       Some(i) => rest.split_at(i),
       None => (rest, "/"),
     };
@@ -35,9 +48,6 @@ impl<'a> WsUrl<'a> {
     }
     if authority.contains('@') {
       return Err(ConnectError::InvalidUrl("userinfo is not allowed"));
-    }
-    if path_and_query.contains('#') {
-      return Err(ConnectError::InvalidUrl("fragments are not allowed"));
     }
     // Split host vs port; IPv6 brackets keep their interior colons.
     let (host, port) = if authority.starts_with('[') {
@@ -60,9 +70,10 @@ impl<'a> WsUrl<'a> {
       }
     };
     let port = match port {
-      Some(p) => p
-        .parse::<u16>()
-        .map_err(|_| ConnectError::InvalidUrl("invalid port"))?,
+      Some(p) => match p.parse::<u16>() {
+        Ok(0) | Err(_) => return Err(ConnectError::InvalidUrl("invalid port")),
+        Ok(p) => p,
+      },
       None if tls => 443,
       None => 80,
     };
@@ -87,6 +98,15 @@ impl<'a> WsUrl<'a> {
       .and_then(|h| h.strip_suffix(']'))
       .unwrap_or(self.host)
   }
+}
+
+/// Case-insensitive scheme strip (the scheme is always ASCII; a non-ASCII
+/// or short head simply fails to match).
+fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
+  let head = url.get(..scheme.len())?;
+  head
+    .eq_ignore_ascii_case(scheme)
+    .then(|| url.get(scheme.len()..).unwrap_or(""))
 }
 
 #[cfg(test)]
