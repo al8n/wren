@@ -314,7 +314,7 @@ impl<'a> ClientHandshake<'a> {
     };
     let code_str = rest.split(' ').next().unwrap_or("");
     // RFC 9112 §4: status-code = 3DIGIT. `u16::parse` alone would accept
-    // `0101` and `+101` as 101 (Codex R23) — not an HTTP status line.
+    // `0101` and `+101` as 101 — not an HTTP status line.
     if code_str.len() != 3 || !code_str.bytes().all(|b| b.is_ascii_digit()) {
       return Err(ClientHandshakeError::Head(HeadError::Malformed(
         parser::MalformedDetail::new(9, "status code is not 3DIGIT"),
@@ -510,7 +510,7 @@ mod tests {
     let cased = ClientOptions::new("h", "/").with_subprotocols(&["chat", "CHAT"]);
     assert!(ClientHandshake::new(cased, &mut CountingRng(0)).is_ok());
 
-    // Regression (Codex R18): offers past `Negotiated`'s inline storage are
+    // Regression: offers past `Negotiated`'s inline storage are
     // rejected at the emitter — a conforming server SELECTING the 65-byte
     // offer would otherwise fail our own response validation. 64 fits.
     let at_cap = "a".repeat(crate::negotiation::MAX_SUBPROTOCOL_LEN);
@@ -533,7 +533,7 @@ mod tests {
       ClientHandshakeError::InvalidOptions(_)
     ));
 
-    // Regression (Codex R13+R14): the managed Host field is a full RFC 3986
+    // Regression: the managed Host field is a full RFC 3986
     // authority — control bytes, whitespace, AND URI delimiters are all
     // invalid (a Host is not a URL).
     for bad_host in [
@@ -548,7 +548,7 @@ mod tests {
       );
     }
 
-    // Regression (Codex R12 class): a raw `#` in the path is a fragment —
+    // Regression: a raw `#` in the path is a fragment —
     // RFC 6455 §3 forbids it (escape as %23).
     let frag = ClientOptions::new("h", "/chat#frag");
     assert!(matches!(
@@ -601,7 +601,7 @@ mod tests {
       ClientHandshakeError::UnexpectedStatus(404)
     ));
 
-    // Regression (Codex R23): status-code = 3DIGIT — spellings that PARSE
+    // Regression: status-code = 3DIGIT — spellings that PARSE
     // to 101 but are not three digits are malformed, not accepted.
     for bad in ["0101", "+101", "1 01", "10"] {
       let resp = format!("HTTP/1.1 {bad} Switching Protocols\r\n\r\n");

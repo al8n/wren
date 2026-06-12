@@ -185,7 +185,7 @@ pub(crate) mod inflate {
     /// the full 32 KiB dictionary, which correctly decodes any stream a peer
     /// produced under an equal-or-smaller window. The negotiated bits matter
     /// only on the SEND side.
-    /// (Deliberate, reviewed: RFC 7692 §7.1.2 places the window limit on
+    /// (Deliberate: RFC 7692 §7.1.2 places the window limit on
     /// the SENDER; no receiver-side rejection of over-distance references
     /// is required, and with a fixed 32 KiB window the cap's memory
     /// benefit is structurally absent — a violating peer is tolerated the
@@ -216,8 +216,8 @@ pub(crate) mod inflate {
     /// counter. The window persists unless [`reset`](Self::reset) is called —
     /// EXCEPT after a peer's final block, which ended the DEFLATE stream
     /// outright: the next message must start a fresh stream regardless of
-    /// context takeover (Codex R21: leaving the inflater in the ended state
-    /// silently poisoned every later compressed message).
+    /// context takeover (leaving the inflater in the ended state would
+    /// silently poison every later compressed message).
     pub(crate) fn begin_message(&mut self) {
       self.inflated_total = 0;
       if self.ended {
@@ -275,8 +275,7 @@ pub(crate) mod inflate {
           // Stream finished (a peer sent a final block). Anything still in
           // the cursor is bytes AFTER the stream end — RFC 7692 §7.2.2
           // requires the whole payload to be part of the message's stream,
-          // so trailing bytes are malformed, not silently dropped
-          // (Codex R21).
+          // so trailing bytes are malformed, not silently dropped.
           Ok(MZStatus::StreamEnd) => {
             if !cursor.is_empty() {
               return Err(InflateFail::Corrupt);
@@ -359,10 +358,10 @@ where
   Ro: Role,
 {
   fn drop(&mut self) {
-    // Regression (Codex R20): an early-dropped cursor used to discard the
-    // unread tail while the frame state had already advanced past its
-    // header — the machine then waited forever for payload bytes the
-    // transport will never resend. Draining here keeps the PROTOCOL
+    // Regression: an early-dropped cursor that discards the unread tail
+    // while the frame state has already advanced past its header leaves the
+    // machine waiting forever for payload bytes the transport will never
+    // resend. Draining here keeps the PROTOCOL
     // consistent on every drop path; only the data views are lost, which
     // dropping the cursor opts into. (`next` makes progress on every call
     // — it consumes input or returns `None` — so this terminates.)
@@ -1381,7 +1380,7 @@ mod tests {
     ));
   }
 
-  /// Regression (Codex R22): a close frame with a VALID two-byte code but a
+  /// Regression: a close frame with a VALID two-byte code but a
   /// malformed-UTF-8 reason fails as invalid payload DATA (1007), the same
   /// class as invalid text — only the STRUCTURAL close-payload shapes (a
   /// one-byte code) are protocol errors (1002).
@@ -1544,7 +1543,7 @@ mod tests {
     );
   }
 
-  /// Regression (Codex R4): a protocol failure arriving AFTER `close()` but
+  /// Regression: a protocol failure arriving AFTER `close()` but
   /// BEFORE the queued close drains must put the FAILURE code on the wire —
   /// only a close that actually went out suppresses the failure close.
   #[test]
@@ -1611,7 +1610,7 @@ mod tests {
     );
   }
 
-  /// Regression (Codex R20): dropping the cursor after the FIRST event of a
+  /// Regression: dropping the cursor after the FIRST event of a
   /// complete frame must not desynchronize the machine — `Drop` drains the
   /// unread tail for its protocol effects, so a ping later in the same read
   /// is still answered and the next `handle` call starts at a frame
@@ -1650,7 +1649,7 @@ mod tests {
     );
   }
 
-  /// Regression (Codex R3): a consumer that handles `CloseReceived` and DROPS
+  /// Regression: a consumer that handles `CloseReceived` and DROPS
   /// the cursor without asking for the trailing `Closed` event must still
   /// observe a terminal connection — the clean-close transition lives on the
   /// connection, not the cursor.
@@ -1874,7 +1873,7 @@ mod tests {
 
     #[test]
     fn final_block_messages_decode_and_recover_across_messages() {
-      // Regression (Codex R21): a peer may end a message with a FINAL
+      // Regression: a peer may end a message with a FINAL
       // DEFLATE block instead of a sync flush. The message decodes — and
       // the ENDED inflater must not poison the next message under context
       // takeover: a final block terminated the stream, so the next message
@@ -1904,7 +1903,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_after_stream_end_fail_the_connection() {
-      // Regression (Codex R21): bytes AFTER the final block are not part of
+      // Regression: bytes AFTER the final block are not part of
       // any DEFLATE stream — RFC 7692 §7.2.2 makes the whole payload part
       // of the message's stream, so they are malformed (1007), never
       // silently dropped.

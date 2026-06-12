@@ -890,7 +890,7 @@ mod deflate_tests {
     assert_eq!(p.server_max_window_bits(), 11);
   }
 
-  /// Regression (Codex R17): the PUBLIC offer emitter refuses out-of-range
+  /// Regression: the PUBLIC offer emitter refuses out-of-range
   /// window bits — `server_max_window_bits=7` on the wire would be rejected
   /// by this crate's own acceptor, so it must be an error, not bytes.
   #[test]
@@ -915,7 +915,7 @@ mod deflate_tests {
     );
   }
 
-  /// Regression (Codex R13): an explicit `server_max_window_bits=15` offer
+  /// Regression: an explicit `server_max_window_bits=15` offer
   /// must be ECHOED in the response — RFC 7692 §7.1.2.1 says a server
   /// accepts the parameter BY including it, and our own client parser
   /// rightly fails on the omission. Before the fix, a websocket-proto
@@ -923,7 +923,7 @@ mod deflate_tests {
   /// produced a response that same client rejected (self-interop failure).
   #[test]
   fn sub_15_server_window_offers_are_declined() {
-    // Regression (Codex R22): an offer demanding `server_max_window_bits`
+    // Regression: an offer demanding `server_max_window_bits`
     // BELOW 15 caps a compressor miniz_oxide cannot bound — granting it
     // would negotiate deflate whose every compressed send fails, so the
     // server DECLINES (no extension) instead. A later acceptable
@@ -1011,7 +1011,7 @@ mod deflate_tests {
       assert!(parse_deflate_response(bad, &offer).is_err(), "{bad}");
     }
 
-    // Regression (Codex R10): RFC 6455 §9.1 lets a parameter value be a
+    // Regression: RFC 6455 §9.1 lets a parameter value be a
     // quoted-string whose unescaped form is a token — a conforming peer may
     // send server_max_window_bits="10" and must not lose the negotiation.
     let p =
@@ -1025,7 +1025,7 @@ mod deflate_tests {
     .unwrap();
     assert_eq!(p.client_max_window_bits(), 12);
 
-    // Regression (audit G2): empty list elements are ignored, not fatal
+    // Regression: empty list elements are ignored, not fatal
     // (RFC 9110 §5.6.1.2) — a stray comma around the single entry is fine,
     // while a second NON-EMPTY entry stays a mismatch (tested above).
     assert!(parse_deflate_response("permessage-deflate,", &offer).is_ok());
@@ -1041,7 +1041,7 @@ mod deflate_tests {
     let capped = DeflateOffer::new().with_server_max_window_bits(Some(10));
     assert!(parse_deflate_response("permessage-deflate", &capped).is_err());
 
-    // Regression (Codex R8): a requested server_no_context_takeover that the
+    // Regression: a requested server_no_context_takeover that the
     // response does NOT echo was not granted (RFC 7692 §7.1.1.1) — accepting
     // it would desync our per-message-reset inflater against a server that
     // keeps its window. Echoed, it is granted.

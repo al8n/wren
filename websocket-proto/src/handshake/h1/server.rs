@@ -675,11 +675,10 @@ Sec-WebSocket-Version: 13\r\n\
     assert_eq!(v.host(), "server.example.com");
   }
 
-  /// Regression (Codex R11): the request target must be a websocket
+  /// Regression: the request target must be a websocket
   /// /resource name/ — origin-form, or an absolute http/https URI
-  /// (RFC 6455 §4.2.1.1 admits BOTH; rejecting absolute-form would fail
-  /// conforming proxied clients, so that half of the review's
-  /// recommendation is deliberately not taken).
+  /// (RFC 6455 §4.2.1.1 admits BOTH; absolute-form is deliberately
+  /// accepted, since rejecting it would fail conforming proxied clients).
   #[test]
   fn request_targets_are_validated() {
     let hs = ServerHandshake::new();
@@ -703,7 +702,7 @@ Sec-WebSocket-Version: 13\r\n\
       "/chat%zz",
       "http://?x",
       "ftp://h/chat",
-      // Regression (Codex R15): the absolute-form AUTHORITY is grammar-
+      // Regression: the absolute-form AUTHORITY is grammar-
       // checked too — bad port, userinfo, multi-colon, unterminated
       // bracket, and non-address bracket forms all fail.
       "http://example.com:bad/chat",
@@ -725,8 +724,7 @@ Sec-WebSocket-Version: 13\r\n\
     // Accepted shapes: absolute-form yields the embedded resource name;
     // a path-less absolute URI reads as "/" (RFC 6455 §3) — INCLUDING the
     // query-only spelling `http://h?q`, whose resource name `/?q` carries a
-    // constructed slash (Codex R12: previously rejected as degenerate);
-    // the scheme is case-insensitive (RFC 3986 §3.1).
+    // constructed slash; the scheme is case-insensitive (RFC 3986 §3.1).
     for (good, want_path, want_query) in [
       ("http://server.example.com/chat?x=1", "/chat", Some("x=1")),
       ("http://server.example.com?token=1", "/", Some("token=1")),
@@ -748,15 +746,14 @@ Sec-WebSocket-Version: 13\r\n\
     }
   }
 
-  /// Regression (Codex R10): the offer list is `1#token` with unique
+  /// Regression: the offer list is `1#token` with unique
   /// elements — a non-token element or a repeat fails the handshake. Empty
-  /// elements are IGNORED, not rejected: RFC 9110 §5.6.1.2 requires a
-  /// recipient to parse and ignore a reasonable number of empty list
-  /// elements (this part deliberately diverges from the review's
-  /// reject-empties recommendation, with the citation).
+  /// elements are deliberately IGNORED, not rejected: RFC 9110 §5.6.1.2
+  /// requires a recipient to parse and ignore a reasonable number of empty
+  /// list elements.
   #[test]
   fn absolute_form_authority_is_the_effective_host() {
-    // Regression (Codex R16): RFC 9112 §3.2.2 — with an absolute-form
+    // Regression: RFC 9112 §3.2.2 — with an absolute-form
     // target, the target's authority IS the effective host and the Host
     // field is ignored; otherwise `GET http://admin.example/ws` with
     // `Host: public.example` would be routed/authorized as public.example.
@@ -793,7 +790,7 @@ Sec-WebSocket-Version: 13\r\n\
 
   #[test]
   fn host_values_are_grammar_checked() {
-    // Regression (Codex R14): the server gate validates Host as an RFC 3986
+    // Regression: the server gate validates Host as an RFC 3986
     // authority before exposing it to routing/origin policy.
     let hs = ServerHandshake::new();
     for bad in ["h/chat", "h?x", "h#f", "u@h", "h st", "a:b:c", "[::1"] {
@@ -1124,7 +1121,7 @@ Sec-WebSocket-Version: 13\r\n\
     ));
   }
 
-  /// Regression (Codex R9): a managed-name extra would put bytes on the wire
+  /// Regression: a managed-name extra would put bytes on the wire
   /// that contradict the returned `Negotiated` — an extra
   /// `Sec-WebSocket-Extensions: permessage-deflate` makes the peer compress
   /// against a connection configured without deflate. All managed names are
@@ -1190,7 +1187,7 @@ Sec-WebSocket-Version: 13\r\n\
     );
   }
 
-  /// Regression (Codex R13): the managed rejection reason-phrase gets the
+  /// Regression: the managed rejection reason-phrase gets the
   /// same control screen as the extras (RFC 9112 §4 grammar) — not just
   /// CR/LF.
   #[test]
@@ -1215,7 +1212,7 @@ Sec-WebSocket-Version: 13\r\n\
     );
   }
 
-  /// Regression (Codex R12): outbound extra-header values follow the
+  /// Regression: outbound extra-header values follow the
   /// RFC 9110 §5.5 field-value grammar — C0 controls (except HTAB) and DEL
   /// are rejected at encode time, exactly mirroring what the inbound parser
   /// screens. HTAB and obs-text stay legal.
@@ -1292,7 +1289,7 @@ Sec-WebSocket-Version: 13\r\n\
     );
     assert_eq!(negotiated.deflate(), Some(params));
 
-    // Regression (Codex R19): the grant is REQUEST-BOUND — replaying the
+    // Regression: the grant is REQUEST-BOUND — replaying the
     // DeflateResponse onto a request with NO deflate offer is an error, not
     // an RSV1 surprise for the peer.
     let plain = view(GOOD);

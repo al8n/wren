@@ -91,8 +91,8 @@ fn extras_strategy() -> impl Strategy<Value = Vec<(String, String)>> {
 fn offer_strategy() -> impl Strategy<Value = websocket_proto::negotiation::DeflateOffer> {
   use websocket_proto::negotiation::DeflateOffer;
   // DELIBERATELY includes out-of-range bits (0..=20): the property asserts
-  // the public emitter REFUSES those configs (Codex R17 found the previous
-  // in-range-only strategy never sampled the unvalidated write path).
+  // the public emitter REFUSES those configs — an in-range-only strategy
+  // would never sample the unvalidated write path.
   (
     any::<bool>(),
     any::<bool>(),
@@ -256,9 +256,9 @@ proptest! {
       .with_require_client_no_context_takeover(require_cnct)
       .with_server_no_context_takeover(server_snct);
     let accepted = accept_deflate_offer([offer_value].into_iter(), &config);
-    // A sub-15 server-window demand is DECLINED (Codex R22: miniz cannot
-    // bound its compressor, so granting would break every compressed send)
-    // — the handshake then proceeds without the extension.
+    // A sub-15 server-window demand is DECLINED (miniz cannot bound its
+    // compressor, so granting would break every compressed send) — the
+    // handshake then proceeds without the extension.
     if offer_value.contains("server_max_window_bits=")
       && !offer_value.contains("server_max_window_bits=15")
     {

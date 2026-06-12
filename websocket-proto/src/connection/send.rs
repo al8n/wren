@@ -703,9 +703,9 @@ where
     // Lazily create the compressor, then compress. The box is TAKEN out of
     // `self` for the duration of the write so the scratch slice borrows a
     // local, not `self` — `write_frame` then borrows `self` disjointly and
-    // no copy of the compressed payload is needed (Codex R23: the old
-    // `to_vec` duplicated an unbounded buffer after the takeover history
-    // had already advanced).
+    // no copy of the compressed payload is needed (a `to_vec` here would
+    // duplicate an unbounded buffer after the takeover history had already
+    // advanced).
     let had_compressor = self.send.deflate.is_some();
     let mut compressor = self
       .send
@@ -813,7 +813,7 @@ mod deflate_tests {
 
   // ── tests ──────────────────────────────────────────────────────────────────
 
-  /// T3-1: A client compresses a text message; a server connection inflates it
+  /// A client compresses a text message; a server connection inflates it
   /// and recovers the original text.
   #[test]
   fn compressed_text_round_trips_through_recv() {
@@ -839,7 +839,7 @@ mod deflate_tests {
     );
   }
 
-  /// T3-2: A client compresses a binary message; a server connection inflates it
+  /// A client compresses a binary message; a server connection inflates it
   /// and recovers the original bytes.
   #[test]
   fn compressed_binary_round_trips_through_recv() {
@@ -864,7 +864,7 @@ mod deflate_tests {
     );
   }
 
-  /// T3-3: The RSV1 bit must be set on a compressed send.
+  /// The RSV1 bit must be set on a compressed send.
   #[test]
   fn compressed_send_sets_rsv1_on_the_wire() {
     let mut conn = deflate_server(default_params());
@@ -884,7 +884,7 @@ mod deflate_tests {
     assert!(decoded.header().fin());
   }
 
-  /// T3-4: `encode_text_compressed` returns `EncodeError::CompressionUnavailable`
+  /// `encode_text_compressed` returns `EncodeError::CompressionUnavailable`
   /// when deflate is not negotiated.
   #[test]
   fn not_negotiated_returns_compression_unavailable() {
@@ -905,14 +905,14 @@ mod deflate_tests {
     ));
   }
 
-  /// T3-5: When the server's outbound window bits < 15, `encode_text_compressed`
+  /// When the server's outbound window bits < 15, `encode_text_compressed`
   /// returns `EncodeError::CompressionUnavailable` (miniz_oxide cannot honor the
   /// window constraint).
   #[test]
   fn outbound_bits_below_15_returns_compression_unavailable() {
-    // Our SERVER now declines sub-15 server-window offers outright (Codex
-    // R22), so server-side params can no longer carry them — but a CLIENT
-    // can still end up capped below 15: its valueless client_max_window_bits
+    // Our SERVER declines sub-15 server-window offers outright, so
+    // server-side params can no longer carry them — but a CLIENT can
+    // still end up capped below 15: its valueless client_max_window_bits
     // hint lets a remote server pick e.g. 10. The client's outbound
     // direction uses client_max_window_bits → CompressionUnavailable.
     let offer = crate::negotiation::DeflateOffer::new();
@@ -935,7 +935,7 @@ mod deflate_tests {
     ));
   }
 
-  /// T3-6: With `no_context_takeover` on the send direction, two successive
+  /// With `no_context_takeover` on the send direction, two successive
   /// compressed messages are each independently decodable by a fresh-context
   /// inflater — verified by decoding both with a server that also negotiated
   /// no_context_takeover on the inbound side.
@@ -1048,7 +1048,7 @@ mod deflate_tests {
     }
   }
 
-  /// Regression (Codex R1): a compressed send rejected for a too-small output
+  /// Regression: a compressed send rejected for a too-small output
   /// buffer must NOT advance the compressor's context-takeover history — the
   /// retry with an adequate buffer must produce a stream a conformant peer
   /// inflater (which never saw the failed attempt) still decodes.
@@ -1567,7 +1567,7 @@ mod tests {
     assert_eq!(got, payloads, "every ping must be answered, in order");
   }
 
-  /// Regression (Codex R2): a ping FLOOD must not grow memory without bound.
+  /// Regression: a ping FLOOD must not grow memory without bound.
   /// Past the overflow cap the oldest queued echoes are shed (RFC 6455 §5.5.3
   /// lets an endpoint answer only the most recent ping), so draining after a
   /// 100-ping flood yields a bounded pong count whose LAST echo answers the

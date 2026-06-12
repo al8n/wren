@@ -857,9 +857,9 @@ mod tests {
         .is_ok()
     );
 
-    // Regression (Codex R18): an offer past `Negotiated`'s inline storage
-    // would make a conforming peer's SELECTION fail our own retention —
-    // reject it at the emitter. 64 fits; 65 does not.
+    // Regression: an offer past `Negotiated`'s inline storage would make a
+    // conforming peer's SELECTION fail our own retention — reject it at the
+    // emitter. 64 fits; 65 does not.
     let at_cap = "a".repeat(crate::negotiation::MAX_SUBPROTOCOL_LEN);
     let over_cap = "a".repeat(crate::negotiation::MAX_SUBPROTOCOL_LEN + 1);
     let offers_ok: &[&str] = &[at_cap.as_str()];
@@ -878,7 +878,7 @@ mod tests {
     );
   }
 
-  /// Regression (Codex R14): `Host:`/`:authority` values are RFC 3986
+  /// Regression: `Host:`/`:authority` values are RFC 3986
   /// authorities — URI delimiters, whitespace, controls, and malformed
   /// IP-literals/ports fail BOTH the builders and the gates; valid
   /// reg-names, ports, and bracketed IPv6 forms pass.
@@ -909,8 +909,8 @@ mod tests {
       "[::1]x",
       "[]",
       "",
-      // Regression (Codex R15): a bracket is an IP-LITERAL, not a byte
-      // soup — dotted-quads and over-compressed colons are not addresses.
+      // Regression: a bracket is an IP-LITERAL, not a byte soup —
+      // dotted-quads and over-compressed colons are not addresses.
       "[127.0.0.1]",
       "[::::]",
       "[1:2:3:4:5:6:7:8:9]",
@@ -942,7 +942,7 @@ mod tests {
       "[::1]:8080",
       "[2001:db8::1]",
       "%41.com",
-      // Regression (Codex R15): real RFC 3986 IP-literals all pass —
+      // Regression: real RFC 3986 IP-literals all pass —
       // full-length IPv6, IPv4-mapped tails, and IPvFuture.
       "[1:2:3:4:5:6:7:8]",
       "[::ffff:127.0.0.1]",
@@ -961,7 +961,7 @@ mod tests {
     }
   }
 
-  /// Regression (Codex R17): `HTTP2-Settings` is an h1-upgrade artifact and
+  /// Regression: `HTTP2-Settings` is an h1-upgrade artifact and
   /// `TE` may only appear in REQUESTS as exactly `trailers`
   /// (RFC 9113 §8.2.2) — anything else fails either gate.
   #[test]
@@ -1015,7 +1015,7 @@ mod tests {
     }
   }
 
-  /// Regression (Codex R14): the response check is symmetric with the
+  /// Regression: the response check is symmetric with the
   /// request gate — h1-only fields fail `validate_connect_response` too.
   #[test]
   fn connect_response_rejects_h1_only_headers() {
@@ -1042,7 +1042,7 @@ mod tests {
     assert!(validate_connect_response(&[], &req).is_ok());
   }
 
-  /// Regression (Codex R13): RFC 8441 §5 / RFC 9113 §8.2.2 — h1 upgrade
+  /// Regression: RFC 8441 §5 / RFC 9113 §8.2.2 — h1 upgrade
   /// machinery and connection-specific fields are forbidden on this
   /// transport; the strict gate rejects them itself.
   #[test]
@@ -1077,7 +1077,7 @@ mod tests {
     assert!(validate_connect_request(base).is_ok());
   }
 
-  /// Regression (Codex R10): the CONNECT gate validates offer lists like the
+  /// Regression: the CONNECT gate validates offer lists like the
   /// h1 server — non-token or repeated elements fail; empty elements are
   /// ignored per RFC 9110 §5.6.1.2.
   #[test]
@@ -1268,7 +1268,7 @@ mod tests {
         ],
         "path",
       ),
-      // Regression (Codex R9): a leading `/` is not enough — `/bad path`
+      // Regression: a leading `/` is not enough — `/bad path`
       // is not a request-target (origin-form admits no SP).
       (
         &[
@@ -1386,7 +1386,7 @@ mod tests {
     assert_eq!(find(headers.iter(), "sec-websocket-protocol"), Some("chat"));
     assert_eq!(server_negotiated.subprotocol(), Some("chat"));
 
-    // Regression (Codex R18): the accept is BOUND to the request — an
+    // Regression: the accept is BOUND to the request — an
     // unoffered selection is an error here, not wire bytes.
     let unoffered = ConnectAccept::new().with_subprotocol(Some("nope"));
     assert!(matches!(
@@ -1434,7 +1434,7 @@ mod tests {
     let (response_headers, server_negotiated) = accept.headers_for(&view).unwrap();
     assert_eq!(server_negotiated.deflate(), Some(params));
 
-    // Regression (Codex R19): replaying the grant onto a request with NO
+    // Regression: replaying the grant onto a request with NO
     // deflate offer fails the bind.
     let plain_req = ConnectRequest::new(Scheme::Https, "h", "/");
     let plain_headers = plain_req.headers().unwrap();
