@@ -4,10 +4,18 @@
 //!
 //! Concurrency model (thread-per-core, `!Send`): all state lives in
 //! `Rc<RefCell<Inner>>`, and a `RefCell` borrow is NEVER held across an
-//! `.await`. The pump takes the stream out of `Inner` by value for the
-//! duration of one step, so dropping a losing `select!` arm cancels only
-//! that read future (and its per-read buffer) — the stream itself survives
-//! in the pump's locals.
+//! `.await`.
+//!
+//! Cancellation model: the transport is the poll-based duplex produced by
+//! [`IntoDuplex`](crate::IntoDuplex), so every IO future is
+//! cancellation-atomic (`Pending` means nothing was consumed, and a
+//! transport's in-flight completion operations live inside the adapter, not
+//! inside the dropped future). On top of that, the pump moves the stream —
+//! and any partially-written batch with its byte cursor — into a [`PumpIo`]
+//! guard whose `Drop` puts them back into `Inner`. Dropping `next()` /
+//! `send()` mid-await (a caller-side `timeout` or `select!`) therefore
+//! neither loses the transport nor loses inbound bytes nor forgets write
+//! progress: the next call resumes exactly where the cancelled one stopped.
 
 use std::{
   cell::{Cell, RefCell},
@@ -16,10 +24,8 @@ use std::{
   time::Instant,
 };
 
-use compio_buf::BufResult;
-use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use event_listener::Event as Doorbell;
-use futures_util::FutureExt;
+use futures_util::{AsyncReadExt, AsyncWriteExt, FutureExt};
 use websocket_proto::{
   Connection, ConnectionConfig, Negotiated,
   connection::{Closed, Event, role},
@@ -30,6 +36,7 @@ use wren_trace::{debug, trace, warn};
 
 use crate::{
   error::Error,
+  into_duplex::Duplex,
   options::{AcceptOptions, ClientOptions},
 };
 
@@ -64,9 +71,19 @@ pub(crate) struct OutboundFrame {
   state: Rc<Cell<FrameState>>,
 }
 
+/// One coalesced wire batch, with resume state: `cursor` bytes are already
+/// on the wire. Lives in `Inner` between polls so a cancelled write picks
+/// up where it stopped instead of resending (or never sending) bytes.
+pub(crate) struct PendingWrite {
+  bytes: Vec<u8>,
+  cursor: usize,
+  states: Vec<Rc<Cell<FrameState>>>,
+}
+
 pub(crate) struct Inner<Ro, S> {
   conn: Connection<Instant, Ro>,
-  /// `None` only while the pump owns the stream across an await.
+  /// `None` only while a [`PumpIo`] guard owns the stream, or after
+  /// teardown.
   stream: Option<S>,
   /// Inbound bytes not yet fed to `conn` (handshake leftover, then reads).
   pending_input: Vec<u8>,
@@ -75,6 +92,9 @@ pub(crate) struct Inner<Ro, S> {
   /// several).
   ready: VecDeque<Message>,
   outbound: VecDeque<OutboundFrame>,
+  /// The in-progress wire batch (see [`PendingWrite`]); `None` when fully
+  /// flushed.
+  pending_write: Option<PendingWrite>,
   closed: Option<Closed>,
   read_half_alive: bool,
   is_split: bool,
@@ -87,6 +107,10 @@ pub(crate) struct Inner<Ro, S> {
 /// `next()` must be polled to drive the protocol: pong echoes, keepalive
 /// pings, the close handshake, and (after [`split`](Self::split)) queued
 /// writes all progress inside it.
+///
+/// `next()` and the senders are cancellation-safe: dropping them mid-await
+/// neither loses inbound bytes nor corrupts the outbound stream — the next
+/// call resumes the interrupted work.
 pub struct WebSocket<Ro, S> {
   inner: Rc<RefCell<Inner<Ro, S>>>,
   doorbell: Rc<Doorbell>,
@@ -115,7 +139,7 @@ fn build_config(
   (config, cap)
 }
 
-impl<S: AsyncRead + AsyncWrite + 'static> WebSocket<ClientRole, S> {
+impl<S: Duplex> WebSocket<ClientRole, S> {
   pub(crate) fn client(
     stream: S,
     negotiated: &Negotiated,
@@ -138,7 +162,7 @@ impl<S: AsyncRead + AsyncWrite + 'static> WebSocket<ClientRole, S> {
   }
 }
 
-impl<S: AsyncRead + AsyncWrite + 'static> WebSocket<ServerRole, S> {
+impl<S: Duplex> WebSocket<ServerRole, S> {
   pub(crate) fn server(
     stream: S,
     negotiated: &Negotiated,
@@ -155,7 +179,7 @@ impl<S: AsyncRead + AsyncWrite + 'static> WebSocket<ServerRole, S> {
   }
 }
 
-impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
+impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
   fn with_conn(stream: S, conn: Connection<Instant, Ro>, cap: usize, leftover: Vec<u8>) -> Self {
     Self {
       inner: Rc::new(RefCell::new(Inner {
@@ -165,6 +189,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
         assembler: MessageAssembler::new(cap),
         ready: VecDeque::new(),
         outbound: VecDeque::new(),
+        pending_write: None,
         closed: None,
         read_half_alive: true,
         is_split: false,
@@ -199,7 +224,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, text.len(), |conn, out| {
       conn.encode_text(text, out)
     })?;
-    send_frame(&self.inner, frame).await
+    send_frame(&self.inner, &self.doorbell, frame).await
   }
 
   /// Sends a whole binary message.
@@ -207,7 +232,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, data.len(), |conn, out| {
       conn.encode_binary(data, out)
     })?;
-    send_frame(&self.inner, frame).await
+    send_frame(&self.inner, &self.doorbell, frame).await
   }
 
   /// Sends a Ping (the peer's Pong is consumed internally).
@@ -215,7 +240,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, payload.len(), |conn, out| {
       conn.encode_ping(payload, out)
     })?;
-    send_frame(&self.inner, frame).await
+    send_frame(&self.inner, &self.doorbell, frame).await
   }
 
   /// Sends a whole text message compressed with permessage-deflate.
@@ -230,7 +255,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, text.len() * 2, |conn, out| {
       conn.encode_text_compressed(text, out)
     })?;
-    send_frame(&self.inner, frame).await
+    send_frame(&self.inner, &self.doorbell, frame).await
   }
 
   /// Sends a whole binary message compressed with permessage-deflate.
@@ -240,7 +265,7 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
     let frame = encode_with(&self.inner, data.len() * 2, |conn, out| {
       conn.encode_binary_compressed(data, out)
     })?;
-    send_frame(&self.inner, frame).await
+    send_frame(&self.inner, &self.doorbell, frame).await
   }
 
   /// Starts the close handshake, drives it to completion (peer echo or the
@@ -276,7 +301,6 @@ impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WebSocket<Ro, S> {
       // `next_message` only returns `None` with the outcome recorded.
       return Err(Error::Closed);
     };
-    teardown(&self.inner).await;
     Ok(closed)
   }
 
@@ -315,49 +339,130 @@ fn encode_with<Ro: role::Role, S>(
   Ok(buf)
 }
 
+/// Moves the stream and the in-progress write out of `Inner` for the
+/// duration of the IO awaits; `Drop` puts whatever is left back, so a
+/// cancelled caller future never strands either.
+struct PumpIo<'a, Ro, S> {
+  inner: &'a Rc<RefCell<Inner<Ro, S>>>,
+  stream: Option<S>,
+  write: Option<PendingWrite>,
+}
+
+impl<'a, Ro, S> PumpIo<'a, Ro, S> {
+  fn take(inner: &'a Rc<RefCell<Inner<Ro, S>>>) -> Self {
+    let (stream, write) = {
+      let mut guard = inner.borrow_mut();
+      (guard.stream.take(), guard.pending_write.take())
+    };
+    Self {
+      inner,
+      stream,
+      write,
+    }
+  }
+}
+
+impl<Ro, S> Drop for PumpIo<'_, Ro, S> {
+  fn drop(&mut self) {
+    let mut guard = self.inner.borrow_mut();
+    guard.stream = self.stream.take();
+    guard.pending_write = self.write.take();
+  }
+}
+
+fn stream_gone() -> Error {
+  Error::Io(std::io::Error::from(std::io::ErrorKind::ResourceBusy))
+}
+
+/// Drives the guard's pending write to the wire: byte cursor loop, then
+/// flush, then frame-state transitions. The cursor advances only on
+/// completed sub-writes, so cancellation mid-batch resumes losslessly.
+async fn drive_pending_write<Ro, S: Duplex>(
+  io: &mut PumpIo<'_, Ro, S>,
+  doorbell: &Doorbell,
+) -> Result<(), Error> {
+  let Some(stream) = io.stream.as_mut() else {
+    return Err(stream_gone());
+  };
+  let Some(pending) = io.write.as_mut() else {
+    return Ok(());
+  };
+  let result = 'drive: {
+    while pending.cursor < pending.bytes.len() {
+      match stream.write(&pending.bytes[pending.cursor..]).await {
+        Ok(0) => break 'drive Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+        Ok(n) => pending.cursor += n,
+        Err(e) => break 'drive Err(e),
+      }
+    }
+    // The batch is fully handed to the transport; flush puts buffered
+    // bytes (the adapter's, TLS records) on the wire. Idempotent, so a
+    // cancellation between the last write and here re-flushes on resume.
+    stream.flush().await
+  };
+  let pending = io.write.take().expect("checked above");
+  match result {
+    Ok(()) => {
+      for state in &pending.states {
+        state.set(FrameState::Written);
+      }
+      doorbell.notify(usize::MAX);
+      Ok(())
+    }
+    Err(e) => {
+      warn!(error = %e, "transport write failed");
+      let kind = e.kind();
+      for state in &pending.states {
+        state.set(FrameState::Failed(kind));
+      }
+      doorbell.notify(usize::MAX);
+      Err(Error::Io(e))
+    }
+  }
+}
+
 /// Direct write of one encoded frame. Only reachable unsplit — `split()`
 /// consumes the `WebSocket`, and the halves enqueue through the doorbell
-/// instead — so the stream is guaranteed parked in `Inner`.
-async fn send_frame<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static>(
+/// instead. Settles any write a cancelled earlier call left behind first.
+async fn send_frame<Ro: role::Role, S: Duplex>(
   inner: &Rc<RefCell<Inner<Ro, S>>>,
+  doorbell: &Rc<Doorbell>,
   frame: Vec<u8>,
 ) -> Result<(), Error> {
   debug_assert!(!inner.borrow().is_split);
-  let mut stream = take_stream(inner)?;
-  // compio-io contract: `write_all` may only fill a buffering stream's
-  // internal buffer (TLS records); `flush` puts the bytes on the wire.
-  let mut result = stream.write_all(frame).await.0;
-  if result.is_ok() {
-    result = stream.flush().await;
+  let mut mine = Some(frame);
+  loop {
+    let mut io = PumpIo::take(inner);
+    if io.write.is_none() {
+      match mine.take() {
+        Some(bytes) => {
+          io.write = Some(PendingWrite {
+            bytes,
+            cursor: 0,
+            states: Vec::new(),
+          });
+        }
+        None => return Ok(()),
+      }
+    }
+    drive_pending_write(&mut io, doorbell).await?;
   }
-  inner.borrow_mut().stream = Some(stream);
-  result.map_err(Error::from)
-}
-
-fn take_stream<Ro, S>(inner: &Rc<RefCell<Inner<Ro, S>>>) -> Result<S, Error> {
-  inner
-    .borrow_mut()
-    .stream
-    .take()
-    .ok_or(Error::Io(std::io::Error::from(
-      std::io::ErrorKind::ResourceBusy,
-    )))
 }
 
 /// Tears the transport down after the close handshake (or on abandonment):
-/// best-effort write-side shutdown (TLS close_notify / TCP FIN), then drop.
+/// best-effort write-side close (TLS close_notify / TCP FIN), then drop.
 /// Consuming the stream makes repeated calls no-ops.
-async fn teardown<Ro, S: AsyncRead + AsyncWrite + 'static>(inner: &Rc<RefCell<Inner<Ro, S>>>) {
+async fn teardown<Ro, S: Duplex>(inner: &Rc<RefCell<Inner<Ro, S>>>) {
   let Some(mut stream) = inner.borrow_mut().stream.take() else {
     return;
   };
   trace!("shutting the transport down");
-  let _ = stream.shutdown().await;
+  let _ = stream.close().await;
 }
 
 /// The shared pump: drives the connection until a data message completes,
 /// the connection closes (`None`), or an error surfaces.
-pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static>(
+pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
   inner: &Rc<RefCell<Inner<Ro, S>>>,
   doorbell: &Rc<Doorbell>,
 ) -> Option<Result<Message, Error>> {
@@ -401,79 +506,72 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
       }
     }
 
-    // Phase 2 (borrow): coalesce queued writer frames + protocol transmits.
-    // Queue first: a writer frame was encoded before any Close the protocol
-    // may have queued since, and data frames must precede the Close on the
-    // wire (RFC 6455 §5.5.1).
-    let (coalesced, states, deadline) = {
+    // Phase 2 (borrow): if no batch is in progress, coalesce queued writer
+    // frames + protocol transmits into one. Queue first: a writer frame
+    // was encoded before any Close the protocol may have queued since, and
+    // data frames must precede the Close on the wire (RFC 6455 §5.5.1).
+    let deadline = {
       let mut guard = inner.borrow_mut();
-      let mut coalesced: Vec<u8> = Vec::new();
-      let mut states = Vec::new();
-      while let Some(frame) = guard.outbound.pop_front() {
-        coalesced.extend_from_slice(&frame.bytes);
-        states.push(frame.state);
-      }
-      let mut scratch = [0u8; TRANSMIT_SCRATCH];
-      let now = Instant::now();
-      loop {
-        match guard.conn.poll_transmit(now, &mut scratch) {
-          Ok(Some(n)) => coalesced.extend_from_slice(scratch.get(..n).unwrap_or(&[])),
-          Ok(None) => break,
-          Err(e) => return Some(Err(e.into())),
+      if guard.pending_write.is_none() {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut states = Vec::new();
+        while let Some(frame) = guard.outbound.pop_front() {
+          bytes.extend_from_slice(&frame.bytes);
+          states.push(frame.state);
+        }
+        let mut scratch = [0u8; TRANSMIT_SCRATCH];
+        let now = Instant::now();
+        loop {
+          match guard.conn.poll_transmit(now, &mut scratch) {
+            Ok(Some(n)) => bytes.extend_from_slice(scratch.get(..n).unwrap_or(&[])),
+            Ok(None) => break,
+            Err(e) => return Some(Err(e.into())),
+          }
+        }
+        if !bytes.is_empty() {
+          guard.pending_write = Some(PendingWrite {
+            bytes,
+            cursor: 0,
+            states,
+          });
         }
       }
-      (coalesced, states, guard.conn.poll_timeout())
+      guard.conn.poll_timeout()
     };
 
-    // Phase 3 (no borrow): put bytes on the wire.
-    if !coalesced.is_empty() {
-      let mut stream = match take_stream(inner) {
-        Ok(s) => s,
-        Err(e) => return Some(Err(e)),
-      };
-      // write_all may only buffer (TLS records); flush hits the wire.
-      let mut result = stream.write_all(coalesced).await.0;
-      if result.is_ok() {
-        result = stream.flush().await;
-      }
-      inner.borrow_mut().stream = Some(stream);
-      match result {
+    // Phase 3 (IO, guarded): put the batch on the wire.
+    if inner.borrow().pending_write.is_some() {
+      let mut io = PumpIo::take(inner);
+      match drive_pending_write(&mut io, doorbell).await {
         Ok(()) => {
-          for state in &states {
-            state.set(FrameState::Written);
-          }
-          doorbell.notify(usize::MAX);
+          drop(io);
           continue; // re-settle: the close frame may have just gone out
         }
-        Err(e) => {
-          warn!(error = %e, "transport write failed");
-          let kind = e.kind();
-          for state in &states {
-            state.set(FrameState::Failed(kind));
-          }
-          doorbell.notify(usize::MAX);
-          return Some(Err(Error::Io(e)));
-        }
+        Err(e) => return Some(Err(e)),
       }
     }
 
     // Terminal check — reached only when phase 2 found NOTHING left to
-    // write (a non-empty coalesce loops back through phase 1 instead), so
-    // a recorded close here means echo, queue, and marker are all on the
+    // write (a non-empty batch loops back through phase 1 instead), so a
+    // recorded close here means echo, queue, and marker are all on the
     // wire. The single `None` producer: shut the transport down (TLS
-    // close_notify / TCP FIN) — the split path tears down through here too.
+    // close_notify / TCP FIN) — the split path tears down through here
+    // too.
     if inner.borrow().closed.is_some() {
       teardown(inner).await;
       return None;
     }
 
-    // Phase 4 (no borrow): park on read / timer / doorbell.
-    let mut stream = match take_stream(inner) {
-      Ok(s) => s,
-      Err(e) => return Some(Err(e)),
+    // Phase 4 (IO, guarded): park on read / timer / doorbell. The losing
+    // arms drop poll-based futures, which is loss-free: a partial read
+    // lives in the transport's own buffers, never in the dropped future.
+    let mut io = PumpIo::take(inner);
+    let Some(stream) = io.stream.as_mut() else {
+      return Some(Err(stream_gone()));
     };
+    let mut scratch = vec![0u8; READ_CHUNK];
     let outcome = {
-      let read = async { stream.read(Vec::with_capacity(READ_CHUNK)).await }.fuse();
+      let read = stream.read(&mut scratch).fuse();
       let timer = async {
         match deadline {
           Some(at) => {
@@ -492,10 +590,10 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
         () = bell => Park::Doorbell,
       }
     };
-    inner.borrow_mut().stream = Some(stream);
+    drop(io);
 
     match outcome {
-      Park::Read(BufResult(Ok(0), _buf)) => {
+      Park::Read(Ok(0)) => {
         // Phase 1/3 already return `None` whenever `closed` is recorded, so
         // a parked read only resolves to EOF while the connection is open.
         debug!("transport EOF before the close handshake completed");
@@ -503,11 +601,14 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
           std::io::ErrorKind::UnexpectedEof,
         ))));
       }
-      Park::Read(BufResult(Ok(n), buf)) => {
+      Park::Read(Ok(n)) => {
         trace!(bytes = n, "transport read");
-        inner.borrow_mut().pending_input.extend_from_slice(&buf);
+        let mut guard = inner.borrow_mut();
+        guard
+          .pending_input
+          .extend_from_slice(scratch.get(..n).unwrap_or(&[]));
       }
-      Park::Read(BufResult(Err(e), _buf)) => return Some(Err(Error::Io(e))),
+      Park::Read(Err(e)) => return Some(Err(Error::Io(e))),
       Park::Timer => {
         let mut guard = inner.borrow_mut();
         let now = Instant::now();
@@ -522,7 +623,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
 }
 
 enum Park {
-  Read(BufResult<usize, Vec<u8>>),
+  Read(std::io::Result<usize>),
   Timer,
   Doorbell,
 }

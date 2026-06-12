@@ -1,31 +1,55 @@
 //! A loopback in-memory byte stream implementing compio's
-//! AsyncRead/AsyncWrite, so connection logic is unit-testable without
-//! sockets.
+//! AsyncRead/AsyncWrite (split into halves), so connection logic is
+//! unit-testable without sockets — through the SAME `AsyncStream`
+//! adapter path production sockets use.
 
 use compio_buf::{BufResult, IoBuf, IoBufMut};
-use compio_io::{AsyncRead, AsyncWrite};
+use compio_io::{AsyncRead, AsyncWrite, util::Splittable};
 use event_listener::Event;
 use std::{cell::RefCell, collections::VecDeque, io, rc::Rc};
 
 #[derive(Debug, Default)]
 struct Shared {
   buf: RefCell<VecDeque<u8>>,
+  /// Writes past this park until the reader drains (0 = unbounded).
+  capacity: usize,
   closed: RefCell<bool>,
   event: Event,
 }
 
-/// One end of a duplex pair. Deliberately NOT `Clone`: dropping an end
-/// closes the channel, which a surviving clone would observe spuriously.
+/// One end of a duplex pair; [`Splittable`] into a reader + writer whose
+/// drops close their direction.
 #[derive(Debug)]
 pub(crate) struct Pipe {
   read: Rc<Shared>,
   write: Rc<Shared>,
 }
 
+pub(crate) struct PipeReader {
+  shared: Rc<Shared>,
+}
+
+pub(crate) struct PipeWriter {
+  shared: Rc<Shared>,
+}
+
 /// A connected in-memory stream pair.
 pub(crate) fn duplex() -> (Pipe, Pipe) {
-  let a = Rc::new(Shared::default());
-  let b = Rc::new(Shared::default());
+  duplex_with_capacity(0)
+}
+
+/// A connected pair whose per-direction buffer parks writers at `cap`
+/// bytes until the peer drains (0 = unbounded) — for write-backpressure
+/// tests.
+pub(crate) fn duplex_with_capacity(cap: usize) -> (Pipe, Pipe) {
+  let a = Rc::new(Shared {
+    capacity: cap,
+    ..Shared::default()
+  });
+  let b = Rc::new(Shared {
+    capacity: cap,
+    ..Shared::default()
+  });
   (
     Pipe {
       read: a.clone(),
@@ -35,12 +59,24 @@ pub(crate) fn duplex() -> (Pipe, Pipe) {
   )
 }
 
-impl AsyncRead for Pipe {
+impl Splittable for Pipe {
+  type ReadHalf = PipeReader;
+  type WriteHalf = PipeWriter;
+
+  fn split(self) -> (PipeReader, PipeWriter) {
+    (
+      PipeReader { shared: self.read },
+      PipeWriter { shared: self.write },
+    )
+  }
+}
+
+impl AsyncRead for PipeReader {
   async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
     loop {
-      let listener = self.read.event.listen();
+      let listener = self.shared.event.listen();
       let copied: Option<usize> = {
-        let mut q = self.read.buf.borrow_mut();
+        let mut q = self.shared.buf.borrow_mut();
         if !q.is_empty() {
           let start = buf.buf_len();
           let queued = q.len();
@@ -62,9 +98,11 @@ impl AsyncRead for Pipe {
             // SAFETY: `ensure_init` initialized the whole capacity and the
             // first `start + n` bytes are now meaningful data.
             unsafe { buf.set_len(start + n) };
+            // A capacity-bounded writer may be parked on the drain.
+            self.shared.event.notify(usize::MAX);
           }
           Some(n)
-        } else if *self.read.closed.borrow() {
+        } else if *self.shared.closed.borrow() {
           Some(0)
         } else {
           None
@@ -78,16 +116,44 @@ impl AsyncRead for Pipe {
   }
 }
 
-impl AsyncWrite for Pipe {
+impl Drop for PipeReader {
+  fn drop(&mut self) {
+    // The peer's writes fail and a parked peer writer wakes.
+    *self.shared.closed.borrow_mut() = true;
+    self.shared.event.notify(usize::MAX);
+  }
+}
+
+impl AsyncWrite for PipeWriter {
   async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
-    if *self.write.closed.borrow() {
-      return BufResult(Err(io::Error::from(io::ErrorKind::BrokenPipe)), buf);
+    loop {
+      let listener = self.shared.event.listen();
+      let outcome: Option<io::Result<usize>> = {
+        if *self.shared.closed.borrow() {
+          Some(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        } else {
+          let mut q = self.shared.buf.borrow_mut();
+          let room = if self.shared.capacity == 0 {
+            usize::MAX
+          } else {
+            self.shared.capacity.saturating_sub(q.len())
+          };
+          if room == 0 {
+            None // full: park until the reader drains
+          } else {
+            let slice = buf.as_init();
+            let n = usize::min(slice.len(), room);
+            q.extend(slice.get(..n).unwrap_or(&[]));
+            self.shared.event.notify(usize::MAX);
+            Some(Ok(n))
+          }
+        }
+      };
+      if let Some(result) = outcome {
+        return BufResult(result, buf);
+      }
+      listener.await;
     }
-    let slice = buf.as_init();
-    self.write.buf.borrow_mut().extend(slice);
-    let n = slice.len();
-    self.write.event.notify(usize::MAX);
-    BufResult(Ok(n), buf)
   }
 
   async fn flush(&mut self) -> io::Result<()> {
@@ -95,18 +161,18 @@ impl AsyncWrite for Pipe {
   }
 
   async fn shutdown(&mut self) -> io::Result<()> {
-    *self.write.closed.borrow_mut() = true;
-    self.write.event.notify(usize::MAX);
+    *self.shared.closed.borrow_mut() = true;
+    self.shared.event.notify(usize::MAX);
     Ok(())
   }
 }
 
-impl Drop for Pipe {
+impl Drop for PipeWriter {
   fn drop(&mut self) {
-    // Dropping an end EOFs the peer's reads and fails its writes.
-    *self.write.closed.borrow_mut() = true;
-    self.write.event.notify(usize::MAX);
-    // And wake any reader parked on data we will never send.
-    self.read.event.notify(usize::MAX);
+    // EOF for the peer's reads.
+    *self.shared.closed.borrow_mut() = true;
+    self.shared.event.notify(usize::MAX);
   }
 }
+
+crate::into_duplex::adapted_into_duplex!(Pipe);

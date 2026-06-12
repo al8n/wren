@@ -11,7 +11,6 @@ use std::{
   rc::Rc,
 };
 
-use compio_io::{AsyncRead, AsyncWrite};
 use event_listener::Event as Doorbell;
 use websocket_proto::{
   connection::{Closed, role},
@@ -59,7 +58,7 @@ impl<Ro, S> std::fmt::Debug for WriteHalf<Ro, S> {
   }
 }
 
-impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> ReadHalf<Ro, S> {
+impl<Ro: role::Role, S: crate::into_duplex::Duplex> ReadHalf<Ro, S> {
   /// The next data message, or `None` once the connection has closed.
   ///
   /// This is the connection's pump: queued writes from the
@@ -88,7 +87,7 @@ impl<Ro, S> Drop for ReadHalf<Ro, S> {
   }
 }
 
-impl<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static> WriteHalf<Ro, S> {
+impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
   /// Sends a whole data message (pumped by the read half).
   pub async fn send(&mut self, message: Message) -> Result<(), Error> {
     match &message {
