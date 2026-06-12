@@ -1,0 +1,108 @@
+name: Autobahn TestSuite
+
+# Opt-in conformance run: the full Autobahn WebSocket TestSuite against both the
+# server and client example harnesses. Not on every push (it is slow and pulls a
+# large docker image) — triggered manually or weekly.
+on:
+  workflow_dispatch:
+  schedule: [cron: "0 4 * * 0"] # Sundays 04:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # crossbario/autobahn-testsuite:latest pinned by digest for reproducibility.
+  # Refresh by re-pulling and copying the new `docker.io/...@sha256:` digest.
+  # latest as of 2025-10-07 build (Autobahn TestSuite 25.10.1, vcs 6ed6f43).
+  AUTOBAHN_IMAGE: "crossbario/autobahn-testsuite:latest@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074"
+
+jobs:
+  autobahn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build example harnesses (release)
+        run: |
+          cargo build -p websocket-proto --release --features std,deflate \
+            --example autobahn-server --example autobahn-client
+
+      - name: Write Autobahn specs
+        run: |
+          mkdir -p autobahn/reports
+          cat > autobahn/fuzzingclient.json <<'JSON'
+          {
+            "outdir": "/reports/servers",
+            "servers": [{ "agent": "websocket-proto", "url": "ws://127.0.0.1:9001" }],
+            "cases": ["*"],
+            "exclude-cases": [],
+            "exclude-agent-cases": {}
+          }
+          JSON
+          cat > autobahn/fuzzingserver.json <<'JSON'
+          {
+            "url": "ws://127.0.0.1:9001",
+            "outdir": "/reports/clients",
+            "cases": ["*"],
+            "exclude-cases": [],
+            "exclude-agent-cases": {}
+          }
+          JSON
+
+      # ── Phase 1: our SERVER vs the dockerized fuzzing CLIENT ──────────────────
+      - name: Start the server harness
+        run: |
+          ./target/release/examples/autobahn-server &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          # Wait for the listener.
+          for _ in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/9001) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+            sleep 0.5
+          done
+
+      - name: Run fuzzingclient against the server (all cases incl. 12/13)
+        run: |
+          docker run --rm --network host \
+            -v "$PWD/autobahn:/config" \
+            -v "$PWD/autobahn/reports:/reports" \
+            "$AUTOBAHN_IMAGE" \
+            wstest -m fuzzingclient -s /config/fuzzingclient.json
+
+      - name: Stop the server harness
+        if: always()
+        run: kill "$SERVER_PID" 2>/dev/null || true
+
+      # ── Phase 2: the dockerized fuzzing SERVER vs our CLIENT ──────────────────
+      - name: Start the fuzzingserver
+        run: |
+          docker run --rm --network host --name fuzzingserver -d \
+            -v "$PWD/autobahn:/config" \
+            -v "$PWD/autobahn/reports:/reports" \
+            "$AUTOBAHN_IMAGE" \
+            wstest -m fuzzingserver -s /config/fuzzingserver.json
+          # Wait for the fuzzingserver listener.
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/9001) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+            sleep 0.5
+          done
+
+      - name: Run the client harness against the fuzzingserver
+        run: ./target/release/examples/autobahn-client
+
+      - name: Stop the fuzzingserver
+        if: always()
+        run: docker rm -f fuzzingserver 2>/dev/null || true
+
+      # ── Gate: fail on any case whose behavior is FAILED ──────────────────────
+      - name: Evaluate reports (fail on any FAILED case)
+        run: python3 .github/workflows/autobahn_gate.py autobahn/reports
+
+      - name: Upload Autobahn reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-reports
+          path: autobahn/reports
+          retention-days: 30

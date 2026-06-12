@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ae75b146d47af7a16fbb48674c985c238445555f197256060e87d824af9c8a19 # shrinks to offer = DeflateOffer { server_no_context_takeover: false, client_no_context_takeover: false, server_max_window_bits: Some(15), client_max_window_bits: None, offer_client_max_window_bits: false }, require_cnct = false, server_snct = false
