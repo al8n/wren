@@ -13,7 +13,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return;
       };
       println!("{peer} connected on {}", summary.path());
-      while let Some(Ok(message)) = ws.next().await {
+      while let Some(result) = ws.next().await {
+        let message = match result {
+          Ok(message) => message,
+          Err(e) => {
+            eprintln!("{peer} errored: {e}");
+            return;
+          }
+        };
         if ws.send(message).await.is_err() {
           break;
         }

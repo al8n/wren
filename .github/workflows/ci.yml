@@ -76,7 +76,9 @@ jobs:
       - run: cargo hack build -p websocket-proto --each-feature
       - run: cargo hack test -p websocket-proto --each-feature
       - run: cargo hack test -p wren-trace --each-feature
-      - run: cargo hack test -p wren-compio --each-feature
+      # Powerset (8 combos over tls/deflate/tracing): feature-interaction
+      # bugs (tls+deflate) escape an each-feature pass.
+      - run: cargo hack test -p wren-compio --feature-powerset
 
   test:
     strategy:

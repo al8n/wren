@@ -22,6 +22,12 @@ fn noop_macros_never_evaluate_arguments() {
   fn boom() -> u32 {
     panic!("must never run");
   }
+  // One side-effecting expression per macro arm shape.
   crate::trace!(x = boom(), "msg");
   crate::debug!(%boom());
+  crate::warn!(?boom());
+  crate::info!(x = %boom(), "msg");
+  crate::error!("plain {}", boom());
+  crate::trace!(target: "t", x = boom(), "msg");
+  let _span = crate::debug_span!("span", field = boom());
 }
