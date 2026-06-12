@@ -1086,8 +1086,7 @@ mod tests {
     assert_eq!(via_h3, Scheme::Https);
     // And the gate called through the alias is the same function: its view
     // interchanges with `connect`'s error type.
-    let err: ConnectRequestError =
-      crate::handshake::h3::validate_connect_request(&[]).unwrap_err();
+    let err: ConnectRequestError = crate::handshake::h3::validate_connect_request(&[]).unwrap_err();
     assert!(matches!(err, ConnectRequestError::NotConnect));
   }
 
