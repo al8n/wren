@@ -98,10 +98,12 @@ pub(crate) async fn drive_client<S: Duplex>(
   }
 }
 
-pub(crate) async fn drive_server<S: Duplex>(
-  mut stream: S,
-  options: &AcceptOptions,
-) -> Result<(S, ServerOutcome), AcceptError> {
+/// Reads one complete upgrade request head; nothing is written. The
+/// returned buffer re-parses statelessly in [`finish_accept`] /
+/// [`finish_reject`].
+pub(crate) async fn drive_server_request<S: Duplex>(
+  stream: &mut S,
+) -> Result<(Vec<u8>, crate::RequestSummary), AcceptError> {
   let hs = ServerHandshake::new();
   let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
   let mut chunk = vec![0u8; READ_CHUNK];
@@ -117,53 +119,86 @@ pub(crate) async fn drive_server<S: Duplex>(
     let Ok(view) = progress.try_unwrap_request() else {
       continue;
     };
-
-    // Everything below borrows `view` (and through it `acc`): build the
-    // whole response and the outcome BEFORE the write await.
     let summary = crate::RequestSummary {
       path: view.path().into(),
       query: view.query().map(Into::into),
       host: view.host().into(),
       origin: view.origin().map(Into::into),
     };
-    let supported: Vec<&str> = options
-      .supported_subprotocols
-      .iter()
-      .map(SmolStr::as_str)
-      .collect();
-    let chosen = select_subprotocol(view.subprotocols(), &supported);
-    let extras: Vec<(&str, &str)> = options
-      .extra_headers
-      .iter()
-      .map(|(n, v)| (n.as_str(), v.as_str()))
-      .collect();
-    #[allow(unused_mut)]
-    let mut accept = Accept::new()
-      .with_subprotocol(chosen)
-      .with_extra_headers(extras.as_slice());
-    #[cfg(feature = "deflate")]
-    if let Some(config) = &options.deflate {
-      let granted = websocket_proto::negotiation::accept_deflate_offer(view.extensions(), config);
-      accept = accept.with_deflate(granted.map(|(_, response)| response));
-    }
-
-    let mut response = vec![0u8; READ_CHUNK];
-    let (n, negotiated) = hs.encode_response(&view, &accept, &mut response)?;
-    let consumed = view.consumed();
-    let leftover = acc.get(consumed..).unwrap_or(&[]).to_vec();
-
-    stream.write_all(response.get(..n).unwrap_or(&[])).await?;
-    stream.flush().await?;
-    debug!(path = %summary.path, leftover = leftover.len(), "server handshake complete");
-    return Ok((
-      stream,
-      ServerOutcome {
-        negotiated,
-        leftover,
-        summary,
-      },
-    ));
+    return Ok((acc, summary));
   }
+}
+
+/// Encodes and flushes the 101 for a previously read request head.
+pub(crate) async fn finish_accept<S: Duplex>(
+  mut stream: S,
+  acc: Vec<u8>,
+  summary: crate::RequestSummary,
+  options: &AcceptOptions,
+) -> Result<(S, ServerOutcome), AcceptError> {
+  let hs = ServerHandshake::new();
+  // Stateless re-parse of the complete head read by drive_server_request.
+  let progress = hs.handle(&acc)?;
+  let Ok(view) = progress.try_unwrap_request() else {
+    unreachable!("the head was complete when it was read")
+  };
+
+  // Everything below borrows `view` (and through it `acc`): build the
+  // whole response and the outcome BEFORE the write await.
+  let supported: Vec<&str> = options
+    .supported_subprotocols
+    .iter()
+    .map(SmolStr::as_str)
+    .collect();
+  let chosen = select_subprotocol(view.subprotocols(), &supported);
+  let extras: Vec<(&str, &str)> = options
+    .extra_headers
+    .iter()
+    .map(|(n, v)| (n.as_str(), v.as_str()))
+    .collect();
+  #[allow(unused_mut)]
+  let mut accept = Accept::new()
+    .with_subprotocol(chosen)
+    .with_extra_headers(extras.as_slice());
+  #[cfg(feature = "deflate")]
+  if let Some(config) = &options.deflate {
+    let granted = websocket_proto::negotiation::accept_deflate_offer(view.extensions(), config);
+    accept = accept.with_deflate(granted.map(|(_, response)| response));
+  }
+
+  let mut response = vec![0u8; READ_CHUNK];
+  let (n, negotiated) = hs.encode_response(&view, &accept, &mut response)?;
+  let consumed = view.consumed();
+  let leftover = acc.get(consumed..).unwrap_or(&[]).to_vec();
+
+  stream.write_all(response.get(..n).unwrap_or(&[])).await?;
+  stream.flush().await?;
+  debug!(path = %summary.path, leftover = leftover.len(), "server handshake complete");
+  Ok((
+    stream,
+    ServerOutcome {
+      negotiated,
+      leftover,
+      summary,
+    },
+  ))
+}
+
+/// Encodes and flushes a non-101 rejection; the transport is then dropped
+/// by the caller.
+pub(crate) async fn finish_reject<S: Duplex>(
+  mut stream: S,
+  status: u16,
+  reason: &str,
+) -> Result<(), AcceptError> {
+  let hs = ServerHandshake::new();
+  let rejection = websocket_proto::handshake::h1::Rejection::new(status, reason);
+  let mut response = vec![0u8; READ_CHUNK];
+  let n = hs.encode_rejection(&rejection, &mut response)?;
+  stream.write_all(response.get(..n).unwrap_or(&[])).await?;
+  stream.flush().await?;
+  debug!(status, "upgrade rejected");
+  Ok(())
 }
 
 #[cfg(test)]

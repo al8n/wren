@@ -737,6 +737,86 @@ async fn peer_close_is_not_clean_when_the_echo_fails() {
   );
 }
 
+/// Delegates everything except `poll_close`, which never completes —
+/// models a TLS close_notify wedged behind a peer that stopped reading.
+struct NeverCloses<D>(D);
+
+impl<D: futures_util::AsyncRead + Unpin> futures_util::AsyncRead for NeverCloses<D> {
+  fn poll_read(
+    mut self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+    buf: &mut [u8],
+  ) -> std::task::Poll<std::io::Result<usize>> {
+    std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+  }
+}
+
+impl<D: futures_util::AsyncWrite + Unpin> futures_util::AsyncWrite for NeverCloses<D> {
+  fn poll_write(
+    mut self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+    buf: &[u8],
+  ) -> std::task::Poll<std::io::Result<usize>> {
+    std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+  }
+
+  fn poll_flush(
+    mut self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    std::pin::Pin::new(&mut self.0).poll_flush(cx)
+  }
+
+  fn poll_close(
+    self: std::pin::Pin<&mut Self>,
+    _cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    std::task::Poll::Pending
+  }
+}
+
+impl IntoDuplex for NeverCloses<PipeDuplex> {
+  type Duplex = Self;
+
+  fn into_duplex(self) -> Self::Duplex {
+    self
+  }
+}
+
+#[compio::test]
+async fn teardown_is_bounded_when_close_notify_wedges() {
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    NeverCloses(c.into_duplex()).into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(100)),
+    Vec::new(),
+  );
+  let mut server = WebSocket::<ServerRole, _>::server(
+    s.into_duplex(),
+    &negotiated,
+    &crate::options::AcceptOptions::default(),
+    Vec::new(),
+  );
+  let server_task = compio_runtime::spawn(async move {
+    assert!(server.next().await.is_none());
+    assert!(server.closed().unwrap().clean());
+  });
+  // The close handshake itself completes; only the transport's own
+  // close (close_notify) wedges. close() must still resolve.
+  let closed = compio::time::timeout(
+    std::time::Duration::from_secs(2),
+    client.close(CloseCode::Normal, "bye"),
+  )
+  .await
+  .expect("teardown is bounded by the close budget")
+  .unwrap();
+  assert!(closed.clean());
+  server_task.await.unwrap();
+}
+
 #[compio::test]
 async fn write_error_poisons_the_connection() {
   // The transport accepts 4 KiB, fails one write, then recovers — like a

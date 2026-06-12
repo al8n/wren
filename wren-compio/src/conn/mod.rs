@@ -524,13 +524,25 @@ async fn send_frame<Ro: role::Role, S: Duplex>(
 
 /// Tears the transport down after the close handshake (or on abandonment):
 /// best-effort write-side close (TLS close_notify / TCP FIN), then drop.
-/// Consuming the stream makes repeated calls no-ops.
+/// The attempt runs under the close budget — a close_notify against a
+/// peer that stopped reading must not turn a finished handshake into a
+/// hang — and consuming the stream makes repeated calls no-ops.
 async fn teardown<Ro, S: Duplex>(inner: &Rc<RefCell<Inner<Ro, S>>>) {
-  let Some(mut stream) = inner.borrow_mut().stream.take() else {
+  let (stream, budget) = {
+    let mut guard = inner.borrow_mut();
+    (guard.stream.take(), guard.close_budget)
+  };
+  let Some(mut stream) = stream else {
     return;
   };
   trace!("shutting the transport down");
-  let _ = stream.close().await;
+  let close = stream.close().fuse();
+  let timer = compio::time::sleep(budget).fuse();
+  futures_util::pin_mut!(close, timer);
+  futures_util::select_biased! {
+    _ = close => {}
+    () = timer => debug!("transport shutdown timed out; dropping"),
+  }
 }
 
 /// The close-flush bound expired: the peer stopped draining while we owed

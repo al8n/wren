@@ -46,7 +46,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Server side, one upgrade per accepted connection:
+Server side, one upgrade per accepted connection (`accept` answers 101
+unconditionally; use `accept_pending` to inspect the request — Origin,
+path, Host — and `reject` before establishing anything):
 
 ```rust,no_run
 use wren_compio::{accept, AcceptOptions};
