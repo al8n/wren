@@ -62,6 +62,9 @@ pub(crate) async fn drive_client<S: AsyncRead + AsyncWrite>(
   let n = hs.encode_request(&mut request)?;
   request.truncate(n);
   stream.write_all(request).await.0?;
+  // compio-io contract: `write_all` may only fill a buffering stream's
+  // internal buffer (TLS records); `flush` puts the bytes on the wire.
+  stream.flush().await?;
 
   let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
   loop {
@@ -157,6 +160,7 @@ pub(crate) async fn drive_server<S: AsyncRead + AsyncWrite>(
     let leftover = acc.get(consumed..).unwrap_or(&[]).to_vec();
 
     stream.write_all(response).await.0?;
+    stream.flush().await?;
     return Ok((
       stream,
       ServerOutcome {

@@ -2,20 +2,96 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
-// Staged: consumed by `connect`/`accept` later in the cycle.
-#[allow(dead_code)]
 mod conn;
 mod error;
-// Staged: consumed by `connect`/`accept` later in the cycle.
-#[allow(dead_code)]
 mod handshake;
+mod maybe_tls;
 mod options;
-// Staged: consumed by `connect` later in the cycle.
-#[allow(dead_code)]
 mod url;
 
 pub use conn::{ClientRole, ReadHalf, ServerRole, WebSocket, WriteHalf};
+pub use maybe_tls::MaybeTls;
 pub use websocket_proto::{Negotiated, connection::Closed, frame::CloseCode, message::Message};
+
+/// The connection type [`connect`] returns.
+pub type ClientWebSocket = WebSocket<ClientRole, MaybeTls>;
+
+/// Connects to a `ws://` or `wss://` URL and completes the opening
+/// handshake. (`wss://` needs the `tls` feature; the default trust roots
+/// are webpki-roots, overridable via
+/// [`ClientOptions::with_tls_connector`].)
+pub async fn connect(
+  url: &str,
+  options: ClientOptions,
+) -> Result<(ClientWebSocket, ConnectResponse), ConnectError> {
+  let parsed = url::WsUrl::parse(url)?;
+  #[cfg(not(feature = "tls"))]
+  if parsed.tls {
+    return Err(ConnectError::UnsupportedScheme);
+  }
+  let tcp = compio_net::TcpStream::connect((parsed.host_for_dial(), parsed.port)).await?;
+  let stream = if parsed.tls {
+    #[cfg(feature = "tls")]
+    {
+      let connector = options.tls.clone().unwrap_or_else(default_tls_connector);
+      MaybeTls::Tls(Box::new(
+        connector.connect(parsed.host_for_dial(), tcp).await?,
+      ))
+    }
+    #[cfg(not(feature = "tls"))]
+    unreachable!("wss:// is rejected above without the tls feature")
+  } else {
+    MaybeTls::Plain(tcp)
+  };
+  client(stream, parsed.authority, parsed.path_and_query, options).await
+}
+
+/// Completes the client handshake over a caller-provided stream (custom
+/// dialers, proxies, pre-wrapped TLS).
+pub async fn client<S>(
+  stream: S,
+  host: &str,
+  path_and_query: &str,
+  options: ClientOptions,
+) -> Result<(WebSocket<ClientRole, S>, ConnectResponse), ConnectError>
+where
+  S: compio_io::AsyncRead + compio_io::AsyncWrite + 'static,
+{
+  let (stream, outcome) = handshake::drive_client(stream, host, path_and_query, &options).await?;
+  let ws = WebSocket::client(stream, &outcome.negotiated, &options, outcome.leftover);
+  Ok((
+    ws,
+    ConnectResponse {
+      negotiated: outcome.negotiated,
+    },
+  ))
+}
+
+/// Accepts one WebSocket upgrade on a caller-provided stream (accept the
+/// TCP connection — and wrap TLS, if any — first).
+pub async fn accept<S>(
+  stream: S,
+  options: AcceptOptions,
+) -> Result<(WebSocket<ServerRole, S>, RequestSummary), AcceptError>
+where
+  S: compio_io::AsyncRead + compio_io::AsyncWrite + 'static,
+{
+  let (stream, outcome) = handshake::drive_server(stream, &options).await?;
+  let ws = WebSocket::server(stream, &outcome.negotiated, &options, outcome.leftover);
+  Ok((ws, outcome.summary))
+}
+
+/// rustls client config trusting the webpki (Mozilla) roots — deterministic
+/// builds, no platform cert store reads.
+#[cfg(feature = "tls")]
+fn default_tls_connector() -> compio_tls::TlsConnector {
+  let mut roots = rustls::RootCertStore::empty();
+  roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+  let config = rustls::ClientConfig::builder()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+  compio_tls::TlsConnector::from(std::sync::Arc::new(config))
+}
 
 #[cfg(test)]
 mod duplex;
