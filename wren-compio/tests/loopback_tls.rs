@@ -8,6 +8,14 @@ use wren_compio::{AcceptOptions, ClientOptions, CloseCode, Message, accept, conn
 
 #[compio::test]
 async fn wss_loopback_echo() {
+  // One guard over the WHOLE flow: any TLS/WS deadlock (e.g. a missing
+  // flush leaving records buffered) fails loudly instead of hanging CI.
+  compio::time::timeout(std::time::Duration::from_secs(20), wss_loopback_echo_body())
+    .await
+    .expect("wss loopback timed out");
+}
+
+async fn wss_loopback_echo_body() {
   // Self-signed cert for localhost; the client trusts exactly this cert.
   let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
   let cert_der = certified.cert.der().clone();
@@ -43,13 +51,9 @@ async fn wss_loopback_echo() {
   });
 
   let url = format!("wss://localhost:{port}/secure");
-  let (mut ws, _resp) = compio::time::timeout(
-    std::time::Duration::from_secs(10),
-    connect(&url, ClientOptions::new().with_tls_connector(connector)),
-  )
-  .await
-  .expect("connect timed out")
-  .unwrap();
+  let (mut ws, _resp) = connect(&url, ClientOptions::new().with_tls_connector(connector))
+    .await
+    .unwrap();
 
   ws.send_text("over tls").await.unwrap();
   let m = ws.next().await.unwrap().unwrap();

@@ -11,6 +11,8 @@ use websocket_proto::{
   negotiation::{Negotiated, select_subprotocol},
 };
 
+use wren_trace::debug;
+
 use crate::{
   error::{AcceptError, ConnectError},
   options::{AcceptOptions, ClientOptions},
@@ -30,10 +32,10 @@ pub(crate) struct ServerOutcome {
   pub(crate) summary: crate::RequestSummary,
 }
 
-/// Guard on the head accumulator; the proto parser carries its own 8 KiB
-/// cap, this bounds the buffer growth before the parser sees it.
-const MAX_HEAD: usize = 16 * 1024;
-
+// Accumulator growth is bounded by the proto parser, not here: `handle` is
+// re-run on every read, and it fails the handshake once the head exceeds
+// its 8 KiB cap without a terminator — so the accumulator can never grow
+// past that cap plus one read chunk.
 const READ_CHUNK: usize = 4096;
 
 pub(crate) async fn drive_client<S: AsyncRead + AsyncWrite>(
@@ -74,18 +76,14 @@ pub(crate) async fn drive_client<S: AsyncRead + AsyncWrite>(
       return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
     }
     acc.extend_from_slice(&chunk);
-    if acc.len() > MAX_HEAD {
-      return Err(ConnectError::InvalidUrl("response head exceeds 16 KiB"));
-    }
     match hs.handle(&acc) {
       Ok(progress) => {
-        if progress.is_need_more() {
-          continue;
-        }
+        // `Err(progress)` is the need-more state: read again.
         let Ok(done) = progress.try_unwrap_complete() else {
           continue;
         };
         let leftover = acc.get(done.consumed()..).unwrap_or(&[]).to_vec();
+        debug!(leftover = leftover.len(), "client handshake complete");
         return Ok((
           stream,
           ClientOutcome {
@@ -117,9 +115,7 @@ pub(crate) async fn drive_server<S: AsyncRead + AsyncWrite>(
     acc.extend_from_slice(&chunk);
 
     let progress = hs.handle(&acc)?;
-    if progress.is_need_more() {
-      continue;
-    }
+    // `Err(progress)` is the need-more state: read again.
     let Ok(view) = progress.try_unwrap_request() else {
       continue;
     };
@@ -161,6 +157,7 @@ pub(crate) async fn drive_server<S: AsyncRead + AsyncWrite>(
 
     stream.write_all(response).await.0?;
     stream.flush().await?;
+    debug!(path = %summary.path, leftover = leftover.len(), "server handshake complete");
     return Ok((
       stream,
       ServerOutcome {

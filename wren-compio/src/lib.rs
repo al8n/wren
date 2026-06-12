@@ -17,9 +17,12 @@ pub use websocket_proto::{Negotiated, connection::Closed, frame::CloseCode, mess
 pub type ClientWebSocket = WebSocket<ClientRole, MaybeTls>;
 
 /// Connects to a `ws://` or `wss://` URL and completes the opening
-/// handshake. (`wss://` needs the `tls` feature; the default trust roots
-/// are webpki-roots, overridable via
-/// [`ClientOptions::with_tls_connector`].)
+/// handshake.
+///
+/// `wss://` needs the `tls` feature. The default trust anchors are the
+/// webpki (Mozilla) roots — the platform certificate store is **not**
+/// consulted, so corporate or otherwise custom CAs need a caller-built
+/// connector via [`ClientOptions::with_tls_connector`].
 pub async fn connect(
   url: &str,
   options: ClientOptions,
@@ -29,6 +32,7 @@ pub async fn connect(
   if parsed.tls {
     return Err(ConnectError::UnsupportedScheme);
   }
+  wren_trace::debug!(url, "connecting");
   let tcp = compio_net::TcpStream::connect((parsed.host_for_dial(), parsed.port)).await?;
   let stream = if parsed.tls {
     #[cfg(feature = "tls")]
@@ -82,7 +86,8 @@ where
 }
 
 /// rustls client config trusting the webpki (Mozilla) roots — deterministic
-/// builds, no platform cert store reads.
+/// builds, no platform cert store reads. Callers needing custom CAs supply
+/// their own connector through [`ClientOptions::with_tls_connector`].
 #[cfg(feature = "tls")]
 fn default_tls_connector() -> compio_tls::TlsConnector {
   let mut roots = rustls::RootCertStore::empty();
