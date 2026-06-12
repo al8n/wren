@@ -101,10 +101,16 @@ pub(crate) struct Inner<Ro, S> {
   closed: Option<Closed>,
   /// A Close frame is owed to the wire (queued locally via `close`, or
   /// the echo the protocol queued for a received Close) and has not been
-  /// flushed yet. While set, the pump withholds buffered messages —
-  /// otherwise a caller that stops polling after a returned message
-  /// leaves the peer (or a parked `WriteHalf::close`) waiting forever.
+  /// flushed yet. While set, the close deadline is suspended — its budget
+  /// cannot start before the peer can possibly have seen our Close.
   close_pending: bool,
+  /// When the close-carrying batch reached the wire. The protocol arms
+  /// its deadline when the Close DRAINS into a batch; under backpressure
+  /// the flush can consume that whole budget, so the driver re-anchors
+  /// the deadline here: it fires at `close_flushed_at + close_budget`.
+  close_flushed_at: Option<Instant>,
+  /// The effective close timeout (mirrors the protocol config).
+  close_budget: core::time::Duration,
   /// Set on the first write-path failure. A failed batch may have left a
   /// partial frame on the wire, so everything after it is refused with
   /// this kind rather than splicing fresh frames into a corrupt stream.
@@ -113,6 +119,8 @@ pub(crate) struct Inner<Ro, S> {
   is_split: bool,
   #[cfg(test)]
   pings_seen: usize,
+  #[cfg(test)]
+  pongs_seen: usize,
 }
 
 /// An established WebSocket connection over `S`.
@@ -139,7 +147,7 @@ fn build_config(
   keepalive: Option<core::time::Duration>,
   close_timeout: Option<core::time::Duration>,
   max_message_size: Option<usize>,
-) -> (ConnectionConfig, usize) {
+) -> (ConnectionConfig, usize, core::time::Duration) {
   let mut config = ConnectionConfig::new();
   if keepalive.is_some() {
     config = config.with_keepalive(keepalive);
@@ -149,7 +157,8 @@ fn build_config(
   }
   let cap = max_message_size.unwrap_or(64 << 20);
   config = config.with_max_message_size(cap as u64);
-  (config, cap)
+  let budget = config.close_timeout();
+  (config, cap, budget)
 }
 
 impl<S: Duplex> WebSocket<ClientRole, S> {
@@ -160,7 +169,7 @@ impl<S: Duplex> WebSocket<ClientRole, S> {
     leftover: Vec<u8>,
   ) -> Self {
     use rand::SeedableRng;
-    let (config, cap) = build_config(
+    let (config, cap, budget) = build_config(
       options.keepalive,
       options.close_timeout,
       options.max_message_size,
@@ -171,7 +180,7 @@ impl<S: Duplex> WebSocket<ClientRole, S> {
       role::Client::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
       Instant::now(),
     );
-    Self::with_conn(stream, conn, cap, leftover)
+    Self::with_conn(stream, conn, cap, budget, leftover)
   }
 }
 
@@ -182,18 +191,24 @@ impl<S: Duplex> WebSocket<ServerRole, S> {
     options: &AcceptOptions,
     leftover: Vec<u8>,
   ) -> Self {
-    let (config, cap) = build_config(
+    let (config, cap, budget) = build_config(
       options.keepalive,
       options.close_timeout,
       options.max_message_size,
     );
     let conn = Connection::new(negotiated, config, role::Server::new(), Instant::now());
-    Self::with_conn(stream, conn, cap, leftover)
+    Self::with_conn(stream, conn, cap, budget, leftover)
   }
 }
 
 impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
-  fn with_conn(stream: S, conn: Connection<Instant, Ro>, cap: usize, leftover: Vec<u8>) -> Self {
+  fn with_conn(
+    stream: S,
+    conn: Connection<Instant, Ro>,
+    cap: usize,
+    close_budget: core::time::Duration,
+    leftover: Vec<u8>,
+  ) -> Self {
     Self {
       inner: Rc::new(RefCell::new(Inner {
         conn,
@@ -205,11 +220,15 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
         pending_write: None,
         closed: None,
         close_pending: false,
+        close_flushed_at: None,
+        close_budget,
         poisoned: None,
         read_half_alive: true,
         is_split: false,
         #[cfg(test)]
         pings_seen: 0,
+        #[cfg(test)]
+        pongs_seen: 0,
       })),
       doorbell: Rc::new(Doorbell::new()),
     }
@@ -334,6 +353,11 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
   pub(crate) fn pings_seen(&self) -> usize {
     self.inner.borrow().pings_seen
   }
+
+  #[cfg(test)]
+  pub(crate) fn pongs_seen(&self) -> usize {
+    self.inner.borrow().pongs_seen
+  }
 }
 
 /// Encodes one frame under a short borrow into an owned buffer.
@@ -426,7 +450,11 @@ async fn drive_pending_write<Ro, S: Duplex>(
         state.set(FrameState::Written);
       }
       if pending.carries_close {
-        io.inner.borrow_mut().close_pending = false;
+        let mut guard = io.inner.borrow_mut();
+        guard.close_pending = false;
+        // The peer can only now have seen the Close: anchor the deadline
+        // budget here, not at the protocol's drain-into-batch instant.
+        guard.close_flushed_at = Some(Instant::now());
       }
       doorbell.notify(usize::MAX);
       Ok(())
@@ -493,6 +521,23 @@ async fn teardown<Ro, S: Duplex>(inner: &Rc<RefCell<Inner<Ro, S>>>) {
   let _ = stream.close().await;
 }
 
+/// The protocol deadline, corrected for transport flush: while the Close
+/// is still unflushed its budget has not started (`None`), and once it
+/// flushed the deadline counts from that instant — the protocol arms it
+/// when the Close drains into a batch, which under backpressure can be a
+/// whole budget earlier than the peer could possibly have seen it. The
+/// keepalive needs no correction (the protocol only arms it while open).
+fn effective_deadline<Ro: role::Role, S>(guard: &Inner<Ro, S>) -> Option<Instant> {
+  let at = guard.conn.poll_timeout()?;
+  if guard.close_pending {
+    return None;
+  }
+  match guard.close_flushed_at {
+    Some(flushed) => Some(at.max(flushed + guard.close_budget)),
+    None => Some(at),
+  }
+}
+
 /// The shared pump: drives the connection until a data message completes,
 /// the connection closes (`None`), or an error surfaces.
 pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
@@ -519,6 +564,10 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
               if matches!(event, Event::Ping(_)) {
                 inner_mut.pings_seen += 1;
               }
+              #[cfg(test)]
+              if matches!(event, Event::Pong(_)) {
+                inner_mut.pongs_seen += 1;
+              }
               if let Event::Closed(closed) = &event {
                 debug!(code = ?closed.code(), clean = closed.clean(), "connection closed");
                 inner_mut.closed = Some(*closed);
@@ -543,24 +592,12 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       // messages cannot starve the close deadline or the keepalive.
       {
         let now = Instant::now();
-        if guard.conn.poll_timeout().is_some_and(|at| at <= now)
+        if effective_deadline(&guard).is_some_and(|at| at <= now)
           && let Some(closed) = guard.conn.handle_timeout(now)
         {
           debug!(clean = closed.clean(), "close deadline elapsed");
           guard.closed = Some(closed);
         }
-      }
-      // Hold buffered messages back while a Close is owed to the wire —
-      // queued locally by close(), or the echo the protocol queued for
-      // the peer's Close: a caller may stop polling after a returned
-      // message, leaving the peer (or a parked WriteHalf::close) waiting
-      // forever (RFC 6455 §5.5.1 wants the echo sent "as soon as
-      // practical"). Once it is out, buffered pre-close messages still
-      // deliver.
-      if !guard.close_pending
-        && let Some(message) = guard.ready.pop_front()
-      {
-        return Some(Ok(message));
       }
     }
 
@@ -599,7 +636,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
           guard.close_pending = false;
         }
       }
-      guard.conn.poll_timeout()
+      effective_deadline(&guard)
     };
 
     // Phase 3 (IO, guarded): put the batch on the wire.
@@ -614,12 +651,19 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       }
     }
 
-    // Terminal check — reached only when phase 2 found NOTHING left to
-    // write (a non-empty batch loops back through phase 1 instead), so a
-    // recorded close here means echo, queue, and marker are all on the
-    // wire. The single `None` producer: shut the transport down (TLS
-    // close_notify / TCP FIN) — the split path tears down through here
-    // too.
+    // Deliver — only after everything the protocol owed (pong echoes,
+    // close frames) reached the wire above: a caller may stop polling
+    // after a returned message, and RFC 6455 §5.5 wants control replies
+    // out "as soon as practical".
+    if let Some(message) = inner.borrow_mut().ready.pop_front() {
+      return Some(Ok(message));
+    }
+
+    // Terminal check — reached only once delivery is drained and phase 2
+    // found NOTHING left to write, so a recorded close here means echo,
+    // queue, and marker are all on the wire. The single `None` producer:
+    // shut the transport down (TLS close_notify / TCP FIN) — the split
+    // path tears down through here too.
     if inner.borrow().closed.is_some() {
       teardown(inner).await;
       return None;
@@ -672,15 +716,9 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
           .extend_from_slice(scratch.get(..n).unwrap_or(&[]));
       }
       Park::Read(Err(e)) => return Some(Err(Error::Io(e))),
-      Park::Timer => {
-        let mut guard = inner.borrow_mut();
-        let now = Instant::now();
-        if let Some(closed) = guard.conn.handle_timeout(now) {
-          debug!(clean = closed.clean(), "close deadline elapsed");
-          guard.closed = Some(closed);
-        }
-      }
-      Park::Doorbell => {}
+      // The next pass's settle advances the timers (one code path, with
+      // the flush-anchored deadline correction applied).
+      Park::Timer | Park::Doorbell => {}
     }
   }
 }
