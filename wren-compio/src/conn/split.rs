@@ -89,6 +89,10 @@ impl<Ro, S> Drop for ReadHalf<Ro, S> {
         state.set(FrameState::Orphaned);
       }
     }
+    // The pump is gone for good: drop the transport so the peer sees EOF
+    // instead of a silently parked connection. (Synchronous best effort —
+    // no close_notify; Drop cannot await.)
+    drop(inner.stream.take());
     drop(inner);
     self.doorbell.notify(usize::MAX);
   }

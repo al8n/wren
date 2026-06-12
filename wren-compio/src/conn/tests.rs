@@ -476,6 +476,105 @@ async fn close_deadline_survives_inbound_flood() {
 }
 
 #[compio::test]
+async fn pong_flushes_before_buffered_data_delivery() {
+  let (mut client, mut server) = pair();
+  // Ping + Text land in the server's pipe before it polls once.
+  client.ping(b"are-you-there").await.unwrap();
+  client.send_text("data").await.unwrap();
+  let m = server.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("data".into()));
+  // The Pong must already be on the wire — the client sees it without
+  // any further server polls (RFC 6455 §5.5.3 "as soon as practical").
+  let outcome = compio::time::timeout(std::time::Duration::from_millis(100), client.next()).await;
+  assert!(outcome.is_err(), "no data message surfaces on the client");
+  assert_eq!(client.pongs_seen(), 1, "the pong reached the client");
+}
+
+#[compio::test]
+async fn close_budget_starts_at_flush_not_at_batching() {
+  // Bounded pipe; 64 KiB of queued data and the Close coalesce into ONE
+  // batch, which stalls on backpressure far past the close budget. The
+  // protocol arms its deadline when the Close drains into the batch —
+  // the driver must re-anchor it at flush, or a prompt peer echo is
+  // misreported as a deadline failure.
+  let (c, s) = duplex_with_capacity(4 * 1024);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(100)),
+    Vec::new(),
+  );
+  let mut server = WebSocket::<ServerRole, _>::server(
+    s.into_duplex(),
+    &negotiated,
+    &crate::options::AcceptOptions::default(),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  // Enqueue 64 KiB without waiting for delivery (cancel after the first
+  // poll: the frame stays queued), then close — both coalesce into one
+  // carrying batch.
+  {
+    use std::future::Future;
+    let payload = vec![0xDD_u8; 64 * 1024];
+    let mut fut = Box::pin(cwrite.send_binary(&payload));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  let closer = compio_runtime::spawn(async move {
+    cwrite.close(CloseCode::Normal, "bye").await.unwrap();
+  });
+  let reader = compio_runtime::spawn(async move {
+    while let Some(m) = cread.next().await {
+      m.unwrap();
+    }
+    cread
+  });
+  // Hold the peer back well past the budget: the carrying batch cannot
+  // flush, so the budget must not be running yet.
+  compio::time::sleep(std::time::Duration::from_millis(250)).await;
+  // The peer drains everything and echoes promptly.
+  let server_task = compio_runtime::spawn(async move {
+    while let Some(m) = server.next().await {
+      m.unwrap();
+    }
+    assert!(server.closed().unwrap().clean());
+  });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the close marker flushes once the peer drains")
+    .unwrap();
+  let cread = compio::time::timeout(std::time::Duration::from_secs(2), reader)
+    .await
+    .expect("the reader runs to completion")
+    .unwrap();
+  assert!(
+    cread.closed().unwrap().clean(),
+    "a prompt echo after a backpressured flush is clean"
+  );
+  server_task.await.unwrap();
+}
+
+#[compio::test]
+async fn dropping_read_half_drops_the_transport() {
+  let (mut client, server) = pair();
+  let (sread, _swrite) = server.split();
+  drop(sread);
+  // The write half stays alive, but with the pump gone the transport is
+  // torn down: the peer must observe EOF rather than a parked forever.
+  let outcome = compio::time::timeout(std::time::Duration::from_secs(2), client.next())
+    .await
+    .expect("the peer observes the teardown");
+  let err = outcome.unwrap().unwrap_err();
+  assert!(matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof));
+}
+
+#[compio::test]
 async fn write_error_poisons_the_connection() {
   // The transport accepts 4 KiB, fails one write, then recovers — like a
   // socket whose send buffer hiccups after a partial frame went out.
