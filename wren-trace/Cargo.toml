@@ -1,0 +1,27 @@
+[package]
+name = "wren-trace"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+description = "Zero-cost tracing shim for the wren WebSocket family."
+repository = "https://github.com/al8n/wren"
+homepage = "https://github.com/al8n/wren"
+documentation = "https://docs.rs/wren-trace"
+license = "MIT OR Apache-2.0"
+keywords = ["websocket", "tracing"]
+categories = ["network-programming"]
+readme = "README.md"
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+
+[dependencies]
+tracing = { workspace = true, optional = true, features = ["attributes", "std"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
