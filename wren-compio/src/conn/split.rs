@@ -82,6 +82,13 @@ impl<Ro, S> Drop for ReadHalf<Ro, S> {
     while let Some(frame) = inner.outbound.pop_front() {
       frame.state.set(FrameState::Orphaned);
     }
+    // A cancelled pump may have parked an in-progress batch with senders
+    // still waiting on it; orphan those too.
+    if let Some(pending) = inner.pending_write.take() {
+      for state in &pending.states {
+        state.set(FrameState::Orphaned);
+      }
+    }
     drop(inner);
     self.doorbell.notify(usize::MAX);
   }
@@ -126,6 +133,9 @@ impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
   pub async fn close(&mut self, code: CloseCode, reason: &str) -> Result<(), Error> {
     {
       let mut inner = self.inner.borrow_mut();
+      if let Some(kind) = inner.poisoned {
+        return Err(Error::Io(kind.into()));
+      }
       if inner.closed.is_some() {
         return Err(Error::Closed);
       }
@@ -141,6 +151,9 @@ impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
     let state = Rc::new(Cell::new(FrameState::Queued));
     {
       let mut inner = self.inner.borrow_mut();
+      if let Some(kind) = inner.poisoned {
+        return Err(Error::Io(kind.into()));
+      }
       if !inner.read_half_alive {
         return Err(Error::ReadHalfGone);
       }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
   IntoDuplex,
-  duplex::{Pipe, duplex, duplex_with_capacity},
+  duplex::{Pipe, duplex, duplex_with_capacity, duplex_with_write_fault},
 };
 
 type PipeDuplex = <Pipe as IntoDuplex>::Duplex;
@@ -251,6 +251,123 @@ async fn cancelled_send_resumes_without_corruption() {
   client.send_text("tail").await.unwrap();
   // Propagates any assertion panic from the server task.
   drop(server_task.await.unwrap());
+}
+
+#[compio::test]
+async fn dropping_read_half_orphans_a_parked_batch() {
+  use std::future::Future;
+
+  // Bounded pipe: the pump's write of the 64 KiB frame parks mid-batch.
+  let (_client, server) = {
+    let (c, s) = duplex_with_capacity(4 * 1024);
+    let negotiated = Negotiated::none();
+    (
+      WebSocket::<ClientRole, _>::client(
+        c.into_duplex(),
+        &negotiated,
+        &crate::options::ClientOptions::default(),
+        Vec::new(),
+      ),
+      WebSocket::<ServerRole, _>::server(
+        s.into_duplex(),
+        &negotiated,
+        &crate::options::AcceptOptions::default(),
+        Vec::new(),
+      ),
+    )
+  };
+  let (mut sread, mut swrite) = server.split();
+  let writer = compio_runtime::spawn(async move {
+    let payload = vec![0xEE_u8; 64 * 1024];
+    swrite.send_binary(&payload).await
+  });
+  // Let the writer enqueue and park on the doorbell.
+  compio::time::sleep(std::time::Duration::from_millis(10)).await;
+  // One pump poll coalesces the frame into the in-progress batch and
+  // parks on backpressure; cancelling it leaves the batch parked.
+  {
+    let mut fut = Box::pin(sread.next());
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  // Nothing will ever pump that batch again: the sender must fail, not
+  // hang on the doorbell forever.
+  drop(sread);
+  let outcome = compio::time::timeout(std::time::Duration::from_secs(2), writer)
+    .await
+    .expect("the parked sender must resolve once the read half is gone");
+  assert!(matches!(outcome.unwrap(), Err(Error::ReadHalfGone)));
+}
+
+#[compio::test]
+async fn close_echo_flushes_before_buffered_data_delivery() {
+  use std::future::Future;
+
+  let (mut client, mut server) = pair_with(
+    crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(100)),
+    crate::options::AcceptOptions::default(),
+  );
+  client.send_text("data").await.unwrap();
+  // Drive the client's close just far enough to put its Close frame on
+  // the wire (it then parks waiting for the echo).
+  let mut close_fut = Box::pin(client.close(CloseCode::Normal, "bye"));
+  futures_util::future::poll_fn(|cx| {
+    assert!(close_fut.as_mut().poll(cx).is_pending());
+    std::task::Poll::Ready(())
+  })
+  .await;
+  // The server sees [data][Close] in one read. Returning the data
+  // message must NOT leave the echo unwritten — the client (which we do
+  // not help by polling the server again) must complete cleanly rather
+  // than hit its close deadline.
+  let m = server.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("data".into()));
+  let closed = close_fut.await.unwrap();
+  assert!(
+    closed.clean(),
+    "the close echo reached the client without further server polls"
+  );
+  assert!(server.next().await.is_none());
+  assert!(server.closed().unwrap().clean());
+}
+
+#[compio::test]
+async fn write_error_poisons_the_connection() {
+  // The transport accepts 4 KiB, fails one write, then recovers — like a
+  // socket whose send buffer hiccups after a partial frame went out.
+  let (c, s) = duplex_with_write_fault(4 * 1024);
+  let negotiated = Negotiated::none();
+  let mut client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let _server = WebSocket::<ServerRole, _>::server(
+    s.into_duplex(),
+    &negotiated,
+    &crate::options::AcceptOptions::default(),
+    Vec::new(),
+  );
+
+  let payload = vec![0xAA_u8; 64 * 1024];
+  let err = client.send_binary(&payload).await.unwrap_err();
+  let Error::Io(first) = err else {
+    panic!("write fault surfaces as Io, got {err:?}");
+  };
+  // A partial frame is on the wire; even though the transport recovered,
+  // nothing may be spliced after it.
+  let err = client.send_text("tail").await.unwrap_err();
+  assert!(
+    matches!(&err, Error::Io(e) if e.kind() == first.kind()),
+    "second send is refused with the poisoned kind, got {err:?}"
+  );
+  let err = client.next().await.unwrap().unwrap_err();
+  assert!(matches!(&err, Error::Io(e) if e.kind() == first.kind()));
 }
 
 #[compio::test]

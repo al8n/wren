@@ -96,6 +96,10 @@ pub(crate) struct Inner<Ro, S> {
   /// flushed.
   pending_write: Option<PendingWrite>,
   closed: Option<Closed>,
+  /// Set on the first write-path failure. A failed batch may have left a
+  /// partial frame on the wire, so everything after it is refused with
+  /// this kind rather than splicing fresh frames into a corrupt stream.
+  poisoned: Option<std::io::ErrorKind>,
   read_half_alive: bool,
   is_split: bool,
   #[cfg(test)]
@@ -191,6 +195,7 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
         outbound: VecDeque::new(),
         pending_write: None,
         closed: None,
+        poisoned: None,
         read_half_alive: true,
         is_split: false,
         #[cfg(test)]
@@ -330,6 +335,9 @@ fn encode_with<Ro: role::Role, S>(
   ) -> Result<usize, websocket_proto::connection::EncodeError>,
 ) -> Result<Vec<u8>, Error> {
   let mut inner = inner.borrow_mut();
+  if let Some(kind) = inner.poisoned {
+    return Err(Error::Io(kind.into()));
+  }
   if inner.closed.is_some() {
     return Err(Error::Closed);
   }
@@ -415,6 +423,16 @@ async fn drive_pending_write<Ro, S: Duplex>(
       for state in &pending.states {
         state.set(FrameState::Failed(kind));
       }
+      // A partial frame may be on the wire: poison the connection so no
+      // later frame splices into the corrupt stream, and fail everything
+      // still queued (nothing will ever drain it).
+      {
+        let mut guard = io.inner.borrow_mut();
+        guard.poisoned = Some(kind);
+        while let Some(frame) = guard.outbound.pop_front() {
+          frame.state.set(FrameState::Failed(kind));
+        }
+      }
       doorbell.notify(usize::MAX);
       Err(Error::Io(e))
     }
@@ -472,9 +490,10 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
     // (they arrived before the peer's Close); new input does not.
     {
       let mut guard = inner.borrow_mut();
-      if let Some(message) = guard.ready.pop_front() {
-        return Some(Ok(message));
+      if let Some(kind) = guard.poisoned {
+        return Some(Err(Error::Io(kind.into())));
       }
+      let mut just_closed = false;
       if guard.closed.is_none() && !guard.pending_input.is_empty() {
         let mut input = std::mem::take(&mut guard.pending_input);
         let inner_mut = &mut *guard;
@@ -489,6 +508,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
               if let Event::Closed(closed) = &event {
                 debug!(code = ?closed.code(), clean = closed.clean(), "connection closed");
                 inner_mut.closed = Some(*closed);
+                just_closed = true;
               }
               match inner_mut.assembler.push(&event) {
                 Ok(Some(message)) => inner_mut.ready.push_back(message),
@@ -501,7 +521,14 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         }
         // All input is consumed by the cursor (drop-drains).
       }
-      if let Some(message) = guard.ready.pop_front() {
+      // Hold buffered messages back while the close echo is not yet on
+      // the wire (just queued by the protocol, or parked in a batch a
+      // cancelled call left behind): a caller may stop polling after a
+      // returned message, and the peer would wait on its echo forever
+      // (RFC 6455 §5.5.1 wants it sent "as soon as practical"). Once the
+      // echo is out, buffered pre-close messages still deliver.
+      let echo_pending = guard.closed.is_some() && (just_closed || guard.pending_write.is_some());
+      if !echo_pending && let Some(message) = guard.ready.pop_front() {
         return Some(Ok(message));
       }
     }

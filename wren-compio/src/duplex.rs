@@ -13,6 +13,9 @@ struct Shared {
   buf: RefCell<VecDeque<u8>>,
   /// Writes past this park until the reader drains (0 = unbounded).
   capacity: usize,
+  /// `Some(n)`: accept `n` more bytes, then fail ONE write and recover —
+  /// for poisoning tests that need a transport which errors once.
+  fault_after: RefCell<Option<usize>>,
   closed: RefCell<bool>,
   event: Event,
 }
@@ -48,6 +51,23 @@ pub(crate) fn duplex_with_capacity(cap: usize) -> (Pipe, Pipe) {
   });
   let b = Rc::new(Shared {
     capacity: cap,
+    ..Shared::default()
+  });
+  (
+    Pipe {
+      read: a.clone(),
+      write: b.clone(),
+    },
+    Pipe { read: b, write: a },
+  )
+}
+
+/// A connected pair where the FIRST pipe's writes accept `after` bytes,
+/// then fail one write and recover — for write-poisoning tests.
+pub(crate) fn duplex_with_write_fault(after: usize) -> (Pipe, Pipe) {
+  let a = Rc::new(Shared::default());
+  let b = Rc::new(Shared {
+    fault_after: RefCell::new(Some(after)),
     ..Shared::default()
   });
   (
@@ -131,6 +151,10 @@ impl AsyncWrite for PipeWriter {
       let outcome: Option<io::Result<usize>> = {
         if *self.shared.closed.borrow() {
           Some(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        } else if matches!(*self.shared.fault_after.borrow(), Some(0)) {
+          // The armed fault fires once, then the transport recovers.
+          *self.shared.fault_after.borrow_mut() = None;
+          Some(Err(io::Error::other("injected write fault")))
         } else {
           let mut q = self.shared.buf.borrow_mut();
           let room = if self.shared.capacity == 0 {
@@ -142,7 +166,13 @@ impl AsyncWrite for PipeWriter {
             None // full: park until the reader drains
           } else {
             let slice = buf.as_init();
-            let n = usize::min(slice.len(), room);
+            let mut n = usize::min(slice.len(), room);
+            let mut fault = self.shared.fault_after.borrow_mut();
+            if let Some(remaining) = fault.as_mut() {
+              n = usize::min(n, *remaining);
+              *remaining -= n;
+            }
+            drop(fault);
             q.extend(slice.get(..n).unwrap_or(&[]));
             self.shared.event.notify(usize::MAX);
             Some(Ok(n))
