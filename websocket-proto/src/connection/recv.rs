@@ -172,6 +172,11 @@ pub(crate) mod inflate {
     /// Inflated bytes accumulated for the in-progress message (reset when a
     /// message completes), checked against `max_message_size`.
     inflated_total: u64,
+    /// The peer finished its DEFLATE stream with a final block. Set on
+    /// `StreamEnd`; the next message then starts a FRESH stream (a final
+    /// block ends the old one — there is nothing to take context from), and
+    /// any further input for the CURRENT message is malformed.
+    ended: bool,
   }
 
   impl InflateBox {
@@ -185,6 +190,7 @@ pub(crate) mod inflate {
         state: InflateState::new_boxed(DataFormat::Raw),
         buf: Vec::new(),
         inflated_total: 0,
+        ended: false,
       })
     }
 
@@ -198,18 +204,28 @@ pub(crate) mod inflate {
     /// message decodes independently.
     pub(crate) fn reset(&mut self) {
       self.state.reset(DataFormat::Raw);
+      self.ended = false;
     }
 
     /// Marks the start of a new message: clears the per-message inflated-byte
-    /// counter. (The window itself persists unless [`reset`](Self::reset) is
-    /// called.)
+    /// counter. The window persists unless [`reset`](Self::reset) is called —
+    /// EXCEPT after a peer's final block, which ended the DEFLATE stream
+    /// outright: the next message must start a fresh stream regardless of
+    /// context takeover (Codex R21: leaving the inflater in the ended state
+    /// silently poisoned every later compressed message).
     pub(crate) fn begin_message(&mut self) {
       self.inflated_total = 0;
+      if self.ended {
+        self.state.reset(DataFormat::Raw);
+        self.ended = false;
+      }
     }
 
     /// Inflates one frame run into `buf` (cleared first). On the message's
     /// final frame, appends the RFC sync-flush tail and drains the trailing
-    /// block. Accumulates `inflated_total` and enforces `max`.
+    /// block — unless the peer already finished the stream with a final
+    /// block, which makes the tail unnecessary (and illegal to feed into an
+    /// ended stream). Accumulates `inflated_total` and enforces `max`.
     pub(crate) fn run(
       &mut self,
       data: &[u8],
@@ -218,7 +234,7 @@ pub(crate) mod inflate {
     ) -> Result<(), InflateFail> {
       self.buf.clear();
       self.feed(data, max)?;
-      if final_frame {
+      if final_frame && !self.ended {
         self.feed(&SYNC_TAIL, max)?;
       }
       Ok(())
@@ -251,8 +267,18 @@ pub(crate) mod inflate {
         cursor = cursor.get(consumed..).unwrap_or(&[]);
 
         match result.status {
-          // Stream finished (a peer sent a final block): no more output.
-          Ok(MZStatus::StreamEnd) => return Ok(()),
+          // Stream finished (a peer sent a final block). Anything still in
+          // the cursor is bytes AFTER the stream end — RFC 7692 §7.2.2
+          // requires the whole payload to be part of the message's stream,
+          // so trailing bytes are malformed, not silently dropped
+          // (Codex R21).
+          Ok(MZStatus::StreamEnd) => {
+            if !cursor.is_empty() {
+              return Err(InflateFail::Corrupt);
+            }
+            self.ended = true;
+            return Ok(());
+          }
           Ok(_) => {
             // Done with this input once it is drained and the last step made
             // no progress (the open-stream steady state between messages).
@@ -1815,6 +1841,49 @@ mod tests {
           Ev::End
         ]
       );
+    }
+
+    #[test]
+    fn final_block_messages_decode_and_recover_across_messages() {
+      // Regression (Codex R21): a peer may end a message with a FINAL
+      // DEFLATE block instead of a sync flush. The message decodes — and
+      // the ENDED inflater must not poison the next message under context
+      // takeover: a final block terminated the stream, so the next message
+      // starts a fresh one.
+      let mut conn = deflate_server(default_params());
+      let p1 = miniz_oxide::deflate::compress_to_vec(b"first", 6);
+      let got1 = fold(drain(&mut conn, &frame(Opcode::Text, true, true, &p1)));
+      assert_eq!(
+        got1,
+        [
+          Ev::Start(MessageKind::Text, true),
+          Ev::Text("first".into()),
+          Ev::End
+        ]
+      );
+      let p2 = miniz_oxide::deflate::compress_to_vec(b"second", 6);
+      let got2 = fold(drain(&mut conn, &frame(Opcode::Text, true, true, &p2)));
+      assert_eq!(
+        got2,
+        [
+          Ev::Start(MessageKind::Text, true),
+          Ev::Text("second".into()),
+          Ev::End
+        ]
+      );
+    }
+
+    #[test]
+    fn trailing_bytes_after_stream_end_fail_the_connection() {
+      // Regression (Codex R21): bytes AFTER the final block are not part of
+      // any DEFLATE stream — RFC 7692 §7.2.2 makes the whole payload part
+      // of the message's stream, so they are malformed (1007), never
+      // silently dropped.
+      let mut conn = deflate_server(default_params());
+      let mut payload = miniz_oxide::deflate::compress_to_vec(b"hello", 6);
+      payload.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+      let got = fold(drain(&mut conn, &frame(Opcode::Text, true, true, &payload)));
+      assert!(got.contains(&Ev::Closed(1007, false)), "{got:?}");
     }
 
     #[test]
