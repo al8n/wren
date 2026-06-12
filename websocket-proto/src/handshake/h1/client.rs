@@ -313,6 +313,13 @@ impl<'a> ClientHandshake<'a> {
       )));
     };
     let code_str = rest.split(' ').next().unwrap_or("");
+    // RFC 9112 §4: status-code = 3DIGIT. `u16::parse` alone would accept
+    // `0101` and `+101` as 101 (Codex R23) — not an HTTP status line.
+    if code_str.len() != 3 || !code_str.bytes().all(|b| b.is_ascii_digit()) {
+      return Err(ClientHandshakeError::Head(HeadError::Malformed(
+        parser::MalformedDetail::new(9, "status code is not 3DIGIT"),
+      )));
+    }
     let Ok(code) = code_str.parse::<u16>() else {
       return Err(ClientHandshakeError::Head(HeadError::Malformed(
         parser::MalformedDetail::new(9, "unparsable status code"),
@@ -593,6 +600,26 @@ mod tests {
       hs.handle(resp).unwrap_err(),
       ClientHandshakeError::UnexpectedStatus(404)
     ));
+
+    // Regression (Codex R23): status-code = 3DIGIT — spellings that PARSE
+    // to 101 but are not three digits are malformed, not accepted.
+    for bad in ["0101", "+101", "1 01", "10"] {
+      let resp = format!("HTTP/1.1 {bad} Switching Protocols\r\n\r\n");
+      assert!(
+        matches!(
+          hs.handle(resp.as_bytes()).unwrap_err(),
+          ClientHandshakeError::Head(_) | ClientHandshakeError::UnexpectedStatus(_)
+        ),
+        "{bad:?}"
+      );
+      // The 3DIGIT shapes specifically are Head(Malformed), not 101.
+      if bad.len() != 3 {
+        assert!(matches!(
+          hs.handle(resp.as_bytes()).unwrap_err(),
+          ClientHandshakeError::Head(_)
+        ));
+      }
+    }
 
     // Garbled status line.
     let resp = b"HTTP/1.1 abc\r\n\r\n";

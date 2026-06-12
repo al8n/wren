@@ -700,21 +700,27 @@ where
       params.client_no_context_takeover()
     };
 
-    // Lazily create the compressor, then compress.
+    // Lazily create the compressor, then compress. The box is TAKEN out of
+    // `self` for the duration of the write so the scratch slice borrows a
+    // local, not `self` — `write_frame` then borrows `self` disjointly and
+    // no copy of the compressed payload is needed (Codex R23: the old
+    // `to_vec` duplicated an unbounded buffer after the takeover history
+    // had already advanced).
     let had_compressor = self.send.deflate.is_some();
-    let compressor = self
+    let mut compressor = self
       .send
       .deflate
-      .get_or_insert_with(compress::CompressorBox::new);
+      .take()
+      .unwrap_or_else(compress::CompressorBox::new);
     if no_takeover && had_compressor {
       compressor.reset();
     }
     let compressed = compressor.compress_message(payload);
-    // Copy the compressed bytes into a temporary owned buffer so we can call
-    // `write_frame` with them (avoid a double-borrow of `self`).
-    let compressed_owned: std::vec::Vec<u8> = compressed.to_vec();
-
-    let n = self.write_frame(opcode, true, true, &compressed_owned, out)?;
+    let written = self.write_frame(opcode, true, true, compressed, out);
+    // Restore the compressor (and its takeover history) on EVERY path
+    // before surfacing the write result.
+    self.send.deflate = Some(compressor);
+    let n = written?;
     self.send.message = SendMessageState::Idle;
     Ok(n)
   }
