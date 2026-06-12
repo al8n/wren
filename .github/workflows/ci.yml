@@ -129,6 +129,11 @@ jobs:
           # cases per property keeps the job in minutes while still running
           # every test through the interpreter.
           PROPTEST_CASES: 8
+          # proptest's failure persistence reads/writes regression files
+          # (committed in-tree), which needs `getcwd` + file IO — host
+          # syscalls miri's isolation rejects. Disabling isolation permits
+          # them; UB detection is unaffected.
+          MIRIFLAGS: -Zmiri-disable-isolation
 
   fuzz-smoke:
     runs-on: ubuntu-latest
@@ -145,9 +150,12 @@ jobs:
           tool: cargo-fuzz
       - name: Fuzz all targets (bounded smoke)
         working-directory: websocket-proto
+        # The target is pinned to gnu: recent cargo-fuzz defaults to musl on
+        # Linux, where ASAN is incompatible with the statically linked libc
+        # (and rustup has no musl std installed here).
         run: |
           for target in $(cargo fuzz list); do
-            cargo fuzz run "$target" -- -runs=100000 -max_total_time=120
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -runs=100000 -max_total_time=120
           done
 
   # Panic-freedom is enforced statically by the clippy lint wall above; this job
