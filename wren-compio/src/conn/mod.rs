@@ -99,6 +99,11 @@ pub(crate) struct Inner<Ro, S> {
   /// flushed.
   pending_write: Option<PendingWrite>,
   closed: Option<Closed>,
+  /// A peer-reported close outcome that may not be published yet: the
+  /// peer's Close arrived, but the echo we owe has not flushed. Promoted
+  /// into `closed` when the close obligation completes — a clean close
+  /// requires our echo on the wire, not just the peer's frame in hand.
+  staged_close: Option<Closed>,
   /// A Close frame is owed to the wire (queued locally via `close`, or
   /// the echo the protocol queued for a received Close) and has not been
   /// flushed yet. While set, the close deadline is suspended — its budget
@@ -219,6 +224,7 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
         outbound: VecDeque::new(),
         pending_write: None,
         closed: None,
+        staged_close: None,
         close_pending: false,
         close_flushed_at: None,
         close_budget,
@@ -455,6 +461,12 @@ async fn drive_pending_write<Ro, S: Duplex>(
         // The peer can only now have seen the Close: anchor the deadline
         // budget here, not at the protocol's drain-into-batch instant.
         guard.close_flushed_at = Some(Instant::now());
+        // The close obligation is met: publish a staged peer outcome.
+        if guard.closed.is_none()
+          && let Some(staged) = guard.staged_close.take()
+        {
+          guard.closed = Some(staged);
+        }
       }
       doorbell.notify(usize::MAX);
       Ok(())
@@ -550,10 +562,16 @@ fn close_flush_timed_out<Ro: role::Role, S: Duplex>(
       frame.state.set(FrameState::Failed(kind));
     }
     drop(pending);
+    // The echo never reached the wire: a staged peer outcome must not
+    // surface as a clean close.
+    guard.staged_close = None;
     if let Some(closed) = guard.conn.handle_timeout(Instant::now()) {
       guard.closed = Some(closed);
       None
     } else {
+      // No protocol verdict (the Close never even drained into a
+      // batch): fail sticky instead of publishing any outcome.
+      guard.poisoned = Some(kind);
       Some(Err(Error::Io(kind.into())))
     }
   };
@@ -584,7 +602,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
   inner: &Rc<RefCell<Inner<Ro, S>>>,
   doorbell: &Rc<Doorbell>,
 ) -> Option<Result<Message, Error>> {
-  loop {
+  'pump: loop {
     // Phase 1 (borrow): feed pending input through the state machine.
     // Buffered `ready` messages drain even after the close is recorded
     // (they arrived before the peer's Close); new input does not.
@@ -610,8 +628,9 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
               }
               if let Event::Closed(closed) = &event {
                 debug!(code = ?closed.code(), clean = closed.clean(), "connection closed");
-                inner_mut.closed = Some(*closed);
-                // The protocol just queued the close echo.
+                // Stage, do not publish: the outcome only holds once the
+                // echo the protocol just queued reaches the wire.
+                inner_mut.staged_close = Some(*closed);
                 inner_mut.close_pending = true;
               }
               match inner_mut.assembler.push(&event) {
@@ -674,6 +693,11 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
           // Nothing left to transmit: the owed Close is already on the
           // wire (e.g. the peer echoed a close we flushed earlier).
           guard.close_pending = false;
+          if guard.closed.is_none()
+            && let Some(staged) = guard.staged_close.take()
+          {
+            guard.closed = Some(staged);
+          }
         }
       }
       effective_deadline(&guard)
@@ -683,8 +707,11 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
     // owed (in this batch, or queued behind it), the flush itself gets
     // the close budget — close_timeout must bound the whole handshake
     // even against a peer that stopped reading, and the echo budget only
-    // starts once the Close is out (it re-arms at flush).
-    if inner.borrow().pending_write.is_some() {
+    // starts once the Close is out (it re-arms at flush). A plain flush
+    // instead parks unbounded, but listens to the doorbell: a close
+    // requested mid-flush re-enters as a bounded flush (the dropped
+    // drive's progress survives in the cursor).
+    while inner.borrow().pending_write.is_some() {
       let close_involved = {
         let guard = inner.borrow();
         guard.close_pending
@@ -693,33 +720,46 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
             .as_ref()
             .is_some_and(|p| p.carries_close)
       };
+      let budget = inner.borrow().close_budget;
       let mut io = PumpIo::take(inner);
-      if close_involved {
-        let budget = io.inner.borrow().close_budget;
-        let outcome = {
-          let drive = drive_pending_write(&mut io, doorbell).fuse();
-          let timer = compio::time::sleep(budget).fuse();
-          futures_util::pin_mut!(drive, timer);
+      let outcome = {
+        let drive = drive_pending_write(&mut io, doorbell).fuse();
+        let timer = async {
+          if close_involved {
+            compio::time::sleep(budget).await;
+          } else {
+            futures_util::future::pending::<()>().await;
+          }
+        }
+        .fuse();
+        let bell = doorbell.listen().fuse();
+        futures_util::pin_mut!(drive, timer, bell);
+        // Lost-wake guard: a close queued between the close_involved
+        // read and the listener registration above would have rung an
+        // unregistered bell — re-enter instead of parking unbounded.
+        if !close_involved && inner.borrow().close_pending {
+          FlushArm::Reconsider
+        } else {
           futures_util::select_biased! {
-            result = drive => Some(result),
-            () = timer => None,
+            result = drive => FlushArm::Done(result),
+            () = timer => FlushArm::Budget,
+            () = bell => FlushArm::Reconsider,
           }
-        };
-        match outcome {
-          Some(Ok(())) => {
-            drop(io);
-            continue; // re-settle: the close frame may have just gone out
-          }
-          Some(Err(e)) => return Some(Err(e)),
-          None => return close_flush_timed_out(inner, io, doorbell),
         }
-      }
-      match drive_pending_write(&mut io, doorbell).await {
-        Ok(()) => {
+      };
+      match outcome {
+        FlushArm::Done(Ok(())) => {
           drop(io);
-          continue; // re-settle: the close frame may have just gone out
+          // Re-settle from the top: the close frame may have just gone
+          // out, and frames enqueued during the flush coalesce next pass
+          // (their doorbell ring predates any new listener).
+          continue 'pump;
         }
-        Err(e) => return Some(Err(e)),
+        FlushArm::Done(Err(e)) => return Some(Err(e)),
+        FlushArm::Budget => return close_flush_timed_out(inner, io, doorbell),
+        // Re-evaluate close_involved (the guard restores the partial
+        // batch); ordinary sender wake-ups simply resume the flush.
+        FlushArm::Reconsider => drop(io),
       }
     }
 
@@ -799,6 +839,12 @@ enum Park {
   Read(std::io::Result<usize>),
   Timer,
   Doorbell,
+}
+
+enum FlushArm {
+  Done(Result<(), Error>),
+  Budget,
+  Reconsider,
 }
 
 #[cfg(test)]

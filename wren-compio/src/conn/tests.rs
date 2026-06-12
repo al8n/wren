@@ -634,6 +634,110 @@ async fn dropping_read_half_drops_the_transport() {
 }
 
 #[compio::test]
+async fn close_during_a_wedged_plain_flush_is_still_bounded() {
+  use std::future::Future;
+
+  // The pump is ALREADY parked flushing a plain 64 KiB batch to a peer
+  // that never drains when close() arrives: the doorbell must interrupt
+  // the unbounded flush so the close budget takes over.
+  let (c, _wedged_peer) = duplex_with_capacity(4 * 1024);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(100)),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  {
+    let payload = vec![0xAB_u8; 64 * 1024];
+    let mut fut = Box::pin(cwrite.send_binary(&payload));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  // The reader task starts the (plain, unbounded) flush first…
+  let reader = compio_runtime::spawn(async move {
+    let outcome = cread.next().await;
+    (outcome, cread)
+  });
+  compio::time::sleep(std::time::Duration::from_millis(30)).await;
+  // …and only then does the close arrive.
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "bye").await });
+  let close_err = compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the close resolves within the budget despite the running flush")
+    .unwrap()
+    .unwrap_err();
+  assert!(matches!(&close_err, Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut));
+  let (outcome, _cread) = compio::time::timeout(std::time::Duration::from_secs(2), reader)
+    .await
+    .expect("the reader observes the outcome")
+    .unwrap();
+  let err = outcome.unwrap().unwrap_err();
+  assert!(matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut));
+}
+
+#[compio::test]
+async fn peer_close_is_not_clean_when_the_echo_fails() {
+  use compio_io::{AsyncWrite as _, util::Splittable as _};
+  use std::future::Future;
+
+  // The peer sends a clean Close, but the carrying batch (64 KiB of
+  // queued data + the echo) dies on a transport fault. The connection
+  // must NOT report a clean close whose echo never reached the wire.
+  let (s, c) = duplex_with_write_fault(4 * 1024);
+  let negotiated = Negotiated::none();
+  let server = WebSocket::<ServerRole, _>::server(
+    s.into_duplex(),
+    &negotiated,
+    &crate::options::AcceptOptions::default(),
+    Vec::new(),
+  );
+  let (mut sread, mut swrite) = server.split();
+  // Park the pump FIRST: the data enqueue and the peer's Close both land
+  // while it waits, so one resumed pass reads the Close and coalesces
+  // [64 KiB data][echo] into a single carrying batch.
+  let mut pump = Box::pin(sread.next());
+  futures_util::future::poll_fn(|cx| {
+    assert!(pump.as_mut().poll(cx).is_pending());
+    std::task::Poll::Ready(())
+  })
+  .await;
+  {
+    let payload = vec![0xCC_u8; 64 * 1024];
+    let mut fut = Box::pin(swrite.send_binary(&payload));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  // Raw peer: deliver a masked Close(1000) (all-zero mask key) and keep
+  // its read half alive.
+  let (_cr, mut cw) = c.split();
+  let frame = vec![0x88, 0x82, 0, 0, 0, 0, 0x03, 0xE8];
+  let compio_buf::BufResult(res, _buf) = cw.write(frame).await;
+  res.unwrap();
+
+  let err = compio::time::timeout(std::time::Duration::from_secs(2), pump.as_mut())
+    .await
+    .expect("the failed echo flush surfaces")
+    .unwrap()
+    .unwrap_err();
+  assert!(matches!(&err, Error::Io(_)), "transport fault, got {err:?}");
+  drop(pump);
+  assert!(
+    sread.closed().is_none_or(|c| !c.clean()),
+    "a close whose echo never flushed must not read as clean, got {:?}",
+    sread.closed()
+  );
+}
+
+#[compio::test]
 async fn write_error_poisons_the_connection() {
   // The transport accepts 4 KiB, fails one write, then recovers — like a
   // socket whose send buffer hiccups after a partial frame went out.
