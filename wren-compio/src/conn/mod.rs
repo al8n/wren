@@ -521,6 +521,46 @@ async fn teardown<Ro, S: Duplex>(inner: &Rc<RefCell<Inner<Ro, S>>>) {
   let _ = stream.close().await;
 }
 
+/// The close-flush bound expired: the peer stopped draining while we owed
+/// it a Close. Record the outcome, fail every waiting sender, and tear
+/// the transport down (synchronous drop — the write path is wedged, a
+/// close_notify could wedge with it). Returns what the pump reports:
+/// `None` with the unclean close recorded, or the timeout as an error
+/// when the Close never even drained into a batch (the protocol's
+/// deadline only arms at drain).
+fn close_flush_timed_out<Ro: role::Role, S: Duplex>(
+  inner: &Rc<RefCell<Inner<Ro, S>>>,
+  mut io: PumpIo<'_, Ro, S>,
+  doorbell: &Doorbell,
+) -> Option<Result<Message, Error>> {
+  warn!("close flush timed out; tearing the transport down");
+  let kind = std::io::ErrorKind::TimedOut;
+  let stream = io.stream.take();
+  let pending = io.write.take();
+  drop(io);
+  drop(stream);
+  let outcome = {
+    let mut guard = inner.borrow_mut();
+    if let Some(pending) = &pending {
+      for state in &pending.states {
+        state.set(FrameState::Failed(kind));
+      }
+    }
+    while let Some(frame) = guard.outbound.pop_front() {
+      frame.state.set(FrameState::Failed(kind));
+    }
+    drop(pending);
+    if let Some(closed) = guard.conn.handle_timeout(Instant::now()) {
+      guard.closed = Some(closed);
+      None
+    } else {
+      Some(Err(Error::Io(kind.into())))
+    }
+  };
+  doorbell.notify(usize::MAX);
+  outcome
+}
+
 /// The protocol deadline, corrected for transport flush: while the Close
 /// is still unflushed its budget has not started (`None`), and once it
 /// flushed the deadline counts from that instant — the protocol arms it
@@ -639,9 +679,41 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       effective_deadline(&guard)
     };
 
-    // Phase 3 (IO, guarded): put the batch on the wire.
+    // Phase 3 (IO, guarded): put the batch on the wire. While a Close is
+    // owed (in this batch, or queued behind it), the flush itself gets
+    // the close budget — close_timeout must bound the whole handshake
+    // even against a peer that stopped reading, and the echo budget only
+    // starts once the Close is out (it re-arms at flush).
     if inner.borrow().pending_write.is_some() {
+      let close_involved = {
+        let guard = inner.borrow();
+        guard.close_pending
+          || guard
+            .pending_write
+            .as_ref()
+            .is_some_and(|p| p.carries_close)
+      };
       let mut io = PumpIo::take(inner);
+      if close_involved {
+        let budget = io.inner.borrow().close_budget;
+        let outcome = {
+          let drive = drive_pending_write(&mut io, doorbell).fuse();
+          let timer = compio::time::sleep(budget).fuse();
+          futures_util::pin_mut!(drive, timer);
+          futures_util::select_biased! {
+            result = drive => Some(result),
+            () = timer => None,
+          }
+        };
+        match outcome {
+          Some(Ok(())) => {
+            drop(io);
+            continue; // re-settle: the close frame may have just gone out
+          }
+          Some(Err(e)) => return Some(Err(e)),
+          None => return close_flush_timed_out(inner, io, doorbell),
+        }
+      }
       match drive_pending_write(&mut io, doorbell).await {
         Ok(()) => {
           drop(io);
