@@ -5,19 +5,26 @@
 - **`wren-compio`**: compio-native (io_uring / IOCP / kqueue, thread-per-core)
   WebSocket driver over `websocket-proto`. Client (`connect` over `ws://` /
   `wss://`, or `client` over any `IntoDuplex` transport) and server
-  (`accept`, same transports). One direct connection object — no background
-  task: `next()` pumps reads, keepalive/close timers, pong echoes, and
-  queued writes. `split()` yields read/write halves for ANY stream type (no
-  `Clone` bound) via a doorbell-flushed outbound queue; a split writer's
-  sends progress while the read half is polled. `next()` and the senders
-  are cancellation-safe: the driver runs on a poll-based duplex (completion
-  streams adapt through `compio_io::compat::AsyncStream`), so dropping a
-  pump or send future mid-await — a caller `timeout` or lost `select!` arm
-  — neither loses inbound bytes nor strands the transport, and partial
-  write progress resumes on the next call. Features: `tls` (compio-tls +
-  rustls/ring, webpki roots by default, full `TlsConnector` override),
-  `deflate` (transparent inflate on receive, `send_*_compressed` senders),
-  `tracing`.
+  (`accept`, plus the two-step `accept_pending` → inspect → `accept` /
+  `reject` for pre-upgrade authorization by Origin, Host, path, or auth).
+  One direct connection object — no background task: `next()` pumps reads,
+  keepalive/close timers, pong echoes, and queued writes. `split()` yields
+  read/write halves for ANY stream type (no `Clone` bound) via a
+  doorbell-flushed outbound queue; a split writer's sends progress while
+  the read half is polled. `next()` and the senders are cancellation-safe:
+  the driver runs on a poll-based duplex (completion streams adapt through
+  `compio_io::compat::AsyncStream`), so dropping a pump or send future
+  mid-await — a caller `timeout` or lost `select!` arm — neither loses
+  inbound bytes nor strands the transport, and partial write progress
+  resumes on the next call. The close handshake is fully bounded by the
+  close timeout (flush, echo wait counted from the flush, and transport
+  shutdown each get the budget), protocol replies flush before buffered
+  messages are delivered, a peer close only reads as clean once our echo
+  is on the wire, and the first write failure poisons the connection
+  instead of splicing frames after a partial one. Features: `tls`
+  (compio-tls + rustls/ring, webpki roots by default, full `TlsConnector`
+  override), `deflate` (transparent inflate on receive,
+  `send_*_compressed` senders), `tracing`.
 - **`wren-trace`**: the family's zero-cost tracing shim — `tracing`-or-noop
   diagnostic and span macros whose disabled form type-checks but never
   evaluates its arguments.

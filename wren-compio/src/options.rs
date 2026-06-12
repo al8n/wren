@@ -51,7 +51,10 @@ impl ClientOptions {
     self
   }
 
-  /// How long to wait for the peer's Close echo before tearing down.
+  /// The close-handshake budget: it bounds flushing our Close, waiting
+  /// for the peer's echo (counted from the flush), and the transport
+  /// shutdown — each individually, so a close takes at most a small
+  /// multiple of it. The default is the protocol's (10 s).
   #[must_use]
   pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
     self.close_timeout = Some(timeout);
@@ -128,7 +131,10 @@ impl AcceptOptions {
     self
   }
 
-  /// How long to wait for the peer's Close echo before tearing down.
+  /// The close-handshake budget: it bounds flushing our Close, waiting
+  /// for the peer's echo (counted from the flush), and the transport
+  /// shutdown — each individually, so a close takes at most a small
+  /// multiple of it. The default is the protocol's (10 s).
   #[must_use]
   pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
     self.close_timeout = Some(timeout);

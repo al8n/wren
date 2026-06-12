@@ -313,8 +313,13 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
   ///
   /// Data messages arriving while the close handshake runs are discarded.
   /// A peer that drops the transport without echoing the Close surfaces as
-  /// the transport error (commonly `UnexpectedEof`); waiting out such peers
-  /// is what [`ClientOptions::with_close_timeout`] bounds.
+  /// the transport error (commonly `UnexpectedEof`).
+  ///
+  /// [`ClientOptions::with_close_timeout`] bounds each phase — flushing
+  /// the Close (even against a peer that stopped reading), waiting for
+  /// the echo (counted from the flush, so local backpressure cannot eat
+  /// the budget), and the transport shutdown — so the whole call takes at
+  /// most a small multiple of it.
   ///
   /// [`ClientOptions::with_close_timeout`]: crate::ClientOptions::with_close_timeout
   pub async fn close(self, code: CloseCode, reason: &str) -> Result<Closed, Error> {
@@ -825,8 +830,9 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
 
     match outcome {
       Park::Read(Ok(0)) => {
-        // Phase 1/3 already return `None` whenever `closed` is recorded, so
-        // a parked read only resolves to EOF while the connection is open.
+        // The terminal check returns `None` before this read is ever
+        // created once `closed` is recorded, so a parked read only
+        // resolves to EOF while the connection is open.
         debug!("transport EOF before the close handshake completed");
         return Some(Err(Error::Io(std::io::Error::from(
           std::io::ErrorKind::UnexpectedEof,
