@@ -313,7 +313,12 @@ async fn send_frame<Ro: role::Role, S: AsyncRead + AsyncWrite + 'static>(
   if !is_split {
     // Single owner: the stream is guaranteed parked in `Inner`.
     let mut stream = take_stream(inner)?;
-    let result = stream.write_all(frame).await.0;
+    // compio-io contract: `write_all` may only fill a buffering stream's
+    // internal buffer (TLS records); `flush` puts the bytes on the wire.
+    let mut result = stream.write_all(frame).await.0;
+    if result.is_ok() {
+      result = stream.flush().await;
+    }
     inner.borrow_mut().stream = Some(stream);
     return result.map_err(Error::from);
   }
@@ -438,7 +443,11 @@ pub(crate) async fn next_message<Ro: role::Role, S: AsyncRead + AsyncWrite + 'st
         Ok(s) => s,
         Err(e) => return Some(Err(e)),
       };
-      let result = stream.write_all(coalesced).await.0;
+      // write_all may only buffer (TLS records); flush hits the wire.
+      let mut result = stream.write_all(coalesced).await.0;
+      if result.is_ok() {
+        result = stream.flush().await;
+      }
       inner.borrow_mut().stream = Some(stream);
       match result {
         Ok(()) => {
