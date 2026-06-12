@@ -5,7 +5,7 @@ resolver = "3"
 [workspace.dependencies]
 websocket-proto = { version = "0.1", path = "websocket-proto", default-features = false }
 wren-trace = { version = "0.1", path = "wren-trace" }
-compio = { version = "0.19", default-features = false }
+compio = "0.19"
 compio-net = "0.12"
 compio-io = "0.10"
 compio-runtime = "0.12"
