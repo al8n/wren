@@ -47,7 +47,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-features --tests -- -D warnings
+      - run: cargo clippy --workspace --all-features --tests --examples -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features alloc -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features deflate -- -D warnings
@@ -75,6 +75,8 @@ jobs:
           tool: cargo-hack
       - run: cargo hack build -p websocket-proto --each-feature
       - run: cargo hack test -p websocket-proto --each-feature
+      - run: cargo hack test -p wren-trace --each-feature
+      - run: cargo hack test -p wren-compio --each-feature
 
   test:
     strategy:
@@ -89,6 +91,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p websocket-proto --all-features
+      - run: cargo test -p wren-trace --all-features
+      - run: cargo test -p wren-compio --all-features
 
   no-std:
     runs-on: ubuntu-latest
@@ -114,6 +118,8 @@ jobs:
       # defeating the tier. lib.rs raises a compile_error!; pin that it fires.
       - run: "! cargo check -p websocket-proto --no-default-features --features no-atomic,deflate 2>/dev/null"
 
+  # Proto only: the driver crates do real socket IO, which miri cannot
+  # interpret (and their unsafe surface is empty regardless).
   miri:
     runs-on: ubuntu-latest
     steps:
