@@ -74,13 +74,66 @@ pub async fn client<S: IntoDuplex>(
 /// Accepts one WebSocket upgrade on a caller-provided transport (accept
 /// the TCP connection — and wrap TLS, if any — first) — see
 /// [`IntoDuplex`].
+///
+/// This commits the 101 unconditionally. Servers that authorize requests
+/// (Origin checks, auth headers, routing) before upgrading use
+/// [`accept_pending`] and decide between [`PendingAccept::accept`] and
+/// [`PendingAccept::reject`].
 pub async fn accept<S: IntoDuplex>(
   stream: S,
   options: AcceptOptions,
 ) -> Result<(WebSocket<ServerRole, S::Duplex>, RequestSummary), AcceptError> {
-  let (stream, outcome) = handshake::drive_server(stream.into_duplex(), &options).await?;
-  let ws = WebSocket::server(stream, &outcome.negotiated, &options, outcome.leftover);
-  Ok((ws, outcome.summary))
+  accept_pending(stream, options).await?.accept().await
+}
+
+/// Reads one upgrade request and stops BEFORE answering, so the caller
+/// can authorize it — reject by Origin, Host, path, or auth — without
+/// establishing the connection first.
+pub async fn accept_pending<S: IntoDuplex>(
+  stream: S,
+  options: AcceptOptions,
+) -> Result<PendingAccept<S::Duplex>, AcceptError> {
+  let mut stream = stream.into_duplex();
+  let (head, summary) = handshake::drive_server_request(&mut stream).await?;
+  Ok(PendingAccept {
+    stream,
+    head,
+    summary,
+    options,
+  })
+}
+
+/// An upgrade request that has been read but not yet answered.
+///
+/// Inspect [`request`](Self::request), then [`accept`](Self::accept) or
+/// [`reject`](Self::reject).
+#[derive(Debug)]
+pub struct PendingAccept<D> {
+  stream: D,
+  head: Vec<u8>,
+  summary: RequestSummary,
+  options: AcceptOptions,
+}
+
+impl<D: Duplex> PendingAccept<D> {
+  /// The upgrade request awaiting a decision.
+  pub fn request(&self) -> &RequestSummary {
+    &self.summary
+  }
+
+  /// Sends the 101 and establishes the connection.
+  pub async fn accept(self) -> Result<(WebSocket<ServerRole, D>, RequestSummary), AcceptError> {
+    let (stream, outcome) =
+      handshake::finish_accept(self.stream, self.head, self.summary, &self.options).await?;
+    let ws = WebSocket::server(stream, &outcome.negotiated, &self.options, outcome.leftover);
+    Ok((ws, outcome.summary))
+  }
+
+  /// Answers with a non-101 rejection (status 300–599) and drops the
+  /// transport.
+  pub async fn reject(self, status: u16, reason: &str) -> Result<(), AcceptError> {
+    handshake::finish_reject(self.stream, status, reason).await
+  }
 }
 
 /// rustls client config trusting the webpki (Mozilla) roots — deterministic
