@@ -77,6 +77,17 @@ the read half's pump flushes the queue. **A split writer's sends progress
 only while the read half is being polled** — the same "keep polling"
 contract the timers have (and the same contract tungstenite documents).
 
+## Cancellation safety
+
+`next()` and every send are safe to race in a `select!` or wrap in a
+timeout: dropping them mid-await neither loses inbound bytes, nor strands
+the transport, nor corrupts the outbound stream. The driver runs on a
+poll-based duplex (completion streams are adapted through
+`compio_io::compat::AsyncStream`, the same adapter compio-tls uses), so a
+dropped future never owns an in-flight kernel operation, and partial
+write progress is tracked in the connection — the next call resumes
+where the cancelled one stopped.
+
 ## Features
 
 | Feature | Description |
@@ -86,9 +97,11 @@ contract the timers have (and the same contract tungstenite documents).
 | `tracing` | structured diagnostics via [`wren-trace`]. |
 
 Custom dialers, proxies, or pre-wrapped TLS plug in through
-`client(stream, …)` / `accept(stream, …)`, which are generic over any
-`compio_io::AsyncRead + AsyncWrite` stream. Bespoke handshake flows can
-drive the re-exported [`websocket-proto`] machines directly
+`client(stream, …)` / `accept(stream, …)`, generic over the `IntoDuplex`
+transports: compio's socket streams, `compio_tls::TlsStream`, or your own
+(implement `IntoDuplex` — identity for a poll-based stream, via
+`AsyncStream` for a completion-based `Splittable` one). Bespoke handshake
+flows can drive the re-exported [`websocket-proto`] machines directly
 (`wren_compio::proto`).
 
 [`websocket-proto`]: https://crates.io/crates/websocket-proto

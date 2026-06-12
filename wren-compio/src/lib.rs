@@ -5,11 +5,13 @@
 mod conn;
 mod error;
 mod handshake;
+mod into_duplex;
 mod maybe_tls;
 mod options;
 mod url;
 
 pub use conn::{ClientRole, ReadHalf, ServerRole, WebSocket, WriteHalf};
+pub use into_duplex::{Duplex, IntoDuplex};
 pub use maybe_tls::MaybeTls;
 pub use websocket_proto::{Negotiated, connection::Closed, frame::CloseCode, message::Message};
 
@@ -45,23 +47,21 @@ pub async fn connect(
     #[cfg(not(feature = "tls"))]
     unreachable!("wss:// is rejected above without the tls feature")
   } else {
-    MaybeTls::Plain(tcp)
+    MaybeTls::plain(tcp)
   };
   client(stream, parsed.authority, parsed.path_and_query, options).await
 }
 
-/// Completes the client handshake over a caller-provided stream (custom
-/// dialers, proxies, pre-wrapped TLS).
-pub async fn client<S>(
+/// Completes the client handshake over a caller-provided transport (custom
+/// dialers, proxies, pre-wrapped TLS) — see [`IntoDuplex`].
+pub async fn client<S: IntoDuplex>(
   stream: S,
   host: &str,
   path_and_query: &str,
   options: ClientOptions,
-) -> Result<(WebSocket<ClientRole, S>, ConnectResponse), ConnectError>
-where
-  S: compio_io::AsyncRead + compio_io::AsyncWrite + 'static,
-{
-  let (stream, outcome) = handshake::drive_client(stream, host, path_and_query, &options).await?;
+) -> Result<(WebSocket<ClientRole, S::Duplex>, ConnectResponse), ConnectError> {
+  let (stream, outcome) =
+    handshake::drive_client(stream.into_duplex(), host, path_and_query, &options).await?;
   let ws = WebSocket::client(stream, &outcome.negotiated, &options, outcome.leftover);
   Ok((
     ws,
@@ -71,16 +71,14 @@ where
   ))
 }
 
-/// Accepts one WebSocket upgrade on a caller-provided stream (accept the
-/// TCP connection — and wrap TLS, if any — first).
-pub async fn accept<S>(
+/// Accepts one WebSocket upgrade on a caller-provided transport (accept
+/// the TCP connection — and wrap TLS, if any — first) — see
+/// [`IntoDuplex`].
+pub async fn accept<S: IntoDuplex>(
   stream: S,
   options: AcceptOptions,
-) -> Result<(WebSocket<ServerRole, S>, RequestSummary), AcceptError>
-where
-  S: compio_io::AsyncRead + compio_io::AsyncWrite + 'static,
-{
-  let (stream, outcome) = handshake::drive_server(stream, &options).await?;
+) -> Result<(WebSocket<ServerRole, S::Duplex>, RequestSummary), AcceptError> {
+  let (stream, outcome) = handshake::drive_server(stream.into_duplex(), &options).await?;
   let ws = WebSocket::server(stream, &outcome.negotiated, &options, outcome.leftover);
   Ok((ws, outcome.summary))
 }

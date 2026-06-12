@@ -1,7 +1,6 @@
-//! Async drivers for the h1 opening handshake over any compio stream.
+//! Async drivers for the h1 opening handshake over the poll-based duplex.
 
-use compio_buf::BufResult;
-use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use futures_util::{AsyncReadExt, AsyncWriteExt};
 use smol_str::SmolStr;
 use websocket_proto::{
   handshake::h1::{
@@ -10,11 +9,11 @@ use websocket_proto::{
   },
   negotiation::{Negotiated, select_subprotocol},
 };
-
 use wren_trace::debug;
 
 use crate::{
   error::{AcceptError, ConnectError},
+  into_duplex::Duplex,
   options::{AcceptOptions, ClientOptions},
 };
 
@@ -38,7 +37,7 @@ pub(crate) struct ServerOutcome {
 // past that cap plus one read chunk.
 const READ_CHUNK: usize = 4096;
 
-pub(crate) async fn drive_client<S: AsyncRead + AsyncWrite>(
+pub(crate) async fn drive_client<S: Duplex>(
   mut stream: S,
   host: &str,
   path_and_query: &str,
@@ -62,20 +61,19 @@ pub(crate) async fn drive_client<S: AsyncRead + AsyncWrite>(
 
   let mut request = vec![0u8; READ_CHUNK];
   let n = hs.encode_request(&mut request)?;
-  request.truncate(n);
-  stream.write_all(request).await.0?;
-  // compio-io contract: `write_all` may only fill a buffering stream's
-  // internal buffer (TLS records); `flush` puts the bytes on the wire.
+  stream.write_all(request.get(..n).unwrap_or(&[])).await?;
+  // The duplex buffers (adapter and TLS records both); flush puts the
+  // request on the wire.
   stream.flush().await?;
 
   let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
+  let mut chunk = vec![0u8; READ_CHUNK];
   loop {
-    let BufResult(res, chunk) = stream.read(Vec::with_capacity(READ_CHUNK)).await;
-    let got = res?;
+    let got = stream.read(&mut chunk).await?;
     if got == 0 {
       return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
     }
-    acc.extend_from_slice(&chunk);
+    acc.extend_from_slice(chunk.get(..got).unwrap_or(&[]));
     match hs.handle(&acc) {
       Ok(progress) => {
         // `Err(progress)` is the need-more state: read again.
@@ -100,19 +98,19 @@ pub(crate) async fn drive_client<S: AsyncRead + AsyncWrite>(
   }
 }
 
-pub(crate) async fn drive_server<S: AsyncRead + AsyncWrite>(
+pub(crate) async fn drive_server<S: Duplex>(
   mut stream: S,
   options: &AcceptOptions,
 ) -> Result<(S, ServerOutcome), AcceptError> {
   let hs = ServerHandshake::new();
   let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
+  let mut chunk = vec![0u8; READ_CHUNK];
   loop {
-    let BufResult(res, chunk) = stream.read(Vec::with_capacity(READ_CHUNK)).await;
-    let got = res?;
+    let got = stream.read(&mut chunk).await?;
     if got == 0 {
       return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
     }
-    acc.extend_from_slice(&chunk);
+    acc.extend_from_slice(chunk.get(..got).unwrap_or(&[]));
 
     let progress = hs.handle(&acc)?;
     // `Err(progress)` is the need-more state: read again.
@@ -151,11 +149,10 @@ pub(crate) async fn drive_server<S: AsyncRead + AsyncWrite>(
 
     let mut response = vec![0u8; READ_CHUNK];
     let (n, negotiated) = hs.encode_response(&view, &accept, &mut response)?;
-    response.truncate(n);
     let consumed = view.consumed();
     let leftover = acc.get(consumed..).unwrap_or(&[]).to_vec();
 
-    stream.write_all(response).await.0?;
+    stream.write_all(response.get(..n).unwrap_or(&[])).await?;
     stream.flush().await?;
     debug!(path = %summary.path, leftover = leftover.len(), "server handshake complete");
     return Ok((

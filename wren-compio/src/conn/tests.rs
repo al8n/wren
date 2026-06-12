@@ -1,7 +1,15 @@
 use super::*;
-use crate::duplex::{Pipe, duplex};
+use crate::{
+  IntoDuplex,
+  duplex::{Pipe, duplex, duplex_with_capacity},
+};
 
-fn pair() -> (WebSocket<ClientRole, Pipe>, WebSocket<ServerRole, Pipe>) {
+type PipeDuplex = <Pipe as IntoDuplex>::Duplex;
+
+fn pair() -> (
+  WebSocket<ClientRole, PipeDuplex>,
+  WebSocket<ServerRole, PipeDuplex>,
+) {
   pair_with(
     crate::options::ClientOptions::default(),
     crate::options::AcceptOptions::default(),
@@ -11,12 +19,15 @@ fn pair() -> (WebSocket<ClientRole, Pipe>, WebSocket<ServerRole, Pipe>) {
 fn pair_with(
   copts: crate::options::ClientOptions,
   sopts: crate::options::AcceptOptions,
-) -> (WebSocket<ClientRole, Pipe>, WebSocket<ServerRole, Pipe>) {
+) -> (
+  WebSocket<ClientRole, PipeDuplex>,
+  WebSocket<ServerRole, PipeDuplex>,
+) {
   let (c, s) = duplex();
   let negotiated = Negotiated::none();
   (
-    WebSocket::client(c, &negotiated, &copts, Vec::new()),
-    WebSocket::server(s, &negotiated, &sopts, Vec::new()),
+    WebSocket::client(c.into_duplex(), &negotiated, &copts, Vec::new()),
+    WebSocket::server(s.into_duplex(), &negotiated, &sopts, Vec::new()),
   )
 }
 
@@ -67,9 +78,9 @@ async fn keepalive_pings_flow_while_idle() {
   let negotiated = Negotiated::none();
   let copts = crate::options::ClientOptions::default()
     .with_keepalive(Some(std::time::Duration::from_millis(50)));
-  let mut client = WebSocket::client(c, &negotiated, &copts, Vec::new());
+  let mut client = WebSocket::client(c.into_duplex(), &negotiated, &copts, Vec::new());
   let mut server = WebSocket::server(
-    s,
+    s.into_duplex(),
     &negotiated,
     &crate::options::AcceptOptions::default(),
     Vec::new(),
@@ -93,7 +104,7 @@ async fn close_deadline_fires_without_peer_echo() {
   let negotiated = Negotiated::none();
   let copts = crate::options::ClientOptions::default()
     .with_close_timeout(std::time::Duration::from_millis(80));
-  let client = WebSocket::client(c, &negotiated, &copts, Vec::new());
+  let client = WebSocket::client(c.into_duplex(), &negotiated, &copts, Vec::new());
   let closed = client.close(CloseCode::Normal, "").await.unwrap();
   assert!(!closed.clean(), "deadline close is unclean");
 }
@@ -167,6 +178,79 @@ async fn dropping_read_half_wakes_writers() {
   drop(sread);
   let err = swrite.send_text("nope").await.unwrap_err();
   assert!(matches!(err, Error::ReadHalfGone));
+}
+
+#[compio::test]
+async fn cancelled_next_preserves_the_connection() {
+  use std::future::Future;
+
+  let (mut client, mut server) = pair();
+  // Park the server pump on its read, then cancel it mid-await.
+  {
+    let mut fut = Box::pin(server.next());
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  // The connection must still work: the stream went back into the
+  // connection when the future dropped, and nothing was lost.
+  client.send_text("after cancel").await.unwrap();
+  let m = server.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("after cancel".into()));
+  // And the reverse direction too.
+  server.send_text("echo").await.unwrap();
+  let m = client.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("echo".into()));
+}
+
+#[compio::test]
+async fn cancelled_send_resumes_without_corruption() {
+  use std::future::Future;
+
+  // A 4 KiB pipe + a 64 KiB frame: the send must park on backpressure
+  // with the frame partially on the wire.
+  let (c, s) = duplex_with_capacity(4 * 1024);
+  let negotiated = Negotiated::none();
+  let mut client = WebSocket::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let mut server = WebSocket::server(
+    s.into_duplex(),
+    &negotiated,
+    &crate::options::AcceptOptions::default(),
+    Vec::new(),
+  );
+
+  let payload = vec![0xCD_u8; 64 * 1024];
+  {
+    // Poll the send until it parks (adapter buffer + pipe both full),
+    // then cancel it. The write cursor must survive in the connection.
+    let mut fut = Box::pin(client.send_binary(&payload));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  // A fresh send resumes the cancelled frame first, then sends its own:
+  // the peer must see BOTH messages intact, in order — no spliced bytes,
+  // no duplicated chunk from a cursor reset.
+  let expect = payload.clone();
+  let server_task = compio_runtime::spawn(async move {
+    let first = server.next().await.unwrap().unwrap();
+    assert_eq!(first, Message::Binary(expect.into()));
+    let second = server.next().await.unwrap().unwrap();
+    assert_eq!(second, Message::Text("tail".into()));
+    server
+  });
+  client.send_text("tail").await.unwrap();
+  // Propagates any assertion panic from the server task.
+  drop(server_task.await.unwrap());
 }
 
 #[compio::test]

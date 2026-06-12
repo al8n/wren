@@ -23,14 +23,14 @@ websocket-proto = { workspace = true, features = ["std"] }
 wren-trace.workspace = true
 compio = { workspace = true, features = ["time"] }
 compio-net.workspace = true
-compio-io.workspace = true
+compio-io = { workspace = true, features = ["compat"] }
 compio-runtime.workspace = true
 compio-buf.workspace = true
 compio-tls = { workspace = true, optional = true, features = ["rustls", "ring"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "1", optional = true }
 event-listener.workspace = true
-futures-util = { workspace = true, features = ["std", "async-await"] }
+futures-util = { workspace = true, features = ["std", "async-await", "io"] }
 rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 thiserror = { workspace = true, features = ["std"] }
 smol_str = { workspace = true, features = ["std"] }
