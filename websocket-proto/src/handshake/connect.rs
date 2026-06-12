@@ -1077,6 +1077,20 @@ mod tests {
     assert!(validate_connect_request(base).is_ok());
   }
 
+  /// The `h2`/`h3` convenience modules are pure aliases: items reached
+  /// through them ARE the `connect` items (same types, not copies).
+  #[test]
+  fn h2_and_h3_reexport_the_connect_surfaces() {
+    let via_h2: crate::handshake::h2::Scheme = Scheme::Https;
+    let via_h3: crate::handshake::h3::Scheme = via_h2;
+    assert_eq!(via_h3, Scheme::Https);
+    // And the gate called through the alias is the same function: its view
+    // interchanges with `connect`'s error type.
+    let err: ConnectRequestError =
+      crate::handshake::h3::validate_connect_request(&[]).unwrap_err();
+    assert!(matches!(err, ConnectRequestError::NotConnect));
+  }
+
   /// Regression: the CONNECT gate validates offer lists like the
   /// h1 server — non-token or repeated elements fail; empty elements are
   /// ignored per RFC 9110 §5.6.1.2.

@@ -26,6 +26,26 @@ pub mod h1;
 
 pub mod connect;
 
+/// WebSocket over HTTP/2 (RFC 8441) — a convenience alias for [`connect`].
+///
+/// RFC 8441 and RFC 9220 share one extended-CONNECT handshake at the
+/// header-data layer this crate handles, so both transports are served by
+/// the same [`connect`] module; this re-export exists purely so the module
+/// tree shows each transport by name.
+pub mod h2 {
+  pub use super::connect::*;
+}
+
+/// WebSocket over HTTP/3 (RFC 9220) — a convenience alias for [`connect`].
+///
+/// RFC 9220 applies the RFC 8441 extended-CONNECT handshake to HTTP/3
+/// unchanged, so both transports are served by the same [`connect`] module;
+/// this re-export exists purely so the module tree shows each transport by
+/// name.
+pub mod h3 {
+  pub use super::connect::*;
+}
+
 use crate::{constants, error::BufferTooSmallDetail};
 use sha1::{Digest, Sha1};
 
