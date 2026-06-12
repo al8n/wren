@@ -77,22 +77,13 @@ caller-provided buffer and yields a borrowed [`MessageRef`] on every tier
 (including the bare `no_std` build); drivers that prefer streaming can consume
 the events directly.
 
-```rust,no_run
-# // Doctests compile with whatever features the test run enables; this one
-# // needs `std` + `alloc`, so it is gated (a no-op under `--no-default-features`).
-# #[cfg(feature = "std")]
-# fn main() {}
-# #[cfg(not(feature = "std"))]
-# fn main() {}
-# #[cfg(feature = "std")]
+```rust,ignore
 use std::time::Instant;
-# #[cfg(feature = "std")]
 use websocket_proto::{
     Message, MessageAssembler,
     connection::{Connection, Event, role::Server},
 };
 
-# #[cfg(feature = "std")]
 fn echo_step(
     conn: &mut Connection<Instant, Server>,
     asm: &mut MessageAssembler,
@@ -136,21 +127,13 @@ The client mirror: draw a nonce from an RNG, write the upgrade request, feed
 the accumulating response to [`ClientHandshake::handle`], then build the
 [`Connection`] with the [`Client`] role.
 
-```rust,no_run
-# // Needs `std`; gated so `--no-default-features` doctest runs is a no-op.
-# #[cfg(feature = "std")]
-# fn main() {}
-# #[cfg(not(feature = "std"))]
-# fn main() {}
-# #[cfg(feature = "std")]
+```rust,ignore
 use std::time::Instant;
-# #[cfg(feature = "std")]
 use websocket_proto::{
     connection::{Connection, ConnectionConfig, role::Client},
     handshake::h1::{ClientHandshake, ClientOptions, ClientProgress},
 };
 
-# #[cfg(feature = "std")]
 fn connect<R: rand_core::Rng>(mut rng: R, response: &[u8], request_out: &mut [u8]) {
     let options = ClientOptions::new("example.com", "/chat");
     let handshake = ClientHandshake::new(options, &mut rng).expect("valid options");
