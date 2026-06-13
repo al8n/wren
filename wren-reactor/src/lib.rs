@@ -2,6 +2,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
+mod conn;
 #[cfg(test)]
 mod duplex;
 mod error;
@@ -10,9 +11,11 @@ mod options;
 mod runtime;
 mod url;
 
+pub use conn::{ClientRole, ReadHalf, ServerRole, WebSocket, WriteHalf};
 pub use error::{AcceptError, ConnectError, Error};
 pub use options::{AcceptOptions, ClientOptions};
 pub use runtime::Duplex;
+pub use websocket_proto::{Negotiated, connection::Closed, frame::CloseCode, message::Message};
 
 /// Owned snapshot of an accepted upgrade request.
 ///
