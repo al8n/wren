@@ -42,7 +42,10 @@ impl<R, Ro, S> std::fmt::Debug for WriteHalf<R, Ro, S> {
 async fn encode_frame<Ro: role::Role, S: Duplex>(
   shared: &Arc<Shared<Ro, S>>,
   hint: usize,
-  f: impl FnOnce(&mut Connection<Instant, Ro>, &mut [u8]) -> Result<usize, websocket_proto::connection::EncodeError>,
+  f: impl FnOnce(
+    &mut Connection<Instant, Ro>,
+    &mut [u8],
+  ) -> Result<usize, websocket_proto::connection::EncodeError>,
 ) -> Result<Vec<u8>, Error> {
   if let Some(kind) = shared.poisoned() {
     return Err(Error::Io(kind.into()));
@@ -61,7 +64,10 @@ async fn encode_frame<Ro: role::Role, S: Duplex>(
 }
 
 /// Writes an encoded frame to the wire (whole-frame atomic under the lock).
-async fn write_frame<Ro: role::Role, S: Duplex>(shared: &Arc<Shared<Ro, S>>, frame: Vec<u8>) -> Result<(), Error> {
+async fn write_frame<Ro: role::Role, S: Duplex>(
+  shared: &Arc<Shared<Ro, S>>,
+  frame: Vec<u8>,
+) -> Result<(), Error> {
   let mut wr = shared.write.lock().await;
   let result = async {
     wr.write_all(&frame).await?;
@@ -77,10 +83,15 @@ async fn write_frame<Ro: role::Role, S: Duplex>(shared: &Arc<Shared<Ro, S>>, fra
 }
 
 /// Owned send (no `&self` borrow) — backs the `Sink` impl's stored future.
-async fn send_message<Ro: role::Role + Send + 'static, S: Duplex>(shared: Arc<Shared<Ro, S>>, msg: Message) -> Result<(), Error> {
+async fn send_message<Ro: role::Role + Send + 'static, S: Duplex>(
+  shared: Arc<Shared<Ro, S>>,
+  msg: Message,
+) -> Result<(), Error> {
   let frame = match &msg {
     Message::Text(t) => encode_frame(&shared, t.len(), |c, o| c.encode_text(t.as_ref(), o)).await?,
-    Message::Binary(d) => encode_frame(&shared, d.len(), |c, o| c.encode_binary(d.as_ref(), o)).await?,
+    Message::Binary(d) => {
+      encode_frame(&shared, d.len(), |c, o| c.encode_binary(d.as_ref(), o)).await?
+    }
   };
   write_frame(&shared, frame).await
 }
@@ -107,7 +118,12 @@ async fn close_owned<Ro: role::Role + Send + 'static, S: Duplex>(
 
 impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WriteHalf<R, Ro, S> {
   pub(crate) fn new(shared: Arc<Shared<Ro, S>>) -> Self {
-    Self { shared, pending: None, close_started: false, _rt: PhantomData }
+    Self {
+      shared,
+      pending: None,
+      close_started: false,
+      _rt: PhantomData,
+    }
   }
 
   /// Sends a whole data message.
@@ -136,14 +152,20 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WriteHalf<R, Ro, S> {
   #[cfg(feature = "deflate")]
   #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
   pub async fn send_text_compressed(&mut self, t: &str) -> Result<(), Error> {
-    let f = encode_frame(&self.shared, t.len() * 2, |c, o| c.encode_text_compressed(t, o)).await?;
+    let f = encode_frame(&self.shared, t.len() * 2, |c, o| {
+      c.encode_text_compressed(t, o)
+    })
+    .await?;
     write_frame(&self.shared, f).await
   }
   /// Sends a whole binary message compressed with permessage-deflate.
   #[cfg(feature = "deflate")]
   #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
   pub async fn send_binary_compressed(&mut self, d: &[u8]) -> Result<(), Error> {
-    let f = encode_frame(&self.shared, d.len() * 2, |c, o| c.encode_binary_compressed(d, o)).await?;
+    let f = encode_frame(&self.shared, d.len() * 2, |c, o| {
+      c.encode_binary_compressed(d, o)
+    })
+    .await?;
     write_frame(&self.shared, f).await
   }
 
@@ -169,7 +191,9 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WriteHalf<R, Ro, S> {
   }
 }
 
-impl<R: RuntimeLite, Ro: role::Role + Send + 'static, S: Duplex> futures_util::Sink<Message> for WriteHalf<R, Ro, S> {
+impl<R: RuntimeLite, Ro: role::Role + Send + 'static, S: Duplex> futures_util::Sink<Message>
+  for WriteHalf<R, Ro, S>
+{
   type Error = Error;
 
   fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {

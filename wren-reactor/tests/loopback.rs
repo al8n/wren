@@ -26,9 +26,15 @@ async fn echo_suite<N: Net>() {
     let (mut ws, resp) = connect::<N>(&url, opts).await.unwrap();
     assert_eq!(resp.subprotocol(), Some("echo.v1"));
     ws.send_text("hello").await.unwrap();
-    assert_eq!(ws.next().await.unwrap().unwrap(), Message::Text("hello".into()));
+    assert_eq!(
+      ws.next().await.unwrap().unwrap(),
+      Message::Text("hello".into())
+    );
     ws.send_binary(&[1, 2, 3]).await.unwrap();
-    assert_eq!(ws.next().await.unwrap().unwrap(), Message::Binary(vec![1, 2, 3].into()));
+    assert_eq!(
+      ws.next().await.unwrap().unwrap(),
+      Message::Binary(vec![1, 2, 3].into())
+    );
     let closed = ws.close(CloseCode::Normal, "bye").await.unwrap();
     assert!(closed.clean());
   };
@@ -73,7 +79,10 @@ async fn deflate_round_trip() {
       .unwrap();
     assert!(resp.deflate().is_some(), "deflate negotiated");
     ws.send_text_compressed(&text).await.unwrap();
-    assert_eq!(ws.next().await.unwrap().unwrap(), Message::Text(expect.into()));
+    assert_eq!(
+      ws.next().await.unwrap().unwrap(),
+      Message::Text(expect.into())
+    );
     assert!(ws.close(CloseCode::Normal, "").await.unwrap().clean());
   };
   futures_util::join!(server, client);

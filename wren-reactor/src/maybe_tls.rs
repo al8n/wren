@@ -19,8 +19,14 @@ pub enum MaybeTls<S> {
   Tls(Box<futures_rustls::client::TlsStream<S>>),
 }
 
-impl<S: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin> futures_util::AsyncRead for MaybeTls<S> {
-  fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, b: &mut [u8]) -> Poll<io::Result<usize>> {
+impl<S: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin> futures_util::AsyncRead
+  for MaybeTls<S>
+{
+  fn poll_read(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    b: &mut [u8],
+  ) -> Poll<io::Result<usize>> {
     match self.get_mut() {
       Self::Plain(s) => Pin::new(s).poll_read(cx, b),
       #[cfg(feature = "tls")]
@@ -29,7 +35,9 @@ impl<S: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin> futures_util
   }
 }
 
-impl<S: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin> futures_util::AsyncWrite for MaybeTls<S> {
+impl<S: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin> futures_util::AsyncWrite
+  for MaybeTls<S>
+{
   fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<io::Result<usize>> {
     match self.get_mut() {
       Self::Plain(s) => Pin::new(s).poll_write(cx, b),

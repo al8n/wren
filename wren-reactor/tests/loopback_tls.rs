@@ -12,7 +12,8 @@ async fn wss_suite<N: Net>() {
   // Self-signed cert for localhost; the client trusts exactly this cert.
   let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
   let cert_der = certified.cert.der().clone();
-  let key_der = rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
+  let key_der =
+    rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
 
   let server_config = rustls::ServerConfig::builder()
     .with_no_client_auth()
@@ -33,7 +34,9 @@ async fn wss_suite<N: Net>() {
   let server = async {
     let (tcp, _peer) = listener.accept().await.unwrap();
     let tls = acceptor.accept(tcp).await.unwrap();
-    let (mut ws, summary) = accept::<<N as Net>::Runtime, _>(tls, AcceptOptions::new()).await.unwrap();
+    let (mut ws, summary) = accept::<<N as Net>::Runtime, _>(tls, AcceptOptions::new())
+      .await
+      .unwrap();
     assert_eq!(summary.path(), "/secure");
     while let Some(msg) = ws.next().await {
       let m = msg.unwrap();
@@ -48,7 +51,10 @@ async fn wss_suite<N: Net>() {
       .await
       .unwrap();
     ws.send_text("over tls").await.unwrap();
-    assert_eq!(ws.next().await.unwrap().unwrap(), Message::Text("over tls".into()));
+    assert_eq!(
+      ws.next().await.unwrap().unwrap(),
+      Message::Text("over tls".into())
+    );
     assert!(ws.close(CloseCode::Normal, "bye").await.unwrap().clean());
   };
 

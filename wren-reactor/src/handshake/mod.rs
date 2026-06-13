@@ -13,8 +13,8 @@ use wren_trace::debug;
 
 use crate::{
   error::{AcceptError, ConnectError},
-  runtime::Duplex,
   options::{AcceptOptions, ClientOptions},
+  runtime::Duplex,
 };
 
 /// What the client handshake leaves behind.

@@ -139,9 +139,15 @@ fn build_config(
 }
 
 impl<R: RuntimeLite, S: Duplex> WebSocket<R, ClientRole, S> {
-  pub(crate) fn client(stream: S, negotiated: &Negotiated, opts: &ClientOptions, leftover: Vec<u8>) -> Self {
+  pub(crate) fn client(
+    stream: S,
+    negotiated: &Negotiated,
+    opts: &ClientOptions,
+    leftover: Vec<u8>,
+  ) -> Self {
     use rand::SeedableRng;
-    let (config, cap, budget) = build_config(opts.keepalive, opts.close_timeout, opts.max_message_size);
+    let (config, cap, budget) =
+      build_config(opts.keepalive, opts.close_timeout, opts.max_message_size);
     let conn = Connection::new(
       negotiated,
       config,
@@ -153,15 +159,27 @@ impl<R: RuntimeLite, S: Duplex> WebSocket<R, ClientRole, S> {
 }
 
 impl<R: RuntimeLite, S: Duplex> WebSocket<R, ServerRole, S> {
-  pub(crate) fn server(stream: S, negotiated: &Negotiated, opts: &AcceptOptions, leftover: Vec<u8>) -> Self {
-    let (config, cap, budget) = build_config(opts.keepalive, opts.close_timeout, opts.max_message_size);
+  pub(crate) fn server(
+    stream: S,
+    negotiated: &Negotiated,
+    opts: &AcceptOptions,
+    leftover: Vec<u8>,
+  ) -> Self {
+    let (config, cap, budget) =
+      build_config(opts.keepalive, opts.close_timeout, opts.max_message_size);
     let conn = Connection::new(negotiated, config, role::Server::new(), Instant::now());
     Self::assemble(stream, conn, cap, budget, leftover)
   }
 }
 
 impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WebSocket<R, Ro, S> {
-  fn assemble(stream: S, conn: Connection<Instant, Ro>, cap: usize, budget: std::time::Duration, leftover: Vec<u8>) -> Self {
+  fn assemble(
+    stream: S,
+    conn: Connection<Instant, Ro>,
+    cap: usize,
+    budget: std::time::Duration,
+    leftover: Vec<u8>,
+  ) -> Self {
     let (read, write) = stream.split(); // futures_util::io::split → BiLock halves
     let shared = Arc::new(Shared {
       conn: Mutex::new(conn),
@@ -180,7 +198,10 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WebSocket<R, Ro, S> {
       _rt: PhantomData,
     };
     let write_half = WriteHalf::new(shared);
-    Self { read: read_half, write: write_half }
+    Self {
+      read: read_half,
+      write: write_half,
+    }
   }
 
   /// The next data message, or `None` once the connection has closed.
@@ -341,7 +362,9 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> ReadHalf<R, Ro, S> {
       // stop polling after a returned message; the echo must precede it).
       {
         let meta = self.shared.meta.lock().unwrap();
-        if !meta.close_pending && let Some(m) = self.ready.pop_front() {
+        if !meta.close_pending
+          && let Some(m) = self.ready.pop_front()
+        {
           return Some(Ok(m));
         }
       }

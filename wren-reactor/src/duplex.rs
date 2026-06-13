@@ -71,7 +71,11 @@ fn duplex_with(cap: usize, fault: Option<usize>) -> (Pipe, Pipe) {
 }
 
 impl futures_util::AsyncRead for Pipe {
-  fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<io::Result<usize>> {
+  fn poll_read(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    out: &mut [u8],
+  ) -> Poll<io::Result<usize>> {
     let mut g = self.read.lock().unwrap();
     if g.buf.is_empty() {
       if g.closed {
@@ -92,7 +96,11 @@ impl futures_util::AsyncRead for Pipe {
 }
 
 impl futures_util::AsyncWrite for Pipe {
-  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+  fn poll_write(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    data: &[u8],
+  ) -> Poll<io::Result<usize>> {
     let mut g = self.write.lock().unwrap();
     if g.closed {
       return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));

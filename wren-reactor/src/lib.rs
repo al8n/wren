@@ -37,7 +37,13 @@ pub use websocket_proto::{Negotiated, connection::Closed, frame::CloseCode, mess
 pub async fn connect<N: Net>(
   url: &str,
   options: ClientOptions,
-) -> Result<(WebSocket<N::Runtime, ClientRole, MaybeTls<N::TcpStream>>, ConnectResponse), ConnectError> {
+) -> Result<
+  (
+    WebSocket<N::Runtime, ClientRole, MaybeTls<N::TcpStream>>,
+    ConnectResponse,
+  ),
+  ConnectError,
+> {
   let parsed = url::WsUrl::parse(url)?;
   #[cfg(not(feature = "tls"))]
   if parsed.tls {
@@ -48,7 +54,10 @@ pub async fn connect<N: Net>(
   let stream = if parsed.tls {
     #[cfg(feature = "tls")]
     {
-      let connector = options.tls.clone().unwrap_or_else(tls::default_tls_connector);
+      let connector = options
+        .tls
+        .clone()
+        .unwrap_or_else(tls::default_tls_connector);
       let domain = rustls::pki_types::ServerName::try_from(parsed.host_for_dial().to_string())
         .map_err(|_| ConnectError::InvalidUrl("invalid TLS server name"))?;
       MaybeTls::Tls(Box::new(connector.connect(domain, tcp).await?))
@@ -71,7 +80,12 @@ pub async fn client<R: RuntimeLite, S: Duplex>(
 ) -> Result<(WebSocket<R, ClientRole, S>, ConnectResponse), ConnectError> {
   let (stream, outcome) = handshake::drive_client(stream, host, path_and_query, &options).await?;
   let ws = WebSocket::<R, _, _>::client(stream, &outcome.negotiated, &options, outcome.leftover);
-  Ok((ws, ConnectResponse { negotiated: outcome.negotiated }))
+  Ok((
+    ws,
+    ConnectResponse {
+      negotiated: outcome.negotiated,
+    },
+  ))
 }
 
 /// Accepts one WebSocket upgrade on a caller-provided stream, committing the
@@ -81,7 +95,10 @@ pub async fn accept<R: RuntimeLite, S: Duplex>(
   stream: S,
   options: AcceptOptions,
 ) -> Result<(WebSocket<R, ServerRole, S>, RequestSummary), AcceptError> {
-  accept_pending::<R, S>(stream, options).await?.accept().await
+  accept_pending::<R, S>(stream, options)
+    .await?
+    .accept()
+    .await
 }
 
 /// Reads one upgrade request and stops BEFORE answering, so the caller can
@@ -92,7 +109,13 @@ pub async fn accept_pending<R: RuntimeLite, S: Duplex>(
   options: AcceptOptions,
 ) -> Result<PendingAccept<R, S>, AcceptError> {
   let (head, summary) = handshake::drive_server_request(&mut stream).await?;
-  Ok(PendingAccept { stream, head, summary, options, _rt: PhantomData })
+  Ok(PendingAccept {
+    stream,
+    head,
+    summary,
+    options,
+    _rt: PhantomData,
+  })
 }
 
 /// An upgrade request that has been read but not yet answered. Inspect
@@ -114,8 +137,10 @@ impl<R: RuntimeLite, S: Duplex> PendingAccept<R, S> {
   }
   /// Sends the 101 and establishes the connection.
   pub async fn accept(self) -> Result<(WebSocket<R, ServerRole, S>, RequestSummary), AcceptError> {
-    let (stream, outcome) = handshake::finish_accept(self.stream, self.head, self.summary, &self.options).await?;
-    let ws = WebSocket::<R, _, _>::server(stream, &outcome.negotiated, &self.options, outcome.leftover);
+    let (stream, outcome) =
+      handshake::finish_accept(self.stream, self.head, self.summary, &self.options).await?;
+    let ws =
+      WebSocket::<R, _, _>::server(stream, &outcome.negotiated, &self.options, outcome.leftover);
     Ok((ws, outcome.summary))
   }
   /// Answers with a non-101 rejection (status 300–599) and drops the
@@ -157,7 +182,10 @@ pub mod tokio {
   pub type ClientWebSocket = WebSocket<Rt, ClientRole, MaybeTls<Tcp>>;
 
   /// See [`crate::connect`].
-  pub async fn connect(url: &str, options: ClientOptions) -> Result<(ClientWebSocket, ConnectResponse), ConnectError> {
+  pub async fn connect(
+    url: &str,
+    options: ClientOptions,
+  ) -> Result<(ClientWebSocket, ConnectResponse), ConnectError> {
     super::connect::<agnostic_net::tokio::Net>(url, options).await
   }
   /// See [`crate::client`].
@@ -170,11 +198,17 @@ pub mod tokio {
     super::client::<Rt, S>(stream, host, path_and_query, options).await
   }
   /// See [`crate::accept`].
-  pub async fn accept<S: Duplex>(stream: S, options: AcceptOptions) -> Result<(WebSocket<Rt, ServerRole, S>, RequestSummary), AcceptError> {
+  pub async fn accept<S: Duplex>(
+    stream: S,
+    options: AcceptOptions,
+  ) -> Result<(WebSocket<Rt, ServerRole, S>, RequestSummary), AcceptError> {
     super::accept::<Rt, S>(stream, options).await
   }
   /// See [`crate::accept_pending`].
-  pub async fn accept_pending<S: Duplex>(stream: S, options: AcceptOptions) -> Result<PendingAccept<Rt, S>, AcceptError> {
+  pub async fn accept_pending<S: Duplex>(
+    stream: S,
+    options: AcceptOptions,
+  ) -> Result<PendingAccept<Rt, S>, AcceptError> {
     super::accept_pending::<Rt, S>(stream, options).await
   }
 }
@@ -192,7 +226,10 @@ pub mod smol {
   pub type ClientWebSocket = WebSocket<Rt, ClientRole, MaybeTls<Tcp>>;
 
   /// See [`crate::connect`].
-  pub async fn connect(url: &str, options: ClientOptions) -> Result<(ClientWebSocket, ConnectResponse), ConnectError> {
+  pub async fn connect(
+    url: &str,
+    options: ClientOptions,
+  ) -> Result<(ClientWebSocket, ConnectResponse), ConnectError> {
     super::connect::<agnostic_net::smol::Net>(url, options).await
   }
   /// See [`crate::client`].
@@ -205,11 +242,17 @@ pub mod smol {
     super::client::<Rt, S>(stream, host, path_and_query, options).await
   }
   /// See [`crate::accept`].
-  pub async fn accept<S: Duplex>(stream: S, options: AcceptOptions) -> Result<(WebSocket<Rt, ServerRole, S>, RequestSummary), AcceptError> {
+  pub async fn accept<S: Duplex>(
+    stream: S,
+    options: AcceptOptions,
+  ) -> Result<(WebSocket<Rt, ServerRole, S>, RequestSummary), AcceptError> {
     super::accept::<Rt, S>(stream, options).await
   }
   /// See [`crate::accept_pending`].
-  pub async fn accept_pending<S: Duplex>(stream: S, options: AcceptOptions) -> Result<PendingAccept<Rt, S>, AcceptError> {
+  pub async fn accept_pending<S: Duplex>(
+    stream: S,
+    options: AcceptOptions,
+  ) -> Result<PendingAccept<Rt, S>, AcceptError> {
     super::accept_pending::<Rt, S>(stream, options).await
   }
 }

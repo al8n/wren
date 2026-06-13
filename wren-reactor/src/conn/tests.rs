@@ -18,7 +18,10 @@ fn pair_cap(cap: usize) -> (Client, Server) {
   )
 }
 
-fn pair_with(co: crate::options::ClientOptions, so: crate::options::AcceptOptions) -> (Client, Server) {
+fn pair_with(
+  co: crate::options::ClientOptions,
+  so: crate::options::AcceptOptions,
+) -> (Client, Server) {
   let (c, s) = duplex();
   let n = Negotiated::none();
   (
@@ -173,8 +176,10 @@ async fn write_error_poisons_the_connection() {
   // The transport accepts 4 KiB, fails one write, then recovers.
   let (c, s) = crate::duplex::duplex_with_write_fault(4 * 1024);
   let n = Negotiated::none();
-  let mut client = WebSocket::<TokioRuntime, ClientRole, Pipe>::client(c, &n, &Default::default(), Vec::new());
-  let _server = WebSocket::<TokioRuntime, ServerRole, Pipe>::server(s, &n, &Default::default(), Vec::new());
+  let mut client =
+    WebSocket::<TokioRuntime, ClientRole, Pipe>::client(c, &n, &Default::default(), Vec::new());
+  let _server =
+    WebSocket::<TokioRuntime, ServerRole, Pipe>::server(s, &n, &Default::default(), Vec::new());
 
   let payload = vec![0xAA_u8; 64 * 1024];
   let err = client.send_binary(&payload).await.unwrap_err();
@@ -252,7 +257,9 @@ async fn stream_sink_round_trip() {
   let (client, server) = pair();
   let (mut cr, mut cw) = client.split();
   let (mut sr, mut sw) = server.split();
-  SinkExt::send(&mut cw, Message::Text("hi".into())).await.unwrap();
+  SinkExt::send(&mut cw, Message::Text("hi".into()))
+    .await
+    .unwrap();
   let srv = tokio::spawn(async move {
     let m = StreamExt::next(&mut sr).await.unwrap().unwrap();
     SinkExt::send(&mut sw, m).await.unwrap();
