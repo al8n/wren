@@ -132,6 +132,20 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WriteHalf<R, Ro, S> {
     let f = encode_frame(&self.shared, p.len(), |c, o| c.encode_ping(p, o)).await?;
     write_frame(&self.shared, f).await
   }
+  /// Sends a whole text message compressed with permessage-deflate.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  pub async fn send_text_compressed(&mut self, t: &str) -> Result<(), Error> {
+    let f = encode_frame(&self.shared, t.len() * 2, |c, o| c.encode_text_compressed(t, o)).await?;
+    write_frame(&self.shared, f).await
+  }
+  /// Sends a whole binary message compressed with permessage-deflate.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  pub async fn send_binary_compressed(&mut self, d: &[u8]) -> Result<(), Error> {
+    let f = encode_frame(&self.shared, d.len() * 2, |c, o| c.encode_binary_compressed(d, o)).await?;
+    write_frame(&self.shared, f).await
+  }
 
   /// Requests the close handshake: queues the Close into proto and wakes the
   /// reader. The [`ReadHalf`](super::ReadHalf) flushes it (budget-bounded,

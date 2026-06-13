@@ -207,6 +207,18 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WebSocket<R, Ro, S> {
   pub async fn ping(&mut self, p: &[u8]) -> Result<(), Error> {
     self.write.ping(p).await
   }
+  /// Sends a whole text message compressed with permessage-deflate.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  pub async fn send_text_compressed(&mut self, t: &str) -> Result<(), Error> {
+    self.write.send_text_compressed(t).await
+  }
+  /// Sends a whole binary message compressed with permessage-deflate.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  pub async fn send_binary_compressed(&mut self, d: &[u8]) -> Result<(), Error> {
+    self.write.send_binary_compressed(d).await
+  }
   /// Starts the close handshake, drives it to completion (peer echo or the
   /// close deadline), tears the transport down, and reports the outcome.
   ///
