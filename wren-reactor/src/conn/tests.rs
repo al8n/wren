@@ -245,3 +245,20 @@ async fn cancelled_next_preserves_the_connection() {
   let m = client.next().await.unwrap().unwrap();
   assert_eq!(m, Message::Text("echo".into()));
 }
+
+#[tokio::test]
+async fn stream_sink_round_trip() {
+  use futures_util::{SinkExt, StreamExt};
+  let (client, server) = pair();
+  let (mut cr, mut cw) = client.split();
+  let (mut sr, mut sw) = server.split();
+  SinkExt::send(&mut cw, Message::Text("hi".into())).await.unwrap();
+  let srv = tokio::spawn(async move {
+    let m = StreamExt::next(&mut sr).await.unwrap().unwrap();
+    SinkExt::send(&mut sw, m).await.unwrap();
+    (sr, sw)
+  });
+  let got = StreamExt::next(&mut cr).await.unwrap().unwrap();
+  assert_eq!(got, Message::Text("hi".into()));
+  drop(srv.await.unwrap());
+}

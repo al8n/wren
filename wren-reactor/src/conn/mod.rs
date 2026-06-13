@@ -14,12 +14,14 @@ use std::{
   time::Instant,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use agnostic_lite::RuntimeLite;
 use async_lock::Mutex;
-use event_listener::Event;
 use futures_util::{
   AsyncReadExt, AsyncWriteExt, FutureExt,
   io::{ReadHalf as IoRead, WriteHalf as IoWrite},
+  task::AtomicWaker,
 };
 use websocket_proto::{
   Connection, ConnectionConfig, Negotiated,
@@ -68,9 +70,11 @@ pub(crate) struct Shared<Ro, S> {
   pub(crate) conn: Mutex<Connection<Instant, Ro>>,
   pub(crate) write: Mutex<IoWrite<S>>,
   pub(crate) meta: StdMutex<Meta>,
-  /// Rung by [`WriteHalf::close`] so a parked split reader re-derives its
-  /// close deadline.
-  pub(crate) reader_wake: Event,
+  /// Woken by [`WriteHalf::close`] so a parked split reader re-derives its
+  /// close deadline. `AtomicWaker` (not a one-shot listener) survives the
+  /// `Stream` impl recreating the pump future each poll — no lost-wake gap.
+  pub(crate) reader_waker: AtomicWaker,
+  pub(crate) wake_flag: AtomicBool,
   pub(crate) close_budget: std::time::Duration,
 }
 
@@ -80,6 +84,11 @@ impl<Ro, S> Shared<Ro, S> {
   }
   pub(crate) fn poisoned(&self) -> Option<std::io::ErrorKind> {
     self.meta.lock().unwrap().poisoned
+  }
+  /// Wakes the reader to re-evaluate (a Close was queued).
+  pub(crate) fn wake_reader(&self) {
+    self.wake_flag.store(true, Ordering::Release);
+    self.reader_waker.wake();
   }
 }
 
@@ -158,7 +167,8 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WebSocket<R, Ro, S> {
       conn: Mutex::new(conn),
       write: Mutex::new(write),
       meta: StdMutex::new(Meta::default()),
-      reader_wake: Event::new(),
+      reader_waker: AtomicWaker::new(),
+      wake_flag: AtomicBool::new(false),
       close_budget: budget,
     });
     let read_half = ReadHalf {
@@ -328,10 +338,13 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> ReadHalf<R, Ro, S> {
         return None;
       }
 
-      // Phase 3 (no lock): park on read / timer / reader-wake.
+      // Phase 3 (no lock): park on read / timer / reader-wake. Split the
+      // borrows so the wake `poll_fn` captures only `shared`, not `read`.
+      let shared = &self.shared;
+      let read = &mut self.read;
       let mut buf = vec![0u8; READ_CHUNK];
       let outcome = {
-        let rd = self.read.read(&mut buf).fuse();
+        let rd = read.read(&mut buf).fuse();
         let timer = async {
           match deadline {
             Some(at) => {
@@ -341,7 +354,16 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> ReadHalf<R, Ro, S> {
           }
         }
         .fuse();
-        let bell = self.shared.reader_wake.listen().fuse();
+        let bell = std::future::poll_fn(|cx| {
+          // Register before checking the flag (AtomicWaker idiom).
+          shared.reader_waker.register(cx.waker());
+          if shared.wake_flag.swap(false, Ordering::AcqRel) {
+            std::task::Poll::Ready(())
+          } else {
+            std::task::Poll::Pending
+          }
+        })
+        .fuse();
         futures_util::pin_mut!(rd, timer, bell);
         futures_util::select_biased! {
           r = rd => Park::Read(r),
@@ -443,6 +465,23 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> ReadHalf<R, Ro, S> {
   #[cfg(test)]
   pub(crate) fn pongs_seen(&self) -> usize {
     self.shared.meta.lock().unwrap().pongs_seen
+  }
+}
+
+impl<R: RuntimeLite, Ro: role::Role, S: Duplex> futures_util::Stream for ReadHalf<R, Ro, S> {
+  type Item = Result<Message, Error>;
+
+  fn poll_next(
+    mut self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Option<Self::Item>> {
+    use std::future::Future;
+    // `ReadHalf` is `Unpin`; recreating the pump future each poll is safe —
+    // its progress lives in `self`'s fields and the reader-wake is an
+    // `AtomicWaker` (re-registered each poll), not a droppable listener.
+    let fut = self.next();
+    futures_util::pin_mut!(fut);
+    fut.poll(cx)
   }
 }
 
