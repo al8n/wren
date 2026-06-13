@@ -1,5 +1,25 @@
 # UNRELEASED
 
+## `wren-reactor` — cycle 3 (runtime-agnostic full-duplex driver)
+
+- **`wren-reactor`**: readiness-based WebSocket driver over `websocket-proto`,
+  runtime-agnostic across **tokio and smol** (feature-selected) via
+  `agnostic-net` / `agnostic-lite`. Client (`connect` over `ws://` / `wss://`,
+  or `client` over any `futures::io` stream) and server (`accept`, plus the
+  two-step `accept_pending` → inspect → `accept` / `reject` for pre-upgrade
+  authorization). The transport is **genuinely split** — reads own one half,
+  writes the other, with the proto state machine shared behind a brief lock
+  touched only to encode/decode (never across an IO await) — so a large
+  outbound write to a slow-reading peer never delays inbound delivery, the
+  head-of-line limitation `wren-compio`'s single pump documented. `split()`
+  yields the two halves; both also implement `futures::Stream` / `Sink`. The
+  senders and `next()` are cancellation-safe by construction (a dropped
+  readiness future consumed nothing), and the close handshake is fully bounded
+  by the close timeout (flush, echo wait counted from the flush, and transport
+  shutdown). Features: `tokio` (default), `smol`, `tls` (futures-rustls +
+  rustls/ring, webpki roots by default, full `TlsConnector` override),
+  `deflate`, `tracing`.
+
 ## `wren-compio` + `wren-trace` — cycle 2 (first async driver)
 
 - **`wren-compio`**: compio-native (io_uring / IOCP / kqueue, thread-per-core)

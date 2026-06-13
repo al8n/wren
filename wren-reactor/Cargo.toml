@@ -38,7 +38,7 @@ bytes = { workspace = true, features = ["std"] }
 [dev-dependencies]
 agnostic-net = { workspace = true, features = ["std", "tokio", "smol"] }
 agnostic-lite = { workspace = true, features = ["std", "time", "tokio", "smol"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 smol = "2"
 rcgen.workspace = true
 
