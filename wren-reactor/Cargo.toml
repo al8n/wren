@@ -1,0 +1,51 @@
+[package]
+name = "wren-reactor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+description = "Runtime-agnostic (tokio + smol) async WebSocket driver (client + server)."
+repository = "https://github.com/al8n/wren"
+homepage = "https://github.com/al8n/wren"
+documentation = "https://docs.rs/wren-reactor"
+license = "MIT OR Apache-2.0"
+keywords = ["websocket", "tokio", "smol", "client", "server"]
+categories = ["network-programming", "asynchronous", "web-programming::websocket"]
+readme = "README.md"
+
+[features]
+default = ["tokio"]
+tokio = ["agnostic-net/tokio", "agnostic-lite/tokio"]
+smol = ["agnostic-net/smol", "agnostic-lite/smol"]
+tls = ["dep:futures-rustls", "dep:rustls", "dep:webpki-roots"]
+deflate = ["websocket-proto/deflate"]
+tracing = ["wren-trace/tracing"]
+
+[dependencies]
+websocket-proto = { workspace = true, features = ["std"] }
+wren-trace.workspace = true
+agnostic-net = { workspace = true, features = ["std"] }
+agnostic-lite = { workspace = true, features = ["std", "time"] }
+async-lock.workspace = true
+event-listener.workspace = true
+futures-util = { workspace = true, features = ["std", "async-await", "io", "sink"] }
+futures-rustls = { workspace = true, optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "1", optional = true }
+rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
+thiserror = { workspace = true, features = ["std"] }
+smol_str = { workspace = true, features = ["std"] }
+bytes = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+agnostic-net = { workspace = true, features = ["std", "tokio", "smol"] }
+agnostic-lite = { workspace = true, features = ["std", "time", "tokio", "smol"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+smol = "2"
+rcgen.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
