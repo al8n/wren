@@ -11,6 +11,7 @@ pub struct ClientOptions {
   pub(crate) extra_headers: Vec<(SmolStr, SmolStr)>,
   pub(crate) keepalive: Option<Duration>,
   pub(crate) close_timeout: Option<Duration>,
+  pub(crate) write_timeout: Option<Duration>,
   pub(crate) max_message_size: Option<usize>,
   #[cfg(feature = "deflate")]
   pub(crate) deflate: Option<websocket_proto::negotiation::DeflateOffer>,
@@ -26,6 +27,7 @@ impl core::fmt::Debug for ClientOptions {
       .field("extra_headers", &self.extra_headers)
       .field("keepalive", &self.keepalive)
       .field("close_timeout", &self.close_timeout)
+      .field("write_timeout", &self.write_timeout)
       .field("max_message_size", &self.max_message_size);
     #[cfg(feature = "deflate")]
     d.field("deflate", &self.deflate);
@@ -36,8 +38,8 @@ impl core::fmt::Debug for ClientOptions {
 }
 
 impl ClientOptions {
-  /// Options with every knob at its default (no subprotocols, no extras,
-  /// proto's default timers, 64 MiB message cap).
+  /// Options with every knob at its default (no subprotocols, no extras, no
+  /// keepalive, no write timeout, proto's default close timeout, 64 MiB cap).
   pub fn new() -> Self {
     Self::default()
   }
@@ -61,20 +63,38 @@ impl ClientOptions {
     self
   }
 
-  /// Keepalive ping interval (`None` disables; the default is disabled).
+  /// Keepalive ping interval. **Off by default** (tungstenite parity): when set,
+  /// the connection sends periodic pings (the peer's pong is consumed internally);
+  /// incoming pings are auto-ponged regardless. It imposes NO liveness timeout —
+  /// detecting a dead or non-reading peer is the caller's job (`timeout(next())`,
+  /// your own ping tracking, or OS TCP keepalive).
   #[must_use]
   pub fn with_keepalive(mut self, interval: Option<Duration>) -> Self {
     self.keepalive = interval;
     self
   }
 
-  /// The close-handshake budget: it bounds flushing our Close, waiting
-  /// for the peer's echo (counted from the flush), and the transport
-  /// shutdown — each individually, so a close takes at most a small
-  /// multiple of it. The default is the protocol's (10 s).
+  /// The close-handshake budget: it bounds flushing our Close, waiting for the
+  /// peer's echo (counted from the flush), and the transport shutdown — so a close
+  /// completes in a small multiple of it. It bounds ONLY the close handshake, never
+  /// ordinary sends. The default is the protocol's (10 s).
   #[must_use]
   pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
     self.close_timeout = Some(timeout);
+    self
+  }
+
+  /// Per-frame deadline bounding an ordinary write/flush (the `poll_write`
+  /// no-progress bound and flush completion). `None` (the default) means the
+  /// library imposes NO write deadline — a stalled write/flush simply pends until
+  /// you bound it with `timeout(send(..))` or drop the connection. Set it on a
+  /// transport whose backpressure hides at `poll_flush` (buffered / TLS) where a
+  /// peer may stall, accepting that a transport genuinely slower than this is then
+  /// treated as stuck and the connection fails with `Io::TimedOut`. Liveness
+  /// (detecting a dead peer) is separate and likewise the caller's job.
+  #[must_use]
+  pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+    self.write_timeout = Some(timeout);
     self
   }
 
@@ -111,6 +131,7 @@ pub struct AcceptOptions {
   pub(crate) extra_headers: Vec<(SmolStr, SmolStr)>,
   pub(crate) keepalive: Option<Duration>,
   pub(crate) close_timeout: Option<Duration>,
+  pub(crate) write_timeout: Option<Duration>,
   pub(crate) max_message_size: Option<usize>,
   #[cfg(feature = "deflate")]
   pub(crate) deflate: Option<websocket_proto::negotiation::ServerDeflateConfig>,
@@ -141,20 +162,38 @@ impl AcceptOptions {
     self
   }
 
-  /// Keepalive ping interval (`None` disables; the default is disabled).
+  /// Keepalive ping interval. **Off by default** (tungstenite parity): when set,
+  /// the connection sends periodic pings (the peer's pong is consumed internally);
+  /// incoming pings are auto-ponged regardless. It imposes NO liveness timeout —
+  /// detecting a dead or non-reading peer is the caller's job (`timeout(next())`,
+  /// your own ping tracking, or OS TCP keepalive).
   #[must_use]
   pub fn with_keepalive(mut self, interval: Option<Duration>) -> Self {
     self.keepalive = interval;
     self
   }
 
-  /// The close-handshake budget: it bounds flushing our Close, waiting
-  /// for the peer's echo (counted from the flush), and the transport
-  /// shutdown — each individually, so a close takes at most a small
-  /// multiple of it. The default is the protocol's (10 s).
+  /// The close-handshake budget: it bounds flushing our Close, waiting for the
+  /// peer's echo (counted from the flush), and the transport shutdown — so a close
+  /// completes in a small multiple of it. It bounds ONLY the close handshake, never
+  /// ordinary sends. The default is the protocol's (10 s).
   #[must_use]
   pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
     self.close_timeout = Some(timeout);
+    self
+  }
+
+  /// Per-frame deadline bounding an ordinary write/flush (the `poll_write`
+  /// no-progress bound and flush completion). `None` (the default) means the
+  /// library imposes NO write deadline — a stalled write/flush simply pends until
+  /// you bound it with `timeout(send(..))` or drop the connection. Set it on a
+  /// transport whose backpressure hides at `poll_flush` (buffered / TLS) where a
+  /// peer may stall, accepting that a transport genuinely slower than this is then
+  /// treated as stuck and the connection fails with `Io::TimedOut`. Liveness
+  /// (detecting a dead peer) is separate and likewise the caller's job.
+  #[must_use]
+  pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+    self.write_timeout = Some(timeout);
     self
   }
 

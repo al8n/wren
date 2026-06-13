@@ -7,7 +7,6 @@ websocket-proto = { version = "0.1", path = "websocket-proto", default-features 
 wren-trace = { version = "0.1", path = "wren-trace" }
 agnostic-net = { version = "0.3", default-features = false }
 agnostic-lite = { version = "0.6", default-features = false }
-async-lock = "3"
 futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 compio = "0.19"
 compio-net = "0.12"

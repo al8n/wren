@@ -17,6 +17,20 @@ struct Shared {
   capacity: usize,
   /// `Some(n)`: accept `n` more bytes, then fail ONE write and recover.
   fault_after: Option<usize>,
+  /// When set, `poll_close` never completes (models a hung TLS close_notify).
+  stall_close: bool,
+  /// When set, `poll_flush` never completes (models a write error followed by a
+  /// stalled flush).
+  stall_flush: bool,
+  /// When set, `poll_flush` completes only once the reader has drained everything
+  /// written (models a buffered transport where "flush" means the peer received
+  /// it): it makes progress to a reading peer, but stalls to a non-reading one.
+  flush_drains: bool,
+  /// When set, every `poll_write` parks (frames back up behind it) until a
+  /// [`FaultTrigger`] flips `fault_now`.
+  stall_writes: bool,
+  /// When set, the next `poll_write` fails once (then `stall_writes` is cleared).
+  fault_now: bool,
   closed: bool,
   read_waker: Option<Waker>,
   write_waker: Option<Waker>,
@@ -49,6 +63,115 @@ pub(crate) fn duplex_with_write_fault(after: usize) -> (Pipe, Pipe) {
       write: b.clone(),
     },
     Pipe { read: b, write: a },
+  )
+}
+
+/// The first pipe's `poll_close` never completes (models a transport whose
+/// shutdown, e.g. a TLS close_notify, hangs on a gone peer).
+pub(crate) fn duplex_with_stalling_close() -> (Pipe, Pipe) {
+  let a = Arc::new(Mutex::new(Shared::default()));
+  let b = Arc::new(Mutex::new(Shared {
+    stall_close: true,
+    ..Default::default()
+  }));
+  (
+    Pipe {
+      read: a.clone(),
+      write: b.clone(),
+    },
+    Pipe { read: b, write: a },
+  )
+}
+
+/// The first pipe's writes succeed but its `poll_flush` never completes (models a
+/// buffered transport whose peer stopped reading: bytes buffer on `write` but the
+/// flush to the socket stalls). The writer's flush deadline must bound this.
+pub(crate) fn duplex_with_stalling_flush() -> (Pipe, Pipe) {
+  let a = Arc::new(Mutex::new(Shared::default()));
+  let b = Arc::new(Mutex::new(Shared {
+    stall_flush: true,
+    ..Default::default()
+  }));
+  (
+    Pipe {
+      read: a.clone(),
+      write: b.clone(),
+    },
+    Pipe { read: b, write: a },
+  )
+}
+
+/// The first pipe's writes always succeed (unbounded buffer), but its `poll_flush`
+/// completes only once the reader has drained everything written — modelling a
+/// buffered transport where "flush" means the peer has received the bytes. A flush
+/// to a reading peer completes (as fast as it reads); to a non-reading peer it
+/// stalls. Used to check that a slow-but-progressing flush is not false-aborted.
+pub(crate) fn duplex_with_draining_flush() -> (Pipe, Pipe) {
+  let a = Arc::new(Mutex::new(Shared::default()));
+  let b = Arc::new(Mutex::new(Shared {
+    flush_drains: true,
+    ..Default::default()
+  }));
+  (
+    Pipe {
+      read: a.clone(),
+      write: b.clone(),
+    },
+    Pipe { read: b, write: a },
+  )
+}
+
+/// The first pipe fails its first write, then its `poll_flush` never completes
+/// (models a transport that errors a write and then stalls the flush).
+pub(crate) fn duplex_with_write_fault_then_stuck_flush() -> (Pipe, Pipe) {
+  let a = Arc::new(Mutex::new(Shared::default()));
+  let b = Arc::new(Mutex::new(Shared {
+    fault_after: Some(0),
+    stall_flush: true,
+    ..Default::default()
+  }));
+  (
+    Pipe {
+      read: a.clone(),
+      write: b.clone(),
+    },
+    Pipe { read: b, write: a },
+  )
+}
+
+/// Fires a one-shot transport write fault on a stalled pipe (see
+/// [`duplex_with_stalled_then_faulting_write`]).
+pub(crate) struct FaultTrigger(Arc<Mutex<Shared>>);
+
+impl FaultTrigger {
+  /// Makes the stalled pipe's parked write wake and fail once.
+  pub(crate) fn fire(&self) {
+    let mut g = self.0.lock().unwrap();
+    g.fault_now = true;
+    if let Some(w) = g.write_waker.take() {
+      w.wake();
+    }
+  }
+}
+
+/// The first pipe's writes park (frames back up behind them) until the returned
+/// [`FaultTrigger`] fires, at which point the parked write fails once. Models a
+/// transport that backs up and then errors, so a send queued behind the stalled
+/// write can be observed surfacing the real Io error rather than a bare Closed.
+pub(crate) fn duplex_with_stalled_then_faulting_write() -> (Pipe, Pipe, FaultTrigger) {
+  let a = Arc::new(Mutex::new(Shared::default()));
+  let b = Arc::new(Mutex::new(Shared {
+    stall_writes: true,
+    ..Default::default()
+  }));
+  let trigger = FaultTrigger(b.clone());
+  (
+    Pipe {
+      read: a.clone(),
+      write: b.clone(),
+    },
+    Pipe { read: b, write: a },
+    trigger,
   )
 }
 
@@ -105,6 +228,15 @@ impl futures_util::AsyncWrite for Pipe {
     if g.closed {
       return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
     }
+    if g.fault_now {
+      g.fault_now = false;
+      g.stall_writes = false; // recover so the transport is consistent post-fault
+      return Poll::Ready(Err(io::Error::other("triggered write fault")));
+    }
+    if g.stall_writes {
+      g.write_waker = Some(cx.waker().clone());
+      return Poll::Pending; // park; frames pile up behind the stalled write
+    }
     if g.fault_after == Some(0) {
       g.fault_after = None;
       return Poll::Ready(Err(io::Error::other("injected write fault")));
@@ -130,12 +262,24 @@ impl futures_util::AsyncWrite for Pipe {
     Poll::Ready(Ok(n))
   }
 
-  fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    let mut g = self.write.lock().unwrap();
+    if g.stall_flush {
+      return Poll::Pending; // never completes; models a stuck flush
+    }
+    if g.flush_drains && !g.buf.is_empty() {
+      // Completes once the reader drains the buffer; `poll_read` wakes this.
+      g.write_waker = Some(cx.waker().clone());
+      return Poll::Pending;
+    }
     Poll::Ready(Ok(()))
   }
 
   fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
     let mut g = self.write.lock().unwrap();
+    if g.stall_close {
+      return Poll::Pending; // never completes; only an external abort frees it
+    }
     g.closed = true;
     if let Some(w) = g.read_waker.take() {
       w.wake();

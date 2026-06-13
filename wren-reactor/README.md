@@ -68,18 +68,21 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Full duplex
 
-`WebSocket::split()` yields independently-owned read and write halves that own
-**separate transport directions**: a large outbound write to a slow-reading
-peer never delays inbound delivery, and a backpressured read never stalls a
-send. The proto state machine is shared behind a brief lock touched only to
-encode/decode — never across an IO await. The halves also implement
-`futures::Stream` / `Sink`, composing with the `StreamExt` / `SinkExt`
-combinators.
+`WebSocket::split()` yields independently-owned read and write halves backed by
+a per-connection **actor**: a *driver* task owns the proto state machine and the
+read half, and a *writer* task owns the write half. The two directions make
+independent progress — a large outbound write to a slow-reading peer never
+delays inbound delivery, and a backpressured read never stalls a send — and
+there is no lock on the data path, since each task owns its state outright. The
+halves also implement `futures::Stream` / `Sink`, composing with the
+`StreamExt` / `SinkExt` combinators.
 
-Because the runtime is readiness-based, the senders and `next()` are
-cancellation-safe by construction: a dropped future never consumed bytes. The
-close handshake is fully bounded by the close timeout — flushing the Close
-(even against a non-reading peer), the echo wait, and the transport shutdown.
+A send enqueues a command for the driver while the real socket write happens in
+the writer task, so senders (inherent and `Sink`) and `next()` are
+cancellation-safe by construction: a dropped send never leaves a partial frame
+and still backpressures the next one. The close handshake is bounded by the
+close timeout — flushing the Close (even against a non-reading peer), the echo
+wait, and the transport shutdown.
 
 ## Features
 

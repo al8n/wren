@@ -78,7 +78,13 @@ async fn deflate_round_trip() {
       .await
       .unwrap();
     assert!(resp.deflate().is_some(), "deflate negotiated");
+    // Tiny payloads exercise the compressed worst-case buffer sizing: the
+    // deflate frame for 0..4 bytes can exceed a naive payload-based guess.
+    ws.send_text_compressed("").await.unwrap();
+    ws.send_text_compressed("a").await.unwrap();
     ws.send_text_compressed(&text).await.unwrap();
+    assert_eq!(ws.next().await.unwrap().unwrap(), Message::Text("".into()));
+    assert_eq!(ws.next().await.unwrap().unwrap(), Message::Text("a".into()));
     assert_eq!(
       ws.next().await.unwrap().unwrap(),
       Message::Text(expect.into())

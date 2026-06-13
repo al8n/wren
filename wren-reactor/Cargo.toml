@@ -25,7 +25,7 @@ websocket-proto = { workspace = true, features = ["std"] }
 wren-trace.workspace = true
 agnostic-net = { workspace = true, features = ["std"] }
 agnostic-lite = { workspace = true, features = ["std", "time"] }
-async-lock.workspace = true
+futures-channel = { version = "0.3", default-features = false, features = ["std", "sink"] }
 futures-util = { workspace = true, features = ["std", "async-await", "async-await-macro", "io", "sink"] }
 futures-rustls = { workspace = true, optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }

@@ -7,16 +7,32 @@
   `agnostic-net` / `agnostic-lite`. Client (`connect` over `ws://` / `wss://`,
   or `client` over any `futures::io` stream) and server (`accept`, plus the
   two-step `accept_pending` → inspect → `accept` / `reject` for pre-upgrade
-  authorization). The transport is **genuinely split** — reads own one half,
-  writes the other, with the proto state machine shared behind a brief lock
-  touched only to encode/decode (never across an IO await) — so a large
-  outbound write to a slow-reading peer never delays inbound delivery, the
-  head-of-line limitation `wren-compio`'s single pump documented. `split()`
-  yields the two halves; both also implement `futures::Stream` / `Sink`. The
-  senders and `next()` are cancellation-safe by construction (a dropped
-  readiness future consumed nothing), and the close handshake is fully bounded
-  by the close timeout (flush, echo wait counted from the flush, and transport
-  shutdown). Features: `tokio` (default), `smol`, `tls` (futures-rustls +
+  authorization). The transport is driven by a per-connection **actor** — a
+  driver task owns the proto state machine and the read half, a writer task owns
+  the write half, with no lock on the data path — so the two directions make
+  independent progress and a large outbound write to a slow-reading peer never
+  delays inbound delivery, the head-of-line limitation `wren-compio`'s single
+  pump documented. `split()` yields the two halves; both also implement
+  `futures::Stream` / `Sink`. Sends (inherent and `Sink`) and `next()` are
+  cancellation-safe by construction (a dropped send never leaves a partial frame
+  and still backpressures the next; a cancelled close keeps its queued `Sink`
+  writes for a retry rather than dropping them) — though sends are not
+  transactional: once a send's command is admitted it is delivered even if the
+  future is dropped, so a timed-out send must not be blindly retried. The close handshake is
+  bounded by the close timeout (flushing the Close, echo wait counted from the
+  flush, and transport shutdown). **Liveness and write deadlines are the caller's
+  responsibility** (tungstenite parity): over `futures::io` an opaque `poll_flush`
+  exposes no byte progress, so the driver cannot tell a slow-but-reading peer from
+  a stuck one without false-aborting healthy transports or hanging on dead ones. So
+  the library auto-pongs incoming pings and bounds the close handshake by
+  `close_timeout`, but imposes no autonomous liveness or write timeout — a stuck or
+  slow write/flush simply pends, bounded by the caller (`timeout(send())`, the
+  opt-in `write_timeout`, a `timeout(next())` / ping loop for liveness, or OS TCP
+  keepalive). Dropping both halves tears the tasks down, so a pending write never
+  leaks. `keepalive` is opt-in (off by default) and only sends pings. A recorded
+  transport write error surfaces as the real `Io` error on every send path — the
+  inherent senders and the `Sink`, whose
+  `poll_flush` confirms its queued writes. Features: `tokio` (default), `smol`, `tls` (futures-rustls +
   rustls/ring, webpki roots by default, full `TlsConnector` override),
   `deflate`, `tracing`.
 
