@@ -26,7 +26,7 @@ wren-trace.workspace = true
 agnostic-net = { workspace = true, features = ["std"] }
 agnostic-lite = { workspace = true, features = ["std", "time"] }
 async-lock.workspace = true
-futures-util = { workspace = true, features = ["std", "async-await", "io", "sink"] }
+futures-util = { workspace = true, features = ["std", "async-await", "async-await-macro", "io", "sink"] }
 futures-rustls = { workspace = true, optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "1", optional = true }

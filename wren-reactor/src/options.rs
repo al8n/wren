@@ -5,7 +5,7 @@ use core::time::Duration;
 use smol_str::SmolStr;
 
 /// Client options for [`connect`](crate::connect) / [`client`](crate::client).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ClientOptions {
   pub(crate) subprotocols: Vec<SmolStr>,
   pub(crate) extra_headers: Vec<(SmolStr, SmolStr)>,
@@ -16,6 +16,23 @@ pub struct ClientOptions {
   pub(crate) deflate: Option<websocket_proto::negotiation::DeflateOffer>,
   #[cfg(feature = "tls")]
   pub(crate) tls: Option<futures_rustls::TlsConnector>,
+}
+
+// Manual: `futures_rustls::TlsConnector` does not implement `Debug`.
+impl core::fmt::Debug for ClientOptions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut d = f.debug_struct("ClientOptions");
+    d.field("subprotocols", &self.subprotocols)
+      .field("extra_headers", &self.extra_headers)
+      .field("keepalive", &self.keepalive)
+      .field("close_timeout", &self.close_timeout)
+      .field("max_message_size", &self.max_message_size);
+    #[cfg(feature = "deflate")]
+    d.field("deflate", &self.deflate);
+    #[cfg(feature = "tls")]
+    d.field("tls", &self.tls.as_ref().map(|_| "<TlsConnector>"));
+    d.finish()
+  }
 }
 
 impl ClientOptions {

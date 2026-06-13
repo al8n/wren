@@ -262,3 +262,41 @@ async fn stream_sink_round_trip() {
   assert_eq!(got, Message::Text("hi".into()));
   drop(srv.await.unwrap());
 }
+
+#[tokio::test]
+async fn pending_accept_rejects_before_upgrade() {
+  let (c, s) = duplex();
+  let client = tokio::spawn(async move {
+    crate::client::<TokioRuntime, _>(c, "intruder.example", "/admin", Default::default())
+      .await
+      .map(|_| ())
+  });
+  let pending = crate::accept_pending::<TokioRuntime, _>(s, Default::default())
+    .await
+    .unwrap();
+  assert_eq!(pending.request().path(), "/admin");
+  assert_eq!(pending.request().host(), "intruder.example");
+  pending.reject(403, "Forbidden").await.unwrap();
+  let err = client.await.unwrap().unwrap_err();
+  assert!(matches!(err, crate::ConnectError::Rejected { status: 403 }));
+}
+
+#[tokio::test]
+async fn pending_accept_accepts_after_inspection() {
+  let (c, s) = duplex();
+  let client = tokio::spawn(async move {
+    crate::client::<TokioRuntime, _>(c, "example.com", "/ok", Default::default())
+      .await
+      .unwrap()
+  });
+  let pending = crate::accept_pending::<TokioRuntime, _>(s, Default::default())
+    .await
+    .unwrap();
+  assert_eq!(pending.request().path(), "/ok");
+  let (mut ws, summary) = pending.accept().await.unwrap();
+  assert_eq!(summary.path(), "/ok");
+  let (mut cws, _resp) = client.await.unwrap();
+  cws.send_text("hi").await.unwrap();
+  let m = ws.next().await.unwrap().unwrap();
+  assert_eq!(m, Message::Text("hi".into()));
+}
