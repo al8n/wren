@@ -42,7 +42,7 @@ jobs:
           set -euo pipefail
           tokeit
           mv tokeit.json loc-wren.json
-          for c in websocket-proto wren-trace wren-compio; do
+          for c in websocket-proto wren-trace wren-compio wren-reactor; do
             ( cd "$c" && tokeit )
             mv "$c/tokeit.json" "loc-$c.json"
           done
@@ -61,7 +61,7 @@ jobs:
             // Gist file name -> LoC json. `wren` is the workspace total; the
             // rest are per-crate. These names match the LoC badge URLs in the
             // crate READMEs (…/raw/<name>).
-            const crates = ['websocket-proto', 'wren-trace', 'wren-compio'];
+            const crates = ['websocket-proto', 'wren-trace', 'wren-compio', 'wren-reactor'];
             const files = {
               wren: { content: fs.readFileSync('loc-wren.json', 'utf8') },
             };

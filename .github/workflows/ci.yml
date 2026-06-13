@@ -79,6 +79,9 @@ jobs:
       # Powerset (8 combos over tls/deflate/tracing): feature-interaction
       # bugs (tls+deflate) escape an each-feature pass.
       - run: cargo hack test -p wren-compio --feature-powerset
+      # wren-reactor: build-only powerset (the runtime axis tokio/smol plus
+      # tls/deflate/tracing) — the socket tests run --all-features in `test`.
+      - run: cargo hack build -p wren-reactor --feature-powerset --no-dev-deps
 
   test:
     strategy:
@@ -95,6 +98,7 @@ jobs:
       - run: cargo test -p websocket-proto --all-features
       - run: cargo test -p wren-trace --all-features
       - run: cargo test -p wren-compio --all-features
+      - run: cargo test -p wren-reactor --all-features
 
   no-std:
     runs-on: ubuntu-latest
