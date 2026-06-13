@@ -11,7 +11,7 @@ use futures_util::AsyncWriteExt;
 use websocket_proto::{Connection, connection::role, frame::CloseCode, message::Message};
 use wren_trace::debug;
 
-use super::{Shared, TRANSMIT_SCRATCH};
+use super::Shared;
 use crate::{error::Error, runtime::Duplex};
 
 /// The write half. App sends progress independently of the read half.
@@ -92,36 +92,23 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WriteHalf<R, Ro, S> {
     self.write_frame(f).await
   }
 
-  /// Starts the close handshake by putting the Close frame on the wire. The
-  /// [`ReadHalf`](super::ReadHalf) drives it to completion — its `next()`
-  /// returns `None` and `closed()` carries the outcome. Wakes a parked split
-  /// reader to re-derive its deadline.
+  /// Requests the close handshake: queues the Close into proto and wakes the
+  /// reader. The [`ReadHalf`](super::ReadHalf) flushes it (budget-bounded,
+  /// even against a non-reading peer) and drives the handshake to completion
+  /// — its `next()` returns `None` and `closed()` carries the outcome.
+  ///
+  /// Resolves once the Close is queued; poll the read half to complete it.
   pub async fn close(&mut self, code: CloseCode, reason: &str) -> Result<(), Error> {
     {
-      let meta = self.shared.meta.lock().unwrap();
+      let mut conn = self.shared.conn.lock().await;
+      let mut meta = self.shared.meta.lock().unwrap();
       if meta.closed.is_some() || meta.close_pending {
         return Err(Error::Closed);
       }
-    }
-    let frame = {
-      let mut conn = self.shared.conn.lock().await;
       conn.close(code, reason)?;
-      let mut scratch = [0u8; TRANSMIT_SCRATCH];
-      let mut batch = Vec::new();
-      let now = Instant::now();
-      while let Ok(Some(n)) = conn.poll_transmit(now, &mut scratch) {
-        batch.extend_from_slice(&scratch[..n]);
-      }
-      batch
-    };
-    debug!(code = ?code, reason, "starting close handshake");
-    self.shared.meta.lock().unwrap().close_pending = true;
-    self.write_frame(frame).await?;
-    {
-      let mut meta = self.shared.meta.lock().unwrap();
-      meta.close_pending = false;
-      meta.close_flushed_at.get_or_insert(Instant::now());
+      meta.close_pending = true;
     }
+    debug!(code = ?code, reason, "close requested");
     self.shared.reader_wake.notify(usize::MAX);
     Ok(())
   }

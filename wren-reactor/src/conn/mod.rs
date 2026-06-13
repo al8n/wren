@@ -220,6 +220,15 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> WebSocket<R, Ro, S> {
   pub fn split(self) -> (ReadHalf<R, Ro, S>, WriteHalf<R, Ro, S>) {
     (self.read, self.write)
   }
+
+  #[cfg(test)]
+  pub(crate) fn pings_seen(&self) -> usize {
+    self.read.pings_seen()
+  }
+  #[cfg(test)]
+  pub(crate) fn pongs_seen(&self) -> usize {
+    self.read.pongs_seen()
+  }
 }
 
 impl<R: RuntimeLite, Ro: role::Role, S: Duplex> ReadHalf<R, Ro, S> {
@@ -356,12 +365,21 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> ReadHalf<R, Ro, S> {
   }
 
   /// Writes a drained transmit batch under the WRITE lock only (no proto
-  /// held). Bounded by the close budget while a Close is owed.
+  /// held). While a Close is owed, the close budget bounds the WHOLE flush —
+  /// including acquiring the write lock, which a wedged app send may be
+  /// holding — so a non-reading peer cannot stall the handshake.
   async fn write_batch(&self, batch: Vec<u8>, carries_close: bool) -> Result<(), Error> {
-    let mut wr = self.shared.write.lock().await;
+    // The lock acquisition is inside the bounded future so the budget covers
+    // it too (an app send wedged on a backpressured write holds the lock).
     let drive = async {
-      wr.write_all(&batch).await?;
-      wr.flush().await
+      let mut wr = self.shared.write.lock().await;
+      let r = async {
+        wr.write_all(&batch).await?;
+        wr.flush().await
+      }
+      .await;
+      drop(wr);
+      r
     };
     let result = if carries_close {
       futures_util::pin_mut!(drive);
@@ -374,7 +392,6 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> ReadHalf<R, Ro, S> {
     } else {
       Some(drive.await)
     };
-    drop(wr);
     match result {
       Some(Ok(())) => {
         if carries_close {
