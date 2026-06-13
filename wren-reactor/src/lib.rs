@@ -2,6 +2,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
+#[cfg(test)]
+mod duplex;
 mod error;
 mod options;
 mod runtime;
