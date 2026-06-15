@@ -37,3 +37,6 @@ pub use error::{BufferTooSmallDetail, Error, H3Error, TruncatedDetail};
 
 /// QUIC variable-length integer codec (RFC 9000 §16).
 pub mod varint;
+
+/// HTTP/3 frame header codec (RFC 9114 §7.1): type + length varints.
+pub mod frame;
