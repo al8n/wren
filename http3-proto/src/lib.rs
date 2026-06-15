@@ -61,3 +61,7 @@ pub mod stream;
 pub use stream::{Items, RequestStream, StreamItem};
 
 pub use qpack::{FieldLines as HeaderSet, Pair};
+
+/// The top-level HTTP/3 Extended-CONNECT tunnel connection state machine.
+pub mod connection;
+pub use connection::{Client, Connection, Frame, Frames, Role, Server};
