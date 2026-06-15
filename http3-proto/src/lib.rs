@@ -34,3 +34,6 @@ extern crate std;
 /// Cross-cutting error building blocks + the HTTP/3 error-code enum.
 pub mod error;
 pub use error::{BufferTooSmallDetail, Error, H3Error, TruncatedDetail};
+
+/// QUIC variable-length integer codec (RFC 9000 §16).
+pub mod varint;
