@@ -56,4 +56,8 @@ pub use event::{Event, StreamId, StreamKind, StreamRole, Transmit};
 pub mod headers;
 pub use headers::Headers;
 
+/// The request-stream inbound FSM: HEADERS-then-DATA frame parsing (RFC 9114 §7).
+pub mod stream;
+pub use stream::{Items, RequestStream, StreamItem};
+
 pub use qpack::{FieldLines as HeaderSet, Pair};
