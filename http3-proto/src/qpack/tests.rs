@@ -109,3 +109,122 @@ mod huffman_tests {
     ));
   }
 }
+
+mod int_tests {
+  use crate::qpack::{QpackError, int::encode_int};
+
+  #[test]
+  fn rfc7541_5_1_1_example() {
+    // 1337 with a 5-bit prefix, zero flags → [0x1f, 0x9a, 0x0a].
+    let mut buf = [0u8; 8];
+    let n = encode_int(&mut buf, 0, 1337, 5, 0x00).unwrap();
+    assert_eq!(&buf[..n], &[0x1f, 0x9a, 0x0a]);
+  }
+
+  #[test]
+  fn small_value_fits_prefix() {
+    let mut buf = [0u8; 8];
+    let n = encode_int(&mut buf, 0, 10, 5, 0x00).unwrap();
+    assert_eq!(&buf[..n], &[0x0a]);
+  }
+
+  #[test]
+  fn flags_preserved() {
+    // index 15, 6-bit prefix, indexed-static flags 0b11 → 0xcf.
+    let mut buf = [0u8; 8];
+    let n = encode_int(&mut buf, 0, 15, 6, 0b1100_0000).unwrap();
+    assert_eq!(&buf[..n], &[0xcf]);
+  }
+
+  #[test]
+  fn value_equal_to_max_spills() {
+    // 31 == 2^5-1 is NOT < max, so it spills: first byte 0x1f, final byte 0x00.
+    let mut buf = [0u8; 8];
+    let n = encode_int(&mut buf, 0, 31, 5, 0x00).unwrap();
+    assert_eq!(&buf[..n], &[0x1f, 0x00]);
+  }
+
+  #[test]
+  fn writes_at_offset() {
+    let mut buf = [0xaau8; 8];
+    let end = encode_int(&mut buf, 2, 10, 5, 0x00).unwrap();
+    assert_eq!(end, 3);
+    assert_eq!(buf[2], 0x0a);
+    assert_eq!(buf[0], 0xaa); // untouched
+  }
+
+  #[test]
+  fn rejects_small_buffer() {
+    assert!(matches!(
+      encode_int(&mut [0u8; 1], 0, 1337, 5, 0),
+      Err(QpackError::Buffer(_))
+    ));
+  }
+}
+
+mod encode_tests {
+  use crate::qpack::encode_field_section;
+
+  #[test]
+  fn encodes_indexed_static_line() {
+    let mut buf = [0u8; 16];
+    let n = encode_field_section(core::iter::once((":method", "CONNECT")), &mut buf).unwrap();
+    assert_eq!(&buf[..n], &[0x00, 0x00, 0xcf]); // prefix + indexed static #15
+  }
+
+  #[test]
+  fn encodes_literal_with_name_ref() {
+    // :path has static name index 1; "/chat" is a literal (raw) value.
+    let mut buf = [0u8; 32];
+    let n = encode_field_section(core::iter::once((":path", "/chat")), &mut buf).unwrap();
+    assert_eq!(
+      &buf[..n],
+      &[0x00, 0x00, 0x51, 0x05, b'/', b'c', b'h', b'a', b't']
+    );
+  }
+
+  #[test]
+  fn encodes_literal_with_literal_name() {
+    // "x" is not in the static table → literal name (raw); "yz" literal value.
+    let mut buf = [0u8; 32];
+    let n = encode_field_section(core::iter::once(("x", "yz")), &mut buf).unwrap();
+    assert_eq!(&buf[..n], &[0x00, 0x00, 0x21, b'x', 0x02, b'y', b'z']);
+  }
+
+  #[test]
+  fn encodes_value_length_continuation() {
+    // 130-byte value → 7-bit length prefix spills: 0x7f, 0x03.
+    let value = [b'a'; 130];
+    let value_str = core::str::from_utf8(&value).unwrap();
+    let mut buf = [0u8; 160];
+    let n = encode_field_section(core::iter::once((":authority", value_str)), &mut buf).unwrap();
+    assert_eq!(&buf[..4], &[0x00, 0x00, 0x50, 0x7f]); // prefix + name-ref idx0 + len hi
+    assert_eq!(buf[4], 0x03); // len continuation
+    assert_eq!(&buf[5..n], &value); // the 130 bytes
+    assert_eq!(n, 135);
+  }
+
+  #[test]
+  fn rejects_small_buffer() {
+    let mut buf = [0u8; 2]; // only the prefix fits
+    assert!(encode_field_section(core::iter::once((":method", "CONNECT")), &mut buf).is_err());
+  }
+
+  #[test]
+  fn encodes_indexed_line_with_prefix_spill() {
+    // ":status" "100" is static index 63 → the 6-bit indexed prefix spills:
+    // first byte 0b1100_0000 | 63 = 0xff, then the 0x00 continuation.
+    let mut buf = [0u8; 16];
+    let n = encode_field_section(core::iter::once((":status", "100")), &mut buf).unwrap();
+    assert_eq!(&buf[..n], &[0x00, 0x00, 0xff, 0x00]);
+  }
+
+  #[test]
+  fn encodes_name_ref_with_prefix_spill() {
+    // ":scheme" name is static index 22; "ftp" is a literal value. The 4-bit
+    // name-ref prefix spills: 0b0101_0000 | 15 = 0x5f, then 22-15 = 0x07.
+    let mut buf = [0u8; 16];
+    let n = encode_field_section(core::iter::once((":scheme", "ftp")), &mut buf).unwrap();
+    assert_eq!(&buf[..n], &[0x00, 0x00, 0x5f, 0x07, 0x03, b'f', b't', b'p']);
+  }
+}

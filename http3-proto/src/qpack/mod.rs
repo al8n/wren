@@ -1,8 +1,12 @@
 //! Static-table-only QPACK (RFC 9204): field-section encode/decode with the
 //! dynamic table disabled. (Encoder/decoder land in later tasks.)
 
+mod encode;
 mod huffman;
+mod int;
 pub mod static_table;
+
+pub use encode::encode_field_section;
 
 use crate::error::BufferTooSmallDetail;
 
@@ -22,6 +26,9 @@ pub enum QpackError {
   /// No valid Huffman code matched (incomplete or overlong sequence).
   #[display("invalid huffman code")]
   HuffmanInvalid,
+  /// A prefixed integer was malformed or overflowed.
+  #[display("invalid qpack integer")]
+  BadInteger,
 }
 
 #[cfg(test)]
