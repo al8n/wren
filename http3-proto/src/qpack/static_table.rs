@@ -54,18 +54,18 @@ pub static STATIC_TABLE: [(&str, &str); 99] = [
   ("content-type", "image/jpeg"),                        // 49
   ("content-type", "image/png"),                         // 50
   ("content-type", "text/css"),                          // 51
-  ("content-type", "text/html;charset=utf-8"),           // 52
+  ("content-type", "text/html; charset=utf-8"),          // 52
   ("content-type", "text/plain"),                        // 53
   ("content-type", "text/plain;charset=utf-8"),          // 54
   ("range", "bytes=0-"),                                 // 55
   ("strict-transport-security", "max-age=31536000"),     // 56
   (
     "strict-transport-security",
-    "max-age=31536000;includesubdomains",
+    "max-age=31536000; includesubdomains",
   ), // 57
   (
     "strict-transport-security",
-    "max-age=31536000;includesubdomains;preload",
+    "max-age=31536000; includesubdomains; preload",
   ), // 58
   ("vary", "accept-encoding"),                           // 59
   ("vary", "origin"),                                    // 60

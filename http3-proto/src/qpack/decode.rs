@@ -281,8 +281,15 @@ fn read_prefix(input: &[u8]) -> Result<usize, QpackError> {
   let rest = input
     .get(ric_consumed..)
     .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
-  // Top bit of the Delta Base byte is the sign; the low 7 bits are the base.
-  // The base must be 0, so the sign is irrelevant.
+  // Top bit of the Delta Base byte is the Sign; the low 7 bits are the Delta
+  // Base. With RIC=0 a Sign of 1 means a negative Base, which is malformed (and
+  // not representable in this static-only tier), so reject it before decoding.
+  let &sign_byte = rest
+    .first()
+    .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
+  if sign_byte & 0x80 != 0 {
+    return Err(QpackError::DynamicReference);
+  }
   let (base_consumed, base) = decode_int(rest, 7)?;
   if base != 0 {
     return Err(QpackError::DynamicReference);

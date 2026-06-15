@@ -51,21 +51,24 @@ only external dependency on that tier is `thiserror` (with `std` off) and
 
 ## Driver contract
 
+A client MUST NOT send its `:protocol` CONNECT request before it has received the
+peer's `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` (RFC 8441 §3 / RFC 9220). The client
+flow is therefore two-phase: `start()` sends the control + QPACK setup streams,
+and `open_with(...)` sends the CONNECT request **only after** the peer's SETTINGS
+have arrived — at which point the opt-in and the peer's `MAX_FIELD_SECTION_SIZE`
+are checked synchronously. The driver learns the peer's SETTINGS arrived by
+polling `conn.peer_settings().is_some()` after `handle_stream` (there is no
+separate event).
+
 The driver loop — simplified, `std` tier:
 
 ```rust,ignore
-use http3_proto::{Connection, Client, event::{StreamId, StreamRole}};
+use http3_proto::{Connection, Client, Error, event::{StreamId, StreamRole}};
 
 let mut conn = Connection::<Client>::new();
 
-// 1. Open the tunnel: enqueues control stream, QPACK streams, HEADERS.
-conn.open_with(&[
-    (":method", "CONNECT"),
-    (":protocol", "websocket"),
-    (":scheme", "https"),
-    (":path", "/"),
-    (":authority", "example.com"),
-])?;
+// 1. start(): enqueue the control stream + the two idle QPACK streams.
+conn.start()?;
 
 // 2. Pump poll_transmit — the driver opens each new stream and writes bytes.
 while let Some(tx) = conn.poll_transmit() {
@@ -77,7 +80,15 @@ while let Some(tx) = conn.poll_transmit() {
 }
 
 // 3. On each inbound QUIC stream data event:
+//    `scratch` is transient Huffman-decode space only: an in-progress HEADERS
+//    field section is buffered inside the connection, so this buffer need NOT be
+//    preserved across calls — a fresh (even stack-local) buffer per event is
+//    fine. It must hold the longest single decoded field line's name+value.
 let mut scratch = [0u8; 4096]; // Huffman decode scratch (bare tier: stack)
+// Drain `frames` to receive all tunnel DATA in this call. Every supplied
+// request-stream byte is validated regardless — dropping the iterator early still
+// checks the rest for protocol errors (a forbidden frame makes the connection
+// terminal) — but unread tunnel DATA in a call you stop draining is discarded.
 let mut frames = conn.handle_stream(stream_id, bytes, &mut scratch)?;
 while let Some(frame) = frames.next()? {
     match frame {
@@ -91,13 +102,111 @@ while let Some(frame) = frames.next()? {
     }
 }
 
-// 4. Drain events.
+// 4. Once the peer's SETTINGS have arrived, send the CONNECT request. Call this
+//    after each inbound pump until it no longer returns WouldBlock.
+if conn.peer_settings().is_some() {
+    match conn.open_with(&[
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        (":scheme", "https"),
+        (":path", "/"),
+        (":authority", "example.com"),
+    ]) {
+        Ok(()) => { /* request enqueued — pump poll_transmit again */ }
+        Err(Error::WouldBlock) => { /* peer SETTINGS not decoded yet; pump + retry */ }
+        Err(Error::ExtendedConnectUnsupported) => { /* peer opted out; fall back */ }
+        Err(Error::FieldSectionTooLarge) => { /* trim headers under the peer's limit */ }
+        Err(Error::Closed) => { /* a prior close()/reset made the connection terminal */ }
+        Err(e) => return Err(e),
+    }
+}
+
+// 5. Drain events.
 while let Some(event) = conn.poll_event() { /* ... */ }
 
-// 5. Send tunnel payload.
+// 6. Send tunnel payload.
 conn.send_data(b"hello websocket")?;
 conn.close();
 ```
+
+The server is symmetric: `start()` to send setup, then `accept_with(response)`
+**only after the peer's `Frame::Request` has been yielded by `handle_stream`**.
+Registering the request stream id (`provide_stream`) is not enough — that happens
+when the QUIC stream opens, before any HEADERS — so `accept_with` returns
+`Error::WouldBlock` until the CONNECT request has actually been decoded. QUIC
+streams are also unordered, so the request can arrive before the client's
+control-stream SETTINGS; until those SETTINGS are decoded `accept_with` likewise
+returns `Error::WouldBlock` (the peer's `MAX_FIELD_SECTION_SIZE` is not yet known),
+so the driver pumps more inbound bytes and retries — the same peer-SETTINGS gate
+the client's `open_with` applies. The response is sent exactly once: a repeat
+`accept_with` after a successful one is a no-op `Ok(())`.
+
+Both send paths are terminal once the connection is closing: after `close()` or a
+peer reset (`handle_stream_reset`), `open_with` / `accept_with` return
+`Error::Closed` rather than sending. `start()` is likewise idempotent (a second
+call is a no-op `Ok(())`, never a duplicate control stream) and terminal once
+closing.
+
+### Lifecycle
+
+Internally the connection is a single explicit state machine, moving through the
+phases `Created → Handshaking → Open`, plus the terminal `Closing` (graceful local
+`close()` / clean peer reset) and `Failed` (a fatal protocol error, surfaced as an
+`Event::ConnError`). Every operation's preconditions derive from the current
+phase, so the driver-visible contract reduces to:
+
+- **Created**: only `start()` is meaningful; the send paths return `Error::Closed`
+  (setup must precede any request / response / DATA).
+- **Handshaking**: the SETTINGS exchange and the CONNECT request/response run here.
+  `open_with` / `accept_with` are gated as above (`WouldBlock` until ready); the
+  tunnel is not yet open, so `send_data` returns `Error::Closed`.
+- **Open**: the CONNECT exchange completed (`is_established()` is `true`);
+  `send_data` flows, and a repeat `open_with` / `accept_with` is a no-op `Ok(())`.
+- **Closing / Failed**: terminal — every send path returns `Error::Closed`. A
+  clean peer request-stream FIN at a frame boundary *after* the CONNECT HEADERS is
+  a *half-close* (`Event::PeerClosed`) and does **not** make the connection
+  terminal, so local sends may continue. A request-stream FIN *before* the
+  mandatory CONNECT HEADERS is an incomplete request (`H3_REQUEST_INCOMPLETE`), and
+  one mid-frame is `H3_FRAME_ERROR` — both are connection-fatal (`Event::ConnError`,
+  terminal), like every connection-fatal inbound error.
+
+### Field-section size
+
+The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` bounds the *decoded* field-section
+size of outbound HEADERS: the sum over every field of its name length + value
+length + 32 bytes of per-field overhead (RFC 9114 §4.2.2). The core enforces it
+synchronously at send time — `open_with` (client) and `accept_with` (server)
+return `Error::FieldSectionTooLarge` when the request/response exceeds the peer's
+advertised limit. Our own peers never advertise the setting, so it reads back as
+`None` (unlimited) and the check never fires against our own stack.
+
+This is separate from the internal `HDR_CAP` bound, which caps the *encoded*
+inbound HEADERS buffer — a memory bound that fails oversize input gracefully with
+`H3_FRAME_ERROR`.
+
+### Control-stream frame handling
+
+After the mandatory SETTINGS frame, the peer's control stream is parsed with a
+role-aware policy (RFC 9114 §7.2):
+
+- `DATA` / `HEADERS` / `PUSH_PROMISE` / HTTP/2-reserved types / a second
+  `SETTINGS` → `H3_FRAME_UNEXPECTED`.
+- `CANCEL_PUSH` → `H3_ID_ERROR`: this crate never enables server push (it never
+  sends `MAX_PUSH_ID`), so no push id is ever valid.
+- `MAX_PUSH_ID` → `H3_FRAME_UNEXPECTED` for a client (it is client→server only);
+  accepted-and-skipped for a server (valid; we simply never push).
+- `GOAWAY` → **accepted and ignored** (v1 limitation): graceful connection
+  shutdown is not modeled by this tunnel core. The frame is parsed and its
+  payload skipped; the driver is not notified.
+- GREASE / unknown extension frames → skipped (RFC 9114 §9).
+
+The peer's SETTINGS payload is buffered into a fixed, no-alloc bound (`CTRL_CAP` =
+1024 bytes) before decoding — generous enough to hold many settings plus
+unknown/GREASE extension settings (RFC 9114 §7.2.4.1), so a conforming peer is
+never rejected for carrying GREASE. A SETTINGS payload that *still* exceeds this
+bound is implausibly large and rejected with `H3_EXCESSIVE_LOAD` (an excessive-load
+policy — "this SETTINGS frame is too big"), never `H3_FRAME_ERROR` ("malformed")
+and never a panic.
 
 ## Tiers
 

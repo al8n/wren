@@ -1,6 +1,6 @@
 //! Bare-tier smoke test: proves `http3-proto` builds and runs with
 //! `--no-default-features` (no `std`, no `alloc`) and that the core contract
-//! — `Connection::new`, `open_with`, `poll_transmit`, `handle_stream`,
+//! — `Connection::new`, `start`, `open_with`, `poll_transmit`, `handle_stream`,
 //! `poll_event` — works without a heap.
 //!
 //! Run as:
@@ -28,9 +28,10 @@ static REQUEST_HEADERS: &[(&str, &str)] = &[
 fn bare_tier_open_and_drain() {
   let mut conn = Connection::<Client>::new();
 
-  // open_with enqueues the control stream, two QPACK streams, and the
-  // request HEADERS. All of this must work without any allocator.
-  conn.open_with(REQUEST_HEADERS).expect("open_with failed");
+  // start() enqueues the control stream and two QPACK streams. The CONNECT request
+  // is sent later with open_with, only after the peer's SETTINGS arrive (RFC 8441
+  // §3). All of this must work without any allocator.
+  conn.start().expect("start failed");
 
   // Drain the transmit queue into a stack scratch buffer.
   let sink = [0u8; 1024];
@@ -43,22 +44,38 @@ fn bare_tier_open_and_drain() {
     let _ = sink.get(..n); // bounds check only; we don't need the data
     tx_count = tx_count.saturating_add(1);
   }
-  // We expect at least 4 transmits: control stream open, QPACK enc open,
-  // QPACK dec open, request stream open with HEADERS.
-  assert!(tx_count >= 4, "expected >= 4 transmits, got {tx_count}");
+  // We expect exactly 3 setup transmits from start: control stream open, QPACK
+  // enc open, QPACK dec open. The request HEADERS are sent later via open_with.
+  assert_eq!(tx_count, 3, "expected 3 setup transmits, got {tx_count}");
 
-  // Register a fake request stream id and feed arbitrary bytes.
+  // Before the peer's SETTINGS arrive, open_with is WouldBlock (no opt-in yet).
+  assert!(
+    conn.open_with(REQUEST_HEADERS).is_err(),
+    "open_with before peer SETTINGS must error (WouldBlock)"
+  );
+
+  // Register a fake request stream id and feed the peer's control SETTINGS.
   conn.provide_stream(StreamRole::Request, StreamId::new(0));
   let mut scratch = [0u8; 512];
-  // Feeding the SETTINGS + QPACK type bytes on a control stream (new unknown
-  // id = 1): type byte 0x00 = control stream, then SETTINGS frame.
-  // The connection routes it to classify_uni then handle_control.
-  let ctrl_bytes: &[u8] = &[0x00, 0x04, 0x00]; // type=ctrl, SETTINGS type=4, length=0
+  // The peer control stream (new unknown id = 1): type byte 0x00, then a SETTINGS
+  // frame (type=0x04, length=2) advertising ENABLE_CONNECT_PROTOCOL=1
+  // (id=0x08, value=0x01). The connection routes it to classify_uni then
+  // handle_control, which decodes and stores the peer's settings.
+  let ctrl_bytes: &[u8] = &[0x00, 0x04, 0x02, 0x08, 0x01];
   if let Ok(mut frames) = conn.handle_stream(StreamId::new(1), ctrl_bytes, &mut scratch) {
     while let Ok(Some(_)) = frames.next() {}
   }
 
-  // Events: none expected yet (no established tunnel).
+  // The peer's SETTINGS opting in have arrived, so open_with now sends the request.
+  conn
+    .open_with(REQUEST_HEADERS)
+    .expect("open_with after peer opt-in failed");
+  let req = conn
+    .poll_transmit()
+    .expect("request enqueued after peer opts in");
+  assert!(!req.bytes().is_empty());
+
+  // No error events on this (conformant) opt-in path.
   assert!(conn.poll_event().is_none());
 }
 

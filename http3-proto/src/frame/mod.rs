@@ -7,10 +7,10 @@ use crate::{
   varint::{self, VarintError},
 };
 
-// `as_str`/`IsVariant` (rust-type-conventions) are intentionally omitted on the
-// frame enums: `FrameType`'s canonical projection is `code()`, `FrameKind::Other`
-// collapses many wire types with no meaningful string slug, and no diagnostic
-// consumer needs them yet. Add them if a human-readable frame name is later needed.
+// `as_str`/`IsVariant` (rust-type-conventions) are intentionally omitted on
+// `FrameType`: its canonical projection is `code()` and no diagnostic consumer
+// needs a string slug yet. `FrameKind` carries both (it drives frame-placement
+// policy and benefits from a human-readable name).
 /// A frame type we emit.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FrameType {
@@ -35,7 +35,13 @@ impl FrameType {
 }
 
 /// The classification of a decoded frame header.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+///
+/// Distinguishes every frame type whose placement RFC 9114 §7.2 constrains, so
+/// the request- and control-stream parsers can apply the per-stream policy:
+/// known-but-misplaced and HTTP/2-reserved types are
+/// [`H3Error::FrameUnexpected`](crate::error::H3Error::FrameUnexpected), while
+/// [`Unknown`](Self::Unknown) (GREASE / unknown extensions) is ignored.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::IsVariant)]
 #[non_exhaustive]
 pub enum FrameKind {
   /// `DATA` (0x00).
@@ -44,8 +50,40 @@ pub enum FrameKind {
   Headers,
   /// `SETTINGS` (0x04).
   Settings,
-  /// Any other type — reserved, GREASE, or known-but-unused; ignore the payload.
-  Other,
+  /// `CANCEL_PUSH` (0x03).
+  CancelPush,
+  /// `PUSH_PROMISE` (0x05).
+  PushPromise,
+  /// `GOAWAY` (0x07).
+  GoAway,
+  /// `MAX_PUSH_ID` (0x0d).
+  MaxPushId,
+  /// An HTTP/2-reserved frame type (0x02, 0x06, 0x08, 0x09) — forbidden on an
+  /// HTTP/3 connection (RFC 9114 §7.2.8): always
+  /// [`H3Error::FrameUnexpected`](crate::error::H3Error::FrameUnexpected).
+  Reserved,
+  /// Any other type — GREASE or an unknown extension; ignore the payload
+  /// (RFC 9114 §9).
+  Unknown,
+}
+
+impl FrameKind {
+  /// A stable, SCREAMING_SNAKE_CASE name for the frame kind (logging /
+  /// diagnostics), matching the RFC 9114 frame-type names.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Data => "DATA",
+      Self::Headers => "HEADERS",
+      Self::Settings => "SETTINGS",
+      Self::CancelPush => "CANCEL_PUSH",
+      Self::PushPromise => "PUSH_PROMISE",
+      Self::GoAway => "GOAWAY",
+      Self::MaxPushId => "MAX_PUSH_ID",
+      Self::Reserved => "RESERVED",
+      Self::Unknown => "UNKNOWN",
+    }
+  }
 }
 
 /// A decoded frame header: its classification + payload length.
@@ -110,8 +148,14 @@ pub fn decode_header(input: &[u8]) -> Result<(usize, FrameHeader), FrameError> {
   let kind = match ty {
     0x00 => FrameKind::Data,
     0x01 => FrameKind::Headers,
+    0x03 => FrameKind::CancelPush,
     0x04 => FrameKind::Settings,
-    _ => FrameKind::Other,
+    0x05 => FrameKind::PushPromise,
+    0x07 => FrameKind::GoAway,
+    0x0d => FrameKind::MaxPushId,
+    // HTTP/2 frame types that must never appear on HTTP/3 (RFC 9114 §7.2.8).
+    0x02 | 0x06 | 0x08 | 0x09 => FrameKind::Reserved,
+    _ => FrameKind::Unknown,
   };
   // n0 and n1 are each ≤ 8 (max varint wire size); their sum cannot overflow usize.
   Ok((n0.saturating_add(n1), FrameHeader { kind, length }))

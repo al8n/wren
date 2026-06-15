@@ -24,6 +24,15 @@ pub struct Settings {
 
 impl Settings {
   /// Our client settings: static-only QPACK; does not advertise Extended CONNECT.
+  ///
+  /// We intentionally do NOT advertise `SETTINGS_MAX_FIELD_SECTION_SIZE`
+  /// (RFC 9114 §7.2.4.1): that setting bounds the *decoded* field-section size
+  /// (each field's name+value length + 32 bytes overhead), but our decoder is
+  /// lazy — it yields field lines one at a time and never buffers the whole
+  /// decoded section — so there is no decoded-size DoS surface for the limit to
+  /// protect. The on-wire *encoded* HEADERS payload is bounded internally at
+  /// `HDR_CAP` (an oversize payload fails gracefully with `H3_FRAME_ERROR`),
+  /// which is a separate, lower-level concern.
   pub const fn for_client() -> Self {
     Self {
       qpack_max_table_capacity: 0,
@@ -34,6 +43,11 @@ impl Settings {
   }
 
   /// Our server settings: static-only QPACK + Extended CONNECT enabled (RFC 9220).
+  ///
+  /// As with [`for_client`](Self::for_client), we intentionally do NOT advertise
+  /// `SETTINGS_MAX_FIELD_SECTION_SIZE`: it limits the *decoded* field-section
+  /// size, which our lazy decoder never accumulates, so it would over-promise. The
+  /// *encoded* HEADERS payload is internally bounded at `HDR_CAP`.
   pub const fn for_server() -> Self {
     Self {
       qpack_max_table_capacity: 0,
@@ -118,6 +132,9 @@ impl Settings {
           if seen_connect {
             return Err(SettingsError::Duplicate(id));
           }
+          if value > 1 {
+            return Err(SettingsError::InvalidConnectProtocol(value));
+          }
           seen_connect = true;
           s.enable_connect_protocol = value == 1;
         }
@@ -162,6 +179,10 @@ pub enum SettingsError {
   /// An HTTP/2-reserved setting identifier was received (RFC 9114 §7.2.4.1).
   #[display("reserved http/2 setting identifier {_0:#x}")]
   Reserved(u64),
+  /// SETTINGS_ENABLE_CONNECT_PROTOCOL carried a value other than 0 or 1
+  /// (RFC 8441 §3 / RFC 9220).
+  #[display("invalid ENABLE_CONNECT_PROTOCOL value {_0}")]
+  InvalidConnectProtocol(u64),
   /// A setting identifier or value varint was malformed.
   #[display("{_0}")]
   Varint(VarintError),

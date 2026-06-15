@@ -82,11 +82,34 @@ fn all_reserved_http2_settings_rejected() {
 
 #[test]
 fn client_payload_exact_bytes() {
-  // for_client encodes exactly QPACK_MAX_TABLE_CAPACITY=0, QPACK_BLOCKED_STREAMS=0;
-  // it must NOT contain ENABLE_CONNECT_PROTOCOL (0x08).
+  // for_client encodes QPACK_MAX_TABLE_CAPACITY=0 and QPACK_BLOCKED_STREAMS=0
+  // only. It must NOT contain ENABLE_CONNECT_PROTOCOL (0x08) and must NOT
+  // advertise MAX_FIELD_SECTION_SIZE (0x06): that setting bounds the *decoded*
+  // field-section size, which our lazy decoder never accumulates, so we do not
+  // send it.
   let mut buf = [0u8; 64];
   let n = Settings::for_client().encode_payload(&mut buf).unwrap();
   assert_eq!(&buf[..n], &[0x01, 0x00, 0x07, 0x00]);
+}
+
+#[test]
+fn for_client_and_for_server_omit_max_field_section_size() {
+  // We intentionally do not advertise MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1)
+  // from either role: the setting is absent from the struct and never appears on
+  // the wire (identifier 0x06).
+  assert_eq!(Settings::for_client().max_field_section_size(), None);
+  assert_eq!(Settings::for_server().max_field_section_size(), None);
+  let mut buf = [0u8; 64];
+  let n = Settings::for_client().encode_payload(&mut buf).unwrap();
+  assert!(
+    !buf[..n].windows(2).any(|w| w[0] == 0x06),
+    "client SETTINGS must not carry MAX_FIELD_SECTION_SIZE"
+  );
+  let n = Settings::for_server().encode_payload(&mut buf).unwrap();
+  assert!(
+    !buf[..n].windows(2).any(|w| w[0] == 0x06),
+    "server SETTINGS must not carry MAX_FIELD_SECTION_SIZE"
+  );
 }
 
 #[test]
@@ -95,9 +118,10 @@ fn client_roundtrip_and_connect_protocol_values() {
   let n = Settings::for_client().encode_payload(&mut buf).unwrap();
   let got = Settings::decode_payload(&buf[..n]).unwrap();
   assert!(!got.enable_connect_protocol());
+  // We do not advertise MAX_FIELD_SECTION_SIZE, so it round-trips as absent.
   assert_eq!(got.max_field_section_size(), None);
-  // Explicit enable / disable, plus the documented lenient handling of an
-  // out-of-range value (RFC 8441 says 0 or 1; we treat >1 as disabled, no error).
+  // Explicit enable / disable; an out-of-range value is a connection error
+  // (RFC 8441 §3 / RFC 9220: the value MUST be 0 or 1).
   assert!(
     Settings::decode_payload(&[0x08, 0x01])
       .unwrap()
@@ -108,11 +132,20 @@ fn client_roundtrip_and_connect_protocol_values() {
       .unwrap()
       .enable_connect_protocol()
   );
-  assert!(
-    !Settings::decode_payload(&[0x08, 0x02])
-      .unwrap()
-      .enable_connect_protocol()
-  );
+  assert!(matches!(
+    Settings::decode_payload(&[0x08, 0x02]),
+    Err(SettingsError::InvalidConnectProtocol(2))
+  ));
+}
+
+#[test]
+fn enable_connect_protocol_rejects_invalid_value() {
+  // RFC 8441 §3 (RFC 9220): ENABLE_CONNECT_PROTOCOL MUST be 0 or 1; anything
+  // else is a connection error rather than the old lenient "treat as disabled".
+  assert!(matches!(
+    Settings::decode_payload(&[0x08, 0x02]),
+    Err(SettingsError::InvalidConnectProtocol(_))
+  ));
 }
 
 #[test]
