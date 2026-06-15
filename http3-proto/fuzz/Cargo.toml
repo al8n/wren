@@ -1,0 +1,43 @@
+[package]
+name = "http3-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+http3-proto = { path = "..", features = ["std"] }
+
+[[bin]]
+name = "varint_decode"
+path = "fuzz_targets/varint_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack_decode"
+path = "fuzz_targets/qpack_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connection_handle"
+path = "fuzz_targets/connection_handle.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone: not a member of the websockit workspace.
+[workspace]
