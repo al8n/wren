@@ -40,3 +40,7 @@ pub mod varint;
 
 /// HTTP/3 frame header codec (RFC 9114 §7.1): type + length varints.
 pub mod frame;
+
+/// QPACK static-table codec (RFC 9204): field-section compression with the
+/// dynamic table disabled.
+pub mod qpack;
