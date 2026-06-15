@@ -44,3 +44,6 @@ pub mod frame;
 /// QPACK static-table codec (RFC 9204): field-section compression with the
 /// dynamic table disabled.
 pub mod qpack;
+
+/// HTTP/3 SETTINGS frame payload codec (RFC 9114 §7.2.4, RFC 9204 §5, RFC 9220 §3).
+pub mod settings;
