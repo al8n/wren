@@ -22,10 +22,10 @@
   )
 )]
 
-// The `alloc as std` alias has no consumer yet; this allow is transient and is
-// removed by the first alloc-gated module that uses `std::`-aliased heap items.
+// Aliased so alloc-gated modules can name heap items via `std::` on both the
+// `std` and `no_std + alloc` tiers (the QPACK decoder's owned scratch is a
+// consumer).
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
-#[allow(unused_extern_crates)]
 extern crate alloc as std;
 
 #[cfg(feature = "std")]
