@@ -1,5 +1,41 @@
 # UNRELEASED
 
+## `wren-reactor` — cycle 3 (runtime-agnostic full-duplex driver)
+
+- **`wren-reactor`**: readiness-based WebSocket driver over `websocket-proto`,
+  runtime-agnostic across **tokio and smol** (feature-selected) via
+  `agnostic-net` / `agnostic-lite`. Client (`connect` over `ws://` / `wss://`,
+  or `client` over any `futures::io` stream) and server (`accept`, plus the
+  two-step `accept_pending` → inspect → `accept` / `reject` for pre-upgrade
+  authorization). **Caller-driven, no background tasks** (tungstenite / soketto
+  parity): `WebSocket<R, Ro, S>` owns the proto state machine and the transport
+  and implements `futures::Stream` / `Sink` plus convenience methods
+  (`send_text`, `send_binary`, `ping`, `close`, the `*_compressed` sends);
+  polling `next()` / the `Sink` *is* the pump — it drives pong echoes and the
+  close handshake. `split()` yields independently-owned read and write halves
+  sharing the connection through a mutex held only across brief, non-blocking
+  poll steps and never across a pending I/O, so a stalled write releases the lock
+  and reads never head-of-line-block behind it (the limitation `wren-compio`'s
+  single pump documented). A single ordered write buffer carries data, pongs, and
+  the Close in FIFO order, so a close never overtakes queued data. Sends are
+  cancellation-safe (a dropped send never leaves a partial frame and still
+  backpressures the next). The write buffer applies *inter-message* backpressure
+  (a send waits for it to fall below a soft cap before encoding the next frame, and
+  the read pump stops reading while a stalled flush has it over the cap, so neither a
+  flooding nor a slow peer grows it without bound); a single message still allocates
+  its whole frame, so bound an individual outbound payload caller-side if needed.
+  **Liveness, write deadlines, and the close handshake
+  are the caller's** — the library is a state machine, not a supervisor, with no
+  autonomous timers: bound them with `timeout(next())`, `timeout(send())`,
+  `timeout(close())`, a ping loop, or OS TCP keepalive. A send not yet flushed
+  when `close` is issued is not guaranteed delivered; await it (or flush) before
+  closing. A recorded transport write error poisons the connection and surfaces
+  as the real `Io` error on every send path; a peer protocol violation fails the
+  connection fast and surfaces as `Error::Protocol(CloseCode)` carrying the code,
+  distinct from a transport reset. Features: `tokio` (default), `smol`,
+  `tls` (futures-rustls + rustls/ring, webpki roots by default, full
+  `TlsConnector` override), `deflate`, `tracing`.
+
 ## `wren-compio` + `wren-trace` — cycle 2 (first async driver)
 
 - **`wren-compio`**: compio-native (io_uring / IOCP / kqueue, thread-per-core)
