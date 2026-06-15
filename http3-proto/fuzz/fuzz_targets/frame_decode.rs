@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
       frame::FrameKind::Data => FrameType::Data,
       frame::FrameKind::Headers => FrameType::Headers,
       frame::FrameKind::Settings => FrameType::Settings,
-      frame::FrameKind::Other => return, // no canonical FrameType to re-encode
+      // Every other kind has no canonical `FrameType` we emit; skip re-encoding.
       _ => return,
     };
     let mut buf = [0u8; 16];

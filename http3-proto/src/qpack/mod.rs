@@ -10,7 +10,7 @@ pub mod static_table;
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use decode::decode_field_section;
 pub use decode::{FieldLines, Pair, decode_field_section_into};
-pub use encode::{encode_field_section, encode_field_section_from};
+pub use encode::{EncodeError, encode_field_section, encode_field_section_from};
 
 use crate::error::{BufferTooSmallDetail, TruncatedDetail};
 

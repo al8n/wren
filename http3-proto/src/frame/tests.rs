@@ -28,13 +28,51 @@ fn settings_and_headers_types() {
 }
 
 #[test]
-fn unknown_and_grease_decode_as_other() {
-  // GREASE type 0x21 (= 0x1f*0 + 0x21), length 0.
+fn grease_decodes_as_unknown() {
+  // GREASE type 0x21 (= 0x1f*0 + 0x21), length 0: an unknown extension.
   let (_, hdr) = decode_header(&[0x21, 0x00]).unwrap();
-  assert_eq!(hdr.kind(), FrameKind::Other);
-  // A reserved/known-unused type (CANCEL_PUSH 0x03) is Other too.
-  let (_, hdr) = decode_header(&[0x03, 0x00]).unwrap();
-  assert_eq!(hdr.kind(), FrameKind::Other);
+  assert_eq!(hdr.kind(), FrameKind::Unknown);
+  assert!(hdr.kind().is_unknown());
+}
+
+#[test]
+fn known_control_frames_decode_to_their_kind() {
+  // CANCEL_PUSH (0x03), GOAWAY (0x07), MAX_PUSH_ID (0x0d), PUSH_PROMISE (0x05)
+  // each decode to their own distinct kind rather than a shared catch-all.
+  assert_eq!(
+    decode_header(&[0x03, 0x00]).unwrap().1.kind(),
+    FrameKind::CancelPush
+  );
+  assert_eq!(
+    decode_header(&[0x07, 0x00]).unwrap().1.kind(),
+    FrameKind::GoAway
+  );
+  assert_eq!(
+    decode_header(&[0x0d, 0x00]).unwrap().1.kind(),
+    FrameKind::MaxPushId
+  );
+  assert_eq!(
+    decode_header(&[0x05, 0x00]).unwrap().1.kind(),
+    FrameKind::PushPromise
+  );
+}
+
+#[test]
+fn http2_reserved_frame_types_decode_as_reserved() {
+  // The HTTP/2-reserved frame types (RFC 9114 §7.2.8): 0x02, 0x06, 0x08, 0x09.
+  for ty in [0x02u8, 0x06, 0x08, 0x09] {
+    let (_, hdr) = decode_header(&[ty, 0x00]).unwrap();
+    assert_eq!(hdr.kind(), FrameKind::Reserved, "type {ty:#x}");
+    assert!(hdr.kind().is_reserved());
+  }
+}
+
+#[test]
+fn frame_kind_as_str() {
+  assert_eq!(FrameKind::Data.as_str(), "DATA");
+  assert_eq!(FrameKind::Reserved.as_str(), "RESERVED");
+  assert_eq!(FrameKind::GoAway.as_str(), "GOAWAY");
+  assert_eq!(FrameKind::Unknown.as_str(), "UNKNOWN");
 }
 
 #[test]
@@ -58,11 +96,11 @@ fn multi_byte_length_roundtrips() {
 }
 
 #[test]
-fn multi_byte_type_decodes_as_other() {
-  // Type 64 encoded as a 2-byte varint [0x40, 0x40], length 0 → Other.
+fn multi_byte_type_decodes_as_unknown() {
+  // Type 64 encoded as a 2-byte varint [0x40, 0x40], length 0 → Unknown.
   let (consumed, hdr) = decode_header(&[0x40, 0x40, 0x00]).unwrap();
   assert_eq!(consumed, 3);
-  assert_eq!(hdr.kind(), FrameKind::Other);
+  assert_eq!(hdr.kind(), FrameKind::Unknown);
 }
 
 #[test]

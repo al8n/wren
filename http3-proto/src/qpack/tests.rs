@@ -28,6 +28,32 @@ fn known_static_indices() {
     )
   );
   assert_eq!(STATIC_TABLE[98], ("x-frame-options", "sameorigin"));
+  // RFC 9204 App. A values verified against quic-go's production table and the
+  // RFC 9204 HTML: indices 52, 57, 58 DO contain a space after each semicolon.
+  // Index 54 ("text/plain;charset=utf-8") has NO space — that is also correct.
+  assert_eq!(
+    STATIC_TABLE[52],
+    ("content-type", "text/html; charset=utf-8")
+  );
+  assert_eq!(
+    STATIC_TABLE[54],
+    ("content-type", "text/plain;charset=utf-8")
+  );
+  assert_eq!(
+    STATIC_TABLE[57],
+    (
+      "strict-transport-security",
+      "max-age=31536000; includesubdomains"
+    )
+  );
+  assert_eq!(
+    STATIC_TABLE[58],
+    (
+      "strict-transport-security",
+      "max-age=31536000; includesubdomains; preload"
+    )
+  );
+  assert_eq!(STATIC_TABLE[31], ("accept-encoding", "gzip, deflate, br"));
 }
 
 #[test]
@@ -455,6 +481,15 @@ mod decode_tests {
     // (surfaces from the constructor, like a non-zero Required Insert Count).
     assert!(matches!(
       decode_field_section_into(&[0x00, 0x01], &mut [0u8; 8]),
+      Err(QpackError::DynamicReference)
+    ));
+  }
+
+  #[test]
+  fn rejects_nonzero_base_sign() {
+    // RIC=0, then Sign=1/DeltaBase=0 (0x80) → negative Base → reject.
+    assert!(matches!(
+      decode_field_section_into(&[0x00, 0x80], &mut [0u8; 8]),
       Err(QpackError::DynamicReference)
     ));
   }

@@ -63,6 +63,17 @@ impl<T: Copy, const N: usize> BoundedQueue<T, N> {
     self.len = self.len.saturating_sub(1);
     item
   }
+
+  /// Discards every queued item, leaving the queue empty. Used by the connection's
+  /// fail transition to drop stale nonfatal lifecycle events the moment it becomes
+  /// terminal-priority (the terminal `ConnError` then supersedes them).
+  pub(crate) fn clear(&mut self) {
+    for slot in &mut self.slots {
+      *slot = None;
+    }
+    self.head = 0;
+    self.len = 0;
+  }
 }
 
 /// The byte capacity of a single transmit slot. A queued transmit — including a
@@ -107,6 +118,14 @@ impl TxRing {
       head: 0,
       len: 0,
     }
+  }
+
+  /// Whether the ring has at least `n` free slots. Used to preflight a multi-slot
+  /// enqueue (the [`start`](super::Connection::start) setup writes three transmits)
+  /// so it stays all-or-nothing: a sequence that cannot fit in full enqueues
+  /// nothing, rather than committing a partial prefix.
+  pub(crate) const fn has_capacity(&self, n: usize) -> bool {
+    TX_N.saturating_sub(self.len) >= n
   }
 
   /// Reserves the next free slot's writable buffer and metadata, calling `fill`

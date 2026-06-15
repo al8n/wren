@@ -10,6 +10,32 @@ use super::{
 };
 use crate::{Error, error::BufferTooSmallDetail, headers::Headers};
 
+/// Why [`encode_field_section_from`] stopped before encoding the whole section.
+///
+/// The two "too large" outcomes are kept distinct from a genuine coding fault so
+/// the connection can refuse oversized outbound HEADERS *locally* (mapping both
+/// [`TooLarge`](Self::TooLarge) and [`BufferExhausted`](Self::BufferExhausted) to
+/// [`Error::FieldSectionTooLarge`]) while still surfacing a real encoder bug as a
+/// protocol error.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EncodeError {
+  /// The running decoded field-section size (Σ `name.len() + value.len() + 32`,
+  /// RFC 9114 §4.2.2) exceeded the caller-supplied `max_decoded` limit — the
+  /// peer's advertised `MAX_FIELD_SECTION_SIZE`. Detected *inside* the single
+  /// encode pass, before (and independent of) any output-buffer exhaustion.
+  TooLarge,
+  /// The output workspace ran out of room (a [`QpackError::Buffer`]). For
+  /// outbound HEADERS this means the section is too large for us to send; the
+  /// connection maps it to [`Error::FieldSectionTooLarge`], a local refusal.
+  BufferExhausted,
+  /// A genuine QPACK encoding fault (e.g. a length that overflows `u64`) — not a
+  /// size-limit or buffer condition. Surfaced as a protocol error.
+  Qpack(QpackError),
+  /// The [`Headers`] supplier's `for_each` returned an error, propagated verbatim.
+  Supplier(Error),
+}
+
 /// Writes a string: its length as a prefixed integer carrying `flags` (Huffman
 /// flag H=0), then the raw bytes. Returns the index just past the string.
 fn encode_str(
@@ -87,36 +113,76 @@ pub fn encode_field_section<'a>(
   Ok(at)
 }
 
-/// Maps a QPACK error to the connection-level [`Error`] (a protocol error
-/// carrying the HTTP/3 error code).
-fn qpack_to_err(e: QpackError) -> Error {
-  Error::Protocol(e.to_h3())
-}
-
 /// Encodes a field section by driving a [`Headers`](crate::headers::Headers)
-/// supplier in push style (its borrowed `&str` cannot be collected). Returns
-/// bytes written, or the driver's error / a QPACK error.
+/// supplier in push style (its borrowed `&str` cannot be collected), in a SINGLE
+/// traversal that BOTH encodes the wire bytes into `out` AND accumulates — and
+/// bounds — the decoded field-section size. Returns `(encoded_len, decoded_size)`:
+/// the number of bytes written to `out`, and the RFC 9114 §4.2.2 decoded size (the
+/// sum over every visited field of `name.len() + value.len() + 32`, saturating).
+///
+/// `max_decoded`, when `Some(limit)`, is the peer's advertised
+/// `MAX_FIELD_SECTION_SIZE`: the moment the running decoded size exceeds it the
+/// pass stops with [`EncodeError::TooLarge`]. That check is applied *before*
+/// encoding each line, so it is independent of — and takes precedence over — any
+/// output-buffer exhaustion ([`EncodeError::BufferExhausted`]); a genuine encoder
+/// fault is [`EncodeError::Qpack`], and a supplier error is
+/// [`EncodeError::Supplier`].
+///
+/// The two outputs come from the *same* `for_each` pass on purpose: the public
+/// [`Headers`](crate::headers::Headers) trait does not guarantee replayable or
+/// deterministic output, so a one-shot / interior-mutable supplier could yield a
+/// different field section on a second traversal. Measuring and encoding together
+/// guarantees the size the caller validates is the size of the bytes it sends.
 ///
 /// `Headers` is taken by `&(impl Headers + ?Sized)` so the unsized
 /// `[(&str, &str)]` blanket impl can be passed directly as `&slice[..]`.
 pub fn encode_field_section_from<H: Headers + ?Sized>(
   headers: &H,
   out: &mut [u8],
-) -> Result<usize, Error> {
-  let at = encode_prefix(out).map_err(qpack_to_err)?;
+  max_decoded: Option<usize>,
+) -> Result<(usize, usize), EncodeError> {
+  let at = encode_prefix(out).map_err(map_encode_err)?;
   let mut cursor = at;
-  let mut enc_err: Option<QpackError> = None;
-  headers.for_each(&mut |n, v| {
-    if enc_err.is_some() {
-      return;
-    }
-    match encode_line(out, cursor, n, v) {
-      Ok(next) => cursor = next,
-      Err(e) => enc_err = Some(e),
-    }
-  })?; // propagates the supplier's crate::Error
+  let mut decoded_size: usize = 0;
+  let mut enc_err: Option<EncodeError> = None;
+  headers
+    .for_each(&mut |n, v| {
+      if enc_err.is_some() {
+        return;
+      }
+      // RFC 9114 §4.2.2 per-field decoded size: name + value + 32 overhead,
+      // saturating so a pathological supplier cannot overflow the running total.
+      decoded_size = decoded_size
+        .saturating_add(n.len())
+        .saturating_add(v.len())
+        .saturating_add(32);
+      // Enforce the peer's limit FIRST — before encoding this line — so the
+      // too-large signal is independent of (and prior to) any buffer exhaustion.
+      if let Some(limit) = max_decoded
+        && decoded_size > limit
+      {
+        enc_err = Some(EncodeError::TooLarge);
+        return;
+      }
+      match encode_line(out, cursor, n, v) {
+        Ok(next) => cursor = next,
+        Err(e) => enc_err = Some(map_encode_err(e)),
+      }
+    })
+    .map_err(EncodeError::Supplier)?;
   if let Some(e) = enc_err {
-    return Err(qpack_to_err(e));
+    return Err(e);
   }
-  Ok(cursor)
+  Ok((cursor, decoded_size))
+}
+
+/// Splits a [`QpackError`] from the encoder into the size-class-aware
+/// [`EncodeError`]: an output-buffer-too-small error becomes
+/// [`EncodeError::BufferExhausted`] (the section is too large for the workspace),
+/// every other QPACK error a genuine [`EncodeError::Qpack`] fault.
+fn map_encode_err(e: QpackError) -> EncodeError {
+  match e {
+    QpackError::Buffer(_) => EncodeError::BufferExhausted,
+    other => EncodeError::Qpack(other),
+  }
 }

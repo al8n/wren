@@ -28,6 +28,7 @@ fn stream_kind_and_event_predicates() {
   assert!(Event::Established.is_established());
   assert!(Event::Reset(7).is_reset());
   assert!(!Event::PeerClosed.is_established());
+  assert!(Event::PeerClosed.is_peer_closed());
 }
 
 #[test]
