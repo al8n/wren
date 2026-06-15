@@ -1,0 +1,138 @@
+//! Connection options for [`connect`](crate::connect) and
+//! [`accept`](crate::accept).
+//!
+//! Parity contract: the library imposes no autonomous liveness, write, or close
+//! deadlines — the caller bounds those with `timeout(..)`, a ping loop, or OS TCP
+//! keepalive. So these options carry only negotiation + sizing knobs.
+
+use smol_str::SmolStr;
+
+/// Client options for [`connect`](crate::connect) / [`client`](crate::client).
+#[derive(Clone, Default)]
+pub struct ClientOptions {
+  pub(crate) subprotocols: Vec<SmolStr>,
+  pub(crate) extra_headers: Vec<(SmolStr, SmolStr)>,
+  pub(crate) max_message_size: Option<usize>,
+  #[cfg(feature = "deflate")]
+  pub(crate) deflate: Option<websocket_proto::negotiation::DeflateOffer>,
+  #[cfg(feature = "tls")]
+  pub(crate) tls: Option<futures_rustls::TlsConnector>,
+}
+
+// Manual: `futures_rustls::TlsConnector` does not implement `Debug`.
+impl core::fmt::Debug for ClientOptions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut d = f.debug_struct("ClientOptions");
+    d.field("subprotocols", &self.subprotocols)
+      .field("extra_headers", &self.extra_headers)
+      .field("max_message_size", &self.max_message_size);
+    #[cfg(feature = "deflate")]
+    d.field("deflate", &self.deflate);
+    #[cfg(feature = "tls")]
+    d.field("tls", &self.tls.as_ref().map(|_| "<TlsConnector>"));
+    d.finish()
+  }
+}
+
+impl ClientOptions {
+  /// Options with every knob at its default (no subprotocols, no extras, 64 MiB cap).
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Subprotocols to offer, in preference order.
+  #[must_use]
+  pub fn with_subprotocols<I>(mut self, subprotocols: I) -> Self
+  where
+    I: IntoIterator,
+    I::Item: Into<SmolStr>,
+  {
+    self.subprotocols = subprotocols.into_iter().map(Into::into).collect();
+    self
+  }
+
+  /// Appends one extra request header (auth, origin, cookies). Names and
+  /// values are validated by the handshake builder at connect time.
+  #[must_use]
+  pub fn with_extra_header(mut self, name: impl Into<SmolStr>, value: impl Into<SmolStr>) -> Self {
+    self.extra_headers.push((name.into(), value.into()));
+    self
+  }
+
+  /// Maximum assembled inbound message size in bytes.
+  #[must_use]
+  pub fn with_max_message_size(mut self, max: usize) -> Self {
+    self.max_message_size = Some(max);
+    self
+  }
+
+  /// Offer permessage-deflate.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  #[must_use]
+  pub fn with_deflate(mut self, offer: websocket_proto::negotiation::DeflateOffer) -> Self {
+    self.deflate = Some(offer);
+    self
+  }
+
+  /// TLS connector for `wss://` (replaces the webpki-roots default).
+  #[cfg(feature = "tls")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
+  #[must_use]
+  pub fn with_tls_connector(mut self, connector: futures_rustls::TlsConnector) -> Self {
+    self.tls = Some(connector);
+    self
+  }
+}
+
+/// Server options for [`accept`](crate::accept).
+#[derive(Debug, Clone, Default)]
+pub struct AcceptOptions {
+  pub(crate) supported_subprotocols: Vec<SmolStr>,
+  pub(crate) extra_headers: Vec<(SmolStr, SmolStr)>,
+  pub(crate) max_message_size: Option<usize>,
+  #[cfg(feature = "deflate")]
+  pub(crate) deflate: Option<websocket_proto::negotiation::ServerDeflateConfig>,
+}
+
+impl AcceptOptions {
+  /// Options with every knob at its default.
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Subprotocols this server supports; the first CLIENT offer that matches
+  /// wins ([`select_subprotocol`](websocket_proto::negotiation::select_subprotocol)).
+  #[must_use]
+  pub fn with_supported_subprotocols<I>(mut self, subprotocols: I) -> Self
+  where
+    I: IntoIterator,
+    I::Item: Into<SmolStr>,
+  {
+    self.supported_subprotocols = subprotocols.into_iter().map(Into::into).collect();
+    self
+  }
+
+  /// Appends one extra response header.
+  #[must_use]
+  pub fn with_extra_header(mut self, name: impl Into<SmolStr>, value: impl Into<SmolStr>) -> Self {
+    self.extra_headers.push((name.into(), value.into()));
+    self
+  }
+
+  /// Maximum assembled inbound message size in bytes.
+  #[must_use]
+  pub fn with_max_message_size(mut self, max: usize) -> Self {
+    self.max_message_size = Some(max);
+    self
+  }
+
+  /// Accept permessage-deflate offers under this policy.
+  #[cfg(feature = "deflate")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+  #[must_use]
+  pub fn with_deflate(mut self, config: websocket_proto::negotiation::ServerDeflateConfig) -> Self {
+    self.deflate = Some(config);
+    self
+  }
+}
