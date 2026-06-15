@@ -1,11 +1,10 @@
-//! Prefixed-integer ENCODER (RFC 7541 §5.1), shared by the QPACK field-section
-//! encoder. A value is packed into the low `prefix_bits` of a first byte (whose
-//! high bits carry caller-supplied `flags`); values that do not fit spill into
-//! 7-bit continuation bytes. Panic-free and bounds-checked. The decoder half
-//! lands in a later task.
+//! Prefixed-integer codec (RFC 7541 §5.1), shared by the QPACK field-section
+//! encoder and decoder. A value is packed into the low `prefix_bits` of a first
+//! byte (whose high bits carry caller-supplied `flags`); values that do not fit
+//! spill into 7-bit continuation bytes. Panic-free and bounds-checked.
 
 use super::QpackError;
-use crate::error::BufferTooSmallDetail;
+use crate::error::{BufferTooSmallDetail, TruncatedDetail};
 
 /// Writes one byte at `at`, returning `at + 1`.
 ///
@@ -49,4 +48,42 @@ pub fn encode_int(
   }
   let last = u8::try_from(value).map_err(|_| QpackError::BadInteger)?;
   put_byte(out, at, last)
+}
+
+/// Decodes a prefixed integer (RFC 7541 §5.1) from the front of `input`,
+/// returning `(bytes consumed, value)`.
+///
+/// The high bits of the first byte above the low `prefix_bits` are flags and are
+/// ignored. Errors with [`QpackError::Truncated`] if `input` ends mid-integer,
+/// or [`QpackError::BadInteger`] if the continuation overflows `u64`.
+pub fn decode_int(input: &[u8], prefix_bits: u32) -> Result<(usize, u64), QpackError> {
+  let max = 1u64.wrapping_shl(prefix_bits).wrapping_sub(1);
+  let &first = input
+    .first()
+    .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
+  let prefix = u64::from(first) & max;
+  if prefix < max {
+    return Ok((1, prefix));
+  }
+  let mut value = max;
+  let mut shift: u32 = 0;
+  let mut consumed = 1usize;
+  loop {
+    let &b = input
+      .get(consumed)
+      .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
+    consumed = consumed.saturating_add(1);
+    let add = u64::from(b & 0x7f)
+      .checked_shl(shift)
+      .ok_or(QpackError::BadInteger)?;
+    value = value.checked_add(add).ok_or(QpackError::BadInteger)?;
+    if b & 0x80 == 0 {
+      break;
+    }
+    shift = shift.checked_add(7).ok_or(QpackError::BadInteger)?;
+    if shift >= 64 {
+      return Err(QpackError::BadInteger);
+    }
+  }
+  Ok((consumed, value))
 }
