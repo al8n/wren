@@ -1,5 +1,82 @@
 # UNRELEASED
 
+## `http3-proto` — cycle 4 (Sans-I/O HTTP/3 tunnel core)
+
+A novel hand-rolled Sans-I/O HTTP/3 Extended-CONNECT tunnel core for Rust —
+no_std + no-alloc capable, zero external runtime dependencies on the bare tier.
+
+### What it is
+
+- **Scope**: the RFC 9114 / 9204 / 9220 subset needed to carry a tunneled byte
+  stream (WebSocket or arbitrary protocol) over QUIC — not a general HTTP/3
+  implementation. The core stays HTTP-status-agnostic and WebSocket-agnostic: it
+  reports the peer's HEADERS as `Frame::Request` / `Frame::Response` and leaves
+  validation of `:status` / `:protocol` to the driver.
+
+### Codec leaves (panic-free, fuzzed)
+
+- **QUIC varint** (RFC 9000 §16): 1/2/4/8-byte encode/decode with zero
+  arithmetic side-effects.
+- **HTTP/3 frame header** (RFC 9114 §7.1): type + length varint pairs;
+  `decode_header` / `encode_header`.
+- **Static-table-only QPACK** (RFC 9204): field-section encode/decode with the
+  dynamic table permanently disabled (matching the WS-tunnel scope). `decode_field_section_into` (no-alloc, caller scratch) and `decode_field_section`
+  (std/alloc, owned scratch). A lending iterator yields `Pair { name, value }`
+  per call with raw/static borrows or Huffman decoding into the scratch.
+- **SETTINGS codec** (RFC 9114 §7.2.4, RFC 9204 §5, RFC 9220 §3): encode/decode
+  the small SETTINGS payload carried on the control stream preamble.
+
+### Connection state machine
+
+- `Connection<Client>` / `Connection<Server>`: Sans-I/O state machine generic
+  over the role marker. No I/O, no clocks, no async.
+- **Setup**: `open_with` (client) / `start` (server) enqueue the control stream
+  (type byte + SETTINGS frame), two idle QPACK uni-streams (encoder + decoder),
+  and (client only) the bidirectional request stream with the CONNECT HEADERS
+  frame. The driver pumps `poll_transmit` and opens the streams, reporting each
+  assigned id via `provide_stream`.
+- **Receive**: `handle_stream(id, bytes, scratch)` routes inbound bytes by
+  stream id — control stream (accumulate + parse SETTINGS), QPACK streams (idle
+  after type byte), unknown uni-streams (classify by leading type varint,
+  buffered across calls), or request stream (HEADERS decode + DATA relay). The
+  request stream yields a lending `Frames` iterator; all other streams yield
+  nothing.
+- **Events**: `poll_event` drains `Event::{Established, PeerClosed, Reset,
+  ConnError}` from a fixed-capacity bounded queue (no heap).
+- **Transmit ring**: a fixed-capacity, no-alloc ring buffer carries outbound
+  transmit slots. `poll_transmit` lends `Transmit { kind, bytes, fin }` one
+  at a time; `StreamKind::{OpenUni, OpenRequest, Existing}` tells the driver
+  which quinn call to make.
+- **Tunnel data + close**: `send_data(payload)` encodes a DATA frame; `close`
+  enqueues a FIN on the request stream.
+
+### Tiers
+
+| Cargo features | Heap | Target |
+|---|---|---|
+| `default` (`std`) | yes | any std platform |
+| `alloc` | yes | WASM, embedded with allocator |
+| _(none)_ | **no** | `thumbv6m-none-eabi`, `thumbv7em-none-eabihf` |
+
+### Tooling
+
+- **no-panic link test** (`tests/no_panic.rs`): wraps `varint::decode` and
+  `frame::decode_header` in `#[no_panic]` shims and verifies panic-freedom at
+  link time in release (they are `#[inline]`, so they inline fully into the
+  shim where `no-panic` can see them). `qpack::decode_field_section_into`
+  panic-freedom is enforced by the crate-wide clippy lint wall
+  (`unwrap_used` / `indexing_slicing` / `arithmetic_side_effects` / …) +
+  fuzzing — its call-tree depth prevents full inlining into a single shim.
+  Enabled via `--features test-no-panic`.
+- **Fuzz harnesses** (`fuzz/fuzz_targets/`): four targets —
+  `varint_decode`, `frame_decode`, `qpack_decode`, `connection_handle` —
+  covering all codec leaf paths and the full connection receive machine with
+  arbitrary byte streams.
+- **Bare-tier smoke test** (`tests/tiers.rs`): four tests run under
+  `--no-default-features` proving the bare tier needs no allocator:
+  `open_with` + drain, varint round-trip, frame decode, QPACK decode-into.
+- **100 unit + integration tests** across all features (from prior cycles).
+
 ## `wren-reactor` — cycle 3 (runtime-agnostic full-duplex driver)
 
 - **`wren-reactor`**: readiness-based WebSocket driver over `websocket-proto`,

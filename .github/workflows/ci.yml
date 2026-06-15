@@ -52,6 +52,8 @@ jobs:
       - run: cargo clippy -p websocket-proto --no-default-features --features alloc -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features deflate -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features no-atomic -- -D warnings
+      - run: cargo clippy -p http3-proto --no-default-features -- -D warnings
+      - run: cargo clippy -p http3-proto --no-default-features --features alloc -- -D warnings
 
   doc:
     runs-on: ubuntu-latest
@@ -75,6 +77,8 @@ jobs:
           tool: cargo-hack
       - run: cargo hack build -p websocket-proto --each-feature
       - run: cargo hack test -p websocket-proto --each-feature
+      - run: cargo hack build -p http3-proto --each-feature
+      - run: cargo hack test -p http3-proto --each-feature
       - run: cargo hack test -p wren-trace --each-feature
       # Powerset (8 combos over tls/deflate/tracing): feature-interaction
       # bugs (tls+deflate) escape an each-feature pass.
@@ -96,6 +100,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p websocket-proto --all-features
+      - run: cargo test -p http3-proto --all-features
       - run: cargo test -p wren-trace --all-features
       - run: cargo test -p wren-compio --all-features
       - run: cargo test -p wren-reactor --all-features
@@ -123,6 +128,15 @@ jobs:
       # combo — deflate's `alloc` dependency drags the atomic-CAS backends in,
       # defeating the tier. lib.rs raises a compile_error!; pin that it fires.
       - run: "! cargo check -p websocket-proto --no-default-features --features no-atomic,deflate 2>/dev/null"
+      # http3-proto bare tier: no std, no alloc — varint/frame/QPACK codecs and
+      # the Connection state machine must compile without any allocator.
+      - run: cargo check -p http3-proto --no-default-features --target thumbv7em-none-eabihf
+      - run: cargo check -p http3-proto --no-default-features --target thumbv6m-none-eabi
+      - run: cargo check -p http3-proto --no-default-features --features alloc --target thumbv7em-none-eabihf
+      - run: cargo check -p http3-proto --no-default-features --features alloc --target wasm32-unknown-unknown
+      # Run the bare-tier smoke test on the host (x86_64) to confirm it executes
+      # without panics (cross-compiled targets cannot run tests in CI without QEMU).
+      - run: cargo test -p http3-proto --no-default-features --test tiers
 
   # Proto only: the driver crates do real socket IO, which miri cannot
   # interpret (and their unsafe surface is empty regardless).
@@ -146,6 +160,10 @@ jobs:
           # syscalls miri's isolation rejects. Disabling isolation permits
           # them; UB detection is unaffected.
           MIRIFLAGS: -Zmiri-disable-isolation
+      - run: cargo miri test -p http3-proto --all-features
+        env:
+          PROPTEST_CASES: 8
+          MIRIFLAGS: -Zmiri-disable-isolation
 
   fuzz-smoke:
     runs-on: ubuntu-latest
@@ -157,14 +175,21 @@ jobs:
           workspaces: |
             .
             websocket-proto/fuzz
+            http3-proto/fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - name: Fuzz all targets (bounded smoke)
+      - name: Fuzz all targets — websocket-proto (bounded smoke)
         working-directory: websocket-proto
         # The target is pinned to gnu: recent cargo-fuzz defaults to musl on
         # Linux, where ASAN is incompatible with the statically linked libc
         # (and rustup has no musl std installed here).
+        run: |
+          for target in $(cargo fuzz list); do
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -runs=100000 -max_total_time=120
+          done
+      - name: Fuzz all targets — http3-proto (bounded smoke)
+        working-directory: http3-proto
         run: |
           for target in $(cargo fuzz list); do
             cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -runs=100000 -max_total_time=120
@@ -188,4 +213,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: no-panic link-time verification (release)
-        run: cargo test -p websocket-proto --release --features test-no-panic --test no_panic
+        run: |
+          cargo test -p websocket-proto --release --features test-no-panic --test no_panic
+          cargo test -p http3-proto --release --features test-no-panic --test no_panic

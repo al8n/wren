@@ -65,3 +65,37 @@ pub use qpack::{FieldLines as HeaderSet, Pair};
 /// The top-level HTTP/3 Extended-CONNECT tunnel connection state machine.
 pub mod connection;
 pub use connection::{Client, Connection, Frame, Frames, Role, Server};
+
+/// Internal hot-path accessors for the `no-panic` link-time test
+/// (`tests/no_panic.rs`). Gated behind `test-no-panic`, doc-hidden, and exempt
+/// from semver: these `pub` forwarders expose the crate's panic-free leaf entry
+/// points so the test can wrap them in `#[no_panic]` shims (`varint_decode`,
+/// `frame_decode_header`) or run as plain smoke tests (`qpack_decode_field_section_into` —
+/// its call tree is too deep to inline into a single shim). A `pub use` of a
+/// `pub(crate)` item is illegal (E0364/E0365), so thin forwarders are used.
+#[cfg(feature = "test-no-panic")]
+#[doc(hidden)]
+pub mod __no_panic_internals {
+  /// Forwards to [`crate::varint::decode`].
+  #[inline]
+  pub fn varint_decode(input: &[u8]) -> Result<(usize, u64), crate::varint::VarintError> {
+    crate::varint::decode(input)
+  }
+
+  /// Forwards to [`crate::frame::decode_header`].
+  #[inline]
+  pub fn frame_decode_header(
+    input: &[u8],
+  ) -> Result<(usize, crate::frame::FrameHeader), crate::frame::FrameError> {
+    crate::frame::decode_header(input)
+  }
+
+  /// Forwards to [`crate::qpack::decode_field_section_into`].
+  #[inline]
+  pub fn qpack_decode_field_section_into<'a>(
+    input: &'a [u8],
+    scratch: &'a mut [u8],
+  ) -> Result<crate::qpack::FieldLines<'a>, crate::qpack::QpackError> {
+    crate::qpack::decode_field_section_into(input, scratch)
+  }
+}
