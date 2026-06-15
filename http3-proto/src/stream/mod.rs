@@ -278,5 +278,5 @@ impl Items<'_> {
   }
 }
 
-#[cfg(all(test, feature = "alloc"))]
+#[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;

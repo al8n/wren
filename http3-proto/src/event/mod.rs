@@ -39,6 +39,10 @@ pub enum StreamRole {
   Request,
 }
 
+/// The number of distinct [`StreamRole`] variants (the bound for role-indexed
+/// fixed arrays in the connection).
+pub(crate) const ROLE_COUNT: usize = 7;
+
 impl StreamRole {
   /// A stable, snake_case name for the role (logging / diagnostics).
   #[inline(always)]
@@ -51,6 +55,20 @@ impl StreamRole {
       Self::QpackDecOut => "qpack_dec_out",
       Self::QpackDecIn => "qpack_dec_in",
       Self::Request => "request",
+    }
+  }
+
+  /// A dense `0..ROLE_COUNT` index for this role, for indexing a fixed array.
+  #[inline(always)]
+  pub(crate) const fn index(self) -> usize {
+    match self {
+      Self::ControlOut => 0,
+      Self::ControlIn => 1,
+      Self::QpackEncOut => 2,
+      Self::QpackEncIn => 3,
+      Self::QpackDecOut => 4,
+      Self::QpackDecIn => 5,
+      Self::Request => 6,
     }
   }
 }
@@ -102,11 +120,14 @@ impl<'a> Transmit<'a> {
 }
 
 /// An owned connection-level signal, drained via `Connection::poll_event`.
+///
+/// Stream opening is *not* signalled here: the core asks the driver to open a
+/// stream via a [`Transmit`] whose [`StreamKind`] is
+/// [`OpenUni`](StreamKind::OpenUni) / [`OpenRequest`](StreamKind::OpenRequest),
+/// drained from `Connection::poll_transmit`. Events carry lifecycle signals only.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::IsVariant)]
 #[non_exhaustive]
 pub enum Event {
-  /// The driver must open a quinn stream for this role, then `provide_stream`.
-  StreamNeeded(StreamRole),
   /// The CONNECT exchange completed (2xx sent/seen); the tunnel is open.
   Established,
   /// The request stream's FIN was observed (graceful tunnel end).

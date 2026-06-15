@@ -104,6 +104,9 @@ pub enum Error {
   /// The tunnel is closed; no further payload can be sent.
   #[error("tunnel closed")]
   Closed,
+  /// The outbound transmit queue is full; drain it with `poll_transmit` and retry.
+  #[error("transmit queue full; drain and retry")]
+  WouldBlock,
   /// A connection-level HTTP/3 protocol violation (terminal).
   #[error("http/3 protocol error: {0}")]
   Protocol(H3Error),
