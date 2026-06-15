@@ -47,3 +47,13 @@ pub mod qpack;
 
 /// HTTP/3 SETTINGS frame payload codec (RFC 9114 §7.2.4, RFC 9204 §5, RFC 9220 §3).
 pub mod settings;
+
+/// Driver-facing vocabulary: stream identity, transmit intents, and connection events.
+pub mod event;
+pub use event::{Event, StreamId, StreamKind, StreamRole, Transmit};
+
+/// Outbound-header supplier trait and blanket slice impl.
+pub mod headers;
+pub use headers::Headers;
+
+pub use qpack::{FieldLines as HeaderSet, Pair};
