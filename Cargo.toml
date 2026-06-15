@@ -1,9 +1,10 @@
 [workspace]
-members = ["websocket-proto", "wren-trace", "wren-compio", "wren-reactor"]
+members = ["websocket-proto", "wren-trace", "wren-compio", "wren-reactor", "http3-proto"]
 resolver = "3"
 
 [workspace.dependencies]
 websocket-proto = { version = "0.1", path = "websocket-proto", default-features = false }
+http3-proto = { version = "0.1", path = "http3-proto", default-features = false }
 wren-trace = { version = "0.1", path = "wren-trace" }
 agnostic-net = { version = "0.3", default-features = false }
 agnostic-lite = { version = "0.6", default-features = false }

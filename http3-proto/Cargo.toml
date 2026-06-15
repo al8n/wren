@@ -1,0 +1,30 @@
+[package]
+name = "http3-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+license = "MIT OR Apache-2.0"
+description = "Sans-I/O HTTP/3 Extended-CONNECT tunnel state machine (RFC 9114/9204/9220; no_std, no_alloc capable, panic-free)."
+repository = "https://github.com/al8n/websockit"
+readme = "README.md"
+keywords = ["http3", "quic", "no-std", "sans-io", "websocket"]
+categories = ["network-programming", "no-std", "embedded", "web-programming"]
+
+[features]
+default = ["std"]
+std = ["thiserror/std"]
+alloc = []
+
+[dependencies]
+thiserror = { workspace = true }
+derive_more = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
