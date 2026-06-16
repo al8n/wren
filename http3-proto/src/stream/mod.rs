@@ -3,6 +3,8 @@
 //! placement (RFC 9114 §7.1/§7.2), and yielding decoded headers + data chunks.
 //! Read-side only; the connection builds the outbound frames.
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
+
 use crate::{
   HeaderSet,
   error::H3Error,
@@ -79,7 +81,9 @@ pub struct RequestStream {
 /// Valid only until the next [`Items::next`] call (lending iterator): a `Data`
 /// chunk borrows the fed input and a `Headers` set borrows the FSM-owned field
 /// accumulator plus the caller's Huffman scratch.
-#[derive(derive_more::IsVariant)]
+#[derive(IsVariant, TryUnwrap, Unwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum StreamItem<'a> {
   /// A decoded HEADERS field section (drain it before the next `next()`).

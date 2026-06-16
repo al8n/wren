@@ -2,6 +2,8 @@
 //! and length are QUIC varints. This module owns the *header* (type+length);
 //! payloads are handled by the stream FSM (HEADERS via QPACK, DATA streamed).
 
+use derive_more::IsVariant;
+
 use crate::{
   error::TruncatedDetail,
   varint::{self, VarintError},
@@ -12,7 +14,7 @@ use crate::{
 // needs a string slug yet. `FrameKind` carries both (it drives frame-placement
 // policy and benefits from a human-readable name).
 /// A frame type we emit.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant)]
 pub enum FrameType {
   /// `DATA` (0x00) — tunnel payload.
   Data,
@@ -41,7 +43,7 @@ impl FrameType {
 /// known-but-misplaced and HTTP/2-reserved types are
 /// [`H3Error::FrameUnexpected`](crate::error::H3Error::FrameUnexpected), while
 /// [`Unknown`](Self::Unknown) (GREASE / unknown extensions) is ignored.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::IsVariant)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant)]
 #[non_exhaustive]
 pub enum FrameKind {
   /// `DATA` (0x00).
@@ -108,15 +110,15 @@ impl FrameHeader {
 }
 
 /// A frame-layer error.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display, derive_more::From)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FrameError {
   /// The input ended mid-header.
-  #[display("{_0}")]
-  Truncated(TruncatedDetail),
+  #[error(transparent)]
+  Truncated(#[from] TruncatedDetail),
   /// The output buffer was too small / a varint overflowed.
-  #[display("{_0}")]
-  Varint(VarintError),
+  #[error(transparent)]
+  Varint(#[from] VarintError),
 }
 
 /// Encodes a frame header (`type` + `length`) into `out`, returning bytes written.

@@ -15,36 +15,36 @@ pub use encode::{EncodeError, encode_field_section, encode_field_section_from};
 use crate::error::{BufferTooSmallDetail, TruncatedDetail};
 
 /// A QPACK error (field-section coding + Huffman string literals).
-#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display, derive_more::From)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum QpackError {
   /// The output buffer was too small.
-  #[display("{_0}")]
-  Buffer(BufferTooSmallDetail),
+  #[error(transparent)]
+  Buffer(#[from] BufferTooSmallDetail),
   /// Huffman padding was longer than 7 bits or not all-ones (RFC 7541 §5.2).
-  #[display("invalid huffman padding")]
+  #[error("invalid huffman padding")]
   HuffmanPadding,
   /// The Huffman EOS symbol appeared in the input (RFC 7541 §5.2).
-  #[display("huffman eos symbol in input")]
+  #[error("huffman eos symbol in input")]
   HuffmanEos,
   /// No valid Huffman code matched (incomplete or overlong sequence).
-  #[display("invalid huffman code")]
+  #[error("invalid huffman code")]
   HuffmanInvalid,
   /// A prefixed integer was malformed or overflowed.
-  #[display("invalid qpack integer")]
+  #[error("invalid qpack integer")]
   BadInteger,
   /// The input ended mid-field-line.
-  #[display("{_0}")]
-  Truncated(TruncatedDetail),
+  #[error(transparent)]
+  Truncated(#[from] TruncatedDetail),
   /// A dynamic-table reference (or non-zero Required Insert Count / Base) was
   /// used; this decoder is static-table-only.
-  #[display("qpack dynamic table reference rejected")]
+  #[error("qpack dynamic table reference rejected")]
   DynamicReference,
   /// A static index was out of range (>= 99).
-  #[display("qpack static index out of range")]
+  #[error("qpack static index out of range")]
   BadStaticIndex,
   /// A decoded string was not valid UTF-8.
-  #[display("qpack string is not valid utf-8")]
+  #[error("qpack string is not valid utf-8")]
   InvalidString,
 }
 

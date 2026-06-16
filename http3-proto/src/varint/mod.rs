@@ -6,17 +6,17 @@ use crate::error::{BufferTooSmallDetail, TruncatedDetail};
 pub const MAX: u64 = (1 << 62) - 1;
 
 /// A varint codec error.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display, derive_more::From)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum VarintError {
   /// The output buffer was too small.
-  #[display("{_0}")]
-  Buffer(BufferTooSmallDetail),
+  #[error(transparent)]
+  Buffer(#[from] BufferTooSmallDetail),
   /// The input ended mid-integer.
-  #[display("{_0}")]
-  Truncated(TruncatedDetail),
+  #[error(transparent)]
+  Truncated(#[from] TruncatedDetail),
   /// The value exceeds [`MAX`] and cannot be encoded.
-  #[display("varint value exceeds 2^62-1")]
+  #[error("varint value exceeds 2^62-1")]
   TooLarge,
 }
 
