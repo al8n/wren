@@ -17,23 +17,27 @@ use crate::{Error, error::BufferTooSmallDetail, headers::Headers};
 /// [`TooLarge`](Self::TooLarge) and [`BufferExhausted`](Self::BufferExhausted) to
 /// [`Error::FieldSectionTooLarge`]) while still surfacing a real encoder bug as a
 /// protocol error.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum EncodeError {
   /// The running decoded field-section size (Σ `name.len() + value.len() + 32`,
   /// RFC 9114 §4.2.2) exceeded the caller-supplied `max_decoded` limit — the
   /// peer's advertised `MAX_FIELD_SECTION_SIZE`. Detected *inside* the single
   /// encode pass, before (and independent of) any output-buffer exhaustion.
+  #[error("field section too large")]
   TooLarge,
   /// The output workspace ran out of room (a [`QpackError::Buffer`]). For
   /// outbound HEADERS this means the section is too large for us to send; the
   /// connection maps it to [`Error::FieldSectionTooLarge`], a local refusal.
+  #[error("buffer exhausted")]
   BufferExhausted,
   /// A genuine QPACK encoding fault (e.g. a length that overflows `u64`) — not a
   /// size-limit or buffer condition. Surfaced as a protocol error.
-  Qpack(QpackError),
+  #[error(transparent)]
+  Qpack(#[from] QpackError),
   /// The [`Headers`] supplier's `for_each` returned an error, propagated verbatim.
-  Supplier(Error),
+  #[error(transparent)]
+  Supplier(#[from] Error),
 }
 
 /// Writes a string: its length as a prefixed integer carrying `flags` (Huffman

@@ -12,7 +12,7 @@ categories = ["network-programming", "no-std", "embedded", "web-programming"]
 
 [features]
 default = ["std"]
-std = ["thiserror/std"]
+std = ["thiserror/default"]
 alloc = []
 # Internal: exposes `pub(crate)` hot paths so `tests/no_panic.rs` can wrap them
 # in `#[no_panic]` shims. Implies `std` (the test driver is std-only). Not for
@@ -20,8 +20,8 @@ alloc = []
 test-no-panic = ["std"]
 
 [dependencies]
-thiserror = { workspace = true }
-derive_more = { workspace = true }
+thiserror.workspace = true
+derive_more.workspace = true
 
 [dev-dependencies]
 proptest = "1"

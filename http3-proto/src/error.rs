@@ -1,11 +1,8 @@
 //! Cross-cutting error building blocks shared by multiple modules, plus the
 //! HTTP/3 / QPACK error-code enum a driver uses to close the QUIC connection.
-
-use derive_more::Display;
-
 /// Detail payload: an output buffer was too small for the bytes a call needed.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Display)]
-#[display("output buffer too small: needed {needed} bytes, had {have}")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("output buffer too small: needed {needed} bytes, had {have}")]
 pub struct BufferTooSmallDetail {
   needed: usize,
   have: usize,
@@ -33,8 +30,8 @@ impl BufferTooSmallDetail {
 
 /// Detail payload: a decode needs more bytes than the input held (the caller
 /// should buffer more and retry).
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Display)]
-#[display("truncated input: need at least {needed} more bytes")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("truncated input: need at least {needed} more bytes")]
 pub struct TruncatedDetail {
   needed: usize,
 }
@@ -55,24 +52,24 @@ impl TruncatedDetail {
 
 /// HTTP/3 (RFC 9114 §8.1) and QPACK (RFC 9204 §6) error codes a driver uses to
 /// close the QUIC connection on a protocol violation.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Display)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum H3Error {
   /// `H3_GENERAL_PROTOCOL_ERROR` (0x0101).
-  #[display("H3_GENERAL_PROTOCOL_ERROR")]
+  #[error("H3_GENERAL_PROTOCOL_ERROR")]
   GeneralProtocol,
   /// `H3_FRAME_UNEXPECTED` (0x0105).
-  #[display("H3_FRAME_UNEXPECTED")]
+  #[error("H3_FRAME_UNEXPECTED")]
   FrameUnexpected,
   /// `H3_FRAME_ERROR` (0x0106).
-  #[display("H3_FRAME_ERROR")]
+  #[error("H3_FRAME_ERROR")]
   FrameError,
   /// `H3_REQUEST_INCOMPLETE` (0x010d): the request stream terminated before the
   /// mandatory CONNECT HEADERS were received. A peer that FINs the request stream
   /// before sending the CONNECT request / response field section has sent an
   /// incomplete request (RFC 9114 §8.1), so the connection is closed rather than
   /// left waiting for HEADERS that will never arrive.
-  #[display("H3_REQUEST_INCOMPLETE")]
+  #[error("H3_REQUEST_INCOMPLETE")]
   RequestIncomplete,
   /// `H3_MESSAGE_ERROR` (0x010e): a request or response message was malformed
   /// (RFC 9114 §8.1 / §4.1.2). A peer that sends tunnel DATA before the CONNECT
@@ -80,25 +77,25 @@ pub enum H3Error {
   /// any DATA on a request stream whose tunnel was never established — has sent a
   /// malformed message (RFC 9114 §4.4 forbids DATA ahead of the 2xx response), so
   /// the connection is closed rather than processing pre-accept tunnel bytes.
-  #[display("H3_MESSAGE_ERROR")]
+  #[error("H3_MESSAGE_ERROR")]
   MessageError,
   /// `H3_SETTINGS_ERROR` (0x0109).
-  #[display("H3_SETTINGS_ERROR")]
+  #[error("H3_SETTINGS_ERROR")]
   SettingsError,
   /// `H3_MISSING_SETTINGS` (0x010a).
-  #[display("H3_MISSING_SETTINGS")]
+  #[error("H3_MISSING_SETTINGS")]
   MissingSettings,
   /// `H3_STREAM_CREATION_ERROR` (0x0103).
-  #[display("H3_STREAM_CREATION_ERROR")]
+  #[error("H3_STREAM_CREATION_ERROR")]
   StreamCreation,
   /// `H3_CLOSED_CRITICAL_STREAM` (0x0104).
-  #[display("H3_CLOSED_CRITICAL_STREAM")]
+  #[error("H3_CLOSED_CRITICAL_STREAM")]
   ClosedCriticalStream,
   /// `H3_ID_ERROR` (0x0108): the peer used a stream id or push id it was not
   /// permitted to. We never enable server push (we never send `MAX_PUSH_ID`, so
   /// the max push id stays 0), so receiving a push unidirectional stream
   /// (type 0x01) is this error.
-  #[display("H3_ID_ERROR")]
+  #[error("H3_ID_ERROR")]
   IdError,
   /// `H3_EXCESSIVE_LOAD` (0x0107): the peer placed an implausibly large load on a
   /// bounded resource. Two cases: it opened more inbound unidirectional streams
@@ -106,20 +103,20 @@ pub enum H3Error {
   /// a stream, so a flood cannot hide a later critical stream), or it sent a
   /// control-stream SETTINGS frame whose payload exceeds the generous buffer bound
   /// (large enough for many settings plus GREASE).
-  #[display("H3_EXCESSIVE_LOAD")]
+  #[error("H3_EXCESSIVE_LOAD")]
   ExcessiveLoad,
   /// `QPACK_DECOMPRESSION_FAILED` (0x0200): a field-section decode failed.
-  #[display("QPACK_DECOMPRESSION_FAILED")]
+  #[error("QPACK_DECOMPRESSION_FAILED")]
   QpackDecompressionFailed,
   /// `QPACK_ENCODER_STREAM_ERROR` (0x0201): an error on the peer's QPACK encoder
   /// stream (RFC 9204 §6). We advertise `QPACK_MAX_TABLE_CAPACITY=0`, so any
   /// encoder-stream instruction the peer sends is a violation.
-  #[display("QPACK_ENCODER_STREAM_ERROR")]
+  #[error("QPACK_ENCODER_STREAM_ERROR")]
   QpackEncoderStreamError,
   /// `QPACK_DECODER_STREAM_ERROR` (0x0202): an error on the peer's QPACK decoder
   /// stream (RFC 9204 §6). We advertise `QPACK_MAX_TABLE_CAPACITY=0`, so any
   /// decoder-stream instruction the peer sends is a violation.
-  #[display("QPACK_DECODER_STREAM_ERROR")]
+  #[error("QPACK_DECODER_STREAM_ERROR")]
   QpackDecoderStreamError,
 }
 
@@ -174,8 +171,8 @@ pub enum Error {
   #[error("header field section exceeds the peer's advertised MAX_FIELD_SECTION_SIZE")]
   FieldSectionTooLarge,
   /// A connection-level HTTP/3 protocol violation (terminal).
-  #[error("http/3 protocol error: {0}")]
-  Protocol(H3Error),
+  #[error(transparent)]
+  Protocol(#[from] H3Error),
 }
 
 #[cfg(all(test, feature = "std"))]

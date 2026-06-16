@@ -45,6 +45,7 @@ mod queue;
 
 use core::marker::PhantomData;
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use queue::{BoundedQueue, TX_CAP, TxError, TxRing};
 
 use crate::{
@@ -114,7 +115,9 @@ const CTRL_HDR_CAP: usize = 16;
 /// A decoded frame yielded by [`Frames`]: the peer's CONNECT HEADERS or a chunk
 /// of tunnel DATA. Borrows the `handle_stream` scratch/input and is invalidated
 /// by the next [`Frames::next`].
-#[derive(derive_more::IsVariant)]
+#[derive(IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum Frame<'a> {
   /// The peer's request HEADERS (server side): the CONNECT field section.
