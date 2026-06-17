@@ -64,7 +64,10 @@ pub use qpack::{FieldLines as HeaderSet, Pair};
 
 /// The top-level HTTP/3 Extended-CONNECT tunnel connection state machine.
 pub mod connection;
-pub use connection::{Client, Connection, Frame, Frames, Role, Server};
+pub use connection::{
+  BorrowedConnection, Client, Connection, DefaultCtrlBuf, DefaultEventBuf, DefaultReqBuf,
+  DefaultTxBuf, DefaultUniBuf, Frame, Frames, Role, Server, UniSlot,
+};
 
 /// Internal hot-path accessors for the `no-panic` link-time test
 /// (`tests/no_panic.rs`). Gated behind `test-no-panic`, doc-hidden, and exempt

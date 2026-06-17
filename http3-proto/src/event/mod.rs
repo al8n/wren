@@ -1,6 +1,6 @@
 //! The driver-facing vocabulary: stream identity, transmit intents, and events.
 
-use derive_more::{Display, IsVariant};
+use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
 /// The driver's opaque identifier for a QUIC stream (the core never mints these).
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -76,7 +76,9 @@ impl StreamRole {
 }
 
 /// What kind of stream a [`Transmit`] targets — so the driver knows the quinn call.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum StreamKind {
   /// An existing stream (already opened + provided).
@@ -127,7 +129,9 @@ impl<'a> Transmit<'a> {
 /// stream via a [`Transmit`] whose [`StreamKind`] is
 /// [`OpenUni`](StreamKind::OpenUni) / [`OpenRequest`](StreamKind::OpenRequest),
 /// drained from `Connection::poll_transmit`. Events carry lifecycle signals only.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum Event {
   /// The CONNECT exchange completed (2xx sent/seen); the tunnel is open.

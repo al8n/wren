@@ -1,7 +1,14 @@
 use std::vec::Vec;
 
 use super::*;
-use crate::event::{StreamKind, StreamRole};
+use crate::{
+  event::{StreamKind, StreamRole},
+  stream::HDR_CAP,
+};
+
+type StaticConnection<Ro> = Connection<'static, 'static, 'static, 'static, 'static, Ro>;
+type StaticBorrowedConnection<Ro> =
+  BorrowedConnection<'static, 'static, 'static, 'static, 'static, Ro>;
 
 /// The CONNECT request a WebSocket client sends (RFC 9220 Extended CONNECT).
 const CONNECT_REQUEST: [(&str, &str); 5] = [
@@ -15,6 +22,48 @@ const CONNECT_REQUEST: [(&str, &str); 5] = [
 /// The server's accepting response.
 const RESPONSE: [(&str, &str); 1] = [(":status", "200")];
 
+#[test]
+fn connection_value_is_small_with_handle_backed_storage() {
+  let borrowed = core::mem::size_of::<StaticBorrowedConnection<Client>>();
+  let default = core::mem::size_of::<StaticConnection<Client>>();
+  assert!(
+    borrowed < 1024,
+    "borrowed connection should only store buffer handles and state, got {borrowed}"
+  );
+  assert!(
+    default < 1024,
+    "default std/alloc connection should only store buffer handles and state, got {default}"
+  );
+}
+
+#[test]
+fn borrowed_transmit_storage_controls_queue_capacity() {
+  let mut request_headers = [0u8; HDR_CAP];
+  let mut control_payload = [0u8; CTRL_CAP];
+  let mut tx_bytes = [0u8; super::queue::TX_CAP * 3];
+  let mut event_slots = [None; EVENT_QUEUE_CAP];
+  let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+  let mut c = BorrowedConnection::<Client>::with_buffers(
+    &mut request_headers[..],
+    &mut control_payload[..],
+    &mut tx_bytes[..],
+    &mut event_slots[..],
+    &mut uni_slots[..],
+  );
+
+  assert!(c.tx.has_capacity_mut(3));
+  assert!(!c.tx.has_capacity_mut(4));
+  c.start().expect("three setup transmits fit");
+  assert!(!c.tx.has_capacity_mut(1));
+
+  let mut drained = 0usize;
+  while c.poll_transmit().is_some() {
+    drained = drained.saturating_add(1);
+  }
+  assert_eq!(drained, 3);
+  assert!(c.tx.has_capacity_mut(3));
+}
+
 /// A captured transmit: owned bytes plus the routing metadata.
 struct Captured {
   kind: StreamKind,
@@ -26,8 +75,8 @@ struct Captured {
 /// (the same [`StreamId`] identifies a stream on both ends), routing transmits
 /// between them and recording the observable outcomes.
 struct Harness {
-  client: Connection<Client>,
-  server: Connection<Server>,
+  client: StaticConnection<Client>,
+  server: StaticConnection<Server>,
   next_id: u64,
   client_established: bool,
   server_established: bool,
@@ -410,7 +459,7 @@ fn reset_enqueues_reset_event_and_closes() {
 
 #[test]
 fn server_accept_before_request_errors() {
-  let mut s: Connection<Server> = Connection::new();
+  let mut s: StaticConnection<Server> = Connection::new();
   s.start().unwrap();
   // No request HEADERS decoded (and no peer SETTINGS) yet → not ready to respond,
   // so accept_with is the retriable WouldBlock, not a terminal error.
@@ -460,7 +509,7 @@ fn filling_transmit_queue_returns_would_block() {
 
 #[test]
 fn grease_uni_stream_is_ignored() {
-  let mut c: Connection<Client> = Connection::new();
+  let mut c: StaticConnection<Client> = Connection::new();
   let id = StreamId::new(42);
   let mut scratch = std::vec![0u8; 64];
   // 0x21 is a reserved/GREASE stream type (0x1f * N + 0x21); its bytes are
@@ -487,7 +536,7 @@ fn handle_stream_fin_before_headers_is_request_incomplete() {
   // half-close: it must enqueue ConnError(RequestIncomplete) and make the
   // connection terminal (so a peer cannot FIN the request stream before the CONNECT
   // exchange and leave the connection stuck handshaking).
-  let mut c: Connection<Client> = Connection::new();
+  let mut c: StaticConnection<Client> = Connection::new();
   let id = StreamId::new(7);
   c.provide_stream(StreamRole::Request, id);
   c.handle_stream_fin(id);
@@ -504,7 +553,7 @@ fn handle_stream_fin_before_headers_is_request_incomplete() {
 
 #[test]
 fn handle_stream_fin_mid_frame_enqueues_conn_error() {
-  let mut c: Connection<Client> = Connection::new();
+  let mut c: StaticConnection<Client> = Connection::new();
   let id = StreamId::new(7);
   c.provide_stream(StreamRole::Request, id);
   // Feed one byte of a frame header (0x01 = HEADERS type, length varint missing),
@@ -629,7 +678,7 @@ fn peer_control_settings(settings_payload: &[u8]) -> Vec<u8> {
 }
 
 /// Drains and discards a connection's queued transmits, returning their count.
-fn drain_transmits<Ro: Role>(c: &mut Connection<Ro>) -> usize {
+fn drain_transmits<Ro: Role>(c: &mut StaticConnection<Ro>) -> usize {
   let mut n = 0usize;
   while c.poll_transmit().is_some() {
     n += 1;
@@ -640,7 +689,7 @@ fn drain_transmits<Ro: Role>(c: &mut Connection<Ro>) -> usize {
 /// Feeds a fresh client its setup transmits, then the peer's control-stream
 /// SETTINGS (`settings_payload`), so `open_with` can be exercised against a known
 /// peer-SETTINGS state. Leaves the transmit ring drained.
-fn client_after_peer_settings(settings_payload: &[u8]) -> Connection<Client> {
+fn client_after_peer_settings(settings_payload: &[u8]) -> StaticConnection<Client> {
   let mut c = Connection::<Client>::new();
   c.start().expect("client start");
   drain_transmits(&mut c);
@@ -847,7 +896,7 @@ fn accept_with_over_peer_max_field_section_size_is_field_section_too_large() {
 /// the peer's (client's) control-stream SETTINGS are NOT yet delivered, so this is
 /// the pre-SETTINGS state in which `accept_with` must block. Leaves the transmit
 /// ring drained.
-fn server_request_registered_no_peer_settings() -> Connection<Server> {
+fn server_request_registered_no_peer_settings() -> StaticConnection<Server> {
   let mut s = Connection::<Server>::new();
   s.start().expect("server start");
   drain_transmits(&mut s);
@@ -875,7 +924,7 @@ fn request_headers_frame(fields: &[(&str, &str)]) -> Vec<u8> {
 /// `req_id`, asserting the server yields exactly the `Frame::Request` (which sets
 /// `request_received`, the gate `accept_with` waits on). The request stream must
 /// already be registered (via `provide_stream`).
-fn deliver_connect_request(s: &mut Connection<Server>, req_id: StreamId) {
+fn deliver_connect_request(s: &mut StaticConnection<Server>, req_id: StreamId) {
   let frame = request_headers_frame(&CONNECT_REQUEST[..]);
   let mut sc = std::vec![0u8; 512];
   let mut frames = s
@@ -2417,7 +2466,7 @@ fn clean_request_fin_after_headers_is_peer_closed_and_not_a_teardown() {
 /// stream at a frame boundary in Tunnel, the transmit ring drained, and the
 /// `Established` event drained — so a follow-on fatal inbound error is observable
 /// in isolation.
-fn client_open_at_tunnel_boundary(req_id: StreamId) -> Connection<Client> {
+fn client_open_at_tunnel_boundary(req_id: StreamId) -> StaticConnection<Client> {
   let mut c = client_after_peer_settings(&[0x08, 0x01]);
   c.open_with(&CONNECT_REQUEST[..]).expect("open_with");
   c.provide_stream(StreamRole::Request, req_id);
@@ -2974,7 +3023,7 @@ fn start_on_a_near_full_ring_enqueues_no_partial_setup_and_retry_is_single() {
     );
   }
   assert!(
-    c.tx.has_capacity(2) && !c.tx.has_capacity(3),
+    c.tx.has_capacity_mut(2) && !c.tx.has_capacity_mut(3),
     "ring has 2 free slots"
   );
   // start cannot fit its three setup transmits: WouldBlock, nothing enqueued.
@@ -3606,7 +3655,7 @@ fn drop_request_frames_unobserved_then_later_data_is_message_error_server() {
 /// SETTINGS decoded and the request stream (id 0) registered, but NOT yet accepted.
 /// This is the state in which a peer can coalesce the request HEADERS and a DATA
 /// frame before the server has sent its 2xx.
-fn server_handshaking_with_peer_settings() -> Connection<Server> {
+fn server_handshaking_with_peer_settings() -> StaticConnection<Server> {
   let mut s = server_request_registered_no_peer_settings();
   let mut sc = [0u8; 128];
   let bytes = peer_control_settings(&[0x08, 0x01]);
@@ -4453,7 +4502,7 @@ fn fully_drained_first_headers_path_is_unchanged() {
 /// `PeerClosed` events directly, so a subsequent fatal path cannot enqueue its
 /// `ConnError` into the queue — proving the terminal error survives via the
 /// dedicated `conn_error` slot. Returns the number pushed (the full capacity).
-fn saturate_event_queue<Ro: Role>(c: &mut Connection<Ro>) -> usize {
+fn saturate_event_queue<Ro: Role>(c: &mut StaticConnection<Ro>) -> usize {
   let mut n = 0usize;
   // `push` returns Err(item) once full; stop there.
   while c.events.push(Event::PeerClosed).is_ok() {
@@ -4474,7 +4523,7 @@ fn saturate_event_queue<Ro: Role>(c: &mut Connection<Ro>) -> usize {
 /// Drains `poll_event`, returning the count of terminal `ConnError`s seen and the
 /// first such error. Asserts exactly one `ConnError` is delivered (the terminal
 /// code), regardless of how many benign events preceded it in the queue.
-fn drain_until_single_conn_error<Ro: Role>(c: &mut Connection<Ro>) -> H3Error {
+fn drain_until_single_conn_error<Ro: Role>(c: &mut StaticConnection<Ro>) -> H3Error {
   let mut conn_errors = std::vec::Vec::new();
   while let Some(ev) = c.poll_event() {
     if let Event::ConnError(e) = ev {
@@ -4795,7 +4844,7 @@ fn clean_request_fin_twice_emits_at_most_one_peer_closed() {
 /// calling `accept_with`, so the tunnel is NOT yet established. This is the exact
 /// pre-establishment window in which a peer can FIN its request stream after its
 /// HEADERS but before the server sends the 2xx. Leaves the transmit ring drained.
-fn server_request_observed_not_yet_accepted(req_id: StreamId) -> Connection<Server> {
+fn server_request_observed_not_yet_accepted(req_id: StreamId) -> StaticConnection<Server> {
   let mut s = server_request_registered_no_peer_settings();
   // Deliver the client's control-stream SETTINGS so the peer-SETTINGS gate is met.
   let bytes = peer_control_settings(&[0x08, 0x01]);
@@ -4900,14 +4949,14 @@ fn second_fin_after_deferred_peer_closed_emits_no_duplicate() {
 #[test]
 fn provide_stream_after_fail_is_a_noop() {
   // `provide_stream` on a `Failed` connection is a no-op — it must not bind a new id
-  // or mint a request FSM after the terminal ConnError. The exploit
-  // would be the driver opening the request stream LATE on a connection that has
-  // already failed via a critical-stream FIN: a fresh RequestStream would then be
-  // created on a terminal core.
+  // after the terminal ConnError. The exploit would be the driver opening the
+  // request stream LATE on a connection that has already failed via a
+  // critical-stream FIN: the late registration must not resurrect bookkeeping on a
+  // terminal core.
   let mut c = Connection::<Client>::new();
   let mut sc = [0u8; 64];
   // Register + FIN the inbound control stream (id 10): a no-return fatal path. No
-  // request stream has been bound yet, so `request`/`request_id` are still None.
+  // request stream has been bound yet, so `request_id` is still None.
   {
     let _ = c
       .handle_stream(StreamId::new(10), &[0x00], &mut sc)
@@ -4921,10 +4970,6 @@ fn provide_stream_after_fail_is_a_noop() {
   assert_eq!(
     c.request_id, None,
     "a Failed connection binds no request id"
-  );
-  assert!(
-    c.request.is_none(),
-    "a Failed connection mints no request FSM"
   );
   // The connection stays Failed and only the original terminal error is delivered.
   assert!(c.phase.is_failed());
