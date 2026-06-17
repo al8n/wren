@@ -6,17 +6,17 @@ use crate::error::{BufferTooSmallDetail, TruncatedDetail};
 pub const MAX: u64 = (1 << 62) - 1;
 
 /// A varint codec error.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display, derive_more::From)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum VarintError {
   /// The output buffer was too small.
-  #[display("{_0}")]
-  Buffer(BufferTooSmallDetail),
+  #[error(transparent)]
+  Buffer(#[from] BufferTooSmallDetail),
   /// The input ended mid-integer.
-  #[display("{_0}")]
-  Truncated(TruncatedDetail),
+  #[error(transparent)]
+  Truncated(#[from] TruncatedDetail),
   /// The value exceeds [`MAX`] and cannot be encoded.
-  #[display("varint value exceeds 2^62-1")]
+  #[error("varint value exceeds 2^62-1")]
   TooLarge,
 }
 
@@ -40,58 +40,67 @@ pub fn encode(value: u64, out: &mut [u8]) -> Result<usize, VarintError> {
   if value > MAX {
     return Err(VarintError::TooLarge);
   }
-  let n = len_of(value);
-  let out_len = out.len();
-  let dst = out
-    .get_mut(..n)
-    .ok_or(BufferTooSmallDetail::new(n, out_len))?;
-  let tag: u8 = match n {
-    1 => 0b00,
-    2 => 0b01,
-    4 => 0b10,
-    _ => 0b11,
-  };
-  let be = value.to_be_bytes();
-  for (d, s) in dst.iter_mut().zip(be.iter().skip(8usize.wrapping_sub(n))) {
-    *d = *s;
+  match len_of(value) {
+    1 => {
+      let byte = u8::try_from(value).map_err(|_| VarintError::TooLarge)?;
+      out_prefix::<1>(out)?.copy_from_slice(&[byte]);
+      Ok(1)
+    }
+    2 => {
+      let encoded = u16::try_from(value).map_err(|_| VarintError::TooLarge)? | 0x4000;
+      out_prefix::<2>(out)?.copy_from_slice(&encoded.to_be_bytes());
+      Ok(2)
+    }
+    4 => {
+      let encoded = u32::try_from(value).map_err(|_| VarintError::TooLarge)? | 0x8000_0000;
+      out_prefix::<4>(out)?.copy_from_slice(&encoded.to_be_bytes());
+      Ok(4)
+    }
+    _ => {
+      let encoded = value | 0xc000_0000_0000_0000;
+      out_prefix::<8>(out)?.copy_from_slice(&encoded.to_be_bytes());
+      Ok(8)
+    }
   }
-  // `dst` is non-empty here: `len_of` returns >= 1 and `out.get_mut(..n)`
-  // succeeded, so `first_mut()` is always `Some`. The `if let` (rather than
-  // `dst[0]`) is what keeps the `indexing_slicing` deny satisfied.
-  if let Some(first) = dst.first_mut() {
-    *first |= tag << 6;
-  }
-  Ok(n)
 }
 
 /// Decodes a varint from the front of `input`: (bytes consumed, value).
 #[inline]
 pub fn decode(input: &[u8]) -> Result<(usize, u64), VarintError> {
   let &first = input.first().ok_or(TruncatedDetail::new(1))?;
-  let n = 1usize << (first >> 6);
-  // `first` was already read, so `input.len() >= 1`; this slice only fails when
-  // `input.len() < n`, hence `n - input.len()` never underflows. `saturating_sub`
-  // is used purely to satisfy the `arithmetic_side_effects` deny.
-  let bytes = input
-    .get(..n)
-    .ok_or(TruncatedDetail::new(n.saturating_sub(input.len())))?;
-  // Build value via a fixed 8-byte array to avoid arithmetic_side_effects lint
-  // from the shift-accumulate approach. We zero-pad `bytes` into the high end
-  // of a u64 big-endian buffer, mask the two tag bits, then read with
-  // from_be_bytes — no shifts, no arithmetic in production code.
-  //
-  // n ∈ {1, 2, 4, 8}, so offset = 8 - n ∈ {0, 4, 6, 7}: always in range.
-  let mut arr = [0u8; 8];
-  let offset = 8usize.wrapping_sub(n);
-  if let Some(dest) = arr.get_mut(offset..) {
-    dest.iter_mut().zip(bytes.iter()).for_each(|(d, s)| *d = *s);
+  match first >> 6 {
+    0 => Ok((1, u64::from(first & 0x3f))),
+    1 => {
+      let [b0, b1] = input_array::<2>(input)?;
+      Ok((2, u64::from(u16::from_be_bytes([b0 & 0x3f, b1]))))
+    }
+    2 => {
+      let [b0, b1, b2, b3] = input_array::<4>(input)?;
+      Ok((4, u64::from(u32::from_be_bytes([b0 & 0x3f, b1, b2, b3]))))
+    }
+    _ => {
+      let [b0, b1, b2, b3, b4, b5, b6, b7] = input_array::<8>(input)?;
+      Ok((
+        8,
+        u64::from_be_bytes([b0 & 0x3f, b1, b2, b3, b4, b5, b6, b7]),
+      ))
+    }
   }
-  // Clear the 2-bit length tag from the most-significant byte of the value.
-  if let Some(b) = arr.get_mut(offset) {
-    *b &= 0x3f;
-  }
-  let value = u64::from_be_bytes(arr);
-  Ok((n, value))
+}
+
+#[inline]
+fn out_prefix<const N: usize>(out: &mut [u8]) -> Result<&mut [u8], VarintError> {
+  let out_len = out.len();
+  out
+    .get_mut(..N)
+    .ok_or_else(|| VarintError::Buffer(BufferTooSmallDetail::new(N, out_len)))
+}
+
+#[inline]
+fn input_array<const N: usize>(input: &[u8]) -> Result<[u8; N], VarintError> {
+  let needed = N.saturating_sub(input.len());
+  let bytes = input.get(..N).ok_or(TruncatedDetail::new(needed))?;
+  <[u8; N]>::try_from(bytes).map_err(|_| VarintError::Truncated(TruncatedDetail::new(needed)))
 }
 
 #[cfg(test)]

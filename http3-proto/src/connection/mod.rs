@@ -45,6 +45,7 @@ mod queue;
 
 use core::marker::PhantomData;
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use queue::{BoundedQueue, TX_CAP, TxError, TxRing};
 
 use crate::{
@@ -55,9 +56,12 @@ use crate::{
   headers::Headers,
   qpack,
   settings::Settings,
-  stream::{Advanced, RequestStream, StreamItem},
+  stream::{Advanced, RequestStream},
   varint,
 };
+
+pub use crate::stream::DefaultReqBuf;
+pub use queue::{DefaultEventBuf, DefaultTxBuf};
 
 mod sealed {
   pub trait Sealed {}
@@ -105,7 +109,40 @@ const STREAM_TYPE_QPACK_DEC: u64 = 0x03;
 /// too big"), never [`H3Error::FrameError`] (which would mean "malformed") and
 /// never a panic. Decoding still uses [`Settings::decode_payload`] over the
 /// buffered payload.
-const CTRL_CAP: usize = 1024;
+pub const CTRL_CAP: usize = 1024;
+
+/// Bytes available to one queued transmit.
+///
+/// The public alias of the internal `queue::TX_CAP`.
+pub const TX_SLOT_CAP: usize = queue::TX_CAP;
+
+/// Total byte storage needed by the default transmit ring.
+pub const TX_BYTES_CAP: usize = queue::TX_BYTES_CAP;
+
+/// Lifecycle-event queue slots needed by the default connection.
+///
+/// The public alias of the internal `queue::EVENT_CAP`.
+pub const EVENT_QUEUE_CAP: usize = queue::EVENT_CAP;
+
+/// Default control-stream SETTINGS payload storage.
+///
+/// With `std` or `alloc`, the default connection stores this in a heap-backed
+/// `Vec<u8>` so the default owned `Connection` stays small.
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub type DefaultCtrlBuf<'a> = std::vec::Vec<u8>;
+
+/// Default control-stream SETTINGS payload storage.
+///
+/// With no allocator available, the default is borrowed caller-owned storage so
+/// borrowed connections stay small. Construct it with
+/// [`Connection::with_buffers`].
+#[cfg(not(any(feature = "std", feature = "alloc")))]
+pub type DefaultCtrlBuf<'a> = &'a mut [u8];
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn default_ctrl_buf() -> DefaultCtrlBuf<'static> {
+  std::vec![0u8; CTRL_CAP]
+}
 
 /// The largest a frame header (type varint + length varint) can be: two 8-byte
 /// QUIC varints. Mirrors the request FSM's bound.
@@ -114,7 +151,9 @@ const CTRL_HDR_CAP: usize = 16;
 /// A decoded frame yielded by [`Frames`]: the peer's CONNECT HEADERS or a chunk
 /// of tunnel DATA. Borrows the `handle_stream` scratch/input and is invalidated
 /// by the next [`Frames::next`].
-#[derive(derive_more::IsVariant)]
+#[derive(IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum Frame<'a> {
   /// The peer's request HEADERS (server side): the CONNECT field section.
@@ -151,8 +190,14 @@ pub enum Frame<'a> {
 /// [`Event::ConnError`] is delivered by [`poll_event`](Connection::poll_event)). This
 /// is the yield-path twin of the drop path's `drain_for_errors` `is_failed()` top guard
 /// (next/drain parity).
-pub struct Frames<'a> {
-  inner: Option<RequestFrames<'a>>,
+pub struct Frames<
+  'a,
+  'req,
+  'event,
+  ReqBuf = DefaultReqBuf<'req>,
+  EventBuf = DefaultEventBuf<'event>,
+> {
+  inner: Option<RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf>>,
 }
 
 /// The request-stream branch of [`Frames`]: wraps the inbound [`RequestStream`]
@@ -167,10 +212,7 @@ pub struct Frames<'a> {
 /// - the handshake-readiness transition the moment [`Frames::next`] YIELDS the
 ///   first HEADERS to the driver — the client's `Handshaking → Open` establish
 ///   ([`Phase::establish_into`]) / the server's `request_received` — via
-///   [`on_headers_decoded`]. Readiness is gated on the driver OBSERVING the HEADERS
-///   (the yield), NOT merely on the FSM decoding it: the drop-drain decodes the same
-///   HEADERS but does not grant readiness, so a [`Frames`] dropped before any
-///   `next()` cannot let the driver accept / use a request/response it never saw, and
+///   [`on_headers_decoded`] (gated on OBSERVATION, not decoding), and
 /// - the `{anything but Failed} → Failed` fail on ANY fatal request-FSM error
 ///   ([`Phase::fail_into`], recording the terminal error in the non-droppable
 ///   `conn_error` slot), so a lazily-surfaced protocol violation (a second
@@ -185,20 +227,20 @@ pub struct Frames<'a> {
 /// fatal-path invariant true for ALL supplied bytes — not just fully-drained
 /// iterators — `Drop` drives the request FSM over any remaining unconsumed input
 /// purely to detect such an error, discarding the items, and routes the first error
-/// through the same [`Phase::fail_into`]. The drop path STRUCTURALLY decodes and
-/// validates the first HEADERS too (so a malformed section is still fatal), but does
-/// NOT run the readiness transition — that fires only on a real `next()` yield, so a
-/// dropped-before-pull iterator advances nothing the driver did not observe. It is a
-/// no-op when the connection is already terminal (a drained-to-error or closed/reset
-/// connection) so a post-error FSM is never re-driven.
+/// through the same [`Phase::fail_into`]. The drop path validates (structurally
+/// decodes the first HEADERS, so a malformed section is still fatal) but grants NO
+/// readiness, and is a no-op when the connection is already terminal so a post-error
+/// FSM is never re-driven. See the observation-gating section on [`Connection`] for
+/// the full validation-vs-observation invariant.
 ///
 /// [`on_headers_decoded`]: RequestFrames::on_headers_decoded
-struct RequestFrames<'a> {
-  items: crate::stream::Items<'a>,
+struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
+  drain_on_drop: fn(&mut RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf>),
+  items: crate::stream::Items<'a, 'req, ReqBuf>,
   /// A disjoint borrow of the connection's lifecycle phase (see the struct docs).
   phase: &'a mut Phase,
   /// A disjoint borrow of the connection's event queue (see the struct docs).
-  events: &'a mut BoundedQueue<Event, 8>,
+  events: &'a mut BoundedQueue<'event, Event, EventBuf>,
   /// A disjoint borrow of the connection's `close_pending` flag. The fail
   /// transition clears it so a `Failed` connection never flushes a deferred
   /// graceful FIN — the same invariant that [`Connection::fail`] maintains on
@@ -248,12 +290,18 @@ struct RequestFrames<'a> {
   tunnel_established: &'a mut bool,
 }
 
-impl Frames<'_> {
+impl<ReqBuf, EventBuf> Frames<'_, '_, '_, ReqBuf, EventBuf> {
   /// An empty frame iterator (non-request streams produce no frames).
   const fn empty() -> Self {
     Self { inner: None }
   }
+}
 
+impl<ReqBuf, EventBuf> Frames<'_, '_, '_, ReqBuf, EventBuf>
+where
+  ReqBuf: AsRef<[u8]> + AsMut<[u8]>,
+  EventBuf: AsMut<[Option<Event>]>,
+{
   /// The next decoded frame, or `Ok(None)` when the fed bytes are exhausted.
   ///
   /// The returned [`Frame`] borrows the `handle_stream` input (`Data`) or its
@@ -322,7 +370,7 @@ impl Frames<'_> {
           // malformed message (RFC 9114 §4.1.2): the shared `fail_if_premature_data`
           // routes it through the centralized fail transition exactly like the lazy
           // request-FSM error above, then we return the code so the driver learns it.
-          if RequestFrames::fail_if_premature_data(
+          if RequestFrames::<ReqBuf, EventBuf>::fail_if_premature_data(
             *rf.tunnel_established,
             rf.phase,
             rf.close_pending,
@@ -356,7 +404,7 @@ impl Frames<'_> {
     // decodes/validates the same HEADERS but does NOT run this, so an iterator dropped
     // before any `next()` never advances the handshake on a request/response the driver
     // never observed.
-    RequestFrames::on_headers_decoded(
+    RequestFrames::<ReqBuf, EventBuf>::on_headers_decoded(
       &mut rf.establish_on_response,
       &mut rf.on_first_request,
       rf.phase,
@@ -373,20 +421,14 @@ impl Frames<'_> {
   }
 }
 
-impl RequestFrames<'_> {
+impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   /// The handshake-READINESS side effect of the driver OBSERVING the first request
   /// HEADERS, run the moment [`Frames::next`] YIELDS the first
   /// [`Frame::Request`] / [`Frame::Response`] to the driver — and ONLY then. This is
   /// deliberately NOT run from the drop-drain
-  /// ([`drain_for_errors`](Self::drain_for_errors)): readiness is gated on the driver
-  /// observing the HEADERS, not merely on the FSM decoding it. The crate's contract
-  /// requires the application to observe and validate the peer's CONNECT request /
-  /// response before accepting or using the tunnel, so a [`Frames`] iterator dropped
-  /// before any `next()` (the HEADERS never surfaced) must NOT advance the handshake —
-  /// otherwise a server could `accept_with` a CONNECT the driver never saw, or a
-  /// client become `Established` on a response it never validated. The drop path still
-  /// structurally decodes/validates that HEADERS (so a malformed section stays fatal),
-  /// it just does not run this.
+  /// ([`drain_for_errors`](Self::drain_for_errors)): it is the SOLE place readiness is
+  /// granted, so this method is what makes readiness gate on observation, not decoding.
+  /// See the observation-gating section on [`Connection`] for why.
   ///
   /// - Server: flip `request_received` (the gate [`accept_with`](Connection::accept_with)
   ///   waits on — the [`Frame::Request`] yield is itself the signal, there is no
@@ -404,10 +446,12 @@ impl RequestFrames<'_> {
     establish_on_response: &mut bool,
     on_first_request: &mut Option<&mut bool>,
     phase: &mut Phase,
-    events: &mut BoundedQueue<Event, 8>,
+    events: &mut BoundedQueue<'_, Event, EventBuf>,
     tunnel_established: &mut bool,
     is_client: bool,
-  ) {
+  ) where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     if is_client {
       // The client tunnel is established at the first *yielded* response HEADERS
       // (this runs only from the `Frames::next` yield, not on entry and not from the
@@ -450,9 +494,12 @@ impl RequestFrames<'_> {
     tunnel_established: bool,
     phase: &mut Phase,
     close_pending: &mut bool,
-    events: &mut BoundedQueue<Event, 8>,
+    events: &mut BoundedQueue<'_, Event, EventBuf>,
     conn_error: &mut Option<H3Error>,
-  ) -> bool {
+  ) -> bool
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     if tunnel_established {
       return false;
     }
@@ -465,7 +512,13 @@ impl RequestFrames<'_> {
     );
     true
   }
+}
 
+impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf>
+where
+  ReqBuf: AsMut<[u8]>,
+  EventBuf: AsMut<[Option<Event>]>,
+{
   /// Drives the request FSM over any input the driver did not consume, purely to
   /// detect a protocol violation, and routes the first one through the centralized
   /// fail transition. The yielded items are discarded (the driver chose not to read
@@ -483,12 +536,8 @@ impl RequestFrames<'_> {
   /// every later frame for a trailing forbidden/fatal one — that trailing-fatal
   /// detection is the whole reason the drop drain exists. It does NOT run the
   /// handshake-READINESS side effects ([`on_headers_decoded`](Self::on_headers_decoded)):
-  /// readiness (the server's `request_received`, the client's `establish` + the
-  /// [`Event::Established`]) is granted only when [`Frames::next`] actually YIELDS the
-  /// first HEADERS to the driver — the observation point. A driver that drops [`Frames`]
-  /// before ever calling `next()` has not observed the peer's CONNECT request /
-  /// response, so it must not be able to `accept_with` it or become `Established` on
-  /// it; only the structural validation (and the fatal-frame scan) runs here.
+  /// validating bytes is not observing them, so a dropped-before-pull iterator grants
+  /// no readiness. See the observation-gating section on [`Connection`].
   ///
   /// This is sync + infallible from the caller's view: it swallows the items and
   /// stops at the first error after calling [`Phase::fail_into`] (idempotent). It is
@@ -511,7 +560,7 @@ impl RequestFrames<'_> {
       return;
     }
     loop {
-      match self.items.next() {
+      match self.items.advance() {
         // No protocol error in the remaining bytes: every supplied byte is now
         // validated. Discarding the items is intentional (the driver abandoned them).
         Ok(None) => return,
@@ -539,7 +588,7 @@ impl RequestFrames<'_> {
         // DATA is premature (RFC 9114 §4.4) and `fail`s the connection. That §4.4
         // violation by the peer SUPERSEDES mere abandonment (exactly as a trailing
         // forbidden frame already supersedes it).
-        Ok(Some(StreamItem::Headers(_))) => {
+        Ok(Some(Advanced::Headers { .. })) => {
           *self.request_abandoned = true;
         }
         // A DATA frame on the drop path passes the SAME establishment gate as
@@ -555,8 +604,8 @@ impl RequestFrames<'_> {
         // `request_abandoned` above. Both empty and non-empty DATA items reach this
         // gate (the FSM yields empty occurrences too). Established DATA is discarded
         // (the driver abandoned it) and the scan continues.
-        Ok(Some(StreamItem::Data(_))) => {
-          if RequestFrames::fail_if_premature_data(
+        Ok(Some(Advanced::Data { .. })) => {
+          if RequestFrames::<ReqBuf, EventBuf>::fail_if_premature_data(
             *self.tunnel_established,
             self.phase,
             self.close_pending,
@@ -584,7 +633,7 @@ impl RequestFrames<'_> {
   }
 }
 
-impl Drop for RequestFrames<'_> {
+impl<ReqBuf, EventBuf> Drop for RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   /// Validates every byte handed to [`handle_stream`](Connection::handle_stream)
   /// for the request stream even when the returned iterator is not fully drained:
   /// an early-stopping driver still gets the remaining input checked for protocol
@@ -592,7 +641,7 @@ impl Drop for RequestFrames<'_> {
   /// panics; the drain just discards items and `fail`s on the first error. A normal
   /// full drain leaves nothing here, so this is a no-op on the common path.
   fn drop(&mut self) {
-    self.drain_for_errors();
+    (self.drain_on_drop)(self);
   }
 }
 
@@ -653,6 +702,45 @@ struct UniEntry {
 /// critical stream.
 const UNI_CAP: usize = 16;
 
+/// Slots needed by the default inbound unidirectional-stream tracking table.
+pub const UNI_TRACKING_CAP: usize = UNI_CAP;
+
+/// One caller-provided storage slot for inbound unidirectional-stream tracking.
+///
+/// The contents are intentionally opaque: the connection stores private parser
+/// state here while classifying peer-opened unidirectional streams. Use
+/// [`UniSlot::EMPTY`] to initialize borrowed storage for
+/// [`Connection::with_buffers`].
+#[derive(Clone, Copy)]
+pub struct UniSlot {
+  entry: Option<UniEntry>,
+}
+
+impl UniSlot {
+  /// An empty inbound-uni tracking slot.
+  pub const EMPTY: Self = Self { entry: None };
+}
+
+/// Default inbound-uni tracking storage.
+///
+/// With `std` or `alloc`, the default connection stores this in a heap-backed
+/// `Vec` so the default owned `Connection` stays small.
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub type DefaultUniBuf<'a> = std::vec::Vec<UniSlot>;
+
+/// Default inbound-uni tracking storage.
+///
+/// With no allocator available, the default is borrowed caller-owned storage so
+/// borrowed connections stay small. Construct it with
+/// [`Connection::with_buffers`].
+#[cfg(not(any(feature = "std", feature = "alloc")))]
+pub type DefaultUniBuf<'a> = &'a mut [UniSlot];
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn default_uni_buf() -> DefaultUniBuf<'static> {
+  std::vec![UniSlot::EMPTY; UNI_CAP]
+}
+
 /// The frame currently being consumed on the peer control stream (after its
 /// header has been parsed).
 enum CtrlCur {
@@ -681,26 +769,29 @@ enum CtrlCur {
 /// - GREASE / unknown frames → skipped.
 ///
 /// Bounded and no-alloc: a frame header buffers in `hdr_buf` and the SETTINGS
-/// payload in `payload` (both fixed-size). An oversize frame header is a graceful
-/// [`H3Error::FrameError`]; a SETTINGS payload over the generous [`CTRL_CAP`]
-/// bound is [`H3Error::ExcessiveLoad`] (an excessive-load policy). Neither panics.
-struct ControlState {
+/// payload in `payload`. An oversize frame header is a graceful
+/// [`H3Error::FrameError`]; a SETTINGS payload over the configured buffer
+/// capacity is [`H3Error::ExcessiveLoad`] (an excessive-load policy). Neither
+/// panics. The default payload storage follows [`DefaultCtrlBuf`].
+struct ControlState<'a, B = DefaultCtrlBuf<'a>> {
   settings_seen: bool,
   cur: CtrlCur,
   hdr_buf: [u8; CTRL_HDR_CAP],
   hdr_len: usize,
-  payload: [u8; CTRL_CAP],
+  payload: B,
+  _storage: PhantomData<&'a mut ()>,
 }
 
-impl ControlState {
-  /// A fresh parser expecting the SETTINGS frame first.
-  const fn new() -> Self {
+impl<B> ControlState<'_, B> {
+  /// A fresh parser backed by caller-provided SETTINGS payload storage.
+  fn with_buffer(payload: B) -> Self {
     Self {
       settings_seen: false,
       cur: CtrlCur::None,
       hdr_buf: [0u8; CTRL_HDR_CAP],
       hdr_len: 0,
-      payload: [0u8; CTRL_CAP],
+      payload,
+      _storage: PhantomData,
     }
   }
 
@@ -712,7 +803,10 @@ impl ControlState {
   /// `is_client` selects the role-dependent frame-placement policy (RFC 9114
   /// §7.2): a client rejects `MAX_PUSH_ID` (it is client→server only), a server
   /// accepts-and-skips it.
-  fn feed(&mut self, is_client: bool, bytes: &[u8]) -> Result<Option<Settings>, H3Error> {
+  fn feed(&mut self, is_client: bool, bytes: &[u8]) -> Result<Option<Settings>, H3Error>
+  where
+    B: AsMut<[u8]>,
+  {
     let mut pos = 0usize;
     let mut decoded = None;
     loop {
@@ -722,13 +816,13 @@ impl ControlState {
           Some(hdr) => self.begin_frame(is_client, hdr)?,
         },
         CtrlCur::Settings { remaining, acc } => {
-          match Self::take_into(self.payload.as_mut_slice(), acc, remaining, bytes, &mut pos)? {
+          match Self::take_into(self.payload.as_mut(), acc, remaining, bytes, &mut pos)? {
             FramePart::More { remaining, acc } => {
               self.cur = CtrlCur::Settings { remaining, acc };
               return Ok(decoded);
             }
             FramePart::Done { acc } => {
-              let payload = self.payload.get(..acc).unwrap_or(&[]);
+              let payload = self.payload.as_mut().get(..acc).unwrap_or(&[]);
               let settings =
                 Settings::decode_payload(payload).map_err(|_| H3Error::SettingsError)?;
               decoded = Some(settings);
@@ -783,7 +877,10 @@ impl ControlState {
   /// Applies the control-stream frame-placement policy to a freshly decoded
   /// header and arms `cur` to consume its payload. `is_client` selects the
   /// role-dependent rules for the push-related frames (RFC 9114 §7.2).
-  fn begin_frame(&mut self, is_client: bool, hdr: frame::FrameHeader) -> Result<(), H3Error> {
+  fn begin_frame(&mut self, is_client: bool, hdr: frame::FrameHeader) -> Result<(), H3Error>
+  where
+    B: AsMut<[u8]>,
+  {
     match hdr.kind() {
       frame::FrameKind::Settings => {
         if self.settings_seen {
@@ -792,9 +889,9 @@ impl ControlState {
         }
         self.settings_seen = true;
         let remaining = hdr.length();
-        if usize::try_from(remaining).map_err(|_| H3Error::ExcessiveLoad)? > CTRL_CAP {
-          // The SETTINGS payload buffer is generous (it holds many settings plus
-          // GREASE), so a payload over even this bound is implausibly large: an
+        let cap = self.payload.as_mut().len().min(CTRL_CAP);
+        if usize::try_from(remaining).map_err(|_| H3Error::ExcessiveLoad)? > cap {
+          // The SETTINGS payload exceeded the configured memory bound: an
           // excessive-load policy, not a malformed-frame error.
           return Err(H3Error::ExcessiveLoad);
         }
@@ -938,11 +1035,13 @@ impl Phase {
   /// half-close): the phase moves on but the tunnel was, in fact, established. It
   /// gates [`Frames::next`] yielding [`Frame::Data`] (DATA only after the CONNECT
   /// exchange completes, RFC 9114 §4.4).
-  fn establish_into(
+  fn establish_into<EventBuf>(
     phase: &mut Self,
-    events: &mut BoundedQueue<Event, 8>,
+    events: &mut BoundedQueue<'_, Event, EventBuf>,
     tunnel_established: &mut bool,
-  ) {
+  ) where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     if phase.is_handshaking() {
       *phase = Self::Open;
       *tunnel_established = true;
@@ -975,13 +1074,15 @@ impl Phase {
   /// Idempotent and exactly-once: a no-op when already `Failed`, and the FIRST fatal
   /// error wins the slot (a second fatal condition neither overwrites it nor
   /// re-records a duplicate).
-  fn fail_into(
+  fn fail_into<EventBuf>(
     phase: &mut Self,
     close_pending: &mut bool,
-    events: &mut BoundedQueue<Event, 8>,
+    events: &mut BoundedQueue<'_, Event, EventBuf>,
     conn_error: &mut Option<H3Error>,
     error: H3Error,
-  ) {
+  ) where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     if phase.is_failed() {
       return;
     }
@@ -1079,7 +1180,11 @@ enum SendGuard<T> {
 /// / DATA frame (RFC 8441 §3 / RFC 9114 §6.2.1). In practice the peer's SETTINGS
 /// cannot arrive before our own [`start`](Self::start), so it only fires on misuse.
 ///
-/// ## Handshake readiness is granted on OBSERVATION, not on bytes
+/// ## The observation-gating invariant (readiness on OBSERVATION, not on bytes)
+///
+/// This section is the single canonical statement of the observation-gating
+/// invariant; the `Frames` / `handle_stream` / drain APIs each restate only their
+/// local specifics and cross-reference back here.
 ///
 /// The CONNECT-HEADERS readiness the table gates on — the server's `request_received`
 /// (which unblocks [`accept_with`](Self::accept_with)) and the client's
@@ -1180,7 +1285,7 @@ enum SendGuard<T> {
 /// | [`Frames::next`] (a live request iterator) | fused: `Ok(None)` (a lazy fatal error inside THIS iterator already routed through the fail transition; no `Frame` surfaces past the terminal `ConnError`) — parity with the drop path's `drain_for_errors` | yields normally (the close is not terminal) |
 /// | [`handle_stream_fin`](Self::handle_stream_fin) | no-op (no `PeerClosed`, no second `ConnError`) | processes; a clean request FIN is `PeerClosed` (idempotent — at most once) |
 /// | [`handle_stream_reset`](Self::handle_stream_reset) | no-op (no `Reset` after the fatal `ConnError`) | no-op (already terminal; `Reset` enqueued at most once) |
-/// | [`provide_stream`](Self::provide_stream) | no-op (binds no id, mints no request FSM) | binds (a deferred close FIN may target a late request stream) |
+/// | [`provide_stream`](Self::provide_stream) | no-op (binds no id) | binds (a deferred close FIN may target a late request stream) |
 /// | [`poll_transmit`](Self::poll_transmit) | no-op: emits nothing (no stale queued bytes, no graceful FIN) | drains; retries the deferred close FIN |
 /// | [`poll_event`](Self::poll_event) | yields EXACTLY the terminal `ConnError` (first, once), then `None` | delivers queued events |
 ///
@@ -1202,10 +1307,22 @@ enum SendGuard<T> {
 /// [`poll_transmit`](Self::poll_transmit) (also retries a deferred close FIN),
 /// [`poll_event`](Self::poll_event), [`peer_settings`](Self::peer_settings), and
 /// [`is_established`](Self::is_established).
-pub struct Connection<Ro> {
+pub struct Connection<
+  'req,
+  'ctrl,
+  'tx,
+  'event,
+  'uni,
+  Ro,
+  ReqBuf = DefaultReqBuf<'req>,
+  CtrlBuf = DefaultCtrlBuf<'ctrl>,
+  TxBuf = DefaultTxBuf<'tx>,
+  EventBuf = DefaultEventBuf<'event>,
+  UniBuf = DefaultUniBuf<'uni>,
+> {
   settings_local: Settings,
   settings_peer: Option<Settings>,
-  request: Option<RequestStream>,
+  request: RequestStream<'req, ReqBuf>,
   request_id: Option<StreamId>,
   /// Role → stream id for the streams *we* open (outbound uni streams) and the
   /// bidirectional request stream; index by [`StreamRole::index`]. Inbound uni
@@ -1215,7 +1332,7 @@ pub struct Connection<Ro> {
   /// role-aware policy for the push frames; GOAWAY / GREASE skipped; DATA /
   /// HEADERS / PUSH_PROMISE / reserved / duplicate SETTINGS rejected). See
   /// [`ControlState`].
-  ctrl: ControlState,
+  ctrl: ControlState<'ctrl, CtrlBuf>,
   /// Every inbound (peer-opened) uni stream we are tracking, by id → state.
   /// Bounded at [`UNI_CAP`]; a stream occupies a slot from its first byte
   /// (`Pending`, while its type varint is mid-parse) through classification: a
@@ -1225,9 +1342,9 @@ pub struct Connection<Ro> {
   /// [`H3Error::ExcessiveLoad`] rather than a silent drop — so a flood of partial
   /// or GREASE streams cannot saturate the table and then hide the peer's real
   /// control stream.
-  uni: [Option<UniEntry>; UNI_CAP],
-  events: BoundedQueue<Event, 8>,
-  tx: TxRing,
+  uni: UniBuf,
+  events: BoundedQueue<'event, Event, EventBuf>,
+  tx: TxRing<'tx, TxBuf>,
   /// The single lifecycle state (see [`Phase`]). Every public operation's
   /// preconditions are derived from this, and it changes ONLY through the
   /// centralized transitions ([`start`](Self::start) / [`establish`](Self::establish)
@@ -1294,38 +1411,19 @@ pub struct Connection<Ro> {
   /// Set when a [`Frames`] iterator is dropped before any [`Frames::next`] over an
   /// input whose first HEADERS the drop-drain decoded UNOBSERVED. Decoding the first
   /// HEADERS advances the inbound [`RequestStream`] FSM into its tunnel phase as a
-  /// side effect ([`stream::Items::next`](crate::stream::Items::next)), and the
-  /// drop-drain ([`RequestFrames::drain_for_errors`]) drives that same FSM — so the
-  /// FSM can sit in `Tunnel` even though the driver never OBSERVED (yielded via
-  /// `next()`) the CONNECT request / response. The consumed HEADERS bytes are gone
-  /// with the per-call input, so the stream can never be observed afterwards: it is
-  /// permanently inert TO THE DRIVER. This flag models that. The request stream then
-  /// never surfaces tunnel data and never grants readiness, but — because abandonment
-  /// is NOT terminal — it is still VALIDATED: only a `Failed` connection bypasses the
-  /// FSM/gate entirely. So an abandoned stream's later input is driven through the
-  /// VALIDATION-ONLY path:
+  /// side effect ([`stream::Items::next`](crate::stream::Items::next)), so the FSM can
+  /// sit in `Tunnel` even though the driver never OBSERVED the CONNECT request /
+  /// response; the consumed HEADERS bytes are gone with the per-call input, so the
+  /// stream can never be observed afterwards. This flag models that permanently-inert-
+  /// to-the-driver state: the request stream then surfaces no tunnel data and grants no
+  /// readiness, yet — because abandonment is NOT terminal — its later bytes / FIN are
+  /// still driven through the validation-only path (only a `Failed` connection bypasses
+  /// the FSM/gate). See the dropped-unobserved subsection of the observation-gating
+  /// section on [`Connection`] for the full per-method behavior and rationale.
   ///
-  /// - [`handle_stream`](Self::handle_stream) runs
-  ///   [`drain_request_abandoned`](Self::drain_request_abandoned) — the FSM is re-driven
-  ///   through [`RequestFrames::drain_for_errors`] (the same premature-DATA gate and FSM
-  ///   error checks as the normal path), surfacing an empty [`Frames`] (no `Frame::Data`
-  ///   from a tunnel the driver never established). A clean read leaves the connection
-  ///   non-terminal; premature DATA on the never-established tunnel is
-  ///   [`H3Error::MessageError`] (RFC 9114 §4.4) and a forbidden frame is its FSM error,
-  ///   either of which fails the connection.
-  /// - [`handle_stream_fin`](Self::handle_stream_fin) drives [`RequestStream::fin`]: a
-  ///   clean FIN surfaces NO [`Event::PeerClosed`] (the tunnel was never observed /
-  ///   established) and stays non-terminal, while a malformed / mid-frame FIN
-  ///   ([`H3Error::FrameError`] / [`H3Error::RequestIncomplete`]) fails the connection.
-  ///
-  /// Abandonment ITSELF is not a connection failure: a lazy driver dropping an iterator
-  /// is not a protocol violation — readiness simply stays ungranted (server
-  /// [`accept_with`](Self::accept_with) keeps returning [`Error::WouldBlock`], the client
-  /// never becomes `Established`), the correct consequence of not observing. The peer's
-  /// protocol violations on the abandoned stream are still its own faults and still fail
-  /// the connection. A data marker, not a phase; never set on a connection whose first
-  /// HEADERS were observed (an observed HEADERS leaves the FSM in `Tunnel` so the drain
-  /// can never re-decode a HEADERS to set this).
+  /// A data marker, not a phase; never set on a connection whose first HEADERS were
+  /// observed (an observed HEADERS leaves the FSM in `Tunnel` so the drain can never
+  /// re-decode a HEADERS to set this).
   request_abandoned: bool,
   /// The terminal connection error, recorded by [`fail`](Self::fail) /
   /// [`Phase::fail_into`] when the `Failed` transition happens (the FIRST fatal
@@ -1339,20 +1437,75 @@ pub struct Connection<Ro> {
   /// queue, so no stale graceful event precedes the terminal `ConnError`.
   conn_error: Option<H3Error>,
   _ro: PhantomData<fn() -> Ro>,
+  _storage: PhantomData<(
+    &'req mut (),
+    &'ctrl mut (),
+    &'tx mut (),
+    &'event mut (),
+    &'uni mut (),
+  )>,
 }
 
-impl<Ro: Role> Default for Connection<Ro> {
-  fn default() -> Self {
-    Self::new()
-  }
-}
+/// A connection backed by borrowed byte buffers.
+///
+/// This is the no-alloc, small-value form: callers own the request HEADERS
+/// accumulator, control-stream payload buffer, transmit-ring byte storage,
+/// event slots, and inbound-uni tracking slots. Each storage class has its own
+/// lifetime parameter so the buffers do not have to come from the same owner.
+pub type BorrowedConnection<'req, 'ctrl, 'tx, 'event, 'uni, Ro> = Connection<
+  'req,
+  'ctrl,
+  'tx,
+  'event,
+  'uni,
+  Ro,
+  &'req mut [u8],
+  &'ctrl mut [u8],
+  &'tx mut [u8],
+  &'event mut [Option<Event>],
+  &'uni mut [UniSlot],
+>;
 
-impl<Ro: Role> Connection<Ro> {
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<Ro: Role> Connection<'static, 'static, 'static, 'static, 'static, Ro> {
   /// A fresh connection in the role `Ro`, with our local settings selected and
   /// all queues empty. Nothing is sent until [`start`](Self::start) (both roles);
   /// the client then sends its CONNECT request with
   /// [`open_with`](Connection::open_with) once the peer's SETTINGS arrive.
+  ///
+  /// No `Default` is implemented: in the bare no-alloc tier the default storage
+  /// is borrowed slices, so there is no honest feature-independent default
+  /// connection value.
+  #[allow(clippy::new_without_default)]
   pub fn new() -> Self {
+    Self::with_buffers(
+      crate::stream::default_req_buf(),
+      default_ctrl_buf(),
+      queue::default_tx_buf(),
+      queue::default_event_buf(),
+      default_uni_buf(),
+    )
+  }
+}
+
+impl<Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+  Connection<'_, '_, '_, '_, '_, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+where
+  Ro: Role,
+{
+  /// A fresh connection backed by caller-provided storage buffers.
+  ///
+  /// This constructor is the no-alloc, small-`Connection` alternative to
+  /// [`new`](Connection::new): put the buffers wherever your application wants
+  /// (arena, static storage, stack, or an allocator outside this crate) and the
+  /// connection value itself stores only the buffer handles.
+  pub fn with_buffers(
+    request_headers: ReqBuf,
+    control_payload: CtrlBuf,
+    tx_bytes: TxBuf,
+    event_slots: EventBuf,
+    uni_slots: UniBuf,
+  ) -> Self {
     let settings_local = if Ro::IS_CLIENT {
       Settings::for_client()
     } else {
@@ -1361,13 +1514,13 @@ impl<Ro: Role> Connection<Ro> {
     Self {
       settings_local,
       settings_peer: None,
-      request: None,
+      request: RequestStream::with_buffer(request_headers),
       request_id: None,
       roles: [None; ROLE_COUNT],
-      ctrl: ControlState::new(),
-      uni: [None; UNI_CAP],
-      events: BoundedQueue::new(),
-      tx: TxRing::new(),
+      ctrl: ControlState::with_buffer(control_payload),
+      uni: uni_slots,
+      events: BoundedQueue::with_buffer(event_slots),
+      tx: TxRing::with_buffer(tx_bytes),
       phase: Phase::Created,
       request_sent: false,
       request_received: false,
@@ -1378,6 +1531,7 @@ impl<Ro: Role> Connection<Ro> {
       request_abandoned: false,
       conn_error: None,
       _ro: PhantomData,
+      _storage: PhantomData,
     }
   }
 
@@ -1438,14 +1592,23 @@ impl<Ro: Role> Connection<Ro> {
   pub(crate) const fn is_close_pending(&self) -> bool {
     self.close_pending
   }
+}
 
+impl<'req, 'event, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+  Connection<'req, '_, '_, 'event, '_, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+where
+  Ro: Role,
+{
   // ── Centralized transitions: the ONLY places `self.phase` changes ────────────
 
   /// `Created → Handshaking`, transactionally enqueuing the three setup transmits
   /// (control+SETTINGS and the two idle QPACK streams). All-or-nothing on a full
   /// ring (see [`enqueue_setup`](Self::enqueue_setup)); on an empty ring it always
   /// fits. Idempotent no-op once past `Created`; `Err(Closed)` when terminal.
-  fn start_handshake(&mut self) -> Result<(), Error> {
+  fn start_handshake(&mut self) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+  {
     match self.phase {
       // The setup is enqueued exactly once; a repeat (in any non-terminal post-
       // setup phase) is a no-op so it never opens a duplicate control stream.
@@ -1479,7 +1642,10 @@ impl<Ro: Role> Connection<Ro> {
   /// `establish_into` was itself a no-op (not `Handshaking`): `tunnel_established`
   /// stays `false`, so `peer_fin_pending` could not have been set on this path, and
   /// even a stray flag is harmless because nothing established.
-  fn establish(&mut self) {
+  fn establish(&mut self)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     Phase::establish_into(
       &mut self.phase,
       &mut self.events,
@@ -1536,7 +1702,10 @@ impl<Ro: Role> Connection<Ro> {
   /// `Phase::Closing` as belt-and-suspenders. This matters when a local
   /// [`close`](Self::close) deferred its FIN under a full ring and a fatal error
   /// then arrives before the FIN flushed.
-  fn fail(&mut self, error: H3Error) {
+  fn fail(&mut self, error: H3Error)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     Phase::fail_into(
       &mut self.phase,
       &mut self.close_pending,
@@ -1550,7 +1719,8 @@ impl<Ro: Role> Connection<Ro> {
   /// stream it opens (after acting on an `OpenUni` / `OpenRequest` transmit) and
   /// for the inbound request stream the peer opens (server side).
   ///
-  /// For [`StreamRole::Request`] this also creates the inbound request FSM.
+  /// For [`StreamRole::Request`] this binds the preallocated inbound request FSM
+  /// to the driver's stream id.
   ///
   /// Binding a role is *write-once*: each role maps to exactly one stream id for
   /// the connection's lifetime. Re-providing the SAME `(role, id)` is an idempotent
@@ -1569,16 +1739,18 @@ impl<Ro: Role> Connection<Ro> {
   /// `request_id` unbound, so the later FIRST `provide_stream(Request, id)` is a
   /// first binding (not a different-id rebind) and still succeeds — the deferred
   /// close FIN then has its target id. By contrast, a `Failed` connection is
-  /// terminal, so `provide_stream` is a no-op there: it neither binds a new id nor
-  /// mints a request FSM (nothing usable could come of it after the terminal
-  /// `ConnError`).
-  pub fn provide_stream(&mut self, role: StreamRole, id: StreamId) {
-    // A `Failed` connection is terminal: registering a new stream id (or creating a
-    // request FSM) on it serves no purpose and must not happen — the driver should
-    // not be opening streams for a connection-fatal core. No-op so a late
-    // registration cannot resurrect bookkeeping (e.g. mint a fresh request FSM)
-    // after the terminal `ConnError`. (`Closing` still binds: a deferred close FIN
-    // may target a request stream the driver opens late — see the method docs.)
+  /// terminal, so `provide_stream` is a no-op there: it does not bind a new id
+  /// (nothing usable could come of it after the terminal `ConnError`).
+  pub fn provide_stream(&mut self, role: StreamRole, id: StreamId)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
+    // A `Failed` connection is terminal: registering a new stream id on it serves
+    // no purpose and must not happen — the driver should not be opening streams
+    // for a connection-fatal core. No-op so a late registration cannot resurrect
+    // bookkeeping after the terminal `ConnError`. (`Closing` still binds: a
+    // deferred close FIN may target a request stream the driver opens late — see
+    // the method docs.)
     if self.phase.is_failed() {
       return;
     }
@@ -1596,9 +1768,6 @@ impl<Ro: Role> Connection<Ro> {
     }
     if role.is_request() {
       self.request_id = Some(id);
-      if self.request.is_none() {
-        self.request = Some(RequestStream::new());
-      }
     }
   }
 
@@ -1613,9 +1782,12 @@ impl<Ro: Role> Connection<Ro> {
   /// `Created`, and a retry would emit a SECOND (partial) setup sequence, opening
   /// duplicate critical streams the peer rejects with `H3_STREAM_CREATION_ERROR`.
   /// The three enqueues below therefore cannot individually fail on a full ring.
-  fn enqueue_setup(&mut self) -> Result<(), Error> {
+  fn enqueue_setup(&mut self) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+  {
     const SETUP_TRANSMITS: usize = 3;
-    if !self.tx.has_capacity(SETUP_TRANSMITS) {
+    if !self.tx.has_capacity_mut(SETUP_TRANSMITS) {
       return Err(Error::WouldBlock);
     }
     let settings = self.settings_local;
@@ -1652,7 +1824,10 @@ impl<Ro: Role> Connection<Ro> {
   /// the first SETTINGS frame completes its payload is decoded and stored; the
   /// client then observes [`peer_settings`](Self::peer_settings) becoming `Some`
   /// and calls [`open_with`](Self::open_with) to send its CONNECT request.
-  fn handle_control(&mut self, bytes: &[u8]) -> Result<(), H3Error> {
+  fn handle_control(&mut self, bytes: &[u8]) -> Result<(), H3Error>
+  where
+    CtrlBuf: AsMut<[u8]>,
+  {
     if let Some(settings) = self.ctrl.feed(Ro::IS_CLIENT, bytes)? {
       self.settings_peer = Some(settings);
     }
@@ -1670,7 +1845,11 @@ impl<Ro: Role> Connection<Ro> {
     &'a mut self,
     bytes: &'a [u8],
     scratch: &'a mut [u8],
-  ) -> Result<Frames<'a>, H3Error> {
+  ) -> Result<Frames<'a, 'req, 'event, ReqBuf, EventBuf>, H3Error>
+  where
+    ReqBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     let is_client = Ro::IS_CLIENT;
     // Decide the role-specific first-HEADERS readiness side effects before the
     // request FSM is borrowed: the client runs the `establish` transition (phase +
@@ -1683,13 +1862,47 @@ impl<Ro: Role> Connection<Ro> {
     // inside the lending iterator over a disjoint borrow.
     let establish_on_response = is_client && self.phase.is_handshaking();
     let needs_request = !is_client && !self.request_received;
-    // Split-borrow the disjoint fields the iterator carries: `phase` + `events`
-    // + `close_pending` + `conn_error` (always present — they back BOTH the lazy
-    // establish AND the lazy fail routing, the latter recording the terminal error
-    // in the non-droppable `conn_error` slot), `tunnel_established` (the gate on
-    // yielding `Frame::Data`, set by the client establish carrier), and,
-    // server-side, `request_received`. All are distinct fields from the request FSM,
-    // so these borrows are disjoint from `self.request`.
+    Ok(Frames {
+      inner: Some(self.build_request_frames(bytes, scratch, establish_on_response, needs_request)),
+    })
+  }
+
+  /// Builds the [`RequestFrames`] carrier shared by the live drain
+  /// ([`handle_request`](Self::handle_request)) and the abandoned validation-only drain
+  /// ([`drain_request_abandoned`](Self::drain_request_abandoned)). All the disjoint
+  /// `self`-field splits the carrier holds live HERE, in one function body, so the
+  /// borrow checker can see they are distinct fields from `self.request` (the FSM the
+  /// iterator drives) — including the conditional `&mut self.request_received` borrow,
+  /// which an `on_first_request: Option<&mut bool>` PARAMETER could not express (the
+  /// caller would have to borrow that field while also passing `&mut self`, two
+  /// overlapping borrows). Passing the `needs_request` / `establish_on_response`
+  /// decisions as plain `bool`s instead keeps every field borrow inside this split.
+  ///
+  /// The carrier borrows: `phase` + `events` + `close_pending` + `conn_error` (always
+  /// present — they back BOTH the lazy establish AND the lazy fail routing, the latter
+  /// recording the terminal error in the non-droppable `conn_error` slot),
+  /// `request_abandoned`, `tunnel_established` (the gate on yielding [`Frame::Data`],
+  /// set by the client establish carrier), and, when `needs_request`, `request_received`.
+  ///
+  /// `establish_on_response` arms the client's `Handshaking → Open` establish on the
+  /// first OBSERVED response (`false` on the server / abandoned path); `needs_request`
+  /// arms the server's `request_received` flip on the first OBSERVED request (the
+  /// abandoned path passes `false` so neither carrier is armed). Both fire only from a
+  /// real [`Frames::next`] yield — never from the drop-drain.
+  fn build_request_frames<'a>(
+    &'a mut self,
+    bytes: &'a [u8],
+    scratch: &'a mut [u8],
+    establish_on_response: bool,
+    needs_request: bool,
+  ) -> RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf>
+  where
+    ReqBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
+  {
+    let is_client = Ro::IS_CLIENT;
+    // Split-borrow the disjoint fields the iterator carries. All are distinct fields
+    // from the request FSM (`self.request`), so these borrows are disjoint from it.
     let phase = &mut self.phase;
     let events = &mut self.events;
     let close_pending = &mut self.close_pending;
@@ -1697,63 +1910,11 @@ impl<Ro: Role> Connection<Ro> {
     let request_abandoned = &mut self.request_abandoned;
     let tunnel_established = &mut self.tunnel_established;
     let request_received = &mut self.request_received;
-    let Some(fsm) = self.request.as_mut() else {
-      // No request FSM for a registered request id is a protocol error. It is
-      // eager (returned here), so the `handle_stream` wrapper routes it through
-      // `fail`; the iterator-carried borrows are unused on this path.
-      return Err(H3Error::FrameUnexpected);
-    };
+    let fsm = &mut self.request;
     let on_first_request = needs_request.then_some(request_received);
     let items = fsm.handle(bytes, scratch);
-    Ok(Frames {
-      inner: Some(RequestFrames {
-        items,
-        phase,
-        events,
-        close_pending,
-        conn_error,
-        request_abandoned,
-        is_client,
-        establish_on_response,
-        on_first_request,
-        tunnel_established,
-      }),
-    })
-  }
-
-  /// Drives later request-stream `bytes` through the VALIDATION-ONLY path on an
-  /// already-abandoned (dropped-unobserved) request stream, surfacing nothing.
-  ///
-  /// An abandoned stream is permanently inert to the DRIVER (it can never observe the
-  /// CONNECT request / response, so it never establishes the tunnel), but it is NOT
-  /// terminal — so unlike a `Failed` connection it may not bypass the FSM/gate. The
-  /// peer can still commit protocol violations on it, and every one must still fail the
-  /// connection: this builds the same [`RequestFrames`] over `fsm.handle(bytes, scratch)`
-  /// as the normal path (the same disjoint borrows) and runs
-  /// [`drain_for_errors`](RequestFrames::drain_for_errors), which applies the
-  /// premature-DATA establishment gate (the tunnel was never established, so any DATA is
-  /// `H3Error::MessageError`, RFC 9114 §4.4), fails on an FSM `Err` (a forbidden /
-  /// second-HEADERS frame, malformed framing), and grants NO readiness and yields NO
-  /// items. The built iterator is then dropped, so the caller hands the driver an
-  /// empty [`Frames`]. The gate logic is reused, never duplicated. A no-op (no request
-  /// FSM, nothing to validate) if the FSM is somehow absent.
-  fn drain_request_abandoned(&mut self, bytes: &[u8], scratch: &mut [u8]) {
-    let is_client = Ro::IS_CLIENT;
-    let phase = &mut self.phase;
-    let events = &mut self.events;
-    let close_pending = &mut self.close_pending;
-    let conn_error = &mut self.conn_error;
-    let request_abandoned = &mut self.request_abandoned;
-    let tunnel_established = &mut self.tunnel_established;
-    let Some(fsm) = self.request.as_mut() else {
-      return;
-    };
-    let items = fsm.handle(bytes, scratch);
-    // An abandoned stream grants no readiness on validation, so neither carrier is
-    // armed: `establish_on_response` stays `false` and `on_first_request` is `None`.
-    // The drain ignores them regardless (it never runs `on_headers_decoded`), but
-    // keeping them inert documents that this path advances nothing the driver observes.
-    let mut rf = RequestFrames {
+    RequestFrames {
+      drain_on_drop: RequestFrames::<ReqBuf, EventBuf>::drain_for_errors,
       items,
       phase,
       events,
@@ -1761,10 +1922,37 @@ impl<Ro: Role> Connection<Ro> {
       conn_error,
       request_abandoned,
       is_client,
-      establish_on_response: false,
-      on_first_request: None,
+      establish_on_response,
+      on_first_request,
       tunnel_established,
-    };
+    }
+  }
+
+  /// Drives later request-stream `bytes` through the VALIDATION-ONLY path on an
+  /// already-abandoned (dropped-unobserved) request stream, surfacing nothing. An
+  /// abandoned stream is inert to the driver but not terminal, so it may not bypass the
+  /// FSM/gate (see the observation-gating section on [`Connection`]).
+  ///
+  /// The peer can still commit protocol violations on it, and every one must still fail
+  /// the connection: this builds the same [`RequestFrames`] over
+  /// `fsm.handle(bytes, scratch)` as the normal path (the same disjoint borrows) and
+  /// runs [`drain_for_errors`](RequestFrames::drain_for_errors), which applies the
+  /// premature-DATA establishment gate (the tunnel was never established, so any DATA is
+  /// `H3Error::MessageError`, RFC 9114 §4.4), fails on an FSM `Err` (a forbidden /
+  /// second-HEADERS frame, malformed framing), and grants NO readiness and yields NO
+  /// items. The built iterator is then dropped, so the caller hands the driver an
+  /// empty [`Frames`]. The gate logic is reused, never duplicated.
+  fn drain_request_abandoned(&mut self, bytes: &[u8], scratch: &mut [u8])
+  where
+    ReqBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
+  {
+    // An abandoned stream grants no readiness on validation, so neither carrier is
+    // armed: `establish_on_response = false` and `needs_request = false` (so
+    // `on_first_request` is `None`). The drain ignores them regardless (it never runs
+    // `on_headers_decoded`), but keeping them inert documents that this path advances
+    // nothing the driver observes. The carrier is then driven for errors and dropped.
+    let mut rf = self.build_request_frames(bytes, scratch, false, false);
     rf.drain_for_errors();
   }
 
@@ -1826,7 +2014,10 @@ impl<Ro: Role> Connection<Ro> {
     &mut self,
     id: StreamId,
     bytes: &[u8],
-  ) -> Result<Option<(UniRole, usize)>, H3Error> {
+  ) -> Result<Option<(UniRole, usize)>, H3Error>
+  where
+    UniBuf: AsMut<[UniSlot]>,
+  {
     let slot_idx = self.uni_slot(id)?;
     let mut consumed = 0usize;
     loop {
@@ -1853,21 +2044,23 @@ impl<Ro: Role> Connection<Ro> {
   /// be reserved is [`H3Error::ExcessiveLoad`] (consistent with the
   /// classified-overflow behavior), so a flood of partial / GREASE streams cannot
   /// hide a later critical stream.
-  fn uni_slot(&mut self, id: StreamId) -> Result<usize, H3Error> {
-    if let Some(i) = self
-      .uni
+  fn uni_slot(&mut self, id: StreamId) -> Result<usize, H3Error>
+  where
+    UniBuf: AsMut<[UniSlot]>,
+  {
+    let slots = self.uni.as_mut();
+    if let Some(i) = slots
       .iter()
-      .position(|s| matches!(s, Some(e) if e.id == id))
+      .position(|s| matches!(s.entry, Some(e) if e.id == id))
     {
       return Ok(i);
     }
-    let i = self
-      .uni
+    let i = slots
       .iter()
-      .position(Option::is_none)
+      .position(|s| s.entry.is_none())
       .ok_or(H3Error::ExcessiveLoad)?;
-    if let Some(slot) = self.uni.get_mut(i) {
-      *slot = Some(UniEntry {
+    if let Some(slot) = slots.get_mut(i) {
+      slot.entry = Some(UniEntry {
         id,
         state: UniState::Pending {
           buf: [0u8; 8],
@@ -1882,8 +2075,16 @@ impl<Ro: Role> Connection<Ro> {
   /// [`UniState::Pending`]; reaching a classified (or empty) slot here is an
   /// internal inconsistency surfaced as `H3_STREAM_CREATION_ERROR` rather than a
   /// panic.
-  fn pending_buf(&self, slot_idx: usize) -> Result<([u8; 8], usize), H3Error> {
-    match self.uni.get(slot_idx).and_then(Option::as_ref) {
+  fn pending_buf(&mut self, slot_idx: usize) -> Result<([u8; 8], usize), H3Error>
+  where
+    UniBuf: AsMut<[UniSlot]>,
+  {
+    match self
+      .uni
+      .as_mut()
+      .get_mut(slot_idx)
+      .and_then(|s| s.entry.as_ref())
+    {
       Some(UniEntry {
         state: UniState::Pending { buf, len },
         ..
@@ -1894,8 +2095,16 @@ impl<Ro: Role> Connection<Ro> {
 
   /// Appends one byte to the partial type-varint buffer in slot `slot_idx`. A
   /// varint exceeding 8 bytes is malformed ([`H3Error::FrameError`]).
-  fn push_pending_byte(&mut self, slot_idx: usize, b: u8) -> Result<(), H3Error> {
-    match self.uni.get_mut(slot_idx).and_then(Option::as_mut) {
+  fn push_pending_byte(&mut self, slot_idx: usize, b: u8) -> Result<(), H3Error>
+  where
+    UniBuf: AsMut<[UniSlot]>,
+  {
+    match self
+      .uni
+      .as_mut()
+      .get_mut(slot_idx)
+      .and_then(|s| s.entry.as_mut())
+    {
       Some(UniEntry {
         state: UniState::Pending { buf, len },
         ..
@@ -1916,26 +2125,24 @@ impl<Ro: Role> Connection<Ro> {
   /// *different* id is `H3_STREAM_CREATION_ERROR` (RFC 9114 §6.2.1 / RFC 9204
   /// §4.2). The slot was already reserved while pending, so no capacity check is
   /// needed here.
-  fn classify_pending(
-    &mut self,
-    slot_idx: usize,
-    id: StreamId,
-    ty: u64,
-  ) -> Result<UniRole, H3Error> {
+  fn classify_pending(&mut self, slot_idx: usize, id: StreamId, ty: u64) -> Result<UniRole, H3Error>
+  where
+    UniBuf: AsMut<[UniSlot]>,
+  {
     let role = classify_stream_type(ty)?;
+    let slots = self.uni.as_mut();
     // A duplicate critical stream (same role, classified under a different id) is
     // a creation error. Pending slots carry no role yet, so they never match.
     if role != UniRole::Ignored
-      && self
-        .uni
+      && slots
         .iter()
-        .flatten()
+        .filter_map(|s| s.entry.as_ref())
         .any(|e| e.id != id && matches!(e.state, UniState::Classified(r) if r == role))
     {
       return Err(H3Error::StreamCreation);
     }
-    if let Some(slot) = self.uni.get_mut(slot_idx) {
-      *slot = Some(UniEntry {
+    if let Some(slot) = slots.get_mut(slot_idx) {
+      slot.entry = Some(UniEntry {
         id,
         state: UniState::Classified(role),
       });
@@ -1947,11 +2154,15 @@ impl<Ro: Role> Connection<Ro> {
   /// already classified. A still-`Pending` stream returns `None` (its bytes flow
   /// back into [`classify_uni`] to continue the type varint), so its continuation
   /// is never routed to a handler before its type is known.
-  fn uni_role_of(&self, id: StreamId) -> Option<UniRole> {
+  fn uni_role_of(&self, id: StreamId) -> Option<UniRole>
+  where
+    UniBuf: AsRef<[UniSlot]>,
+  {
     self
       .uni
+      .as_ref()
       .iter()
-      .flatten()
+      .filter_map(|s| s.entry.as_ref())
       .find(|e| e.id == id)
       .and_then(|e| match e.state {
         UniState::Classified(role) => Some(role),
@@ -2020,20 +2231,22 @@ impl<Ro: Role> Connection<Ro> {
   /// an early-stopping driver and leave the connection non-terminal — but a driver
   /// that wants the tunnel DATA must drain.
   ///
-  /// Validation is NOT observation: dropping [`Frames`] checks the bytes but does not
-  /// surface the peer's CONNECT HEADERS to the driver. Handshake readiness — the
-  /// server becoming able to [`accept_with`](Self::accept_with), the client becoming
-  /// [`Established`](Event::Established) — is granted ONLY when [`Frames::next`]
-  /// actually yields the first [`Frame::Request`] / [`Frame::Response`] (the
-  /// observation point). A [`Frames`] dropped before any `next()` validates its bytes
-  /// but advances no readiness: the driver must observe and validate the request /
-  /// response before accepting or using the tunnel.
+  /// Validation is NOT observation: dropping [`Frames`] checks the bytes but advances
+  /// no readiness, so the driver must pull the request / response via [`Frames::next`]
+  /// before accepting or using the tunnel. See the observation-gating section on
+  /// [`Connection`].
   pub fn handle_stream<'a>(
     &'a mut self,
     id: StreamId,
     bytes: &'a [u8],
     scratch: &'a mut [u8],
-  ) -> Result<Frames<'a>, H3Error> {
+  ) -> Result<Frames<'a, 'req, 'event, ReqBuf, EventBuf>, H3Error>
+  where
+    ReqBuf: AsMut<[u8]>,
+    CtrlBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
+    UniBuf: AsRef<[UniSlot]> + AsMut<[UniSlot]>,
+  {
     // A `Failed` connection is terminal: it must neither process nor yield any
     // inbound bytes, on ANY stream (request, control, QPACK, uni). The terminal
     // `ConnError` is the last observable signal — surfacing application DATA (or
@@ -2077,14 +2290,7 @@ impl<Ro: Role> Connection<Ro> {
       self.drain_request_abandoned(bytes, scratch);
       return Ok(Frames::empty());
     }
-    // The request stream: a missing FSM for a registered request id is an eager
-    // protocol error routed through `fail` here (lifted out of `handle_request` so
-    // the success borrow does not entangle the error path's `fail` call). The
-    // success branch's lazy FSM errors route through `fail` from `Frames::next`.
-    if self.request.is_none() {
-      self.fail(H3Error::FrameUnexpected);
-      return Err(H3Error::FrameUnexpected);
-    }
+    // The request stream. Lazy FSM errors route through `fail` from `Frames::next`.
     self.handle_request(bytes, scratch)
   }
 
@@ -2094,7 +2300,11 @@ impl<Ro: Role> Connection<Ro> {
   /// caller ([`handle_stream`](Self::handle_stream)) routes it through
   /// [`fail`](Self::fail). Split out so the eager error path holds no escaping
   /// borrow.
-  fn handle_non_request(&mut self, id: StreamId, bytes: &[u8]) -> Result<(), H3Error> {
+  fn handle_non_request(&mut self, id: StreamId, bytes: &[u8]) -> Result<(), H3Error>
+  where
+    CtrlBuf: AsMut<[u8]>,
+    UniBuf: AsRef<[UniSlot]> + AsMut<[UniSlot]>,
+  {
     // An already-tracked inbound uni stream: route by its recorded role. A
     // critical role goes to its handler; an `Ignored` id is discarded *by lookup*
     // (its `stream_role()` is `None`), so its payload is never reparsed as a
@@ -2128,7 +2338,10 @@ impl<Ro: Role> Connection<Ro> {
   }
 
   /// Routes a registered non-request stream by role. Produces no frames.
-  fn dispatch_registered(&mut self, role: StreamRole, bytes: &[u8]) -> Result<(), H3Error> {
+  fn dispatch_registered(&mut self, role: StreamRole, bytes: &[u8]) -> Result<(), H3Error>
+  where
+    CtrlBuf: AsMut<[u8]>,
+  {
     match role {
       StreamRole::ControlIn | StreamRole::ControlOut => self.handle_control(bytes),
       StreamRole::QpackEncIn
@@ -2136,7 +2349,8 @@ impl<Ro: Role> Connection<Ro> {
       | StreamRole::QpackEncOut
       | StreamRole::QpackDecOut => Self::handle_qpack(role, bytes),
       // A registered request id is handled before role lookup; reaching here for
-      // Request means no request FSM exists, which is a protocol error.
+      // Request means the role table and request id diverged, which is a protocol
+      // error from the caller's stream registration sequence.
       StreamRole::Request => Err(H3Error::FrameUnexpected),
     }
   }
@@ -2151,7 +2365,10 @@ impl<Ro: Role> Connection<Ro> {
   ///   it with [`poll_transmit`](Self::poll_transmit) and retry;
   /// - [`Err`]`(`[`Error::Protocol`]`(`[`H3Error::FrameError`]`))` when the framed
   ///   payload does not fit a single transmit slot (the v1 no-alloc bound).
-  pub fn send_data(&mut self, payload: &[u8]) -> Result<(), Error> {
+  pub fn send_data(&mut self, payload: &[u8]) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+  {
     // The single precondition: DATA flows only while the tunnel is `Open`. This one
     // phase check subsumes the old `!started || !established || closing` triple —
     // `Created` / `Handshaking` (not yet open) and `Closing` / `Failed` (no longer
@@ -2180,7 +2397,10 @@ impl<Ro: Role> Connection<Ro> {
   /// exactly once: a second `close` while one is already pending is a no-op, and
   /// once enqueued `close_pending` is cleared. A `close` on an already-terminal
   /// connection (`Closing`/`Failed`) is a no-op.
-  pub fn close(&mut self) {
+  pub fn close(&mut self)
+  where
+    TxBuf: AsMut<[u8]>,
+  {
     // Enter `Closing` (a no-op if already terminal), and on the FIRST transition
     // arm the deferred FIN — the local half-close sends an empty FIN on the request
     // stream (deferred via `close_pending` if the ring is full / the stream is not
@@ -2201,7 +2421,10 @@ impl<Ro: Role> Connection<Ro> {
   /// does not flush a clean close FIN. `fail` already clears `close_pending` (the
   /// primary guard), so this phase check is belt-and-suspenders against a deferred
   /// FIN surviving a later failure.
-  fn try_send_fin(&mut self) {
+  fn try_send_fin(&mut self)
+  where
+    TxBuf: AsMut<[u8]>,
+  {
     if !self.close_pending || !self.phase.is_closing() {
       return;
     }
@@ -2252,7 +2475,11 @@ impl<Ro: Role> Connection<Ro> {
   ///   - still `Pending` (reset before its type varint completed) → **free the slot**
   ///     for the same reason.
   /// - **Any other (unknown / untracked) id** is ignored (no panic).
-  pub fn handle_stream_reset(&mut self, id: StreamId, code: u64) {
+  pub fn handle_stream_reset(&mut self, id: StreamId, code: u64)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+    UniBuf: AsMut<[UniSlot]>,
+  {
     // A `Failed` connection is terminal: a reset is moot. Do nothing — no `Reset`
     // (it would be delivered, FIFO, BEFORE the terminal `ConnError` from the
     // dedicated slot, breaking terminal ordering) and no second `ConnError`.
@@ -2314,7 +2541,11 @@ impl<Ro: Role> Connection<Ro> {
   ///   - still `Pending` (closed before its type varint completed) → **free the
   ///     slot** for the same reason.
   /// - **Any other (unknown / untracked) id** is ignored (no panic).
-  pub fn handle_stream_fin(&mut self, id: StreamId) {
+  pub fn handle_stream_fin(&mut self, id: StreamId)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+    UniBuf: AsMut<[UniSlot]>,
+  {
     // A `Failed` connection is terminal: a FIN on any stream is moot. Do nothing —
     // no `PeerClosed` (it would be delivered, FIFO, BEFORE the terminal `ConnError`
     // that `poll_event` surfaces from the dedicated slot, breaking terminal
@@ -2323,9 +2554,8 @@ impl<Ro: Role> Connection<Ro> {
     if self.phase.is_failed() {
       return;
     }
-    if Some(id) == self.request_id
-      && let Some(req) = self.request.as_ref()
-    {
+    if Some(id) == self.request_id {
+      let req = &self.request;
       // An abandoned request stream: a prior `handle_stream` decoded its first HEADERS
       // on the drop-drain without the driver observing it, advancing the FSM into its
       // tunnel phase. It is permanently inert to the DRIVER (the tunnel was never
@@ -2407,7 +2637,11 @@ impl<Ro: Role> Connection<Ro> {
   ///   [`H3Error::ClosedCriticalStream`]; `Pending` and `Classified(Ignored)` are
   ///   non-fatal (no event).
   /// - **Any other (unknown / untracked) id** is ignored (no panic).
-  fn resolve_non_request_close(&mut self, id: StreamId) {
+  fn resolve_non_request_close(&mut self, id: StreamId)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+    UniBuf: AsMut<[UniSlot]>,
+  {
     // An outbound critical stream we opened (tracked in `roles`, not `uni`):
     // closing it is a closed-critical-stream connection error (terminal).
     if self.role_of(id).is_some_and(is_critical_role) {
@@ -2438,12 +2672,16 @@ impl<Ro: Role> Connection<Ro> {
   /// still-`Pending` stream frees its capacity (it can no longer send bytes, so it
   /// need not be retained), and a closed critical stream's now-moot slot is
   /// reclaimed while the connection fails.
-  fn take_uni_state(&mut self, id: StreamId) -> Option<UniState> {
+  fn take_uni_state(&mut self, id: StreamId) -> Option<UniState>
+  where
+    UniBuf: AsMut<[UniSlot]>,
+  {
     let slot = self
       .uni
+      .as_mut()
       .iter_mut()
-      .find(|s| matches!(s, Some(e) if e.id == id))?;
-    slot.take().map(|e| e.state)
+      .find(|s| matches!(s.entry, Some(e) if e.id == id))?;
+    slot.entry.take().map(|e| e.state)
   }
 
   /// The next queued transmit (bytes the driver must write on a QUIC stream),
@@ -2460,7 +2698,10 @@ impl<Ro: Role> Connection<Ro> {
   ///
   /// Lending: the returned [`Transmit`] borrows the connection's transmit ring
   /// and is valid until the next `poll_transmit`.
-  pub fn poll_transmit(&mut self) -> Option<Transmit<'_>> {
+  pub fn poll_transmit(&mut self) -> Option<Transmit<'_>>
+  where
+    TxBuf: AsRef<[u8]> + AsMut<[u8]>,
+  {
     if self.phase.is_failed() {
       return None;
     }
@@ -2495,7 +2736,10 @@ impl<Ro: Role> Connection<Ro> {
   /// call on an empty ring, so this never blocks; the guard just rules out the
   /// partial path. Drain the ring with [`poll_transmit`](Self::poll_transmit) and
   /// retry.
-  pub fn start(&mut self) -> Result<(), Error> {
+  pub fn start(&mut self) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+  {
     self.start_handshake()
   }
 
@@ -2516,7 +2760,10 @@ impl<Ro: Role> Connection<Ro> {
   ///
   /// Before any failure (the `conn_error` slot empty) this drains the normal
   /// lifecycle queue in FIFO order.
-  pub fn poll_event(&mut self) -> Option<Event> {
+  pub fn poll_event(&mut self) -> Option<Event>
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     if let Some(error) = self.conn_error.take() {
       return Some(Event::ConnError(error));
     }
@@ -2524,7 +2771,9 @@ impl<Ro: Role> Connection<Ro> {
   }
 }
 
-impl Connection<Client> {
+impl<ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+  Connection<'_, '_, '_, '_, '_, Client, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+{
   /// Sends the CONNECT request HEADERS — call this AFTER the peer's SETTINGS have
   /// been received (i.e. [`peer_settings`](Connection::peer_settings) is `Some`).
   ///
@@ -2554,7 +2803,10 @@ impl Connection<Client> {
   /// [`provide_stream`](Connection::provide_stream). Calling `open_with` again
   /// after the request was already sent is a no-op `Ok(())` (the request is sent
   /// exactly once).
-  pub fn open_with<H: Headers + ?Sized>(&mut self, request: &H) -> Result<(), Error> {
+  pub fn open_with<H: Headers + ?Sized>(&mut self, request: &H) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+  {
     let limit = match self.guard_open()? {
       SendGuard::AlreadyDone => return Ok(()),
       SendGuard::Proceed(limit) => limit,
@@ -2606,7 +2858,9 @@ impl Connection<Client> {
   }
 }
 
-impl Connection<Server> {
+impl<ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+  Connection<'_, '_, '_, '_, '_, Server, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+{
   /// Accepts the peer's request, enqueuing the response HEADERS frame on the
   /// (already-registered) request stream, marking the tunnel established, and
   /// enqueuing [`Event::Established`].
@@ -2646,7 +2900,11 @@ impl Connection<Server> {
   /// `Ok(())` (no second HEADERS, no second `Established`), mirroring the client's
   /// exactly-once `request_sent` guard. A single CONNECT phase carries exactly one
   /// response HEADERS, so re-sending it would be a protocol violation.
-  pub fn accept_with<H: Headers + ?Sized>(&mut self, response: &H) -> Result<(), Error> {
+  pub fn accept_with<H: Headers + ?Sized>(&mut self, response: &H) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
+  {
     let (id, limit) = match self.guard_accept()? {
       SendGuard::AlreadyDone => return Ok(()),
       SendGuard::Proceed(resolved) => resolved,
@@ -2761,16 +3019,13 @@ fn write_headers_frame<H: Headers + ?Sized>(
   headers: &H,
   limit: Option<u64>,
 ) -> Result<usize, Error> {
-  // Encode the field section into a TX_CAP-sized workspace (reserving room for the
-  // frame header prepended below) so a section that fits the transmit slot is
-  // accepted even when it would overflow a smaller scratch. The decoded size is
-  // bounded against the peer's limit inside the same pass.
-  let mut fs = [0u8; TX_CAP];
-  let workspace = fs
-    .get_mut(..TX_CAP - HEADERS_HDR_RESERVE)
-    .unwrap_or(&mut []);
+  // Encode the field section directly into the transmit slot after a worst-case
+  // frame-header gap. Once the real header length is known, the field section is
+  // moved down in-place. This keeps the single encode+measure pass but avoids a
+  // separate TX_CAP stack scratch and a scratch-to-slot copy.
   let max_decoded = limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX));
-  let (fs_len, _decoded_size) =
+  let (fs_len, _decoded_size) = {
+    let workspace = out.get_mut(HEADERS_HDR_RESERVE..).ok_or(too_large())?;
     match qpack::encode_field_section_from(headers, workspace, max_decoded) {
       Ok(out) => out,
       // Both "over the peer's limit" and "too large for the local workspace" are a
@@ -2780,10 +3035,20 @@ fn write_headers_frame<H: Headers + ?Sized>(
       }
       Err(qpack::EncodeError::Qpack(e)) => return Err(Error::Protocol(e.to_h3())),
       Err(qpack::EncodeError::Supplier(e)) => return Err(e),
-    };
-  let fs = fs.get(..fs_len).unwrap_or(&[]);
+    }
+  };
   let at = write_frame_header(out, 0, FrameType::Headers, fs_len)?;
-  copy_into(out, at, fs)
+  if at > HEADERS_HDR_RESERVE {
+    return Err(too_large());
+  }
+  let src_end = HEADERS_HDR_RESERVE.checked_add(fs_len).ok_or(too_large())?;
+  let frame_len = at.checked_add(fs_len).ok_or(too_large())?;
+  out.get(..src_end).ok_or(too_large())?;
+  out.get(..frame_len).ok_or(too_large())?;
+  if at < HEADERS_HDR_RESERVE && fs_len != 0 {
+    out.copy_within(HEADERS_HDR_RESERVE..src_end, at);
+  }
+  Ok(frame_len)
 }
 
 /// Writes a DATA frame (`[header][payload]`) for `payload`.
@@ -2865,7 +3130,7 @@ const fn classify_stream_type(ty: u64) -> Result<UniRole, H3Error> {
 }
 
 /// The inverse of [`StreamRole::index`].
-fn role_from_index(i: usize) -> Option<StreamRole> {
+const fn role_from_index(i: usize) -> Option<StreamRole> {
   Some(match i {
     0 => StreamRole::ControlOut,
     1 => StreamRole::ControlIn,

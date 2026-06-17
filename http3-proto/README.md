@@ -49,6 +49,52 @@ The bare `no_std`, no-`alloc` tier compiles with `--no-default-features`. The
 only external dependency on that tier is `thiserror` (with `std` off) and
 `derive_more`.
 
+## Storage model
+
+The default request/connection storage is feature-configured through
+`DefaultReqBuf<'a>`, `DefaultCtrlBuf<'a>`, `DefaultTxBuf<'a>`, and
+`DefaultEventBuf<'a>` / `DefaultUniBuf<'a>`.
+
+With `std` or `alloc`, `Connection::<Role>::new()` allocates the
+request/control/transmit byte buffers, event-slot buffer, and inbound-uni
+tracking buffer, and stores only their handles in the connection value.
+In the bare `no_std`, no-`alloc` tier, the default buffer aliases are borrowed
+`&mut [u8]`, `&mut [Option<Event>]`, and `&mut [UniSlot]` slices. Each
+connection storage class has its own lifetime, so request, control, transmit,
+event, and uni-tracking storage can come from different owners/scopes. The
+connection still stores only handles and is constructed with
+`RequestStream::with_buffer(...)` / `Connection::with_buffers(...)` /
+`BorrowedConnection`.
+
+For production code that wants explicit placement, use `BorrowedConnection` /
+`Connection::with_buffers(...)` and keep those buffers in caller-owned
+storage instead:
+
+```rust,ignore
+use http3_proto::{BorrowedConnection, Client, UniSlot};
+use http3_proto::connection::{CTRL_CAP, EVENT_QUEUE_CAP, TX_BYTES_CAP, UNI_TRACKING_CAP};
+use http3_proto::stream::HDR_CAP;
+
+let mut request_headers = [0u8; HDR_CAP];
+let mut control_payload = [0u8; CTRL_CAP];
+let mut tx_bytes = [0u8; TX_BYTES_CAP];
+let mut event_slots = [None; EVENT_QUEUE_CAP];
+let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+
+let mut conn = BorrowedConnection::<Client>::with_buffers(
+    &mut request_headers,
+    &mut control_payload,
+    &mut tx_bytes,
+    &mut event_slots,
+    &mut uni_slots,
+);
+```
+
+Borrowed storage does not require `alloc`; it just moves the backing buffers out
+of the connection value. Smaller buffers are allowed. A shorter HEADERS,
+SETTINGS, event, or inbound-uni buffer lowers that memory bound, and transmit
+storage is used in complete slot-sized chunks up to the default queue depth.
+
 ## Driver contract
 
 A client MUST NOT send its `:protocol` CONNECT request before it has received the
@@ -180,9 +226,10 @@ return `Error::FieldSectionTooLarge` when the request/response exceeds the peer'
 advertised limit. Our own peers never advertise the setting, so it reads back as
 `None` (unlimited) and the check never fires against our own stack.
 
-This is separate from the internal `HDR_CAP` bound, which caps the *encoded*
-inbound HEADERS buffer — a memory bound that fails oversize input gracefully with
-`H3_FRAME_ERROR`.
+This is separate from the internal HEADERS accumulator bound (`HDR_CAP` by
+default, or the caller-provided request buffer length for `BorrowedConnection`),
+which caps the *encoded* inbound HEADERS buffer and fails oversize input
+gracefully with `H3_FRAME_ERROR`.
 
 ### Control-stream frame handling
 
@@ -200,13 +247,14 @@ role-aware policy (RFC 9114 §7.2):
   payload skipped; the driver is not notified.
 - GREASE / unknown extension frames → skipped (RFC 9114 §9).
 
-The peer's SETTINGS payload is buffered into a fixed, no-alloc bound (`CTRL_CAP` =
-1024 bytes) before decoding — generous enough to hold many settings plus
-unknown/GREASE extension settings (RFC 9114 §7.2.4.1), so a conforming peer is
-never rejected for carrying GREASE. A SETTINGS payload that *still* exceeds this
-bound is implausibly large and rejected with `H3_EXCESSIVE_LOAD` (an excessive-load
-policy — "this SETTINGS frame is too big"), never `H3_FRAME_ERROR` ("malformed")
-and never a panic.
+The peer's SETTINGS payload is buffered into a no-alloc bound (`CTRL_CAP` = 1024
+bytes by default, or the caller-provided control buffer length for
+`BorrowedConnection`) before decoding. The default is generous enough to hold many
+settings plus unknown/GREASE extension settings (RFC 9114 §7.2.4.1), so a
+conforming peer is never rejected for carrying GREASE. A SETTINGS payload that
+exceeds the configured bound is rejected with `H3_EXCESSIVE_LOAD` (an
+excessive-load policy — "this SETTINGS frame is too big"), never `H3_FRAME_ERROR`
+("malformed") and never a panic.
 
 ## Tiers
 

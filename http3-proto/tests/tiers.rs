@@ -1,7 +1,7 @@
 //! Bare-tier smoke test: proves `http3-proto` builds and runs with
 //! `--no-default-features` (no `std`, no `alloc`) and that the core contract
-//! — `Connection::new`, `start`, `open_with`, `poll_transmit`, `handle_stream`,
-//! `poll_event` — works without a heap.
+//! — `Connection::with_buffers`, `start`, `open_with`, `poll_transmit`,
+//! `handle_stream`, `poll_event` — works without a heap.
 //!
 //! Run as:
 //! ```sh
@@ -9,9 +9,13 @@
 //! ```
 
 use http3_proto::{
-  Client, Connection,
+  BorrowedConnection, Client, Connection, UniSlot,
+  connection::{CTRL_CAP, EVENT_QUEUE_CAP, TX_BYTES_CAP, UNI_TRACKING_CAP},
   event::{StreamId, StreamRole},
+  stream::{HDR_CAP, RequestStream},
 };
+
+type StaticConnection<Ro> = Connection<'static, 'static, 'static, 'static, 'static, Ro>;
 
 /// A minimal `Headers` impl backed by a static slice: the bare tier cannot use
 /// `Vec`, so the `[(&str, &str)]` blanket impl on a fixed-size array is the
@@ -26,7 +30,18 @@ static REQUEST_HEADERS: &[(&str, &str)] = &[
 
 #[test]
 fn bare_tier_open_and_drain() {
-  let mut conn = Connection::<Client>::new();
+  let mut request_headers = [0u8; HDR_CAP];
+  let mut control_payload = [0u8; CTRL_CAP];
+  let mut tx_bytes = [0u8; TX_BYTES_CAP];
+  let mut event_slots = [None; EVENT_QUEUE_CAP];
+  let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+  let mut conn = BorrowedConnection::<Client>::with_buffers(
+    &mut request_headers[..],
+    &mut control_payload[..],
+    &mut tx_bytes[..],
+    &mut event_slots[..],
+    &mut uni_slots[..],
+  );
 
   // start() enqueues the control stream and two QPACK streams. The CONNECT request
   // is sent later with open_with, only after the peer's SETTINGS arrive (RFC 8441
@@ -77,6 +92,20 @@ fn bare_tier_open_and_drain() {
 
   // No error events on this (conformant) opt-in path.
   assert!(conn.poll_event().is_none());
+}
+
+#[test]
+fn bare_tier_default_connection_type_is_small() {
+  let connection_size = core::mem::size_of::<StaticConnection<Client>>();
+  let request_stream_size = core::mem::size_of::<RequestStream<'static>>();
+  assert!(
+    connection_size < 1024,
+    "bare default Connection should store borrowed buffer handles, got {connection_size}"
+  );
+  assert!(
+    request_stream_size < 128,
+    "bare default RequestStream should store a borrowed buffer handle, got {request_stream_size}"
+  );
 }
 
 #[test]
