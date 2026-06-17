@@ -145,11 +145,11 @@ pub(crate) enum Advanced {
 #[cfg(any(feature = "std", feature = "alloc"))]
 impl RequestStream<'static> {
   /// A fresh read FSM expecting a HEADERS frame first.
-  #[inline]
   ///
   /// No `Default` is implemented: in the bare no-alloc tier the default storage
   /// is borrowed slices, so there is no honest feature-independent default read
   /// FSM value.
+  #[inline]
   #[allow(clippy::new_without_default)]
   pub fn new() -> Self {
     Self::with_buffer(default_req_buf())

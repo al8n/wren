@@ -2,11 +2,6 @@
 //! (peers may Huffman-code string literals); `encoded_len` sizes the encoder's
 //! output. The decoder is a panic-free MSB-first canonical bit walk.
 
-// Transient: `decode` and `encoded_len` are consumed by the QPACK field-section
-// decoder/encoder in later tasks; until a production caller exists they are
-// reachable only from tests, so dead_code is silenced for now.
-#![allow(dead_code)]
-
 use super::QpackError;
 use crate::error::BufferTooSmallDetail;
 mod generated;
@@ -15,6 +10,9 @@ use generated::{CODE_LENGTHS, HUFFMAN_ROOT, HuffmanStep};
 
 /// The number of bytes `input` occupies Huffman-encoded: the sum of the per-byte
 /// code lengths, rounded up to whole bytes.
+// The seed for outbound Huffman encoding (tracked separately); no production
+// caller sizes an encode yet, so it is dead outside tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encoded_len(input: &[u8]) -> usize {
   let bits = input.iter().fold(0usize, |acc, &byte| {
     acc.saturating_add(
