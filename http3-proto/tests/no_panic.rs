@@ -138,6 +138,9 @@ fn qpack_decode_runs_clean() {
 
 // ── connection handle + drain (client role) ───────────────────────────────────
 
+type StaticConnection<Ro> =
+  http3_proto::Connection<'static, 'static, 'static, 'static, 'static, Ro>;
+
 /// One full receive step: `handle_stream` → drain frames → drain transmits
 /// → drain events.
 ///
@@ -148,7 +151,7 @@ fn qpack_decode_runs_clean() {
 /// these functions. This smoke still *runs* the path in release so any panic
 /// would surface as a test failure.
 fn handle_step(
-  conn: &mut http3_proto::Connection<http3_proto::Client>,
+  conn: &mut StaticConnection<http3_proto::Client>,
   bytes: &[u8],
   scratch: &mut [u8],
 ) -> bool {

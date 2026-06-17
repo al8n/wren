@@ -2,7 +2,7 @@
 //! and length are QUIC varints. This module owns the *header* (type+length);
 //! payloads are handled by the stream FSM (HEADERS via QPACK, DATA streamed).
 
-use derive_more::IsVariant;
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
 use crate::{
   error::TruncatedDetail,
@@ -14,7 +14,8 @@ use crate::{
 // needs a string slug yet. `FrameKind` carries both (it drives frame-placement
 // policy and benefits from a human-readable name).
 /// A frame type we emit.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant, derive_more::Display)]
+#[display("{}", self.as_str())]
 pub enum FrameType {
   /// `DATA` (0x00) — tunnel payload.
   Data,
@@ -34,6 +35,16 @@ impl FrameType {
       Self::Settings => 0x04,
     }
   }
+
+  /// Returns the string name of this frame type (for diagnostics).
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Data => "DATA",
+      Self::Headers => "HEADERS",
+      Self::Settings => "SETTINGS",
+    }
+  }
 }
 
 /// The classification of a decoded frame header.
@@ -43,7 +54,8 @@ impl FrameType {
 /// known-but-misplaced and HTTP/2-reserved types are
 /// [`H3Error::FrameUnexpected`](crate::error::H3Error::FrameUnexpected), while
 /// [`Unknown`](Self::Unknown) (GREASE / unknown extensions) is ignored.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant, derive_more::Display)]
+#[display("{}", self.as_str())]
 #[non_exhaustive]
 pub enum FrameKind {
   /// `DATA` (0x00).
@@ -110,8 +122,10 @@ impl FrameHeader {
 }
 
 /// A frame-layer error.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[non_exhaustive]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum FrameError {
   /// The input ended mid-header.
   #[error(transparent)]
