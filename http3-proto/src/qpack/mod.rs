@@ -5,6 +5,9 @@ mod decode;
 mod encode;
 mod huffman;
 mod int;
+/// Static-table index lookups, exposed only so the QPACK static-lookup benchmark
+/// can measure them. Not part of the stable public API.
+#[doc(hidden)]
 pub mod static_table;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
