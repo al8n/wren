@@ -46,7 +46,7 @@ mod queue;
 use core::marker::PhantomData;
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
-use queue::{BoundedQueue, EVENT_CAP, TX_CAP, TxError, TxRing};
+use queue::{BoundedQueue, TX_CAP, TxError, TxRing};
 
 use crate::{
   Error, HeaderSet,
@@ -244,7 +244,7 @@ struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
   /// A disjoint borrow of the connection's lifecycle phase (see the struct docs).
   phase: &'a mut Phase,
   /// A disjoint borrow of the connection's event queue (see the struct docs).
-  events: &'a mut BoundedQueue<'event, Event, EVENT_CAP, EventBuf>,
+  events: &'a mut BoundedQueue<'event, Event, EventBuf>,
   /// A disjoint borrow of the connection's `close_pending` flag. The fail
   /// transition clears it so a `Failed` connection never flushes a deferred
   /// graceful FIN — the same invariant that [`Connection::fail`] maintains on
@@ -456,7 +456,7 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
     establish_on_response: &mut bool,
     on_first_request: &mut Option<&mut bool>,
     phase: &mut Phase,
-    events: &mut BoundedQueue<'_, Event, EVENT_CAP, EventBuf>,
+    events: &mut BoundedQueue<'_, Event, EventBuf>,
     tunnel_established: &mut bool,
     is_client: bool,
   ) where
@@ -504,7 +504,7 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
     tunnel_established: bool,
     phase: &mut Phase,
     close_pending: &mut bool,
-    events: &mut BoundedQueue<'_, Event, EVENT_CAP, EventBuf>,
+    events: &mut BoundedQueue<'_, Event, EventBuf>,
     conn_error: &mut Option<H3Error>,
   ) -> bool
   where
@@ -1051,7 +1051,7 @@ impl Phase {
   /// exchange completes, RFC 9114 §4.4).
   fn establish_into<EventBuf>(
     phase: &mut Self,
-    events: &mut BoundedQueue<'_, Event, EVENT_CAP, EventBuf>,
+    events: &mut BoundedQueue<'_, Event, EventBuf>,
     tunnel_established: &mut bool,
   ) where
     EventBuf: AsMut<[Option<Event>]>,
@@ -1091,7 +1091,7 @@ impl Phase {
   fn fail_into<EventBuf>(
     phase: &mut Self,
     close_pending: &mut bool,
-    events: &mut BoundedQueue<'_, Event, EVENT_CAP, EventBuf>,
+    events: &mut BoundedQueue<'_, Event, EventBuf>,
     conn_error: &mut Option<H3Error>,
     error: H3Error,
   ) where
@@ -1353,7 +1353,7 @@ pub struct Connection<
   /// or GREASE streams cannot saturate the table and then hide the peer's real
   /// control stream.
   uni: UniBuf,
-  events: BoundedQueue<'event, Event, EVENT_CAP, EventBuf>,
+  events: BoundedQueue<'event, Event, EventBuf>,
   tx: TxRing<'tx, TxBuf>,
   /// The single lifecycle state (see [`Phase`]). Every public operation's
   /// preconditions are derived from this, and it changes ONLY through the
