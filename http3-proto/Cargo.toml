@@ -26,6 +26,13 @@ derive_more.workspace = true
 [dev-dependencies]
 proptest = "1"
 no-panic = "0.1"
+phf = { version = "0.13.1", default-features = false, features = ["macros"] }
+criterion = "0.7"
+
+[[bench]]
+name = "qpack_static_lookup"
+harness = false
+required-features = ["std"]
 
 [package.metadata.docs.rs]
 all-features = true

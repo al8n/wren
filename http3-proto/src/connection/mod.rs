@@ -2764,16 +2764,13 @@ fn write_headers_frame<H: Headers + ?Sized>(
   headers: &H,
   limit: Option<u64>,
 ) -> Result<usize, Error> {
-  // Encode the field section into a TX_CAP-sized workspace (reserving room for the
-  // frame header prepended below) so a section that fits the transmit slot is
-  // accepted even when it would overflow a smaller scratch. The decoded size is
-  // bounded against the peer's limit inside the same pass.
-  let mut fs = [0u8; TX_CAP];
-  let workspace = fs
-    .get_mut(..TX_CAP - HEADERS_HDR_RESERVE)
-    .unwrap_or(&mut []);
+  // Encode the field section directly into the transmit slot after a worst-case
+  // frame-header gap. Once the real header length is known, the field section is
+  // moved down in-place. This keeps the single encode+measure pass but avoids a
+  // separate TX_CAP stack scratch and a scratch-to-slot copy.
   let max_decoded = limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX));
-  let (fs_len, _decoded_size) =
+  let (fs_len, _decoded_size) = {
+    let workspace = out.get_mut(HEADERS_HDR_RESERVE..).ok_or(too_large())?;
     match qpack::encode_field_section_from(headers, workspace, max_decoded) {
       Ok(out) => out,
       // Both "over the peer's limit" and "too large for the local workspace" are a
@@ -2783,10 +2780,20 @@ fn write_headers_frame<H: Headers + ?Sized>(
       }
       Err(qpack::EncodeError::Qpack(e)) => return Err(Error::Protocol(e.to_h3())),
       Err(qpack::EncodeError::Supplier(e)) => return Err(e),
-    };
-  let fs = fs.get(..fs_len).unwrap_or(&[]);
+    }
+  };
   let at = write_frame_header(out, 0, FrameType::Headers, fs_len)?;
-  copy_into(out, at, fs)
+  if at > HEADERS_HDR_RESERVE {
+    return Err(too_large());
+  }
+  let src_end = HEADERS_HDR_RESERVE.checked_add(fs_len).ok_or(too_large())?;
+  let frame_len = at.checked_add(fs_len).ok_or(too_large())?;
+  out.get(..src_end).ok_or(too_large())?;
+  out.get(..frame_len).ok_or(too_large())?;
+  if at < HEADERS_HDR_RESERVE && fs_len != 0 {
+    out.copy_within(HEADERS_HDR_RESERVE..src_end, at);
+  }
+  Ok(frame_len)
 }
 
 /// Writes a DATA frame (`[header][payload]`) for `payload`.
@@ -2868,7 +2875,7 @@ const fn classify_stream_type(ty: u64) -> Result<UniRole, H3Error> {
 }
 
 /// The inverse of [`StreamRole::index`].
-fn role_from_index(i: usize) -> Option<StreamRole> {
+const fn role_from_index(i: usize) -> Option<StreamRole> {
   Some(match i {
     0 => StreamRole::ControlOut,
     1 => StreamRole::ControlIn,
