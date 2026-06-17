@@ -43,7 +43,10 @@ pub(crate) fn default_event_buf() -> DefaultEventBuf<'static> {
   std::vec![None; EVENT_CAP]
 }
 
-/// A fixed-capacity ring buffer of `Copy` items (used for queued [`Event`]s).
+/// A fixed-capacity ring buffer over a generic backing store `B` of
+/// `Option<T>` slots (used for queued [`Event`]s). `N` is the logical cap; the
+/// usable capacity is `min(N, B's length)`. The `Copy` bound on `T` lives only
+/// on the push/pop/clear impl block, not on the type itself.
 ///
 /// [`Event`]: crate::event::Event
 pub(crate) struct BoundedQueue<'a, T, const N: usize, B> {
@@ -83,7 +86,9 @@ where
       self.len = self.len.saturating_add(1);
       Ok(())
     } else {
-      // Unreachable: `tail < N`. Kept panic-free as a fallback.
+      // `tail < capacity <= slots.as_mut().len()` (capacity is that length
+      // min'd with N), so `get_mut` always succeeds; this `else` is a panic-free
+      // fallback.
       Err(item)
     }
   }
@@ -111,7 +116,10 @@ where
   /// fail transition to drop stale nonfatal lifecycle events the moment it becomes
   /// terminal-priority (the terminal `ConnError` then supersedes them).
   pub(crate) fn clear(&mut self) {
-    for slot in self.slots.as_mut().iter_mut().take(N) {
+    // Clear the actual backing slice: push/pop bound by `slots.len().min(N)`, so
+    // clearing every slot (rather than the first `N`) matches that
+    // slice-is-truth capacity model.
+    for slot in self.slots.as_mut().iter_mut() {
       *slot = None;
     }
     self.head = 0;
@@ -197,6 +205,10 @@ impl<B> TxRing<'_, B> {
 /// A default-sized buffer yields [`TX_N`] slots. A borrowed buffer may be smaller;
 /// complete [`TX_CAP`]-sized chunks become slots and any trailing partial chunk
 /// is ignored.
+///
+/// MUST cap at [`TX_N`]: `head`/`tail` index the fixed `[TxMeta; TX_N]` slots
+/// array, so a larger byte buffer must not yield more slots than that array
+/// holds, or indexing would go out of range.
 fn capacity_for_len(mut bytes_len: usize) -> usize {
   let mut slots = 0usize;
   while bytes_len >= TX_CAP && slots < TX_N {
@@ -221,6 +233,9 @@ where
       return None;
     }
     let capacity = self.capacity();
+    // `capacity_for_len` caps at `TX_N`, so `head` below stays in range of the
+    // fixed `slots` array.
+    debug_assert!(capacity <= TX_N);
     if capacity == 0 {
       return None;
     }
@@ -238,8 +253,20 @@ impl<B> TxRing<'_, B>
 where
   B: AsMut<[u8]>,
 {
+  /// The usable slot capacity, computed via `AsMut` (the write-side twin of the
+  /// `AsRef` [`capacity`](TxRing::capacity) that backs `poll`).
+  fn capacity_via_mut(&mut self) -> usize {
+    capacity_for_len(self.bytes.as_mut().len())
+  }
+
+  /// Whether `n` more transmits would fit, preflighting a multi-slot enqueue so
+  /// a caller's setup (e.g. [`start`]'s control + QPACK streams) stays
+  /// all-or-nothing instead of half-queuing and then failing. `&mut` is needed
+  /// only to reach `AsMut` for the capacity read; it queues nothing.
+  ///
+  /// [`start`]: crate::connection::Connection::start
   pub(crate) fn has_capacity_mut(&mut self, n: usize) -> bool {
-    capacity_for_len(self.bytes.as_mut().len()).saturating_sub(self.len) >= n
+    self.capacity_via_mut().saturating_sub(self.len) >= n
   }
 
   /// Reserves the next free slot's writable buffer and metadata, calling `fill`
@@ -254,7 +281,10 @@ where
     fin: bool,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, E>,
   ) -> Result<(), TxError<E>> {
-    let capacity = capacity_for_len(self.bytes.as_mut().len());
+    let capacity = self.capacity_via_mut();
+    // `capacity_for_len` caps at `TX_N`, so `tail`/`head` below stay in range of
+    // the fixed `slots` array.
+    debug_assert!(capacity <= TX_N);
     if capacity == 0 || self.len >= capacity {
       return Err(TxError::Full);
     }

@@ -112,12 +112,16 @@ const STREAM_TYPE_QPACK_DEC: u64 = 0x03;
 pub const CTRL_CAP: usize = 1024;
 
 /// Bytes available to one queued transmit.
+///
+/// The public alias of the internal `queue::TX_CAP`.
 pub const TX_SLOT_CAP: usize = queue::TX_CAP;
 
 /// Total byte storage needed by the default transmit ring.
 pub const TX_BYTES_CAP: usize = queue::TX_BYTES_CAP;
 
 /// Lifecycle-event queue slots needed by the default connection.
+///
+/// The public alias of the internal `queue::EVENT_CAP`.
 pub const EVENT_QUEUE_CAP: usize = queue::EVENT_CAP;
 
 /// Default control-stream SETTINGS payload storage.
