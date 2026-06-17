@@ -3,6 +3,10 @@
 //! placement (RFC 9114 §7.1/§7.2), and yielding decoded headers + data chunks.
 //! Read-side only; the connection builds the outbound frames.
 
+use core::marker::PhantomData;
+
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
+
 use crate::{
   HeaderSet,
   error::H3Error,
@@ -14,17 +18,38 @@ use crate::{
 // two 8-byte varints.
 const MAX_HEADER_LEN: usize = 16;
 
-/// The largest HEADERS field section (QPACK-encoded, on the wire) this FSM will
-/// accumulate. The in-progress field section is buffered into FSM-owned storage
-/// of this size across split reads; a field section larger than this is rejected
-/// with a graceful [`H3Error::FrameError`] (never a panic). This is purely an
-/// internal *encoded*-payload memory bound; we do NOT advertise it as
+/// The default HEADERS field-section accumulator size (QPACK-encoded, on the
+/// wire) used by the alloc/std owned constructor and by the recommended borrowed
+/// buffer size. A field section larger than the configured accumulator is
+/// rejected with a graceful [`H3Error::FrameError`] (never a panic). This is
+/// purely an internal *encoded*-payload memory bound; we do NOT advertise it as
 /// `SETTINGS_MAX_FIELD_SECTION_SIZE` (that setting limits the *decoded*
 /// field-section size, which our lazy decoder never accumulates — see
 /// [`Settings::for_client`](crate::settings::Settings::for_client)). The CONNECT
 /// request/response field sections are a handful of pseudo-header lines, far
 /// below this.
-pub(crate) const HDR_CAP: usize = 4096;
+pub const HDR_CAP: usize = 4096;
+
+/// Default request HEADERS accumulator storage.
+///
+/// With `std` or `alloc`, the default read FSM stores this in a heap-backed
+/// `Vec<u8>` so `RequestStream<'static>` and the default owned `Connection`
+/// stay small.
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub type DefaultReqBuf<'a> = std::vec::Vec<u8>;
+
+/// Default request HEADERS accumulator storage.
+///
+/// With no allocator available, the default is borrowed caller-owned storage so
+/// `RequestStream<'a>` and borrowed connections stay small. Construct it with
+/// [`RequestStream::with_buffer`].
+#[cfg(not(any(feature = "std", feature = "alloc")))]
+pub type DefaultReqBuf<'a> = &'a mut [u8];
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub(crate) fn default_req_buf() -> DefaultReqBuf<'static> {
+  std::vec![0u8; HDR_CAP]
+}
 
 /// Phase of the read side.
 enum Phase {
@@ -58,7 +83,7 @@ enum Cur {
 ///
 /// [`handle`]: RequestStream::handle
 /// [`fin`]: RequestStream::fin
-pub struct RequestStream {
+pub struct RequestStream<'a, B = DefaultReqBuf<'a>> {
   phase: Phase,
   cur: Cur,
   /// Partial frame-header bytes (type varint + length varint, `<= 16`).
@@ -67,11 +92,13 @@ pub struct RequestStream {
   /// The in-progress HEADERS field section, accumulated across [`handle`] calls
   /// into FSM-owned storage so the caller's `scratch` need not be preserved
   /// between calls. The valid prefix is `hdr_acc[..acc]` where `acc` lives in the
-  /// active [`Cur::Headers`]; bounded at [`HDR_CAP`] (oversize is a graceful
-  /// [`H3Error::FrameError`]).
+  /// active [`Cur::Headers`]; bounded by the configured accumulator length. The
+  /// alloc/std owned constructor uses [`HDR_CAP`]; borrowed storage uses the
+  /// caller-provided slice length. Oversize is a graceful [`H3Error::FrameError`].
   ///
   /// [`handle`]: RequestStream::handle
-  hdr_acc: [u8; HDR_CAP],
+  hdr_acc: B,
+  _storage: PhantomData<&'a mut ()>,
 }
 
 /// One parsed item, borrowed from the current [`RequestStream::handle`] call.
@@ -79,7 +106,9 @@ pub struct RequestStream {
 /// Valid only until the next [`Items::next`] call (lending iterator): a `Data`
 /// chunk borrows the fed input and a `Headers` set borrows the FSM-owned field
 /// accumulator plus the caller's Huffman scratch.
-#[derive(derive_more::IsVariant)]
+#[derive(IsVariant, TryUnwrap, Unwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum StreamItem<'a> {
   /// A decoded HEADERS field section (drain it before the next `next()`).
@@ -90,8 +119,8 @@ pub enum StreamItem<'a> {
 
 /// A lending iterator over the items produced by one [`RequestStream::handle`]
 /// call. Drive it with [`Items::next`] until it returns `Ok(None)`.
-pub struct Items<'a> {
-  fsm: &'a mut RequestStream,
+pub struct Items<'a, 'buf, B = DefaultReqBuf<'buf>> {
+  fsm: &'a mut RequestStream<'buf, B>,
   input: &'a [u8],
   pos: usize,
   scratch: &'a mut [u8],
@@ -113,16 +142,31 @@ pub(crate) enum Advanced {
   Data { start: usize, end: usize },
 }
 
-impl RequestStream {
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl RequestStream<'static> {
   /// A fresh read FSM expecting a HEADERS frame first.
+  ///
+  /// No `Default` is implemented: in the bare no-alloc tier the default storage
+  /// is borrowed slices, so there is no honest feature-independent default read
+  /// FSM value.
   #[inline]
-  pub const fn new() -> Self {
+  #[allow(clippy::new_without_default)]
+  pub fn new() -> Self {
+    Self::with_buffer(default_req_buf())
+  }
+}
+
+impl<'buf, B> RequestStream<'buf, B> {
+  /// A fresh read FSM backed by caller-provided persistent HEADERS storage.
+  #[inline]
+  pub fn with_buffer(hdr_acc: B) -> Self {
     Self {
       phase: Phase::AwaitingHeaders,
       cur: Cur::None,
       hdr_buf: [0u8; MAX_HEADER_LEN],
       hdr_len: 0,
-      hdr_acc: [0u8; HDR_CAP],
+      hdr_acc,
+      _storage: PhantomData,
     }
   }
 
@@ -137,7 +181,7 @@ impl RequestStream {
   /// [`Items`] and be large enough for the longest single field line's decoded
   /// name+value.
   #[inline]
-  pub fn handle<'a>(&'a mut self, bytes: &'a [u8], scratch: &'a mut [u8]) -> Items<'a> {
+  pub fn handle<'a>(&'a mut self, bytes: &'a [u8], scratch: &'a mut [u8]) -> Items<'a, 'buf, B> {
     Items {
       fsm: self,
       input: bytes,
@@ -172,14 +216,19 @@ impl RequestStream {
   }
 }
 
-impl Default for RequestStream {
-  #[inline]
-  fn default() -> Self {
-    Self::new()
+impl<'a, B> Items<'a, '_, B> {
+  /// The fed input slice (input lifetime), so a caller that drove the FSM with
+  /// [`advance`](Self::advance) can re-derive a DATA chunk's bytes from the reported
+  /// offsets independently of any `&mut self` borrow.
+  pub(crate) fn input(&self) -> &'a [u8] {
+    self.input
   }
 }
 
-impl<'a> Items<'a> {
+impl<B> Items<'_, '_, B>
+where
+  B: AsRef<[u8]> + AsMut<[u8]>,
+{
   /// The next item these bytes complete, or `Ok(None)` when they are exhausted.
   ///
   /// The returned [`StreamItem`] borrows the fed input (`Data`) or the FSM-owned
@@ -203,14 +252,12 @@ impl<'a> Items<'a> {
       }
     }
   }
+}
 
-  /// The fed input slice (input lifetime), so a caller that drove the FSM with
-  /// [`advance`](Self::advance) can re-derive a DATA chunk's bytes from the reported
-  /// offsets independently of any `&mut self` borrow.
-  pub(crate) fn input(&self) -> &'a [u8] {
-    self.input
-  }
-
+impl<B> Items<'_, '_, B>
+where
+  B: AsRef<[u8]>,
+{
   /// Decodes the completed, already-validated HEADERS field section sitting in the
   /// FSM-owned `hdr_acc[..acc_end]` (the section [`advance`](Self::advance) reported as
   /// [`Advanced::Headers`]). This is the FRESH yield decode: [`advance`] has already
@@ -222,10 +269,20 @@ impl<'a> Items<'a> {
     &mut self,
     acc_end: usize,
   ) -> Result<HeaderSet<'_>, H3Error> {
-    let fs = self.fsm.hdr_acc.get(..acc_end).ok_or(H3Error::FrameError)?;
+    let fs = self
+      .fsm
+      .hdr_acc
+      .as_ref()
+      .get(..acc_end)
+      .ok_or(H3Error::FrameError)?;
     qpack::decode_field_section_into(fs, self.scratch).map_err(|e| e.to_h3())
   }
+}
 
+impl<B> Items<'_, '_, B>
+where
+  B: AsMut<[u8]>,
+{
   /// Advances the FSM by one item, returning a borrow-free [`Advanced`] (offsets /
   /// the completed-section length) rather than a borrowing [`StreamItem`]. The FSM
   /// state is left positioned PAST the returned item; `Ok(None)` means the fed bytes
@@ -256,7 +313,9 @@ impl<'a> Items<'a> {
       hdr_buf,
       hdr_len,
       hdr_acc,
+      _storage,
     } = &mut **fsm;
+    let hdr_acc = hdr_acc.as_mut();
     loop {
       match *cur {
         Cur::None => {
@@ -341,8 +400,8 @@ impl<'a> Items<'a> {
           let acc_end = acc.checked_add(take).ok_or(H3Error::FrameError)?;
           // Accumulate the field section into FSM-owned storage (not the caller's
           // scratch, which may be fresh each call). A field section larger than
-          // `HDR_CAP` is a graceful frame error, never a panic; `get_mut` rejects
-          // `acc_end > HDR_CAP` for us.
+          // the configured accumulator is a graceful frame error, never a panic;
+          // `get_mut` rejects an out-of-range `acc_end` for us.
           let dst = hdr_acc.get_mut(acc..acc_end).ok_or(H3Error::FrameError)?;
           dst.copy_from_slice(src);
           *pos = end;

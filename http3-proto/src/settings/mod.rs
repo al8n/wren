@@ -167,25 +167,25 @@ fn map_varint(e: VarintError) -> SettingsError {
 }
 
 /// A SETTINGS payload error.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SettingsError {
   /// The payload ended mid-setting (identifier or value incomplete).
-  #[display("{_0}")]
-  Truncated(TruncatedDetail),
+  #[error(transparent)]
+  Truncated(#[from] TruncatedDetail),
   /// A known setting identifier occurred more than once (RFC 9114 §7.2.4.1).
-  #[display("duplicate setting identifier {_0:#x}")]
+  #[error("duplicate setting identifier {0:#x}")]
   Duplicate(u64),
   /// An HTTP/2-reserved setting identifier was received (RFC 9114 §7.2.4.1).
-  #[display("reserved http/2 setting identifier {_0:#x}")]
+  #[error("reserved http/2 setting identifier {0:#x}")]
   Reserved(u64),
   /// SETTINGS_ENABLE_CONNECT_PROTOCOL carried a value other than 0 or 1
   /// (RFC 8441 §3 / RFC 9220).
-  #[display("invalid ENABLE_CONNECT_PROTOCOL value {_0}")]
+  #[error("invalid ENABLE_CONNECT_PROTOCOL value {0}")]
   InvalidConnectProtocol(u64),
   /// A setting identifier or value varint was malformed.
-  #[display("{_0}")]
-  Varint(VarintError),
+  #[error(transparent)]
+  Varint(#[from] VarintError),
 }
 
 #[cfg(test)]

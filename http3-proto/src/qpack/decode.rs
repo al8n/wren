@@ -5,7 +5,7 @@
 //! buffer, so a yielded [`Pair`] is valid only until the next [`FieldLines::next`]
 //! call (the scratch is reused per call).
 
-use super::{QpackError, huffman, int::decode_int, static_table::STATIC_TABLE};
+use super::{QpackError, huffman, int::decode_int, static_table};
 use crate::error::TruncatedDetail;
 
 /// Scratch storage for Huffman-decoded names/values: a caller-supplied slice
@@ -160,18 +160,25 @@ fn parse_value(input: &[u8], pos: &mut usize) -> Result<Src, QpackError> {
   read_string(input, pos, len, huff)
 }
 
+/// Bounds-checks the `[start, start + len)` span of `input`, returning the bytes
+/// or [`QpackError::Truncated`] if it runs off the end (or `start + len`
+/// overflows).
+fn checked_span(input: &[u8], start: usize, len: usize) -> Result<&[u8], QpackError> {
+  let end = start
+    .checked_add(len)
+    .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
+  input
+    .get(start..end)
+    .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))
+}
+
 /// Records a string span of `len` bytes at `*pos`, advancing `*pos` past it.
 /// Bounds-checks the span (truncated input → [`QpackError::Truncated`]).
 fn read_string(input: &[u8], pos: &mut usize, len: u64, huff: bool) -> Result<Src, QpackError> {
   let len = usize::try_from(len).map_err(|_| QpackError::BadInteger)?;
   let start = *pos;
-  let end = start
-    .checked_add(len)
-    .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
-  if end > input.len() {
-    return Err(QpackError::Truncated(TruncatedDetail::new(1)));
-  }
-  *pos = end;
+  checked_span(input, start, len)?;
+  *pos = start.saturating_add(len);
   if huff {
     Ok(Src::Huff { start, len })
   } else {
@@ -182,10 +189,7 @@ fn read_string(input: &[u8], pos: &mut usize, len: u64, huff: bool) -> Result<Sr
 /// Looks up a static-table entry, rejecting out-of-range indices.
 fn static_pair(index: u64) -> Result<(&'static str, &'static str), QpackError> {
   let index = usize::try_from(index).map_err(|_| QpackError::BadStaticIndex)?;
-  STATIC_TABLE
-    .get(index)
-    .copied()
-    .ok_or(QpackError::BadStaticIndex)
+  static_table::entry(index).ok_or(QpackError::BadStaticIndex)
 }
 
 /// Materializes the name and value from their descriptors, Huffman-decoding into
@@ -239,12 +243,7 @@ fn materialize<'a>(
 
 /// The Huffman-coded bytes of a `Huff` span (bounds-checked).
 fn huff_span(input: &[u8], start: usize, len: usize) -> Result<&[u8], QpackError> {
-  let end = start
-    .checked_add(len)
-    .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
-  input
-    .get(start..end)
-    .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))
+  checked_span(input, start, len)
 }
 
 /// Resolves a `Static` or `Raw` descriptor to a `&str` borrowing the input.
@@ -252,12 +251,7 @@ fn non_huff_str(input: &[u8], src: Src) -> Result<&str, QpackError> {
   match src {
     Src::Static(s) => Ok(s),
     Src::Raw { start, len } => {
-      let end = start
-        .checked_add(len)
-        .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
-      let bytes = input
-        .get(start..end)
-        .ok_or(QpackError::Truncated(TruncatedDetail::new(1)))?;
+      let bytes = checked_span(input, start, len)?;
       core::str::from_utf8(bytes).map_err(|_| QpackError::InvalidString)
     }
     // Huffman is materialized by the caller against the scratch.
@@ -270,9 +264,11 @@ fn str_from_huff(bytes: &[u8]) -> Result<&str, QpackError> {
   core::str::from_utf8(bytes).map_err(|_| QpackError::InvalidString)
 }
 
-/// Decodes the 2-byte field-section prefix (RFC 9204 §4.5.1), returning the
-/// offset of the first field line. Required Insert Count and Base must both be 0
-/// (this decoder is static-table-only).
+/// Decodes the field-section prefix (RFC 9204 §4.5.1), returning the offset of
+/// the first field line. Required Insert Count must be 0 (this decoder is
+/// static-table-only). A nonnegative Base is accepted: RFC 9204 permits any Base
+/// when the field section does not reference the dynamic table, and later line
+/// parsing still rejects every dynamic representation.
 fn read_prefix(input: &[u8]) -> Result<usize, QpackError> {
   let (ric_consumed, ric) = decode_int(input, 8)?;
   if ric != 0 {
@@ -290,10 +286,7 @@ fn read_prefix(input: &[u8]) -> Result<usize, QpackError> {
   if sign_byte & 0x80 != 0 {
     return Err(QpackError::DynamicReference);
   }
-  let (base_consumed, base) = decode_int(rest, 7)?;
-  if base != 0 {
-    return Err(QpackError::DynamicReference);
-  }
+  let (base_consumed, _base) = decode_int(rest, 7)?;
   Ok(ric_consumed.saturating_add(base_consumed))
 }
 

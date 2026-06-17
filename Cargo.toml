@@ -1,5 +1,5 @@
 [workspace]
-members = ["websocket-proto", "wren-trace", "wren-compio", "wren-reactor", "http3-proto"]
+members = ["websocket-proto", "wren-trace", "wren-compio", "wren-reactor", "http3-proto", "xtask"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -20,10 +20,10 @@ futures-util = { version = "0.3", default-features = false }
 tracing = { version = "0.1", default-features = false }
 rcgen = "0.14"
 thiserror = { version = "2", default-features = false }
-derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "try_unwrap"] }
+derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "try_unwrap", "unwrap"] }
 rand_core = { version = "0.10", default-features = false }
 rand = { version = "0.10", default-features = false }
-sha1 = { version = "0.10", default-features = false }
+sha1 = { version = "0.11", default-features = false }
 miniz_oxide = { version = "0.9", default-features = false }
 smol_str = { version = "0.3", default-features = false }
 bytes = { version = "1", default-features = false }

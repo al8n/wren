@@ -1,59 +1,61 @@
-use super::static_table::{STATIC_TABLE, find_name, find_name_value};
+use super::static_table::{STATIC_TABLE_LEN, entry, find_name, find_name_value};
 
 #[test]
 fn static_table_has_99_entries() {
-  assert_eq!(STATIC_TABLE.len(), 99);
+  assert_eq!(STATIC_TABLE_LEN, 99);
+  assert!(entry(98).is_some());
+  assert_eq!(entry(99), None);
 }
 
 #[test]
 fn known_static_indices() {
   // Spot-check entries the CONNECT handshake uses + transcription anchors (RFC 9204 App. A).
-  assert_eq!(STATIC_TABLE[0], (":authority", ""));
-  assert_eq!(STATIC_TABLE[1], (":path", "/"));
-  assert_eq!(STATIC_TABLE[15], (":method", "CONNECT"));
-  assert_eq!(STATIC_TABLE[17], (":method", "GET"));
-  assert_eq!(STATIC_TABLE[22], (":scheme", "http"));
-  assert_eq!(STATIC_TABLE[23], (":scheme", "https"));
-  assert_eq!(STATIC_TABLE[25], (":status", "200"));
+  assert_eq!(entry(0), Some((":authority", "")));
+  assert_eq!(entry(1), Some((":path", "/")));
+  assert_eq!(entry(15), Some((":method", "CONNECT")));
+  assert_eq!(entry(17), Some((":method", "GET")));
+  assert_eq!(entry(22), Some((":scheme", "http")));
+  assert_eq!(entry(23), Some((":scheme", "https")));
+  assert_eq!(entry(25), Some((":status", "200")));
   // End + tricky-value anchors to lock the full transcription.
   assert_eq!(
-    STATIC_TABLE[73],
-    ("access-control-allow-credentials", "FALSE")
+    entry(73),
+    Some(("access-control-allow-credentials", "FALSE"))
   );
   assert_eq!(
-    STATIC_TABLE[85],
-    (
+    entry(85),
+    Some((
       "content-security-policy",
       "script-src 'none'; object-src 'none'; base-uri 'none'"
-    )
+    ))
   );
-  assert_eq!(STATIC_TABLE[98], ("x-frame-options", "sameorigin"));
+  assert_eq!(entry(98), Some(("x-frame-options", "sameorigin")));
   // RFC 9204 App. A values verified against quic-go's production table and the
   // RFC 9204 HTML: indices 52, 57, 58 DO contain a space after each semicolon.
   // Index 54 ("text/plain;charset=utf-8") has NO space — that is also correct.
   assert_eq!(
-    STATIC_TABLE[52],
-    ("content-type", "text/html; charset=utf-8")
+    entry(52),
+    Some(("content-type", "text/html; charset=utf-8"))
   );
   assert_eq!(
-    STATIC_TABLE[54],
-    ("content-type", "text/plain;charset=utf-8")
+    entry(54),
+    Some(("content-type", "text/plain;charset=utf-8"))
   );
   assert_eq!(
-    STATIC_TABLE[57],
-    (
+    entry(57),
+    Some((
       "strict-transport-security",
       "max-age=31536000; includesubdomains"
-    )
+    ))
   );
   assert_eq!(
-    STATIC_TABLE[58],
-    (
+    entry(58),
+    Some((
       "strict-transport-security",
       "max-age=31536000; includesubdomains; preload"
-    )
+    ))
   );
-  assert_eq!(STATIC_TABLE[31], ("accept-encoding", "gzip, deflate, br"));
+  assert_eq!(entry(31), Some(("accept-encoding", "gzip, deflate, br")));
 }
 
 #[test]
@@ -276,6 +278,17 @@ mod decode_tests {
   }
 
   #[test]
+  fn decodes_static_section_with_nonzero_positive_base() {
+    // RFC 9204 §4.5.1.2 permits any Base when the section has no dynamic-table
+    // references. RIC=0, Sign=0, Delta Base=5, then indexed static #15.
+    let mut sc = [0u8; 64];
+    let mut d = decode_field_section_into(&[0x00, 0x05, 0xcf], &mut sc).unwrap();
+    let p = d.next().unwrap().unwrap();
+    assert_eq!((p.name(), p.value()), (":method", "CONNECT"));
+    assert!(d.next().unwrap().is_none());
+  }
+
+  #[test]
   fn decodes_literal_name_ref_raw_value() {
     let bytes = [0x00, 0x00, 0x51, 0x05, b'/', b'c', b'h', b'a', b't'];
     let mut sc = [0u8; 64];
@@ -473,16 +486,6 @@ mod decode_tests {
     let mut sc = [0u8; 64];
     let mut d = decode_field_section_into(&[0x00, 0x00, 0x10], &mut sc).unwrap();
     assert!(matches!(d.next(), Err(QpackError::DynamicReference)));
-  }
-
-  #[test]
-  fn rejects_nonzero_delta_base() {
-    // A non-zero Delta Base in the section prefix implies dynamic-table use → reject
-    // (surfaces from the constructor, like a non-zero Required Insert Count).
-    assert!(matches!(
-      decode_field_section_into(&[0x00, 0x01], &mut [0u8; 8]),
-      Err(QpackError::DynamicReference)
-    ));
   }
 
   #[test]
