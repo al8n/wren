@@ -118,7 +118,7 @@ fn bounded_queue_shorter_slice_uses_shorter_capacity() {
   // A slice SHORTER than EVENT_CAP caps the queue at the slice length.
   let short = EVENT_QUEUE_CAP - 2;
   let mut slots = std::vec![None; short];
-  let mut q = super::queue::BoundedQueue::<Event, EVENT_QUEUE_CAP, _>::with_buffer(&mut slots[..]);
+  let mut q = super::queue::BoundedQueue::<Event, _>::with_buffer(&mut slots[..]);
   for _ in 0..short {
     q.push(Event::Established)
       .expect("fits under the shorter cap");
@@ -136,13 +136,18 @@ fn bounded_queue_shorter_slice_uses_shorter_capacity() {
 }
 
 #[test]
-fn bounded_queue_longer_slice_caps_at_n() {
-  // A slice LONGER than EVENT_CAP is capped at EVENT_CAP (the min(N) behavior).
-  let mut slots = std::vec![None; EVENT_QUEUE_CAP + 4];
-  let mut q = super::queue::BoundedQueue::<Event, EVENT_QUEUE_CAP, _>::with_buffer(&mut slots[..]);
-  for _ in 0..EVENT_QUEUE_CAP {
-    q.push(Event::Established).expect("fits up to N");
+fn bounded_queue_longer_slice_uses_full_capacity() {
+  // The backing slice's length is the capacity: a slice LONGER than the default
+  // EVENT_CAP is NOT capped — it uses its full length (consistent with `TxRing`,
+  // which bounds capacity by its byte buffer's length and never caps it).
+  let long = EVENT_QUEUE_CAP + 4;
+  let mut slots = std::vec![None; long];
+  let mut q = super::queue::BoundedQueue::<Event, _>::with_buffer(&mut slots[..]);
+  for _ in 0..long {
+    q.push(Event::Established)
+      .expect("fits up to the full slice length");
   }
+  // Full at the full slice length, NOT at EVENT_CAP.
   assert!(q.push(Event::Established).is_err());
 }
 

@@ -44,12 +44,14 @@ pub(crate) fn default_event_buf() -> DefaultEventBuf<'static> {
 }
 
 /// A fixed-capacity ring buffer over a generic backing store `B` of
-/// `Option<T>` slots (used for queued [`Event`]s). `N` is the logical cap; the
-/// usable capacity is `min(N, B's length)`. The `Copy` bound on `T` lives only
-/// on the push/pop/clear impl block, not on the type itself.
+/// `Option<T>` slots (used for queued [`Event`]s). The usable capacity is the
+/// backing slice's length — the default owned `Vec` is sized [`EVENT_CAP`], and a
+/// borrowed slice is the caller's length (consistent with [`TxRing`], which also
+/// treats its byte buffer's length as the bound). The `Copy` bound on `T` lives
+/// only on the push/pop/clear impl block, not on the type itself.
 ///
 /// [`Event`]: crate::event::Event
-pub(crate) struct BoundedQueue<'a, T, const N: usize, B> {
+pub(crate) struct BoundedQueue<'a, T, B> {
   slots: B,
   head: usize,
   len: usize,
@@ -57,7 +59,7 @@ pub(crate) struct BoundedQueue<'a, T, const N: usize, B> {
   _storage: PhantomData<&'a mut ()>,
 }
 
-impl<T, const N: usize, B> BoundedQueue<'_, T, N, B> {
+impl<T, B> BoundedQueue<'_, T, B> {
   /// An empty queue backed by caller-provided slot storage.
   pub(crate) fn with_buffer(slots: B) -> Self {
     Self {
@@ -70,13 +72,13 @@ impl<T, const N: usize, B> BoundedQueue<'_, T, N, B> {
   }
 }
 
-impl<T: Copy, const N: usize, B> BoundedQueue<'_, T, N, B>
+impl<T: Copy, B> BoundedQueue<'_, T, B>
 where
   B: AsMut<[Option<T>]>,
 {
   /// Pushes `item` to the back, returning `Err(item)` if the queue is full.
   pub(crate) fn push(&mut self, item: T) -> Result<(), T> {
-    let capacity = self.slots.as_mut().len().min(N);
+    let capacity = self.slots.as_mut().len();
     if capacity == 0 || self.len >= capacity {
       return Err(item);
     }
@@ -86,9 +88,8 @@ where
       self.len = self.len.saturating_add(1);
       Ok(())
     } else {
-      // `tail < capacity <= slots.as_mut().len()` (capacity is that length
-      // min'd with N), so `get_mut` always succeeds; this `else` is a panic-free
-      // fallback.
+      // `tail < capacity == slots.as_mut().len()`, so `get_mut` always succeeds;
+      // this `else` is a panic-free fallback.
       Err(item)
     }
   }
@@ -98,7 +99,7 @@ where
     if self.len == 0 {
       return None;
     }
-    let capacity = self.slots.as_mut().len().min(N);
+    let capacity = self.slots.as_mut().len();
     if capacity == 0 {
       return None;
     }
@@ -116,9 +117,8 @@ where
   /// fail transition to drop stale nonfatal lifecycle events the moment it becomes
   /// terminal-priority (the terminal `ConnError` then supersedes them).
   pub(crate) fn clear(&mut self) {
-    // Clear the actual backing slice: push/pop bound by `slots.len().min(N)`, so
-    // clearing every slot (rather than the first `N`) matches that
-    // slice-is-truth capacity model.
+    // Clear the actual backing slice: push/pop bound by `slots.len()`, so clearing
+    // every slot matches that slice-is-truth capacity model.
     for slot in self.slots.as_mut().iter_mut() {
       *slot = None;
     }
