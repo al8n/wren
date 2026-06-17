@@ -3,12 +3,18 @@
 mod generated;
 
 /// The static index whose `(name, value)` both match, if any.
+///
+/// Exposed only for the QPACK static-lookup benchmark; not a stable public API.
+#[doc(hidden)]
 #[inline]
 pub fn find_name_value(name: &str, value: &str) -> Option<usize> {
   generated::find_name_value(name, value)
 }
 
 /// The first static index whose name matches, if any (for literal-with-name-ref).
+///
+/// Exposed only for the QPACK static-lookup benchmark; not a stable public API.
+#[doc(hidden)]
 #[inline]
 pub fn find_name(name: &str) -> Option<usize> {
   generated::find_name(name)
