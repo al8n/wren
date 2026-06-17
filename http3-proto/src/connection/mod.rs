@@ -212,10 +212,7 @@ pub struct Frames<
 /// - the handshake-readiness transition the moment [`Frames::next`] YIELDS the
 ///   first HEADERS to the driver — the client's `Handshaking → Open` establish
 ///   ([`Phase::establish_into`]) / the server's `request_received` — via
-///   [`on_headers_decoded`]. Readiness is gated on the driver OBSERVING the HEADERS
-///   (the yield), NOT merely on the FSM decoding it: the drop-drain decodes the same
-///   HEADERS but does not grant readiness, so a [`Frames`] dropped before any
-///   `next()` cannot let the driver accept / use a request/response it never saw, and
+///   [`on_headers_decoded`] (gated on OBSERVATION, not decoding), and
 /// - the `{anything but Failed} → Failed` fail on ANY fatal request-FSM error
 ///   ([`Phase::fail_into`], recording the terminal error in the non-droppable
 ///   `conn_error` slot), so a lazily-surfaced protocol violation (a second
@@ -230,12 +227,11 @@ pub struct Frames<
 /// fatal-path invariant true for ALL supplied bytes — not just fully-drained
 /// iterators — `Drop` drives the request FSM over any remaining unconsumed input
 /// purely to detect such an error, discarding the items, and routes the first error
-/// through the same [`Phase::fail_into`]. The drop path STRUCTURALLY decodes and
-/// validates the first HEADERS too (so a malformed section is still fatal), but does
-/// NOT run the readiness transition — that fires only on a real `next()` yield, so a
-/// dropped-before-pull iterator advances nothing the driver did not observe. It is a
-/// no-op when the connection is already terminal (a drained-to-error or closed/reset
-/// connection) so a post-error FSM is never re-driven.
+/// through the same [`Phase::fail_into`]. The drop path validates (structurally
+/// decodes the first HEADERS, so a malformed section is still fatal) but grants NO
+/// readiness, and is a no-op when the connection is already terminal so a post-error
+/// FSM is never re-driven. See the observation-gating section on [`Connection`] for
+/// the full validation-vs-observation invariant.
 ///
 /// [`on_headers_decoded`]: RequestFrames::on_headers_decoded
 struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
@@ -430,15 +426,9 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   /// HEADERS, run the moment [`Frames::next`] YIELDS the first
   /// [`Frame::Request`] / [`Frame::Response`] to the driver — and ONLY then. This is
   /// deliberately NOT run from the drop-drain
-  /// ([`drain_for_errors`](Self::drain_for_errors)): readiness is gated on the driver
-  /// observing the HEADERS, not merely on the FSM decoding it. The crate's contract
-  /// requires the application to observe and validate the peer's CONNECT request /
-  /// response before accepting or using the tunnel, so a [`Frames`] iterator dropped
-  /// before any `next()` (the HEADERS never surfaced) must NOT advance the handshake —
-  /// otherwise a server could `accept_with` a CONNECT the driver never saw, or a
-  /// client become `Established` on a response it never validated. The drop path still
-  /// structurally decodes/validates that HEADERS (so a malformed section stays fatal),
-  /// it just does not run this.
+  /// ([`drain_for_errors`](Self::drain_for_errors)): it is the SOLE place readiness is
+  /// granted, so this method is what makes readiness gate on observation, not decoding.
+  /// See the observation-gating section on [`Connection`] for why.
   ///
   /// - Server: flip `request_received` (the gate [`accept_with`](Connection::accept_with)
   ///   waits on — the [`Frame::Request`] yield is itself the signal, there is no
@@ -546,12 +536,8 @@ where
   /// every later frame for a trailing forbidden/fatal one — that trailing-fatal
   /// detection is the whole reason the drop drain exists. It does NOT run the
   /// handshake-READINESS side effects ([`on_headers_decoded`](Self::on_headers_decoded)):
-  /// readiness (the server's `request_received`, the client's `establish` + the
-  /// [`Event::Established`]) is granted only when [`Frames::next`] actually YIELDS the
-  /// first HEADERS to the driver — the observation point. A driver that drops [`Frames`]
-  /// before ever calling `next()` has not observed the peer's CONNECT request /
-  /// response, so it must not be able to `accept_with` it or become `Established` on
-  /// it; only the structural validation (and the fatal-frame scan) runs here.
+  /// validating bytes is not observing them, so a dropped-before-pull iterator grants
+  /// no readiness. See the observation-gating section on [`Connection`].
   ///
   /// This is sync + infallible from the caller's view: it swallows the items and
   /// stops at the first error after calling [`Phase::fail_into`] (idempotent). It is
@@ -1194,7 +1180,11 @@ enum SendGuard<T> {
 /// / DATA frame (RFC 8441 §3 / RFC 9114 §6.2.1). In practice the peer's SETTINGS
 /// cannot arrive before our own [`start`](Self::start), so it only fires on misuse.
 ///
-/// ## Handshake readiness is granted on OBSERVATION, not on bytes
+/// ## The observation-gating invariant (readiness on OBSERVATION, not on bytes)
+///
+/// This section is the single canonical statement of the observation-gating
+/// invariant; the `Frames` / `handle_stream` / drain APIs each restate only their
+/// local specifics and cross-reference back here.
 ///
 /// The CONNECT-HEADERS readiness the table gates on — the server's `request_received`
 /// (which unblocks [`accept_with`](Self::accept_with)) and the client's
@@ -1421,38 +1411,19 @@ pub struct Connection<
   /// Set when a [`Frames`] iterator is dropped before any [`Frames::next`] over an
   /// input whose first HEADERS the drop-drain decoded UNOBSERVED. Decoding the first
   /// HEADERS advances the inbound [`RequestStream`] FSM into its tunnel phase as a
-  /// side effect ([`stream::Items::next`](crate::stream::Items::next)), and the
-  /// drop-drain ([`RequestFrames::drain_for_errors`]) drives that same FSM — so the
-  /// FSM can sit in `Tunnel` even though the driver never OBSERVED (yielded via
-  /// `next()`) the CONNECT request / response. The consumed HEADERS bytes are gone
-  /// with the per-call input, so the stream can never be observed afterwards: it is
-  /// permanently inert TO THE DRIVER. This flag models that. The request stream then
-  /// never surfaces tunnel data and never grants readiness, but — because abandonment
-  /// is NOT terminal — it is still VALIDATED: only a `Failed` connection bypasses the
-  /// FSM/gate entirely. So an abandoned stream's later input is driven through the
-  /// VALIDATION-ONLY path:
+  /// side effect ([`stream::Items::next`](crate::stream::Items::next)), so the FSM can
+  /// sit in `Tunnel` even though the driver never OBSERVED the CONNECT request /
+  /// response; the consumed HEADERS bytes are gone with the per-call input, so the
+  /// stream can never be observed afterwards. This flag models that permanently-inert-
+  /// to-the-driver state: the request stream then surfaces no tunnel data and grants no
+  /// readiness, yet — because abandonment is NOT terminal — its later bytes / FIN are
+  /// still driven through the validation-only path (only a `Failed` connection bypasses
+  /// the FSM/gate). See the dropped-unobserved subsection of the observation-gating
+  /// section on [`Connection`] for the full per-method behavior and rationale.
   ///
-  /// - [`handle_stream`](Self::handle_stream) runs
-  ///   [`drain_request_abandoned`](Self::drain_request_abandoned) — the FSM is re-driven
-  ///   through [`RequestFrames::drain_for_errors`] (the same premature-DATA gate and FSM
-  ///   error checks as the normal path), surfacing an empty [`Frames`] (no `Frame::Data`
-  ///   from a tunnel the driver never established). A clean read leaves the connection
-  ///   non-terminal; premature DATA on the never-established tunnel is
-  ///   [`H3Error::MessageError`] (RFC 9114 §4.4) and a forbidden frame is its FSM error,
-  ///   either of which fails the connection.
-  /// - [`handle_stream_fin`](Self::handle_stream_fin) drives [`RequestStream::fin`]: a
-  ///   clean FIN surfaces NO [`Event::PeerClosed`] (the tunnel was never observed /
-  ///   established) and stays non-terminal, while a malformed / mid-frame FIN
-  ///   ([`H3Error::FrameError`] / [`H3Error::RequestIncomplete`]) fails the connection.
-  ///
-  /// Abandonment ITSELF is not a connection failure: a lazy driver dropping an iterator
-  /// is not a protocol violation — readiness simply stays ungranted (server
-  /// [`accept_with`](Self::accept_with) keeps returning [`Error::WouldBlock`], the client
-  /// never becomes `Established`), the correct consequence of not observing. The peer's
-  /// protocol violations on the abandoned stream are still its own faults and still fail
-  /// the connection. A data marker, not a phase; never set on a connection whose first
-  /// HEADERS were observed (an observed HEADERS leaves the FSM in `Tunnel` so the drain
-  /// can never re-decode a HEADERS to set this).
+  /// A data marker, not a phase; never set on a connection whose first HEADERS were
+  /// observed (an observed HEADERS leaves the FSM in `Tunnel` so the drain can never
+  /// re-decode a HEADERS to set this).
   request_abandoned: bool,
   /// The terminal connection error, recorded by [`fail`](Self::fail) /
   /// [`Phase::fail_into`] when the `Failed` transition happens (the FIRST fatal
@@ -2249,14 +2220,10 @@ where
   /// an early-stopping driver and leave the connection non-terminal — but a driver
   /// that wants the tunnel DATA must drain.
   ///
-  /// Validation is NOT observation: dropping [`Frames`] checks the bytes but does not
-  /// surface the peer's CONNECT HEADERS to the driver. Handshake readiness — the
-  /// server becoming able to [`accept_with`](Self::accept_with), the client becoming
-  /// [`Established`](Event::Established) — is granted ONLY when [`Frames::next`]
-  /// actually yields the first [`Frame::Request`] / [`Frame::Response`] (the
-  /// observation point). A [`Frames`] dropped before any `next()` validates its bytes
-  /// but advances no readiness: the driver must observe and validate the request /
-  /// response before accepting or using the tunnel.
+  /// Validation is NOT observation: dropping [`Frames`] checks the bytes but advances
+  /// no readiness, so the driver must pull the request / response via [`Frames::next`]
+  /// before accepting or using the tunnel. See the observation-gating section on
+  /// [`Connection`].
   pub fn handle_stream<'a>(
     &'a mut self,
     id: StreamId,
