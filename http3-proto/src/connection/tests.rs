@@ -64,6 +64,88 @@ fn borrowed_transmit_storage_controls_queue_capacity() {
   assert!(c.tx.has_capacity_mut(3));
 }
 
+/// Fills the next free transmit slot with `n` zero bytes via `enqueue`, asserting
+/// it succeeds.
+fn push_tx<B: AsMut<[u8]>>(ring: &mut super::queue::TxRing<'_, B>, n: usize) {
+  ring
+    .enqueue(StreamKind::OpenRequest, false, |buf| {
+      let take = n.min(buf.len());
+      buf.get_mut(..take).map_or(Err(()), |slot| {
+        slot.fill(0);
+        Ok::<usize, ()>(take)
+      })
+    })
+    .map_err(|_| ())
+    .expect("slot is free");
+}
+
+#[test]
+fn tx_ring_trailing_partial_chunk_is_ignored() {
+  // TX_CAP*3 + 100: three whole slots plus a partial that must NOT count.
+  let mut bytes = std::vec![0u8; super::queue::TX_CAP * 3 + 100];
+  let mut ring = super::queue::TxRing::with_buffer(&mut bytes[..]);
+  assert!(ring.has_capacity_mut(3));
+  assert!(!ring.has_capacity_mut(4));
+  for _ in 0..3 {
+    push_tx(&mut ring, 1);
+  }
+  // The partial chunk yields no fourth slot.
+  assert!(!ring.has_capacity_mut(1));
+}
+
+#[test]
+fn tx_ring_oversized_buffer_caps_at_tx_n() {
+  // A buffer far larger than the default still yields only TX_N slots, so the
+  // fixed `slots` array is never indexed out of range.
+  let mut bytes = std::vec![0u8; super::queue::TX_BYTES_CAP + super::queue::TX_CAP * 4];
+  let mut ring = super::queue::TxRing::with_buffer(&mut bytes[..]);
+  assert!(ring.has_capacity_mut(super::queue::TX_N));
+  assert!(!ring.has_capacity_mut(super::queue::TX_N + 1));
+  // Fill every slot and drain it: exercises enqueue/poll wrap at the TX_N cap.
+  for _ in 0..super::queue::TX_N {
+    push_tx(&mut ring, 1);
+  }
+  assert!(!ring.has_capacity_mut(1));
+  let mut drained = 0usize;
+  while ring.poll().is_some() {
+    drained = drained.saturating_add(1);
+  }
+  assert_eq!(drained, super::queue::TX_N);
+}
+
+#[test]
+fn bounded_queue_shorter_slice_uses_shorter_capacity() {
+  // A slice SHORTER than EVENT_CAP caps the queue at the slice length.
+  let short = EVENT_QUEUE_CAP - 2;
+  let mut slots = std::vec![None; short];
+  let mut q = super::queue::BoundedQueue::<Event, EVENT_QUEUE_CAP, _>::with_buffer(&mut slots[..]);
+  for _ in 0..short {
+    q.push(Event::Established)
+      .expect("fits under the shorter cap");
+  }
+  // Full at the shorter cap, not at EVENT_CAP.
+  assert!(q.push(Event::Established).is_err());
+  assert!(matches!(q.pop(), Some(Event::Established)));
+  // After a clear the shorter-capacity queue is reusable to the same bound.
+  q.clear();
+  assert!(q.pop().is_none());
+  for _ in 0..short {
+    q.push(Event::Established).expect("reusable after clear");
+  }
+  assert!(q.push(Event::Established).is_err());
+}
+
+#[test]
+fn bounded_queue_longer_slice_caps_at_n() {
+  // A slice LONGER than EVENT_CAP is capped at EVENT_CAP (the min(N) behavior).
+  let mut slots = std::vec![None; EVENT_QUEUE_CAP + 4];
+  let mut q = super::queue::BoundedQueue::<Event, EVENT_QUEUE_CAP, _>::with_buffer(&mut slots[..]);
+  for _ in 0..EVENT_QUEUE_CAP {
+    q.push(Event::Established).expect("fits up to N");
+  }
+  assert!(q.push(Event::Established).is_err());
+}
+
 /// A captured transmit: owned bytes plus the routing metadata.
 struct Captured {
   kind: StreamKind,
