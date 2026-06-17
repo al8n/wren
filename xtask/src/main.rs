@@ -177,6 +177,13 @@ fn generate_huffman(codes: &[(u32, u8)]) -> Result<String, Box<dyn std::error::E
     }
   }
 
+  // The RFC 7541 Huffman tree is complete, so a finished build has no missing
+  // children; `INVALID_EDGE` (and the branch that tests for it) is only emitted
+  // when some edge is actually `Empty`.
+  let has_empty_edge = nodes
+    .iter()
+    .any(|node| matches!(node.zero, Edge::Empty) || matches!(node.one, Edge::Empty));
+
   let mut out = String::from(GENERATED_HEADER);
   out.push_str(
     "\
@@ -194,10 +201,12 @@ pub(super) enum HuffmanStep {
 
 pub(super) const HUFFMAN_ROOT: u16 = 0;
 const SYMBOL_FLAG: u16 = 0x8000;
-const INVALID_EDGE: u16 = 0xffff;
-
 ",
   );
+  if has_empty_edge {
+    out.push_str("const INVALID_EDGE: u16 = 0xffff;\n");
+  }
+  out.push('\n');
 
   out.push_str("#[rustfmt::skip]\npub(super) static CODE_LENGTHS: [u8; 256] = [\n");
   for chunk in codes[..256].chunks(16) {
@@ -238,7 +247,11 @@ pub(super) fn step(node: u16, bit: u32) -> HuffmanStep {
 
 #[inline]
 fn decode_edge(edge: u16) -> HuffmanStep {
-  if edge == INVALID_EDGE {
+",
+  );
+  if has_empty_edge {
+    out.push_str(
+      "  if edge == INVALID_EDGE {
     HuffmanStep::Invalid
   } else if edge & SYMBOL_FLAG == SYMBOL_FLAG {
     HuffmanStep::Symbol(usize::from(edge & !SYMBOL_FLAG))
@@ -247,7 +260,18 @@ fn decode_edge(edge: u16) -> HuffmanStep {
   }
 }
 ",
-  );
+    );
+  } else {
+    out.push_str(
+      "  if edge & SYMBOL_FLAG == SYMBOL_FLAG {
+    HuffmanStep::Symbol(usize::from(edge & !SYMBOL_FLAG))
+  } else {
+    HuffmanStep::Node(edge)
+  }
+}
+",
+    );
+  }
 
   Ok(out)
 }

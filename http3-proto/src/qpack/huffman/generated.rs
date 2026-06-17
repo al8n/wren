@@ -16,7 +16,6 @@ pub(super) enum HuffmanStep {
 
 pub(super) const HUFFMAN_ROOT: u16 = 0;
 const SYMBOL_FLAG: u16 = 0x8000;
-const INVALID_EDGE: u16 = 0xffff;
 
 #[rustfmt::skip]
 pub(super) static CODE_LENGTHS: [u8; 256] = [
@@ -1076,9 +1075,7 @@ pub(super) fn step(node: u16, bit: u32) -> HuffmanStep {
 
 #[inline]
 fn decode_edge(edge: u16) -> HuffmanStep {
-  if edge == INVALID_EDGE {
-    HuffmanStep::Invalid
-  } else if edge & SYMBOL_FLAG == SYMBOL_FLAG {
+  if edge & SYMBOL_FLAG == SYMBOL_FLAG {
     HuffmanStep::Symbol(usize::from(edge & !SYMBOL_FLAG))
   } else {
     HuffmanStep::Node(edge)
