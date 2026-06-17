@@ -2,6 +2,9 @@
 name = "http3-proto"
 version = "0.1.0"
 edition = "2024"
+# `benches/generated_static_lookup.rs` is `include!`d by the bench below, not a
+# standalone target; disable auto-discovery so it is not built as its own bench.
+autobenches = false
 rust-version = "1.91.0"
 license = "MIT OR Apache-2.0"
 description = "Sans-I/O HTTP/3 Extended-CONNECT tunnel state machine (RFC 9114/9204/9220; no_std, no_alloc capable, panic-free)."

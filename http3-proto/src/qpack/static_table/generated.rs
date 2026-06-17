@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 #![allow(missing_docs)]
 
+#[cfg(test)]
 pub(super) const STATIC_TABLE_LEN: usize = 99;
 
 #[rustfmt::skip]
