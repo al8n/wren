@@ -1862,13 +1862,47 @@ where
     // inside the lending iterator over a disjoint borrow.
     let establish_on_response = is_client && self.phase.is_handshaking();
     let needs_request = !is_client && !self.request_received;
-    // Split-borrow the disjoint fields the iterator carries: `phase` + `events`
-    // + `close_pending` + `conn_error` (always present — they back BOTH the lazy
-    // establish AND the lazy fail routing, the latter recording the terminal error
-    // in the non-droppable `conn_error` slot), `tunnel_established` (the gate on
-    // yielding `Frame::Data`, set by the client establish carrier), and,
-    // server-side, `request_received`. All are distinct fields from the request FSM,
-    // so these borrows are disjoint from `self.request`.
+    Ok(Frames {
+      inner: Some(self.build_request_frames(bytes, scratch, establish_on_response, needs_request)),
+    })
+  }
+
+  /// Builds the [`RequestFrames`] carrier shared by the live drain
+  /// ([`handle_request`](Self::handle_request)) and the abandoned validation-only drain
+  /// ([`drain_request_abandoned`](Self::drain_request_abandoned)). All the disjoint
+  /// `self`-field splits the carrier holds live HERE, in one function body, so the
+  /// borrow checker can see they are distinct fields from `self.request` (the FSM the
+  /// iterator drives) — including the conditional `&mut self.request_received` borrow,
+  /// which an `on_first_request: Option<&mut bool>` PARAMETER could not express (the
+  /// caller would have to borrow that field while also passing `&mut self`, two
+  /// overlapping borrows). Passing the `needs_request` / `establish_on_response`
+  /// decisions as plain `bool`s instead keeps every field borrow inside this split.
+  ///
+  /// The carrier borrows: `phase` + `events` + `close_pending` + `conn_error` (always
+  /// present — they back BOTH the lazy establish AND the lazy fail routing, the latter
+  /// recording the terminal error in the non-droppable `conn_error` slot),
+  /// `request_abandoned`, `tunnel_established` (the gate on yielding [`Frame::Data`],
+  /// set by the client establish carrier), and, when `needs_request`, `request_received`.
+  ///
+  /// `establish_on_response` arms the client's `Handshaking → Open` establish on the
+  /// first OBSERVED response (`false` on the server / abandoned path); `needs_request`
+  /// arms the server's `request_received` flip on the first OBSERVED request (the
+  /// abandoned path passes `false` so neither carrier is armed). Both fire only from a
+  /// real [`Frames::next`] yield — never from the drop-drain.
+  fn build_request_frames<'a>(
+    &'a mut self,
+    bytes: &'a [u8],
+    scratch: &'a mut [u8],
+    establish_on_response: bool,
+    needs_request: bool,
+  ) -> RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf>
+  where
+    ReqBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
+  {
+    let is_client = Ro::IS_CLIENT;
+    // Split-borrow the disjoint fields the iterator carries. All are distinct fields
+    // from the request FSM (`self.request`), so these borrows are disjoint from it.
     let phase = &mut self.phase;
     let events = &mut self.events;
     let close_pending = &mut self.close_pending;
@@ -1879,33 +1913,30 @@ where
     let fsm = &mut self.request;
     let on_first_request = needs_request.then_some(request_received);
     let items = fsm.handle(bytes, scratch);
-    Ok(Frames {
-      inner: Some(RequestFrames {
-        drain_on_drop: RequestFrames::<ReqBuf, EventBuf>::drain_for_errors,
-        items,
-        phase,
-        events,
-        close_pending,
-        conn_error,
-        request_abandoned,
-        is_client,
-        establish_on_response,
-        on_first_request,
-        tunnel_established,
-      }),
-    })
+    RequestFrames {
+      drain_on_drop: RequestFrames::<ReqBuf, EventBuf>::drain_for_errors,
+      items,
+      phase,
+      events,
+      close_pending,
+      conn_error,
+      request_abandoned,
+      is_client,
+      establish_on_response,
+      on_first_request,
+      tunnel_established,
+    }
   }
 
   /// Drives later request-stream `bytes` through the VALIDATION-ONLY path on an
-  /// already-abandoned (dropped-unobserved) request stream, surfacing nothing.
+  /// already-abandoned (dropped-unobserved) request stream, surfacing nothing. An
+  /// abandoned stream is inert to the driver but not terminal, so it may not bypass the
+  /// FSM/gate (see the observation-gating section on [`Connection`]).
   ///
-  /// An abandoned stream is permanently inert to the DRIVER (it can never observe the
-  /// CONNECT request / response, so it never establishes the tunnel), but it is NOT
-  /// terminal — so unlike a `Failed` connection it may not bypass the FSM/gate. The
-  /// peer can still commit protocol violations on it, and every one must still fail the
-  /// connection: this builds the same [`RequestFrames`] over `fsm.handle(bytes, scratch)`
-  /// as the normal path (the same disjoint borrows) and runs
-  /// [`drain_for_errors`](RequestFrames::drain_for_errors), which applies the
+  /// The peer can still commit protocol violations on it, and every one must still fail
+  /// the connection: this builds the same [`RequestFrames`] over
+  /// `fsm.handle(bytes, scratch)` as the normal path (the same disjoint borrows) and
+  /// runs [`drain_for_errors`](RequestFrames::drain_for_errors), which applies the
   /// premature-DATA establishment gate (the tunnel was never established, so any DATA is
   /// `H3Error::MessageError`, RFC 9114 §4.4), fails on an FSM `Err` (a forbidden /
   /// second-HEADERS frame, malformed framing), and grants NO readiness and yields NO
@@ -1916,32 +1947,12 @@ where
     ReqBuf: AsMut<[u8]>,
     EventBuf: AsMut<[Option<Event>]>,
   {
-    let is_client = Ro::IS_CLIENT;
-    let phase = &mut self.phase;
-    let events = &mut self.events;
-    let close_pending = &mut self.close_pending;
-    let conn_error = &mut self.conn_error;
-    let request_abandoned = &mut self.request_abandoned;
-    let tunnel_established = &mut self.tunnel_established;
-    let fsm = &mut self.request;
-    let items = fsm.handle(bytes, scratch);
     // An abandoned stream grants no readiness on validation, so neither carrier is
-    // armed: `establish_on_response` stays `false` and `on_first_request` is `None`.
-    // The drain ignores them regardless (it never runs `on_headers_decoded`), but
-    // keeping them inert documents that this path advances nothing the driver observes.
-    let mut rf = RequestFrames {
-      drain_on_drop: RequestFrames::<ReqBuf, EventBuf>::drain_for_errors,
-      items,
-      phase,
-      events,
-      close_pending,
-      conn_error,
-      request_abandoned,
-      is_client,
-      establish_on_response: false,
-      on_first_request: None,
-      tunnel_established,
-    };
+    // armed: `establish_on_response = false` and `needs_request = false` (so
+    // `on_first_request` is `None`). The drain ignores them regardless (it never runs
+    // `on_headers_decoded`), but keeping them inert documents that this path advances
+    // nothing the driver observes. The carrier is then driven for errors and dropped.
+    let mut rf = self.build_request_frames(bytes, scratch, false, false);
     rf.drain_for_errors();
   }
 
