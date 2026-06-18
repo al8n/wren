@@ -45,7 +45,7 @@ mod queue;
 
 use core::marker::PhantomData;
 
-use derive_more::{IsVariant, TryUnwrap, Unwrap};
+use derive_more::IsVariant;
 use queue::{BoundedQueue, TX_CAP, TxError, TxRing};
 
 use crate::{
@@ -152,20 +152,33 @@ fn default_ctrl_buf() -> DefaultCtrlBuf<'static> {
 /// QUIC varints. Mirrors the request FSM's bound.
 const CTRL_HDR_CAP: usize = 16;
 
-/// A decoded frame yielded by [`Frames`]: the peer's CONNECT HEADERS or a chunk
-/// of tunnel DATA. Borrows the `handle_stream` scratch/input and is invalidated
-/// by the next [`Frames::next`].
-#[derive(IsVariant, Unwrap, TryUnwrap)]
-#[unwrap(ref, ref_mut)]
-#[try_unwrap(ref, ref_mut)]
+/// A decoded frame yielded by [`Frames`]: the peer's request/response HEADERS, a
+/// trailing HEADERS section (trailers), or a chunk of DATA. Borrows the
+/// `handle_stream` scratch/input and is invalidated by the next [`Frames::next`].
+//
+// `Unwrap`/`TryUnwrap` are NOT derived: `derive_more` cannot generate them for a
+// struct variant (`Response { .. }`) — it panics at derive time (exactly what bit
+// `StreamItem`). `IsVariant` (unit-of-work predicates) handles every variant; the
+// driver `match`es to bind the payload.
+#[derive(IsVariant)]
 #[non_exhaustive]
 pub enum Frame<'a> {
-  /// The peer's request HEADERS (server side): the CONNECT field section.
+  /// The peer's request HEADERS (server side): the leading field section.
   Request(HeaderSet<'a>),
-  /// The peer's response HEADERS (client side): the CONNECT response field section.
-  Response(HeaderSet<'a>),
-  /// A chunk of DATA-frame payload (tunnel bytes). Yielded ONLY once the tunnel is
-  /// established (the CONNECT exchange completed). EVERY DATA-frame occurrence —
+  /// The peer's response HEADERS (client side): a leading field section.
+  Response {
+    /// Whether this is an interim (1xx informational) response, decided by the
+    /// `:status` pseudo-header. `true` means more responses follow (one or more
+    /// interim 1xx then exactly one final); `false` is the final response.
+    interim: bool,
+    /// The decoded response field section.
+    headers: HeaderSet<'a>,
+  },
+  /// A trailing HEADERS section (trailers) after the body, in either direction.
+  Trailers(HeaderSet<'a>),
+  /// A chunk of DATA-frame payload (body / tunnel bytes). Yielded ONLY once the
+  /// stream is established (the final response sent/seen; the CONNECT exchange
+  /// completed). EVERY DATA-frame occurrence —
   /// including a zero-length one — passes the establishment gate, on BOTH the yield
   /// path ([`Frames::next`]) and the drop-drain (a dropped [`Frames`] cannot smuggle
   /// premature DATA past the gate): premature DATA — on the server before
@@ -426,7 +439,7 @@ where
     // empty occurrence). Looping over `advance` (owned offsets) rather than the
     // borrowing `Items::next` is what lets the skip compile on stable NLL: no returned
     // borrow crosses the loop back-edge.
-    let acc_end = loop {
+    let headers = loop {
       // A lazily-surfaced request-FSM error (a second HEADERS, DATA before HEADERS,
       // malformed QPACK, PUSH_PROMISE → IdError, …) is connection-fatal exactly like
       // the eager `handle_stream` errors: route it through the centralized fail
@@ -442,15 +455,41 @@ where
       };
       match advanced {
         None => return Ok(None),
-        // A HEADERS section. The CONNECT tunnel exchanges exactly ONE HEADERS each way,
-        // so a HEADERS once a prior section already completed (a repeated leading /
-        // interim section OR a trailing section — the FSM now allows both, leaving the
-        // policy here) is a frame-placement violation: route it through the centralized
-        // fail transition exactly like any other lazy fatal request-FSM error. The
-        // `kind` is ignored at the tunnel layer (a later task uses it for general
-        // per-stream interim/trailers acceptance).
-        Some(Advanced::Headers { acc_end, kind: _ }) => {
-          if rf.first_headers_seen {
+        // A HEADERS section. The FSM already classified it by placement
+        // ([`HeadersKind`]): an `Initial` leading section (request / interim / final
+        // response) or a post-DATA `Trailers` section. The connection layer applies the
+        // ROLE-based placement policy here:
+        //
+        // - `Initial` on the SERVER: exactly one inbound `Frame::Request` is legal (a
+        //   request has no interim inbound HEADERS), so a SECOND `Initial` is a
+        //   frame-placement violation — route it through the centralized fail transition
+        //   exactly like any other lazy fatal request-FSM error.
+        // - `Initial` on the CLIENT: each is a `Frame::Response`; interim 1xx responses
+        //   precede the FINAL one, so REPEATS BEFORE the final are allowed (the `interim`
+        //   flag, decided by `:status` in the yield tail, distinguishes them). An
+        //   `Initial` AFTER the final response (the client established on it — RFC 9114
+        //   §4.1: a final response is the last leading section) is illegal → fail. The
+        //   per-stream `tunnel_established` is exactly "the final response was observed"
+        //   on the client (interim 1xx do not establish), so it gates this reject;
+        //   tightening to full interim-then-one-final placement is a later task.
+        // - `Trailers` (either role): a single trailing section is allowed (the FSM
+        //   enforces at-most-one and nothing-after) → `Frame::Trailers`.
+        //
+        // The CONNECT tunnel is the specialization: a tunnel server gets one request
+        // `Initial`, a tunnel client gets one final response `Initial` (then it is
+        // established), so a second inbound `Initial` fails on EITHER role — keeping the
+        // tunnel exactly as strict as before.
+        Some(Advanced::Headers { acc_end, kind }) => {
+          let second_initial_illegal = kind.is_initial()
+            && if rf.is_client {
+              // The client rejects an `Initial` only AFTER the final response (already
+              // established); pre-final interim repeats flow through.
+              *rf.tunnel_established
+            } else {
+              // The server rejects any second `Initial` (one request, no interim inbound).
+              rf.first_headers_seen
+            };
+          if second_initial_illegal {
             Phase::fail_into(
               rf.phase,
               rf.close_pending,
@@ -460,10 +499,14 @@ where
             );
             return Err(H3Error::FrameUnexpected);
           }
-          // The first HEADERS: break out so the readiness side effect + the borrowing
-          // yield run once, outside the skip loop.
-          rf.first_headers_seen = true;
-          break acc_end;
+          // Record that a leading section has been observed (gates the server's
+          // second-`Initial` reject above, across `handle_stream` calls too). A
+          // `Trailers` section never re-arms it. Break out so the readiness side effect +
+          // the borrowing yield run once, outside the skip loop.
+          if kind.is_initial() {
+            rf.first_headers_seen = true;
+          }
+          break (acc_end, kind);
         }
         Some(Advanced::Data { start, end }) => {
           // Tunnel DATA is delivered ONLY once the tunnel reached `Open`
@@ -506,14 +549,25 @@ where
         }
       }
     };
-    // The first HEADERS is current. We are about to YIELD it to the driver — the
-    // observation point. Run the handshake-READINESS side effect here — server
-    // `request_received`, client `establish` — over the disjoint field borrows, then
-    // re-decode the buffered (already-validated) section and yield it. This is the ONLY
-    // place readiness fires: the drop-drain (`drain_for_errors`) structurally
-    // decodes/validates the same HEADERS but does NOT run this, so an iterator dropped
-    // before any `next()` never advances the handshake on a request/response the driver
-    // never observed.
+    let (acc_end, kind) = headers;
+    // A trailing HEADERS section is just `Frame::Trailers` (either role): it carries no
+    // handshake readiness (the leading section already granted it) and its `interim`
+    // distinction does not apply. Re-decode the buffered (already-validated) section and
+    // yield it. Decoding here is what surfaces a malformed QPACK trailers section as an
+    // error at the yield point (the FSM eager-validates only the FIRST section; later
+    // accepted sections are decoded here).
+    if kind.is_trailers() {
+      let hs = rf.items.decode_buffered_headers(acc_end)?;
+      return Ok(Some(Frame::Trailers(hs)));
+    }
+    // A leading (`Initial`) HEADERS is current. We are about to YIELD it to the driver —
+    // the observation point. Run the handshake-READINESS side effect here — server
+    // `request_received`, client `establish` — over the disjoint field borrows. Both
+    // carriers fire AT MOST ONCE (consumed by `take`), so a client interim 1xx that runs
+    // this again is a no-op. This is the ONLY place readiness fires: the drop-drain
+    // (`drain_for_errors`) structurally decodes/validates the same HEADERS but does NOT
+    // run this, so an iterator dropped before any `next()` never advances the handshake
+    // on a request/response the driver never observed.
     RequestFrames::<ReqBuf, EventBuf>::on_headers_decoded(
       &mut rf.establish_on_response,
       &mut rf.on_first_request,
@@ -522,10 +576,21 @@ where
       rf.tunnel_established,
       rf.is_client,
     );
-    let hs = rf.items.decode_buffered_headers(acc_end)?;
     if rf.is_client {
-      Ok(Some(Frame::Response(hs)))
+      // A client `Initial` is a response. Decide `interim` (a 1xx informational
+      // response, more to follow) by its `:status`, re-decoding the section once to scan
+      // for it, then re-decode for the yield (each `decode_buffered_headers` is a fresh,
+      // idempotent decode over the same owned bytes). Decoding here also surfaces a
+      // malformed QPACK section (e.g. a second/interim section the FSM did not eagerly
+      // validate) as an error at the yield point.
+      let interim = is_interim_status(rf.items.decode_buffered_headers(acc_end)?)?;
+      let hs = rf.items.decode_buffered_headers(acc_end)?;
+      Ok(Some(Frame::Response {
+        interim,
+        headers: hs,
+      }))
     } else {
+      let hs = rf.items.decode_buffered_headers(acc_end)?;
       Ok(Some(Frame::Request(hs)))
     }
   }
@@ -700,11 +765,19 @@ where
         //    established the tunnel, so that DATA is premature (RFC 9114 §4.4) and
         //    `fail`s the connection. That §4.4 violation by the peer SUPERSEDES mere
         //    abandonment (exactly as a trailing forbidden frame already supersedes it).
-        Ok(Some(Advanced::Headers { .. })) => {
-          // A HEADERS once a prior section already completed is the SAME second-HEADERS
-          // placement violation the live path rejects (next/drain parity): the tunnel
-          // exchanges exactly one HEADERS each way. Route it through `fail` and stop.
-          if self.first_headers_seen {
+        Ok(Some(Advanced::Headers { kind, .. })) => {
+          // The SAME role-based placement reject the live path (`Frames::next`) applies
+          // (next/drain parity): a second `Initial` on the server, or an `Initial` after
+          // the final response on the client (already established), is illegal. A
+          // `Trailers` section is allowed (the FSM enforces at-most-one / nothing-after)
+          // and is not an abandonment trigger.
+          let second_initial_illegal = kind.is_initial()
+            && if self.is_client {
+              *self.tunnel_established
+            } else {
+              self.first_headers_seen
+            };
+          if second_initial_illegal {
             Phase::fail_into(
               self.phase,
               self.close_pending,
@@ -714,10 +787,13 @@ where
             );
             return;
           }
-          // The UNOBSERVED first HEADERS: mark the stream abandoned (no readiness on the
-          // drop path) and keep scanning for a trailing violation in this same input.
-          self.first_headers_seen = true;
-          *self.request_abandoned = true;
+          // The UNOBSERVED first `Initial`: mark the stream abandoned (no readiness on
+          // the drop path) and keep scanning for a trailing violation in this same input.
+          // A `Trailers` section never re-arms `first_headers_seen` or marks abandonment.
+          if kind.is_initial() {
+            self.first_headers_seen = true;
+            *self.request_abandoned = true;
+          }
         }
         // A DATA frame on the drop path passes the SAME establishment gate as
         // `Frames::next` (via the shared `fail_if_premature_data`), so premature DATA
@@ -2592,8 +2668,9 @@ where
     }
   }
 
-  /// Sends a chunk of tunnel payload as an HTTP/3 DATA frame on the request
-  /// stream.
+  /// Sends a chunk of tunnel payload as an HTTP/3 DATA frame on the CONNECT tunnel's
+  /// request stream — a thin wrapper over [`send_data_on`](Self::send_data_on) keyed
+  /// by the tunnel-slot pointer (`request_id`).
   ///
   /// Returns:
   /// - [`Err`]`(`[`Error::Closed`]`)` before the tunnel is established or after
@@ -2606,22 +2683,120 @@ where
   where
     TxBuf: AsMut<[u8]>,
   {
-    // The single precondition: DATA flows only while the tunnel is `Open`. This one
+    // The tunnel precondition: DATA flows only while the tunnel is `Open`. This one
     // phase check subsumes the old `!started || !established || closing` triple —
     // `Created` / `Handshaking` (not yet open) and `Closing` / `Failed` (no longer
     // open) all report `Closed`. It also pins setup-before-traffic: the control
     // stream's SETTINGS reach the wire (in `Handshaking`) before any DATA frame
-    // (RFC 8441 / RFC 9114 ordering).
+    // (RFC 8441 / RFC 9114 ordering). This stays the TUNNEL gate; the general
+    // `send_data_on` enqueue is shared underneath.
     if !self.phase.is_open() {
       return Err(Error::Closed);
     }
     let id = self.request_id.ok_or(Error::Closed)?;
+    self.send_data_on(id, payload)
+  }
+
+  /// Sends a chunk of DATA-frame payload (request/response body, or tunnel bytes) on
+  /// the request stream `id` — the GENERAL per-stream DATA entry point.
+  ///
+  /// Distinct in name from the tunnel [`send_data`](Self::send_data) because Rust
+  /// cannot overload by arity and the tunnel keeps its `send_data(&[u8])` (a thin
+  /// wrapper over this). `id` must name a known request stream; the connection must
+  /// be non-terminal and past setup.
+  ///
+  /// Returns:
+  /// - [`Err`]`(`[`Error::Closed`]`)` when the connection is closing/failed, setup
+  ///   has not run, or `id` is not a known request stream;
+  /// - [`Err`]`(`[`Error::WouldBlock`]`)` when the transmit ring is momentarily full
+  ///   — drain it with [`poll_transmit`](Self::poll_transmit) and retry;
+  /// - [`Err`]`(`[`Error::Protocol`]`(`[`H3Error::FrameError`]`))` when the framed
+  ///   payload does not fit a single transmit slot (the v1 no-alloc bound).
+  pub fn send_data_on(&mut self, id: StreamId, payload: &[u8]) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+  {
+    self.guard_send_on(id)?;
     self
       .tx
       .enqueue(StreamKind::Existing(id), false, |out| {
         write_data_frame(out, payload)
       })
       .map_err(map_tx)
+  }
+
+  /// Sends a trailing HEADERS section (trailers) on the request stream `id`, in
+  /// either direction (request trailers from a client, response trailers from a
+  /// server). A single trailing section is allowed after the body. The driver owns
+  /// trailer validity; the core stays semantics-agnostic (the full validator is a
+  /// later task).
+  ///
+  /// Returns the same `Err` set as [`send_data_on`](Self::send_data_on), plus
+  /// [`Error::FieldSectionTooLarge`] when the trailers' decoded field-section size
+  /// exceeds the peer's advertised `MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2).
+  pub fn send_trailers<H: Headers + ?Sized>(
+    &mut self,
+    id: StreamId,
+    headers: &H,
+  ) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+  {
+    self.guard_send_on(id)?;
+    // The peer's SETTINGS bound the trailers' field-section size, as for any HEADERS
+    // frame. When they have not arrived the size is unbounded locally; matching the
+    // request/response paths, block until they do.
+    let limit = self
+      .settings_peer
+      .ok_or(Error::WouldBlock)?
+      .max_field_section_size();
+    self
+      .tx
+      .enqueue(StreamKind::Existing(id), false, |out| {
+        write_headers_frame(out, headers, limit)
+      })
+      .map_err(map_tx)
+  }
+
+  /// Half-closes the request stream `id` by enqueuing an empty FIN transmit on it —
+  /// the GENERAL per-stream finish (end of the locally-sent message: after the
+  /// request body / trailers on a client, or the response body / trailers on a
+  /// server). Unlike the connection-level [`close`](Self::close) it does NOT change
+  /// the connection phase; it is a per-stream send-half close.
+  ///
+  /// Returns the same `Err` set as [`send_data_on`](Self::send_data_on) (a full ring
+  /// is [`Error::WouldBlock`] — retry after [`poll_transmit`](Self::poll_transmit)).
+  pub fn finish(&mut self, id: StreamId) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+  {
+    self.guard_send_on(id)?;
+    // An empty FIN: zero bytes, fin = true. The fill closure writes nothing, so its
+    // error type is the uninhabited-in-practice `()`; a full ring is the only failure
+    // and maps to `WouldBlock` (retry after `poll_transmit`).
+    self
+      .tx
+      .enqueue(StreamKind::Existing(id), true, |_out| Ok::<usize, ()>(0))
+      .map_err(|e| match e {
+        TxError::Full => Error::WouldBlock,
+        TxError::Fill(()) => too_large(),
+      })
+  }
+
+  /// Shared precondition for the general per-stream send paths
+  /// ([`send_data_on`](Self::send_data_on) / [`send_trailers`](Self::send_trailers) /
+  /// [`finish`](Self::finish)): the connection must be non-terminal and past setup,
+  /// and `id` must name a known request stream. A terminal/`Created` connection or an
+  /// unknown `id` is [`Error::Closed`].
+  fn guard_send_on(&self, id: StreamId) -> Result<(), Error> {
+    match self.phase {
+      Phase::Closing | Phase::Failed | Phase::Created => return Err(Error::Closed),
+      Phase::Handshaking | Phase::Open => {}
+    }
+    if self.streams.get(id).is_none() {
+      return Err(Error::Closed);
+    }
+    Ok(())
   }
 
   /// Closes the tunnel: moves to phase `Closing` (from any non-terminal phase) and
@@ -3078,6 +3253,83 @@ where
     Ok(())
   }
 
+  /// Opens a new request stream on the driver-minted QUIC bidi id `id`, registering
+  /// its [`StreamEntry`] slot and enqueuing the request HEADERS as an `Existing(id)`
+  /// transmit so the bytes flush on `id` via
+  /// [`poll_transmit`](Connection::poll_transmit).
+  ///
+  /// This is the GENERAL request entry point (any HTTP request), distinct from the
+  /// CONNECT-tunnel [`open_with`](Connection::open_with) in two ways:
+  ///
+  /// - **Id-explicit, no round-trip.** It mirrors
+  ///   [`provide_stream`](Connection::provide_stream) ("ids are the driver's"): the
+  ///   driver opens the QUIC stream first, then calls this with that id. There is no
+  ///   `OpenRequest`/`provide_stream` round-trip and no single-outstanding-request
+  ///   limit — call it repeatedly with DISTINCT ids for genuinely concurrent request
+  ///   streams, each its own slot.
+  /// - **No Extended-CONNECT opt-in.** A normal request does not require
+  ///   `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so (unlike `open_with`) this does not
+  ///   check it. It still requires a non-terminal post-setup phase and the peer's
+  ///   SETTINGS for the `MAX_FIELD_SECTION_SIZE` size check.
+  ///
+  /// Returns:
+  /// - [`Error::Closed`] — the connection is closing/failed, or setup has not run
+  ///   (`Created`), so the request must not be sent (mirrors `open_with`).
+  /// - [`Error::WouldBlock`] — the peer's SETTINGS have not arrived yet (pump more
+  ///   inbound bytes and retry), or the transmit ring is momentarily full (drain it
+  ///   with [`poll_transmit`](Connection::poll_transmit) and retry). On a full ring
+  ///   the slot is already registered; the retry re-enqueues the HEADERS (idempotent).
+  /// - [`Error::FieldSectionTooLarge`] — the request's decoded field-section size
+  ///   exceeds the peer's advertised `MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2).
+  pub fn open_request<H: Headers + ?Sized>(
+    &mut self,
+    id: StreamId,
+    headers: &H,
+  ) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+    ReqBuf: Default,
+  {
+    // Same phase + peer-SETTINGS preconditions as `open_with`, minus the
+    // Extended-CONNECT opt-in (a normal request has no `:protocol`). Resolved before
+    // any slot is registered so a not-ready call mutates no state.
+    let limit = self.guard_open_request()?;
+    // Register the per-stream slot (recv FSM + lifecycle markers) keyed by the
+    // driver-minted `id`, mirroring an inbound `provide_stream(Request, id)`. The
+    // first registered id also names the CONNECT tunnel slot; later ids are
+    // independent concurrent streams. An at-capacity store drops the overflow stream
+    // (the driver resets it), not connection-fatal.
+    self.provide_request_stream(id);
+    // Enqueue the request HEADERS on `id` (size-checked in the single encode pass, as
+    // in `open_with`). On a full ring this writes nothing and returns `WouldBlock`; the
+    // slot stays registered and a retry re-enqueues.
+    self
+      .tx
+      .enqueue(StreamKind::Existing(id), false, |out| {
+        write_headers_frame(out, headers, limit)
+      })
+      .map_err(map_tx)
+  }
+
+  /// The preconditions for [`open_request`](Self::open_request): identical to
+  /// [`guard_open`](Self::guard_open) MINUS the Extended-CONNECT opt-in check (a
+  /// general request carries no `:protocol`) and MINUS the exactly-once
+  /// `request_sent` short-circuit (each `open_request` call opens a distinct id).
+  /// Returns the resolved `MAX_FIELD_SECTION_SIZE` limit, or the appropriate `Err`.
+  fn guard_open_request(&self) -> Result<Option<u64>, Error> {
+    match self.phase {
+      // Terminal, or setup not yet run: the request must not be sent (mirrors
+      // `guard_open`'s `Closing`/`Failed`/`Created` arms).
+      Phase::Closing | Phase::Failed | Phase::Created => Err(Error::Closed),
+      // The peer's SETTINGS gate the request for its `MAX_FIELD_SECTION_SIZE`; until
+      // they arrive, block and retry. No `enable_connect_protocol` check.
+      Phase::Handshaking | Phase::Open => {
+        let settings = self.settings_peer.ok_or(Error::WouldBlock)?;
+        Ok(settings.max_field_section_size())
+      }
+    }
+  }
+
   /// The single source of truth for `open_with`'s preconditions. Returns the
   /// resolved field-size limit to proceed, [`SendGuard::AlreadyDone`] for the
   /// idempotent already-sent case, or the appropriate `Err`. The phase decides
@@ -3176,6 +3428,92 @@ where
     // `Event::Established` exactly once — only after the response is committed.
     self.establish();
     Ok(())
+  }
+
+  /// Sends a response HEADERS frame on the request stream `id`, the GENERAL
+  /// (non-CONNECT) server response entry point.
+  ///
+  /// `id` must name a known request stream the server has OBSERVED as a
+  /// [`Frame::Request`] (registered via [`provide_stream`](Connection::provide_stream)
+  /// and seen via [`handle_stream`](Connection::handle_stream)). The `:status` is the
+  /// driver's to choose; the core stays status-agnostic.
+  ///
+  /// `last` distinguishes an interim from the final response:
+  /// - `last == false` — an interim (1xx informational) response: more responses
+  ///   follow, the stream is NOT marked established, and no body may flow yet.
+  /// - `last == true` — the final response: the per-stream entry is marked
+  ///   `established`, which gates yielding [`Frame::Data`] (request/response bodies)
+  ///   on this stream.
+  ///
+  /// **No connection event.** Unlike the CONNECT-tunnel
+  /// [`accept_with`](Connection::accept_with), `send_response` pushes NO
+  /// [`Event::Established`]: [`Event`]s are connection-scoped, and a general request
+  /// stream is not connection-scoped. Per-stream lifecycle is surfaced through
+  /// [`Frames`] and these return values; `Event::Established` stays the
+  /// CONNECT-tunnel-only signal. `send_response` also does NOT change the connection
+  /// phase (it stays whatever the connection-level lifecycle set it to).
+  ///
+  /// Returns:
+  /// - [`Error::WouldBlock`] — the request on `id` has not been observed yet, the
+  ///   peer's SETTINGS have not arrived (its `MAX_FIELD_SECTION_SIZE` is unknown), or
+  ///   the transmit ring is momentarily full (drain it with
+  ///   [`poll_transmit`](Connection::poll_transmit) and retry).
+  /// - [`Error::Closed`] — the connection is closing/failed, or setup has not run.
+  /// - [`Error::FieldSectionTooLarge`] — the response's decoded field-section size
+  ///   exceeds the peer's advertised `MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2),
+  ///   enforced in the single encode+measure pass exactly as `accept_with` does.
+  pub fn send_response<H: Headers + ?Sized>(
+    &mut self,
+    id: StreamId,
+    headers: &H,
+    last: bool,
+  ) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
+  {
+    let limit = self.guard_send_response(id)?;
+    // Size-checked in the single encode pass (see `accept_with` / `open_with`): on a
+    // too-large section `write_headers_frame` errors, the slot is discarded, and the
+    // `established` flip below is NOT reached.
+    self
+      .tx
+      .enqueue(StreamKind::Existing(id), false, |out| {
+        write_headers_frame(out, headers, limit)
+      })
+      .map_err(map_tx)?;
+    // The final response marks the per-stream entry established (gating `Frame::Data`)
+    // but pushes NO connection `Event` — general streams are not connection-scoped (see
+    // the doc above). An interim response leaves it unestablished. A missing entry was
+    // already rejected by the guard.
+    if last && let Some(entry) = self.streams.get_mut(id) {
+      entry.established = true;
+    }
+    Ok(())
+  }
+
+  /// The preconditions for [`send_response`](Self::send_response). Returns the
+  /// resolved `MAX_FIELD_SECTION_SIZE` limit, or the appropriate `Err`. Like
+  /// [`guard_accept`](Self::guard_accept) it gates on a non-terminal post-setup
+  /// phase, the request being OBSERVED on `id`, and the peer's SETTINGS — but it is
+  /// per-`id` (not the single tunnel slot) and has no exactly-once short-circuit
+  /// (interim 1xx then final responses are several `send_response` calls).
+  fn guard_send_response(&self, id: StreamId) -> Result<Option<u64>, Error> {
+    match self.phase {
+      // Terminal, or setup not yet run: the response must not be sent.
+      Phase::Closing | Phase::Failed | Phase::Created => Err(Error::Closed),
+      Phase::Handshaking | Phase::Open => {
+        // The request on `id` must be observed first (registration alone is not
+        // enough); a missing entry reads as not-yet-observed.
+        let observed = self.streams.get(id).is_some_and(|e| e.observed);
+        if !observed {
+          return Err(Error::WouldBlock);
+        }
+        // The peer's SETTINGS gate the response for its `MAX_FIELD_SECTION_SIZE`.
+        let settings = self.settings_peer.ok_or(Error::WouldBlock)?;
+        Ok(settings.max_field_section_size())
+      }
+    }
   }
 
   /// The single source of truth for `accept_with`'s preconditions. Returns the
@@ -3302,6 +3640,29 @@ fn write_headers_frame<H: Headers + ?Sized>(
     out.copy_within(HEADERS_HDR_RESERVE..src_end, at);
   }
   Ok(frame_len)
+}
+
+/// Whether a decoded response field section is an interim (1xx informational)
+/// response, decided by its `:status` pseudo-header (RFC 9110 §15.2): a status in
+/// the `100..=199` range. A response without a `:status`, or with one outside the
+/// 1xx range, is final (`false`). The full pseudo-header validation (presence,
+/// uniqueness, position) is the semantic validator's job (a later task); this is
+/// the minimal placement check the response tagging in [`Frames::next`] needs to
+/// set [`Frame::Response::interim`].
+///
+/// Consumes the lending [`HeaderSet`] iterator (scanning every line for `:status`),
+/// so the caller re-decodes the section for the yield. A QPACK error mid-section
+/// surfaces here.
+fn is_interim_status(mut headers: HeaderSet<'_>) -> Result<bool, H3Error> {
+  while let Some(pair) = headers.next().map_err(|e| e.to_h3())? {
+    if pair.name() == ":status" {
+      // A 1xx status is exactly three ASCII digits beginning with '1'. Parse the
+      // numeric value and test the `100..=199` range; a non-numeric or out-of-range
+      // value is not interim (final or, ultimately, a validator error).
+      return Ok(matches!(pair.value().parse::<u16>(), Ok(100..=199)));
+    }
+  }
+  Ok(false)
 }
 
 /// Writes a DATA frame (`[header][payload]`) for `payload`.

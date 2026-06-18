@@ -241,7 +241,16 @@ impl Harness {
       Side::Server => Side::Client,
     };
     let id = match cap.kind {
-      StreamKind::Existing(id) => id,
+      StreamKind::Existing(id) => {
+        // `Existing(id)` only ever targets a bidi request stream (HEADERS / DATA /
+        // FIN). The general `open_request` enqueues its request HEADERS on a
+        // driver-minted id without an `OpenRequest` round-trip, so the receiving
+        // peer learns of the new inbound bidi stream out of band — model that here
+        // by provisioning the stream on the `to` side (idempotent: a re-provide of
+        // an already-registered tunnel id is a no-op).
+        self.provide(to, StreamRole::Request, id);
+        id
+      }
       StreamKind::OpenUni(role) => {
         let id = self.fresh_id();
         // The opener records its own outbound uni stream's id↔role.
@@ -288,7 +297,8 @@ impl Harness {
               // Drain the header set so its borrow is consumed.
               while hs.next().expect("req header").is_some() {}
             }
-            Frame::Response(_) => panic!("server received a Response"),
+            Frame::Trailers(mut hs) => while hs.next().expect("req trailer").is_some() {},
+            Frame::Response { .. } => panic!("server received a Response"),
             Frame::Data(chunk) => self.server_rx.extend_from_slice(chunk),
           }
         }
@@ -300,10 +310,16 @@ impl Harness {
           .expect("client handle_stream");
         while let Some(frame) = frames.next().expect("client frame") {
           match frame {
-            Frame::Response(mut hs) => {
-              self.client_saw_response = true;
-              while hs.next().expect("resp header").is_some() {}
+            Frame::Response {
+              interim,
+              mut headers,
+            } => {
+              if !interim {
+                self.client_saw_response = true;
+              }
+              while headers.next().expect("resp header").is_some() {}
             }
+            Frame::Trailers(mut hs) => while hs.next().expect("resp trailer").is_some() {},
             Frame::Request(_) => panic!("client received a Request"),
             Frame::Data(chunk) => self.client_rx.extend_from_slice(chunk),
           }
@@ -393,6 +409,42 @@ fn client_server_connect_then_tunnel() {
   h.client.send_data(b"ping").unwrap();
   h.pump();
   assert_eq!(h.server_rx.as_slice(), b"ping");
+}
+
+#[test]
+fn general_request_response_headers_roundtrip() {
+  // Client opens a normal GET; server sees Frame::Request, sends a final 200.
+  let mut h = Harness::new();
+  h.client.start().expect("c start");
+  h.server.start().expect("s start");
+  // Exchange SETTINGS so both directions can send HEADERS.
+  for _ in 0..8 {
+    h.pump();
+    if h.client.peer_settings().is_some() && h.server.peer_settings().is_some() {
+      break;
+    }
+  }
+  // Client opens a GET request on a driver-minted bidi id (general API).
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "example.com"),
+  ];
+  h.client.open_request(id, get).expect("open_request");
+  h.pump();
+  assert!(h.server_saw_request, "server must observe Frame::Request");
+  // Server responds 200 final on the same id (general API).
+  let resp: &[(&str, &str)] = &[(":status", "200")];
+  h.server
+    .send_response(id, resp, true)
+    .expect("send_response");
+  h.pump();
+  assert!(
+    h.client_saw_response,
+    "client must observe Frame::Response{{interim:false}}"
+  );
 }
 
 #[test]
@@ -1024,7 +1076,9 @@ fn deliver_connect_request(s: &mut StaticConnection<Server>, req_id: StreamId) {
         saw_request = true;
         while hs.next().expect("req header").is_some() {}
       }
-      Frame::Response(_) | Frame::Data(_) => panic!("expected only the request HEADERS"),
+      Frame::Response { .. } | Frame::Trailers(_) | Frame::Data(_) => {
+        panic!("expected only the request HEADERS")
+      }
     }
   }
   assert!(
@@ -2562,9 +2616,9 @@ fn client_open_at_tunnel_boundary(req_id: StreamId) -> StaticConnection<Client> 
       .expect("response HEADERS decode");
     let mut saw = false;
     while let Some(f) = frames.next().expect("response frame") {
-      if let Frame::Response(mut hs) = f {
+      if let Frame::Response { mut headers, .. } = f {
         saw = true;
-        while hs.next().expect("resp header").is_some() {}
+        while headers.next().expect("resp header").is_some() {}
       }
     }
     assert!(saw, "the client yields the response HEADERS");
@@ -2896,7 +2950,7 @@ fn undrained_request_frames_drop_validates_trailing_forbidden_frame_client() {
       .expect("first frame ok")
       .expect("a first frame");
     assert!(
-      matches!(first, Frame::Response(_)),
+      matches!(first, Frame::Response { .. }),
       "the first yielded frame is the response HEADERS"
     );
     // Drop without pulling the trailing forbidden HEADERS.
@@ -2957,7 +3011,9 @@ fn fully_drained_request_frames_drop_is_not_a_spurious_failure() {
           saw = true;
           while hs.next().expect("req header").is_some() {}
         }
-        Frame::Response(_) | Frame::Data(_) => panic!("expected only the request HEADERS"),
+        Frame::Response { .. } | Frame::Trailers(_) | Frame::Data(_) => {
+          panic!("expected only the request HEADERS")
+        }
       }
     }
     assert!(saw, "the server yields the CONNECT request HEADERS");
@@ -3910,7 +3966,9 @@ fn client_establish_then_data_yields_frame_data() {
       .handle_stream(req_id, &frame, &mut sc)
       .expect("response HEADERS decode");
     match frames.next().expect("response frame") {
-      Some(Frame::Response(mut hs)) => while hs.next().expect("resp header").is_some() {},
+      Some(Frame::Response { mut headers, .. }) => {
+        while headers.next().expect("resp header").is_some() {}
+      }
       _ => panic!("expected Frame::Response"),
     }
   }
@@ -4157,7 +4215,7 @@ fn observe_response_frame_then_drop_establishes_client() {
       .expect("first frame ok")
       .expect("a first frame");
     assert!(
-      matches!(first, Frame::Response(_)),
+      matches!(first, Frame::Response { .. }),
       "the first yielded frame is the response HEADERS"
     );
     // `frames` drops here AFTER observation — the tunnel is already established.
@@ -4553,9 +4611,9 @@ fn fully_drained_first_headers_path_is_unchanged() {
       .expect("response HEADERS decode");
     let mut saw = false;
     while let Some(f) = frames.next().expect("response frame") {
-      if let Frame::Response(mut hs) = f {
+      if let Frame::Response { mut headers, .. } = f {
         saw = true;
-        while hs.next().expect("resp header").is_some() {}
+        while headers.next().expect("resp header").is_some() {}
       }
     }
     assert!(
