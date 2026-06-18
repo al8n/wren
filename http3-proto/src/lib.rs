@@ -84,6 +84,10 @@ cfg_heap! {
 
 pub use qpack::{FieldLines as HeaderSet, Pair};
 
+/// Role-aware HTTP/3 message semantic validation (RFC 9114 §4/§5).
+pub mod validate;
+pub use validate::MessageKind;
+
 /// The top-level HTTP/3 Extended-CONNECT tunnel connection state machine.
 pub mod connection;
 #[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
