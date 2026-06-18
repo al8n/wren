@@ -87,6 +87,29 @@ pub enum StreamKind {
   OpenUni(StreamRole),
   /// Open the bidirectional request stream, then write.
   OpenRequest,
+  /// Abort the existing request stream `id` with QUIC `RESET_STREAM` carrying
+  /// application error `code` — NOT "write bytes". A [`Transmit`] with this kind
+  /// has empty [`bytes`](Transmit::bytes) and a `false` [`fin`](Transmit::fin); the
+  /// driver issues `reset_stream(id, code)` on the QUIC stream instead of `write`.
+  /// Emitted for a stream-scoped HTTP/3 error (a malformed message on a general
+  /// request stream, or the capacity backstop with
+  /// [`H3Error`](crate::error::H3Error)`::RequestRejected`), which resets just that
+  /// stream while the connection and every other stream stay live — unlike a
+  /// connection-fatal error, which surfaces an [`Event::ConnError`] and closes the
+  /// whole connection.
+  // `Unwrap`/`TryUnwrap` cannot generate an accessor for a struct-like (anonymous
+  // record) variant, so skip it for those two derives; `IsVariant` still yields
+  // `is_reset_stream`, and callers destructure the fields via a `match` / `if let`.
+  #[unwrap(ignore)]
+  #[try_unwrap(ignore)]
+  ResetStream {
+    /// The request stream to abort.
+    id: StreamId,
+    /// The QUIC application error code to reset it with (an [`H3Error`] code).
+    ///
+    /// [`H3Error`]: crate::error::H3Error
+    code: u64,
+  },
 }
 
 /// Bytes the driver must write on a stream (and whether to FIN afterwards).

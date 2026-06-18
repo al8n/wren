@@ -290,6 +290,17 @@ impl Harness {
         self.request_id = Some(id);
         id
       }
+      StreamKind::ResetStream { id, code } => {
+        // A `RESET_STREAM` abort carries no bytes: the driver issues a QUIC stream
+        // reset, which the peer observes as `handle_stream_reset`. Deliver that and
+        // stop (there is nothing to `deliver`).
+        match to {
+          Side::Client => self.client.handle_stream_reset(id, code),
+          Side::Server => self.server.handle_stream_reset(id, code),
+        }
+        self.drain_events();
+        return;
+      }
     };
     // FIN carries no bytes for this harness; the request FSM models FIN via its
     // own `fin()`, which these tests do not exercise.
@@ -661,9 +672,8 @@ fn general_client_final_response_establishes_per_stream_without_connection_event
 
 // Two concurrent request streams (distinct driver-minted ids) exchange interleaved
 // frames with per-stream body isolation — the whole point of Phase 0 (#15). The
-// per-stream RESET isolation half rides Task 8's per-stream `reset_stream` (a
-// non-tunnel reset is stream-scoped), which is still a no-op stub, so it lives in the
-// `#[ignore]`d sibling test below; this half must pass now.
+// per-stream RESET isolation half (a non-tunnel reset is stream-scoped) lives in the
+// sibling test below.
 #[test]
 fn two_concurrent_request_streams_are_isolated() {
   let mut h = Harness::new();
@@ -706,13 +716,11 @@ fn two_concurrent_request_streams_are_isolated() {
   assert!(!h.client.is_failed() && !h.server.is_failed());
 }
 
-// The per-stream RESET-isolation half of the concurrent-streams scenario. It depends
-// on a real per-stream `reset_stream` for a non-tunnel stream (stream-scoped, not
-// connection-fatal) and the freeing of the reset stream's slot — both land in a later
-// task, where this test is un-ignored and completed. Ignored (not deleted) so it
-// stands as the failing driver for that work.
+// The per-stream RESET-isolation half of the concurrent-streams scenario: a real
+// per-stream `reset_stream` for a non-tunnel stream is stream-scoped (not
+// connection-fatal) and frees only the reset stream's slot, leaving the connection and
+// every other stream live.
 #[test]
-#[ignore = "per-stream reset lands in Task 8"]
 fn two_concurrent_request_streams_reset_is_isolated() {
   let mut h = Harness::new();
   h.exchange_settings();
@@ -749,6 +757,76 @@ fn two_concurrent_request_streams_reset_is_isolated() {
     h.client_rx_for(id_b),
     b"still-ok",
     "stream B is undisturbed by A's reset"
+  );
+}
+
+// A malformed RESPONSE on a GENERAL client stream is a STREAM error (RFC 9114 §4.1.2),
+// not connection-fatal: `Frames::next` surfaces the `MessageError`, the connection is
+// NOT failed, a `RESET_STREAM` for that stream is enqueued, the stream's slot is freed,
+// and a concurrent general stream keeps working. This is the lazy-carrier
+// (`fail_or_reset` → `pending_reset` → `apply_pending_reset`) path, distinct from the
+// driver-requested `reset_stream` above. The client `open_request` stream is
+// unambiguously non-tunnel (vs `open_with`'s tunnel), so the scope is clear.
+#[test]
+fn malformed_response_on_general_client_stream_resets_alone() {
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id_a = StreamId::new(0);
+  let id_b = StreamId::new(4);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id_a, get).unwrap();
+  h.client.open_request(id_b, get).unwrap();
+  h.pump();
+  // Stream B gets a valid final 200 (established end to end).
+  h.server
+    .send_response(id_b, &[(":status", "200")][..], true)
+    .unwrap();
+  h.pump();
+  // Feed a MALFORMED response on stream A straight to the client: a HEADERS section with
+  // NO `:status` (it cannot be tagged interim/final) is a malformed message.
+  let bad = request_headers_frame(&[("x", "y")][..]);
+  let mut scratch = std::vec![0u8; 2048];
+  {
+    let mut frames = h
+      .client
+      .handle_stream(id_a, &bad, &mut scratch)
+      .expect("handle_stream builds the iterator");
+    // The stream-scoped error surfaces to the driver as `MessageError`...
+    assert_eq!(frames.next().err(), Some(H3Error::MessageError));
+    // ...and the connection is NOT failed (a stream error is not connection-fatal).
+    drop(frames);
+  }
+  assert!(
+    !h.client.is_failed(),
+    "a malformed response on a general stream must NOT fail the connection"
+  );
+  // The pending reset materializes on the next API entry: a `RESET_STREAM` transmit for
+  // A is emitted and A's slot is freed. Copy the transmit's facts out so its borrow of
+  // the client ends before the `stream_is_gone` read below.
+  let (kind, empty, no_fin) = {
+    let t = h.client.poll_transmit().expect("a reset transmit");
+    (t.kind(), t.bytes().is_empty(), !t.fin())
+  };
+  assert!(
+    matches!(kind, StreamKind::ResetStream { id, code }
+      if id == id_a && code == H3Error::MessageError.code()),
+    "a RESET_STREAM(MessageError) for stream A is enqueued"
+  );
+  assert!(empty, "a RESET_STREAM carries no bytes");
+  assert!(no_fin, "a RESET_STREAM is not a FIN");
+  assert!(h.client.stream_is_gone(id_a), "reset stream A is freed");
+  // Stream B is undisturbed: a trailing server body lands on it end to end.
+  h.server.send_data_on(id_b, b"still-ok").unwrap();
+  h.pump();
+  assert_eq!(
+    h.client_rx_for(id_b),
+    b"still-ok",
+    "stream B is undisturbed by A's stream-scoped reset"
   );
 }
 

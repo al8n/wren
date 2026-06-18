@@ -32,6 +32,25 @@ fn stream_kind_and_event_predicates() {
 }
 
 #[test]
+fn reset_stream_kind_carries_id_and_code() {
+  let kind = StreamKind::ResetStream {
+    id: StreamId::new(4),
+    code: 0x010e,
+  };
+  assert!(kind.is_reset_stream());
+  assert!(!kind.is_existing());
+  // A RESET_STREAM transmit carries no bytes and is not a FIN (the driver issues a QUIC
+  // reset instead of a write).
+  let t = Transmit::new(kind, &[], false);
+  assert!(t.bytes().is_empty());
+  assert!(!t.fin());
+  assert!(matches!(
+    t.kind(),
+    StreamKind::ResetStream { id, code } if id == StreamId::new(4) && code == 0x010e
+  ));
+}
+
+#[test]
 fn transmit_without_fin() {
   let t = Transmit::new(StreamKind::Existing(StreamId::new(3)), b"data", false);
   assert!(!t.fin());
