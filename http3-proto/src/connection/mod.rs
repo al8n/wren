@@ -1746,8 +1746,8 @@ pub struct Connection<
   /// the real reset (remove the slot + enqueue the `RESET_STREAM` transmit), so it
   /// records `(id, code)` here; the next `&mut self` API entry
   /// ([`apply_pending_reset`](Self::apply_pending_reset), run from
-  /// [`handle_stream`](Self::handle_stream) / [`poll_transmit`](Self::poll_transmit) /
-  /// [`poll_event`](Self::poll_event)) drains it through
+  /// [`handle_stream`](Self::handle_stream) / [`poll_transmit`](Self::poll_transmit))
+  /// drains it through
   /// [`reset_stream`](Self::reset_stream). This is the stream-scoped twin of
   /// `conn_error` (the connection-fatal slot): a distinct `Connection` field so the
   /// carrier's borrow of it stays disjoint from `phase` / `events` / `close_pending` /
@@ -2207,7 +2207,7 @@ where
       // so there is a window with the wrong scope. A GENERAL server that receives a
       // MALFORMED request BEFORE it has called `send_response` (the flip to
       // `is_tunnel = false`) sees that request error treated as CONNECTION-fatal
-      // rather than the RFC 9114 §4.1.3 per-stream error a general request stream
+      // rather than the RFC 9114 §4.1.2 per-stream error a general request stream
       // deserves — the entry is still tunnel-assumed, so `fail_or_reset` /
       // `fail_or_reset_stream` take the connection-fatal branch. (A client never hits
       // this: it knows whether it opened a tunnel or a general stream.) The
@@ -2290,9 +2290,12 @@ where
   /// and no [`Event::ConnError`] is enqueued.
   ///
   /// Used for stream-scoped errors on a GENERAL (non-tunnel) request stream — a
-  /// malformed message / validator violation / premature DATA (RFC 9114 §4.1.2), or
-  /// the capacity backstop ([`H3Error::RequestRejected`]) — and as the
-  /// driver-requested per-stream cancel. A fatal on the CONNECT **tunnel** stream is
+  /// malformed message / validator violation / premature DATA (RFC 9114 §4.1.2) — and
+  /// as the driver-requested per-stream cancel. Note: the capacity backstop
+  /// ([`H3Error::RequestRejected`]) calls this function but the stream entry was never
+  /// inserted (the `streams.insert` failed), so `streams.remove` returns `None` and NO
+  /// `RESET_STREAM` transmit is emitted; the driver bounds concurrency via QUIC
+  /// `MAX_STREAMS` instead. A fatal on the CONNECT **tunnel** stream is
   /// connection-fatal instead (one tunnel = one connection), failing the whole
   /// connection rather than resetting here.
   ///
@@ -2328,10 +2331,10 @@ where
   /// holds only disjoint per-entry borrows, not `streams` / `tx`), performing the
   /// real [`reset_stream`](Self::reset_stream) now that `&mut self` is whole again.
   /// Run at the head of every `&mut self` entry that can observe the effect —
-  /// [`handle_stream`](Self::handle_stream), [`poll_transmit`](Self::poll_transmit),
-  /// [`poll_event`](Self::poll_event) — so the freed slot and the `RESET_STREAM`
-  /// transmit are in place before the driver looks. Idempotent: `pending_reset` is
-  /// `take`n, so a second call is a no-op.
+  /// [`handle_stream`](Self::handle_stream), [`poll_transmit`](Self::poll_transmit) —
+  /// so the freed slot and the `RESET_STREAM` transmit are in place before the driver
+  /// looks. (`poll_event` does not call this: a stream reset produces no `Event`.)
+  /// Idempotent: `pending_reset` is `take`n, so a second call is a no-op.
   fn apply_pending_reset(&mut self)
   where
     TxBuf: AsMut<[u8]>,
