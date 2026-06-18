@@ -2201,6 +2201,22 @@ where
       //   [`send_response`](Self::send_response) flips the entry to `is_tunnel = false`
       //   (a stream-scoped error then resets just that stream); `accept_with` keeps it
       //   `true` (the established tunnel).
+      //
+      // NOTE (Phase-0 limitation — DOCUMENTED, not fixed here): the server's
+      // "assume tunnel, flip on `send_response`" heuristic is `is_tunnel`-per-stream,
+      // so there is a window with the wrong scope. A GENERAL server that receives a
+      // MALFORMED request BEFORE it has called `send_response` (the flip to
+      // `is_tunnel = false`) sees that request error treated as CONNECTION-fatal
+      // rather than the RFC 9114 §4.1.3 per-stream error a general request stream
+      // deserves — the entry is still tunnel-assumed, so `fail_or_reset` /
+      // `fail_or_reset_stream` take the connection-fatal branch. (A client never hits
+      // this: it knows whether it opened a tunnel or a general stream.) The
+      // principled fix is a CONNECTION-LEVEL tunnel-mode (the connection, not the
+      // individual stream, is tunnel or general: a tunnel-mode connection FAILS on a
+      // stream error, a general-mode connection RESETS), which removes the
+      // pre-response ambiguity entirely. That is deferred beyond Phase 0; for now the
+      // strict-CONNECT default is intentional, and every CONNECT-tunnel test stays
+      // green.
       self.provide_request_stream(id, true);
       return;
     }
@@ -2961,8 +2977,16 @@ where
   }
 
   /// Sends a chunk of tunnel payload as an HTTP/3 DATA frame on the CONNECT tunnel's
-  /// request stream — a thin wrapper over [`send_data_on`](Self::send_data_on) keyed
-  /// by the tunnel-slot pointer (`request_id`).
+  /// request stream — the CONNECT **specialization** of the general
+  /// [`send_data_on`](Self::send_data_on): a thin wrapper that forwards to
+  /// `send_data_on(request_id, …)`, so the DATA frame travels the exact same per-id
+  /// path as a general request/response body. The specialization is only the
+  /// signature and the implicit id: it keeps the tunnel's `send_data(&[u8])` arity
+  /// (copying the borrowed slice into a [`DataBuf`](crate::backend::DataBuf) on the
+  /// heap tiers, since the caller hands no owned buffer) and targets the single
+  /// tunnel-slot pointer (`request_id`) instead of an explicit id. As with every
+  /// tunnel method, a framing/transport error here is CONNECTION-fatal (one tunnel =
+  /// one connection), where a general stream resets per-stream.
   ///
   /// Returns:
   /// - [`Err`]`(`[`Error::Closed`]`)` before the tunnel is established or after
@@ -3157,6 +3181,11 @@ where
 
   /// Closes the tunnel: moves to phase `Closing` (from any non-terminal phase) and
   /// enqueues an empty FIN transmit on the request stream.
+  ///
+  /// Unlike the other tunnel methods this has no general per-id counterpart in
+  /// Phase 0: it is connection-level (the tunnel-slot pointer `request_id` IS the
+  /// connection's one stream), so it half-closes the connection rather than a single
+  /// general stream. A per-id graceful half-close for general streams is future work.
   ///
   /// If the transmit ring is momentarily full (or the request stream has not been
   /// opened yet), the FIN cannot be enqueued now; it is marked pending and
@@ -3589,6 +3618,19 @@ where
   /// Sends the CONNECT request HEADERS — call this AFTER the peer's SETTINGS have
   /// been received (i.e. [`peer_settings`](Connection::peer_settings) is `Some`).
   ///
+  /// This is the CONNECT **specialization** of the general
+  /// [`open_request`](Connection::open_request): it opens a request stream with the
+  /// same `write_headers_frame` encode+size-check, adding exactly one extra
+  /// precondition — the Extended-CONNECT opt-in (`SETTINGS_ENABLE_CONNECT_PROTOCOL`,
+  /// checked in `guard_open` where `open_request`'s `guard_open_request` does not) —
+  /// and registering the resulting stream `is_tunnel = true`. That marker makes the
+  /// tunnel connection-scoped: it establishes the whole connection
+  /// ([`Event::Established`], `Phase::Open`) and a stream error on it is
+  /// CONNECTION-fatal (one tunnel = one connection), where a general `open_request`
+  /// stream establishes per-stream and resets per-stream (RFC 9114 §4.1.2). It also
+  /// goes through the id-minting `OpenRequest` round-trip rather than taking a
+  /// driver-supplied id.
+  ///
   /// A client MUST NOT send a request carrying the `:protocol` pseudo-header
   /// before it has received `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` (RFC 8441 §3 /
   /// RFC 9220), so the opt-in and the peer's `MAX_FIELD_SECTION_SIZE` are checked
@@ -3759,6 +3801,18 @@ where
   /// Accepts the peer's request, enqueuing the response HEADERS frame on the
   /// (already-registered) request stream, marking the tunnel established, and
   /// enqueuing [`Event::Established`].
+  ///
+  /// This is the CONNECT **specialization** of the general
+  /// [`send_response`](Connection::send_response): it is `send_response(id, response,
+  /// last = true)` (the same `write_headers_frame` encode+size-check + final-response
+  /// enqueue) PLUS the tunnel establish path — keep the entry `is_tunnel = true`, run
+  /// the connection-scoped `establish` (phase → `Open`, push [`Event::Established`],
+  /// flush any deferred `peer_fin_pending` as [`Event::PeerClosed`]). `send_response`
+  /// instead flips the entry to
+  /// `is_tunnel = false` and pushes NO connection event. The error scope rides that
+  /// marker: a stream error on the established tunnel is CONNECTION-fatal (one tunnel
+  /// = one connection), where a general response stream resets per-stream (RFC 9114
+  /// §4.1.2).
   ///
   /// The driver validates `response`'s `:status`; the core stays status-agnostic.
   ///
