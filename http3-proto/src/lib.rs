@@ -75,6 +75,10 @@ pub use headers::Headers;
 pub mod stream;
 pub use stream::{HeadersKind, Items, RequestStream, Stream, StreamItem};
 
+/// Per-tier keyed storage for request/response streams.
+pub mod stream_store;
+pub use stream_store::{ArraySlot, ArrayStore, StreamStore};
+
 pub use qpack::{FieldLines as HeaderSet, Pair};
 
 /// The top-level HTTP/3 Extended-CONNECT tunnel connection state machine.
