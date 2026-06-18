@@ -78,6 +78,9 @@ pub use stream::{HeadersKind, Items, RequestStream, Stream, StreamItem};
 /// Per-tier keyed storage for request/response streams.
 pub mod stream_store;
 pub use stream_store::{ArraySlot, ArrayStore, StreamStore};
+cfg_heap! {
+  pub use stream_store::SlabStore;
+}
 
 pub use qpack::{FieldLines as HeaderSet, Pair};
 

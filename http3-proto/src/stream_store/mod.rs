@@ -196,5 +196,87 @@ impl<S, const N: usize> StreamStore<S> for ArrayStore<'_, S, N> {
   }
 }
 
+cfg_heap! {
+  // `std` HashMap when std is on; `hashbrown` on the alloc / no-atomic heaps.
+  #[cfg(feature = "std")]
+  type StreamMap = std::collections::HashMap<StreamId, usize>;
+  #[cfg(all(not(feature = "std"), any(feature = "alloc", feature = "no-atomic")))]
+  type StreamMap = hashbrown::HashMap<StreamId, usize>;
+
+  /// A dynamically-growing [`StreamStore`] for the heap tiers: a
+  /// `slab::Slab<(StreamId, S)>` holding the streams plus a
+  /// `HashMap<StreamId, slab-key>` index. O(1) insert / remove / lookup, with
+  /// unbounded growth (the QUIC transport bounds concurrency via `MAX_STREAMS`).
+  ///
+  /// Each slab slot stores its own [`StreamId`] alongside the stream, so
+  /// [`iter_mut`](StreamStore::iter_mut) is a single safe map over the slab and
+  /// needs no second index lookup.
+  pub struct SlabStore<S> {
+    slab: slab::Slab<(StreamId, S)>,
+    index: StreamMap,
+  }
+
+  impl<S> SlabStore<S> {
+    /// A fresh, empty slab store.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+      Self {
+        slab: slab::Slab::new(),
+        index: StreamMap::default(),
+      }
+    }
+  }
+
+  impl<S> sealed::Sealed for SlabStore<S> {}
+
+  impl<S> StreamStore<S> for SlabStore<S> {
+    fn get(&self, id: StreamId) -> Option<&S> {
+      self
+        .index
+        .get(&id)
+        .and_then(|&k| self.slab.get(k))
+        .map(|(_, s)| s)
+    }
+
+    fn get_mut(&mut self, id: StreamId) -> Option<&mut S> {
+      let k = *self.index.get(&id)?;
+      self.slab.get_mut(k).map(|(_, s)| s)
+    }
+
+    fn insert(&mut self, id: StreamId, s: S) -> Result<(), S> {
+      // Re-bind an existing id in place (idempotent), else allocate a slab slot.
+      if let Some(&k) = self.index.get(&id)
+        && let Some(slot) = self.slab.get_mut(k)
+      {
+        slot.1 = s;
+        return Ok(());
+      }
+      let k = self.slab.insert((id, s));
+      self.index.insert(id, k);
+      Ok(())
+    }
+
+    fn remove(&mut self, id: StreamId) -> Option<S> {
+      let k = self.index.remove(&id)?;
+      self.slab.try_remove(k).map(|(_, s)| s)
+    }
+
+    fn iter_mut<'s>(&'s mut self) -> impl Iterator<Item = (StreamId, &'s mut S)>
+    where
+      S: 's,
+    {
+      self.slab.iter_mut().map(|(_, (id, s))| (*id, s))
+    }
+
+    fn capacity(&self) -> Option<usize> {
+      None
+    }
+
+    fn len(&self) -> usize {
+      self.slab.len()
+    }
+  }
+}
+
 #[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;

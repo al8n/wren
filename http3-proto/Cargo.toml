@@ -15,8 +15,8 @@ categories = ["network-programming", "no-std", "embedded", "web-programming"]
 
 [features]
 default = ["std"]
-std = ["thiserror/default", "dep:bytes", "bytes/std", "dep:slab", "slab/std", "dep:hashbrown"]
-alloc = ["dep:bytes", "dep:slab", "dep:hashbrown"]
+std = ["thiserror/default", "dep:bytes", "bytes/std", "dep:slab", "slab/std", "dep:hashbrown", "hashbrown/default-hasher"]
+alloc = ["dep:bytes", "dep:slab", "dep:hashbrown", "hashbrown/default-hasher"]
 # `no-atomic`: the alloc tier for cores WITHOUT native atomic CAS (Cortex-M0+ /
 # thumbv6m / RP2040). Same state machine as `alloc`, but the refcounted DATA
 # buffer uses `portable_atomic_util::Arc<[u8]>` (cheap clone via
@@ -28,6 +28,7 @@ no-atomic = [
   "portable-atomic/critical-section",
   "dep:slab",
   "dep:hashbrown",
+  "hashbrown/default-hasher",
 ]
 slab = ["dep:slab"]
 # Internal: exposes `pub(crate)` hot paths so `tests/no_panic.rs` can wrap them

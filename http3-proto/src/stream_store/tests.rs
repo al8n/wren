@@ -39,3 +39,26 @@ fn caller_slice_backed_store_works() {
   assert!(store.insert(StreamId::new(1), 7).is_ok());
   assert_eq!(store.get(StreamId::new(1)), Some(&7));
 }
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[test]
+fn slab_store_dynamic_insert_lookup_remove() {
+  let mut store: SlabStore<u32> = SlabStore::new();
+  let a = StreamId::new(0);
+  let b = StreamId::new(400);
+  assert!(store.insert(a, 1).is_ok());
+  assert!(store.insert(b, 2).is_ok());
+  assert_eq!(store.len(), 2);
+  assert_eq!(store.get(a), Some(&1));
+  *store.get_mut(b).unwrap() = 20;
+  assert_eq!(store.get(b), Some(&20));
+  assert_eq!(store.remove(a), Some(1));
+  assert_eq!(store.get(a), None);
+  assert_eq!(store.len(), 1);
+  // Grows well past any fixed bound.
+  for i in 0..1000u64 {
+    assert!(store.insert(StreamId::new(1000 + i), i as u32).is_ok());
+  }
+  assert_eq!(store.len(), 1001);
+  assert_eq!(store.capacity(), None);
+}
