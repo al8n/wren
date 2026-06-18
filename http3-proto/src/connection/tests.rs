@@ -1,4 +1,7 @@
-use std::vec::Vec;
+use std::{
+  string::{String, ToString},
+  vec::Vec,
+};
 
 use super::*;
 use crate::{
@@ -176,6 +179,21 @@ struct Harness {
   server_rx: Vec<u8>,
   /// Bytes the client received over the tunnel (DATA frames).
   client_rx: Vec<u8>,
+  /// Bytes the server received per request stream id (general DATA bodies).
+  server_rx_by_id: std::collections::BTreeMap<u64, Vec<u8>>,
+  /// Bytes the client received per request stream id (general DATA bodies).
+  client_rx_by_id: std::collections::BTreeMap<u64, Vec<u8>>,
+  /// Every request stream id the server observed as a `Frame::Request`, in order.
+  server_request_ids: Vec<StreamId>,
+  /// Set when the server observes a `Frame::Trailers` on any request stream.
+  server_saw_trailers: bool,
+  /// Every client response, in observation order, tagged `(interim, headers)` where
+  /// `headers` is the decoded field section as `(name, value)` pairs. Populated by
+  /// [`Harness::pump_collect_client_responses`].
+  client_responses: Vec<(bool, Vec<(String, String)>)>,
+  /// Whether `deliver` should record full client responses into `client_responses`
+  /// (only the interim-precedes-final test needs the decoded headers).
+  collect_client_responses: bool,
   /// The id assigned to the bidirectional request stream, once opened.
   request_id: Option<StreamId>,
 }
@@ -200,6 +218,12 @@ impl Harness {
       client_opened: false,
       server_rx: Vec::new(),
       client_rx: Vec::new(),
+      server_rx_by_id: std::collections::BTreeMap::new(),
+      client_rx_by_id: std::collections::BTreeMap::new(),
+      server_request_ids: Vec::new(),
+      server_saw_trailers: false,
+      client_responses: Vec::new(),
+      collect_client_responses: false,
       request_id: None,
     }
   }
@@ -294,12 +318,23 @@ impl Harness {
           match frame {
             Frame::Request(mut hs) => {
               self.server_saw_request = true;
+              self.server_request_ids.push(id);
               // Drain the header set so its borrow is consumed.
               while hs.next().expect("req header").is_some() {}
             }
-            Frame::Trailers(mut hs) => while hs.next().expect("req trailer").is_some() {},
+            Frame::Trailers(mut hs) => {
+              self.server_saw_trailers = true;
+              while hs.next().expect("req trailer").is_some() {}
+            }
             Frame::Response { .. } => panic!("server received a Response"),
-            Frame::Data(chunk) => self.server_rx.extend_from_slice(chunk),
+            Frame::Data(chunk) => {
+              self.server_rx.extend_from_slice(chunk);
+              self
+                .server_rx_by_id
+                .entry(id.get())
+                .or_default()
+                .extend_from_slice(chunk);
+            }
           }
         }
       }
@@ -317,11 +352,26 @@ impl Harness {
               if !interim {
                 self.client_saw_response = true;
               }
-              while headers.next().expect("resp header").is_some() {}
+              if self.collect_client_responses {
+                let mut pairs = Vec::new();
+                while let Some(p) = headers.next().expect("resp header") {
+                  pairs.push((p.name().to_string(), p.value().to_string()));
+                }
+                self.client_responses.push((interim, pairs));
+              } else {
+                while headers.next().expect("resp header").is_some() {}
+              }
             }
             Frame::Trailers(mut hs) => while hs.next().expect("resp trailer").is_some() {},
             Frame::Request(_) => panic!("client received a Request"),
-            Frame::Data(chunk) => self.client_rx.extend_from_slice(chunk),
+            Frame::Data(chunk) => {
+              self.client_rx.extend_from_slice(chunk);
+              self
+                .client_rx_by_id
+                .entry(id.get())
+                .or_default()
+                .extend_from_slice(chunk);
+            }
           }
         }
       }
@@ -397,6 +447,69 @@ impl Harness {
       self.client_established, self.server_established, self.server_saw_request, self.client_opened
     );
   }
+
+  /// `start()`s both roles and pumps until BOTH have decoded the peer's SETTINGS, so
+  /// either direction can send HEADERS. Unlike [`run_until_established`] this opens no
+  /// stream — the general tests drive `open_request` / `send_response` themselves.
+  fn exchange_settings(&mut self) {
+    self.client.start().expect("client start");
+    self.server.start().expect("server start");
+    for _ in 0..16 {
+      self.pump();
+      if self.client.peer_settings().is_some() && self.server.peer_settings().is_some() {
+        return;
+      }
+    }
+    panic!("peer SETTINGS never exchanged");
+  }
+
+  /// Brings up a GENERAL (non-CONNECT) request/response exchange to its final response
+  /// on `id`: exchange SETTINGS, `open_request` a GET on `id`, then `send_response` a
+  /// final 200. After this both the request and the final response have been observed,
+  /// so DATA bodies flow in both directions. Returns the id it opened on.
+  fn establish_general_get(&mut self, id: StreamId) -> StreamId {
+    self.exchange_settings();
+    let get: &[(&str, &str)] = &[
+      (":method", "GET"),
+      (":scheme", "https"),
+      (":path", "/"),
+      (":authority", "x"),
+    ];
+    self.client.open_request(id, get).expect("open_request");
+    self.pump();
+    let resp: &[(&str, &str)] = &[(":status", "200")];
+    self
+      .server
+      .send_response(id, resp, true)
+      .expect("send_response final");
+    self.pump();
+    id
+  }
+
+  /// Pumps both directions with full client-response capture enabled, recording every
+  /// `Frame::Response` the client observes into `client_responses` as
+  /// `(interim, headers)`.
+  fn pump_collect_client_responses(&mut self) {
+    self.collect_client_responses = true;
+    self.pump();
+    self.collect_client_responses = false;
+  }
+
+  /// The bytes the server received on request stream `id` (general DATA body).
+  fn server_rx_for(&self, id: StreamId) -> &[u8] {
+    self
+      .server_rx_by_id
+      .get(&id.get())
+      .map_or(&[][..], Vec::as_slice)
+  }
+
+  /// The bytes the client received on request stream `id` (general DATA body).
+  fn client_rx_for(&self, id: StreamId) -> &[u8] {
+    self
+      .client_rx_by_id
+      .get(&id.get())
+      .map_or(&[][..], Vec::as_slice)
+  }
 }
 
 #[test]
@@ -444,6 +557,198 @@ fn general_request_response_headers_roundtrip() {
   assert!(
     h.client_saw_response,
     "client must observe Frame::Response{{interim:false}}"
+  );
+}
+
+#[test]
+fn request_body_and_response_body_flow_both_directions() {
+  let mut h = Harness::new();
+  // SETTINGS + open GET on a driver-minted id + 200 final; returns the id.
+  let id = h.establish_general_get(StreamId::new(0));
+  // Client sends a request body chunk AFTER the request headers.
+  h.client.send_data_on(id, b"ping").expect("client body");
+  h.pump();
+  assert_eq!(h.server_rx, b"ping");
+  // Server sends a response body chunk.
+  h.server.send_data_on(id, b"pong").expect("server body");
+  h.pump();
+  assert_eq!(h.client_rx, b"pong");
+}
+
+#[test]
+fn interim_1xx_precedes_final_response() {
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, get).unwrap();
+  h.pump();
+  // Server sends 103 interim (last=false), then 200 final (last=true).
+  h.server
+    .send_response(id, &[(":status", "103")][..], false)
+    .unwrap();
+  h.server
+    .send_response(id, &[(":status", "200")][..], true)
+    .unwrap();
+  // Collect every response frame the client observes, tagging interim.
+  h.pump_collect_client_responses();
+  assert_eq!(
+    h.client_responses,
+    std::vec![
+      (true, std::vec![(":status".to_string(), "103".to_string())]),
+      (false, std::vec![(":status".to_string(), "200".to_string())])
+    ]
+  );
+}
+
+#[test]
+fn trailers_after_body_both_directions() {
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  h.client.send_data_on(id, b"x").unwrap();
+  h.client
+    .send_trailers(id, &[("x-checksum", "abc")][..])
+    .unwrap();
+  h.pump();
+  assert!(h.server_saw_trailers, "server observes Frame::Trailers");
+}
+
+#[test]
+fn incomplete_message_fin_before_headers_is_error() {
+  let mut s = Connection::<Server>::new();
+  s.start().unwrap();
+  let id = StreamId::new(0);
+  s.provide_stream(StreamRole::Request, id);
+  s.handle_stream_fin(id); // FIN before any HEADERS
+  assert!(matches!(
+    s.poll_event(),
+    Some(Event::ConnError(H3Error::RequestIncomplete))
+  ));
+}
+
+#[test]
+fn general_client_final_response_establishes_per_stream_without_connection_event() {
+  // A GENERAL client stream's FINAL response sets up `Frame::Data` flow (the per-stream
+  // entry is `established`) but emits NO connection `Event::Established` and does NOT flip
+  // the connection to `Phase::Open` — events are connection-scoped only (RFC 9114 §2), and
+  // a general request stream is not the connection-scoped CONNECT tunnel. (The tunnel
+  // keeps `Event::Established` + `Open`; see `client_server_connect_then_tunnel`.)
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  // No connection-level establish for a general stream.
+  assert!(
+    !h.client_established,
+    "a general client final response must NOT emit Event::Established"
+  );
+  assert!(
+    !h.client.is_established(),
+    "a general stream must NOT flip the connection to Open"
+  );
+  // Yet the per-stream entry IS established: DATA flows both ways.
+  h.client.send_data_on(id, b"req-body").expect("client body");
+  h.server
+    .send_data_on(id, b"resp-body")
+    .expect("server body");
+  h.pump();
+  assert_eq!(h.server_rx, b"req-body");
+  assert_eq!(h.client_rx, b"resp-body");
+}
+
+// Two concurrent request streams (distinct driver-minted ids) exchange interleaved
+// frames with per-stream body isolation — the whole point of Phase 0 (#15). The
+// per-stream RESET isolation half rides Task 8's per-stream `reset_stream` (a
+// non-tunnel reset is stream-scoped), which is still a no-op stub, so it lives in the
+// `#[ignore]`d sibling test below; this half must pass now.
+#[test]
+fn two_concurrent_request_streams_are_isolated() {
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id_a = StreamId::new(0);
+  let id_b = StreamId::new(4);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  // Open both request streams concurrently (distinct ids => distinct slots).
+  h.client.open_request(id_a, get).unwrap();
+  h.client.open_request(id_b, get).unwrap();
+  h.pump();
+  // Server saw two independent Frame::Request streams.
+  assert_eq!(h.server_request_ids, std::vec![id_a, id_b]);
+  // Interleave: respond on A, respond on B, body on A, body on B, in mixed order.
+  h.server
+    .send_response(id_a, &[(":status", "200")][..], true)
+    .unwrap();
+  h.server
+    .send_response(id_b, &[(":status", "200")][..], true)
+    .unwrap();
+  h.client.send_data_on(id_a, b"a-body").unwrap();
+  h.client.send_data_on(id_b, b"b-body").unwrap();
+  h.pump();
+  assert_eq!(h.server_rx_for(id_a), b"a-body");
+  assert_eq!(h.server_rx_for(id_b), b"b-body");
+  // Both streams remain usable: a trailing server→client body on each lands on the
+  // right stream, proving per-stream isolation of the DATA path.
+  h.server.send_data_on(id_a, b"a-tail").unwrap();
+  h.server.send_data_on(id_b, b"b-tail").unwrap();
+  h.pump();
+  assert_eq!(h.client_rx_for(id_a), b"a-tail");
+  assert_eq!(h.client_rx_for(id_b), b"b-tail");
+  // Neither stream's traffic leaked into the connection-scoped tunnel buffers as the
+  // sole occupant (each id has its own per-id buffer).
+  assert!(!h.client.is_failed() && !h.server.is_failed());
+}
+
+// The per-stream RESET-isolation half of the concurrent-streams scenario. It depends
+// on a real per-stream `reset_stream` for a non-tunnel stream (stream-scoped, not
+// connection-fatal) and the freeing of the reset stream's slot — both land in a later
+// task, where this test is un-ignored and completed. Ignored (not deleted) so it
+// stands as the failing driver for that work.
+#[test]
+#[ignore = "per-stream reset lands in Task 8"]
+fn two_concurrent_request_streams_reset_is_isolated() {
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id_a = StreamId::new(0);
+  let id_b = StreamId::new(4);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id_a, get).unwrap();
+  h.client.open_request(id_b, get).unwrap();
+  h.pump();
+  h.server
+    .send_response(id_a, &[(":status", "200")][..], true)
+    .unwrap();
+  h.server
+    .send_response(id_b, &[(":status", "200")][..], true)
+    .unwrap();
+  h.pump();
+  // Reset stream A only (non-tunnel => stream-scoped). The connection and stream B
+  // survive: B still carries a trailing exchange end to end.
+  h.client.reset_stream(id_a, 0x010c); // H3_REQUEST_CANCELLED (raw u64 code)
+  h.pump();
+  assert!(
+    !h.client.is_failed() && !h.server.is_failed(),
+    "connection survives a per-stream reset"
+  );
+  assert!(h.server.stream_is_gone(id_a), "reset stream A is freed");
+  h.server.send_data_on(id_b, b"still-ok").unwrap();
+  h.pump();
+  assert_eq!(
+    h.client_rx_for(id_b),
+    b"still-ok",
+    "stream B is undisturbed by A's reset"
   );
 }
 

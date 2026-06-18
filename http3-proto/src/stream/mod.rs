@@ -52,6 +52,44 @@ pub(crate) fn default_req_buf() -> DefaultReqBuf<'static> {
   std::vec![0u8; HDR_CAP]
 }
 
+/// Mints a fresh, correctly-sized HEADERS accumulator for a NEWLY-registered request
+/// stream (the connection holds one [`Stream`] FSM per concurrent stream, each needing
+/// its own accumulator). Replaces a bare `Default` bound on the multi-stream registration
+/// paths, because `Vec::<u8>::default()` is EMPTY (zero capacity) — an empty accumulator
+/// rejects the first HEADERS section with [`H3Error::FrameError`], so a second concurrent
+/// request stream could never decode its HEADERS.
+///
+/// - Heap accumulators ([`Vec<u8>`], the default owned buffer) allocate [`HDR_CAP`]
+///   bytes, so every concurrent stream gets a usable buffer.
+/// - A borrowed `&mut [u8]` accumulator cannot allocate, so `fresh` yields an empty
+///   borrow: a borrowed-buffer connection (any tier) therefore supports only the single
+///   tunnel stream seeded at construction (`req_seed`); bare multi-stream buffering is a
+///   later task.
+///
+/// Crate-internal (a `pub(crate)` bound on the otherwise-public registration methods, via
+/// `#[allow(private_bounds)]`), so it adds no public API surface.
+pub(crate) trait ReqBufAlloc {
+  /// A fresh accumulator for one new request stream (heap: sized [`HDR_CAP`]; borrowed:
+  /// an empty slice).
+  fn fresh() -> Self;
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl ReqBufAlloc for std::vec::Vec<u8> {
+  fn fresh() -> Self {
+    default_req_buf()
+  }
+}
+
+impl ReqBufAlloc for &mut [u8] {
+  fn fresh() -> Self {
+    // Borrowed storage cannot allocate; an empty slice is the only honest value. Only
+    // ever reached for an ADDITIONAL stream — the single tunnel stream takes the
+    // construction-time `req_seed` — which a borrowed-buffer connection does not open.
+    &mut []
+  }
+}
+
 /// Which placement a decoded HEADERS section occupies in the RFC 9114 §4.1
 /// request-stream sequence `HEADERS(interim)* HEADERS(final) DATA* HEADERS(trailers)?`.
 ///
