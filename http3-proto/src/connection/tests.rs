@@ -2304,40 +2304,37 @@ fn out_of_order_calls_do_not_panic() {
 // ── provide_stream must not silently rebind a role to a new id ────────
 
 #[test]
-fn provide_stream_rebinding_request_to_a_different_id_is_terminal_not_a_rebind() {
-  // `provide_stream(Request, id)` is write-once. A SECOND request stream
-  // (or a duplicate driver registration) carrying a DIFFERENT id is a duplicate
-  // critical/request stream: it must mark the connection closing and enqueue a
-  // terminal ConnError(StreamCreation) WITHOUT retargeting the stored id (which
-  // would point send_data / close / the request FSM at the new id while reusing
-  // the old FSM). Re-providing the SAME (role, id) stays an idempotent no-op.
+fn provide_stream_second_request_id_coexists_and_keeps_the_tunnel_slot() {
+  // A request stream is NO LONGER write-once-singular (the multi-stream core): a
+  // SECOND request id gets its OWN store entry rather than failing the connection,
+  // and `request_id` — the single CONNECT tunnel-slot pointer — keeps naming the
+  // FIRST id (so send_data / close / accept_with still target the original tunnel).
+  // Re-providing the SAME (Request, id) is an idempotent no-op (the entry is kept).
   let mut c = Connection::<Client>::new();
   let id1 = StreamId::new(4);
   let id2 = StreamId::new(8);
   c.provide_stream(StreamRole::Request, id1);
-  assert_eq!(c.request_id, Some(id1), "first binding records id1");
+  assert_eq!(
+    c.request_id,
+    Some(id1),
+    "first binding records the tunnel slot"
+  );
   assert!(!c.is_terminal(), "the first binding is healthy");
-  // A different id for the already-bound Request role: rejected, not rebound.
+  // A second, different request id: accepted (its own entry), not a teardown.
   c.provide_stream(StreamRole::Request, id2);
   assert!(
-    c.is_terminal(),
-    "a different-id rebind makes the connection terminal"
+    !c.is_terminal(),
+    "a second request id coexists rather than failing the connection"
   );
   assert_eq!(
     c.request_id,
     Some(id1),
-    "the stored request id must NOT be retargeted to id2"
+    "the tunnel-slot pointer keeps naming the first id"
   );
-  assert_eq!(
-    c.poll_event(),
-    Some(Event::ConnError(H3Error::StreamCreation)),
-    "a duplicate request stream is H3_STREAM_CREATION_ERROR"
-  );
-  assert_eq!(
-    c.poll_event(),
-    None,
-    "exactly one ConnError is enqueued for the duplicate"
-  );
+  assert_eq!(c.poll_event(), None, "no duplicate-stream error: not fatal");
+  // Both ids are tracked as request streams: each routes to the request path.
+  assert!(c.streams.get(id1).is_some(), "id1 has its own store entry");
+  assert!(c.streams.get(id2).is_some(), "id2 has its own store entry");
   // Re-providing the ORIGINAL (role, id) is an idempotent no-op: no further event.
   c.provide_stream(StreamRole::Request, id1);
   assert_eq!(
@@ -3526,7 +3523,7 @@ fn drop_request_frames_unobserved_does_not_grant_request_received_server() {
     assert!(frames.next().expect("no frames").is_none());
   }
   assert!(
-    !s.request_received,
+    !s.request_received(),
     "request_received is false before any HEADERS arrive"
   );
   // A single, well-formed CONNECT request HEADERS frame.
@@ -3543,7 +3540,7 @@ fn drop_request_frames_unobserved_does_not_grant_request_received_server() {
   // The HEADERS was decoded by the drop-drain, but it was never OBSERVED, so
   // `request_received` stays false — the driver did not see the CONNECT request.
   assert!(
-    !s.request_received,
+    !s.request_received(),
     "an unobserved (dropped-before-next) request must NOT set request_received"
   );
   // A valid request is not an error: the connection stays non-terminal, no event.
@@ -3691,7 +3688,7 @@ fn drop_request_frames_unobserved_then_later_data_is_message_error_server() {
     // Drop without pulling: marks `request_abandoned`.
   }
   assert!(
-    !s.request_received,
+    !s.request_received(),
     "an unobserved (dropped-before-next) request must NOT set request_received"
   );
   assert!(!s.is_terminal(), "abandonment alone is not a teardown");
@@ -4120,7 +4117,7 @@ fn observe_request_frame_then_drop_grants_request_received_server() {
     // `frames` drops here AFTER observation — readiness already fired in next().
   }
   assert!(
-    s.request_received,
+    s.request_received(),
     "observing the Frame::Request via next() must set request_received"
   );
   assert!(
@@ -4451,7 +4448,7 @@ fn abandoned_request_then_separate_data_before_accept_is_message_error_server() 
   }
   assert!(!s.is_terminal(), "abandonment alone is not a teardown");
   assert!(
-    !s.request_received,
+    !s.request_received(),
     "the unobserved request never granted readiness"
   );
   // A SEPARATE later read carrying a DATA frame: premature (tunnel never established).
@@ -4627,26 +4624,22 @@ fn drain_until_single_conn_error<Ro: Role>(c: &mut StaticConnection<Ro>) -> H3Er
 
 #[test]
 fn terminal_conn_error_survives_saturated_queue_on_duplicate_provide_stream() {
-  // `provide_stream`'s duplicate-role path is a NO-RETURN-VALUE fatal path — without
-  // the dedicated `conn_error` slot, a saturated event queue would swallow its
-  // terminal ConnError and leave the connection Failed with NO observable error.
-  // With the slot, the terminal code is delivered exactly once.
+  // `provide_stream`'s duplicate-CRITICAL-role path is a NO-RETURN-VALUE fatal path
+  // — without the dedicated `conn_error` slot, a saturated event queue would swallow
+  // its terminal ConnError and leave the connection Failed with NO observable error.
+  // With the slot, the terminal code is delivered exactly once. (A duplicate REQUEST
+  // id is no longer fatal in the multi-stream core, so a critical role is the
+  // duplicate-stream trigger.)
   let mut c = Connection::<Client>::new();
-  let id1 = StreamId::new(4);
-  c.provide_stream(StreamRole::Request, id1);
+  c.provide_stream(StreamRole::ControlOut, StreamId::new(0));
   assert!(!c.is_terminal(), "healthy after the first binding");
   // Saturate the event queue so a queue-only push would be lost.
   saturate_event_queue(&mut c);
-  // Trigger the no-return fatal path: a different id for the already-bound Request.
-  c.provide_stream(StreamRole::Request, StreamId::new(8));
+  // Trigger the no-return fatal path: a different id for the already-bound critical role.
+  c.provide_stream(StreamRole::ControlOut, StreamId::new(2));
   assert!(
     c.is_terminal(),
-    "the duplicate request stream makes the connection Failed even with a full queue"
-  );
-  assert_eq!(
-    c.request_id,
-    Some(id1),
-    "the stored id is not retargeted by the rejected rebind"
+    "the duplicate critical stream makes the connection Failed even with a full queue"
   );
   // The terminal ConnError is delivered exactly once (after the benign events).
   assert_eq!(
@@ -4657,7 +4650,7 @@ fn terminal_conn_error_survives_saturated_queue_on_duplicate_provide_stream() {
   // After it is delivered, the connection is terminal with an empty queue.
   assert_eq!(c.poll_event(), None, "the terminal error is delivered once");
   // A second fatal condition does not re-deliver or overwrite the terminal error.
-  c.provide_stream(StreamRole::Request, StreamId::new(12));
+  c.provide_stream(StreamRole::ControlOut, StreamId::new(6));
   assert_eq!(
     c.poll_event(),
     None,
@@ -4713,12 +4706,12 @@ fn terminal_conn_error_supersedes_queued_events() {
   // `poll_event` yields EXACTLY the terminal ConnError (from the dedicated slot),
   // then None — no stale queued PeerClosed ahead of it.
   let mut c = Connection::<Client>::new();
-  c.provide_stream(StreamRole::Request, StreamId::new(4));
+  c.provide_stream(StreamRole::ControlOut, StreamId::new(0));
   // A couple of benign events (not a saturating flood) precede the failure.
   assert!(c.events.push(Event::PeerClosed).is_ok());
   assert!(c.events.push(Event::PeerClosed).is_ok());
-  // No-return fatal path with room still in the queue.
-  c.provide_stream(StreamRole::Request, StreamId::new(8));
+  // No-return fatal path (a duplicate critical stream) with room still in the queue.
+  c.provide_stream(StreamRole::ControlOut, StreamId::new(2));
   assert!(c.is_terminal());
   // The terminal ConnError supersedes the stale queued events: it is delivered
   // first and alone, with the previously-queued PeerClosed events suppressed.
@@ -4809,15 +4802,19 @@ fn handle_stream_after_fail_yields_no_data_and_stays_failed() {
 }
 
 #[test]
-fn handle_stream_after_fail_via_duplicate_provide_yields_no_data() {
-  // The other no-return path: fail via a duplicate `provide_stream` (rebinding the
-  // request role to a different id) and confirm a subsequent request-stream DATA
-  // frame is likewise ignored — empty iterator.
+fn handle_stream_after_fail_via_duplicate_critical_yields_no_data() {
+  // Another no-return path: fail via a duplicate critical stream (a SECOND inbound
+  // control stream) and confirm a subsequent request-stream DATA frame is likewise
+  // ignored — empty iterator. (A duplicate REQUEST id is no longer fatal in the
+  // multi-stream core, so a critical stream is the duplicate-stream trigger.)
   let req_id = StreamId::new(0);
   let mut c = client_open_at_tunnel_boundary(req_id);
-  // No-return fatal path: a second, different id for the already-bound Request.
-  c.provide_stream(StreamRole::Request, StreamId::new(9));
-  assert!(c.phase.is_failed(), "a duplicate request binding fails it");
+  // No-return fatal path: a second inbound control stream (id 3 already classified).
+  let mut tc = [0u8; 32];
+  {
+    let _ = c.handle_stream(StreamId::new(11), &[0x00], &mut tc);
+  }
+  assert!(c.phase.is_failed(), "a duplicate critical stream fails it");
   let data = request_data_frame(b"post");
   let mut sc = std::vec![0u8; 512];
   {
@@ -4826,7 +4823,7 @@ fn handle_stream_after_fail_via_duplicate_provide_yields_no_data() {
       .expect("Failed handle_stream is an empty no-op");
     assert!(
       frames.next().expect("no frames").is_none(),
-      "no Frame::Data after a fatal duplicate-provide"
+      "no Frame::Data after a fatal duplicate critical stream"
     );
   }
   assert!(c.phase.is_failed());
@@ -5125,19 +5122,24 @@ fn terminal_conn_error_supersedes_a_previously_queued_reset() {
 
 #[test]
 fn terminal_conn_error_supersedes_a_previously_queued_peer_closed() {
-  // PeerClosed + duplicate-provide variant: a graceful `PeerClosed` queued by a clean
+  // PeerClosed + duplicate-critical variant: a graceful `PeerClosed` queued by a clean
   // request-stream FIN (a half-close that leaves the
   // tunnel Open) must be SUPPRESSED when a later no-return fatal path — a duplicate
-  // `provide_stream` rebinding the request role — fails the connection. The next
-  // event is EXACTLY the terminal ConnError, with no intervening PeerClosed.
+  // critical stream (a SECOND inbound control stream) — fails the connection. The next
+  // event is EXACTLY the terminal ConnError, with no intervening PeerClosed. (A
+  // duplicate REQUEST id is no longer fatal in the multi-stream core.)
   let req_id = StreamId::new(0);
   let mut c = client_open_at_tunnel_boundary(req_id);
   // A clean request FIN at the Tunnel boundary queues PeerClosed (stays Open).
   c.handle_stream_fin(req_id);
   assert!(!c.is_terminal(), "a clean half-close is not a teardown");
-  // No-return fatal path BEFORE polling: rebind the request role to a different id.
-  c.provide_stream(StreamRole::Request, StreamId::new(9));
-  assert!(c.phase.is_failed(), "a duplicate request binding fails it");
+  // No-return fatal path BEFORE polling: a second inbound control stream (the peer's
+  // control stream id 3 was already classified) is a duplicate critical stream.
+  let mut sc = [0u8; 32];
+  {
+    let _ = c.handle_stream(StreamId::new(11), &[0x00], &mut sc);
+  }
+  assert!(c.phase.is_failed(), "a duplicate critical stream fails it");
   // EXACTLY the terminal ConnError, with NO intervening PeerClosed.
   assert_eq!(
     c.poll_event(),
@@ -5388,4 +5390,21 @@ fn reset_on_critical_stream_while_closing_supersedes_the_close() {
     "the terminal ConnError supersedes the graceful close"
   );
   assert_eq!(c.poll_event(), None, "exactly one terminal event");
+}
+
+#[test]
+fn two_request_streams_coexist_in_store() {
+  // Server side: register two inbound request streams; both get independent
+  // store slots and independent recv FSMs.
+  let mut s = Connection::<Server>::new();
+  s.start().expect("start");
+  s.provide_stream(StreamRole::Request, StreamId::new(0));
+  s.provide_stream(StreamRole::Request, StreamId::new(4));
+  // Both ids are tracked; feeding a partial HEADERS to one does not disturb the
+  // other (no panic, independent FSMs). Detailed behavior is covered in Task 6.
+  let mut scratch = std::vec![0u8; 1024];
+  let _ = s.handle_stream(StreamId::new(0), &[0x01, 0x03], &mut scratch);
+  let _ = s.handle_stream(StreamId::new(4), &[0x01, 0x03], &mut scratch);
+  // No connection-fatal error from independent partial reads.
+  assert!(s.poll_event().is_none());
 }

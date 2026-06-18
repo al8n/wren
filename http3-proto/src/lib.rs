@@ -86,9 +86,12 @@ pub use qpack::{FieldLines as HeaderSet, Pair};
 
 /// The top-level HTTP/3 Extended-CONNECT tunnel connection state machine.
 pub mod connection;
+#[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+pub use connection::StreamSlot;
 pub use connection::{
   BorrowedConnection, Client, Connection, DefaultCtrlBuf, DefaultEventBuf, DefaultReqBuf,
-  DefaultTxBuf, DefaultUniBuf, Frame, Frames, Role, Server, UniSlot,
+  DefaultStreamStore, DefaultTxBuf, DefaultUniBuf, Frame, Frames, Role, Server, StreamEntry,
+  UniSlot,
 };
 
 /// Internal hot-path accessors for the `no-panic` link-time test
