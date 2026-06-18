@@ -288,6 +288,16 @@ struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
   /// `Connection` field, so the borrow stays disjoint from `phase` / `events` /
   /// `close_pending` / `conn_error` / `request_abandoned` / `request_received`.
   tunnel_established: &'a mut bool,
+  /// Whether a HEADERS section already completed on this stream (initialized from
+  /// the recv FSM's [`headers_seen`](crate::stream::Stream::headers_seen) at build
+  /// time, then set `true` the moment this carrier first observes / abandons a
+  /// HEADERS). A HEADERS that arrives once this is set is a second HEADERS on the
+  /// CONNECT tunnel — a frame-placement violation ([`H3Error::FrameUnexpected`]).
+  /// The general recv FSM allows repeated leading (interim 1xx) HEADERS and a
+  /// trailing section, so this tunnel-layer "exactly one HEADERS each way" guard
+  /// lives here in the connection, not in the FSM (a later task wires per-stream
+  /// interim/trailers acceptance for non-tunnel streams).
+  first_headers_seen: bool,
 }
 
 impl<ReqBuf, EventBuf> Frames<'_, '_, '_, ReqBuf, EventBuf> {
@@ -352,9 +362,29 @@ where
       };
       match advanced {
         None => return Ok(None),
-        // The first HEADERS: break out so the readiness side effect + the borrowing
-        // yield run once, outside the skip loop.
-        Some(Advanced::Headers { acc_end }) => break acc_end,
+        // A HEADERS section. The CONNECT tunnel exchanges exactly ONE HEADERS each way,
+        // so a HEADERS once a prior section already completed (a repeated leading /
+        // interim section OR a trailing section — the FSM now allows both, leaving the
+        // policy here) is a frame-placement violation: route it through the centralized
+        // fail transition exactly like any other lazy fatal request-FSM error. The
+        // `kind` is ignored at the tunnel layer (a later task uses it for general
+        // per-stream interim/trailers acceptance).
+        Some(Advanced::Headers { acc_end, kind: _ }) => {
+          if rf.first_headers_seen {
+            Phase::fail_into(
+              rf.phase,
+              rf.close_pending,
+              rf.events,
+              rf.conn_error,
+              H3Error::FrameUnexpected,
+            );
+            return Err(H3Error::FrameUnexpected);
+          }
+          // The first HEADERS: break out so the readiness side effect + the borrowing
+          // yield run once, outside the skip loop.
+          rf.first_headers_seen = true;
+          break acc_end;
+        }
         Some(Advanced::Data { start, end }) => {
           // Tunnel DATA is delivered ONLY once the tunnel reached `Open`
           // (`tunnel_established`, set on the single establish transition). RFC 9114
@@ -564,31 +594,49 @@ where
         // No protocol error in the remaining bytes: every supplied byte is now
         // validated. Discarding the items is intentional (the driver abandoned them).
         Ok(None) => return,
-        // The first HEADERS is decoded + fully validated by `Items::next` above (a
-        // malformed section would have returned `Err` here), but readiness is NOT
-        // granted on the drop path — `on_headers_decoded` runs only when
-        // `Frames::next` yields the HEADERS to the driver (the observation point). A
-        // driver that never pulled has not observed the request/response, so the
-        // server must not be able to `accept_with` it nor the client become
-        // `Established` on it.
+        // A HEADERS section is decoded + fully validated by the FSM here (a malformed
+        // section would have returned `Err`). The recv FSM now allows a repeated
+        // leading / trailing HEADERS, so this arm covers TWO cases, split on whether a
+        // prior section already completed (`first_headers_seen`):
         //
-        // This arm is the unambiguous UNOBSERVED-first-HEADERS signal: an OBSERVED
-        // HEADERS leaves the FSM in `Tunnel`, so the drain can never re-decode a
-        // HEADERS here. Decoding it nonetheless advanced the inbound FSM into its
-        // tunnel phase as a side effect, and the consumed HEADERS bytes are gone with
-        // the per-call input — the stream can never be observed afterwards, so it is
-        // permanently inert. Mark it `request_abandoned` so every later observable
-        // path treats the request stream as a no-op (no `Frame::Data` from a tunnel
-        // the driver never established, no `PeerClosed` on a clean FIN), WITHOUT
-        // failing the connection (a lazy drop is not a protocol violation; readiness
-        // simply stays ungranted). KEEP scanning the rest of THIS call's input below —
-        // a trailing forbidden frame is a peer protocol violation that routes through
-        // `fail_into`, and a coalesced DATA frame now hits the establishment gate in
-        // the DATA arm: an unobserved request never established the tunnel, so that
-        // DATA is premature (RFC 9114 §4.4) and `fail`s the connection. That §4.4
-        // violation by the peer SUPERSEDES mere abandonment (exactly as a trailing
-        // forbidden frame already supersedes it).
+        // 1. A SECOND HEADERS (`first_headers_seen` already set) is the same tunnel
+        //    second-HEADERS placement violation the live path rejects — fail (handled in
+        //    the arm body below).
+        // 2. The UNOBSERVED FIRST HEADERS. Readiness is NOT granted on the drop path —
+        //    `on_headers_decoded` runs only when `Frames::next` yields the HEADERS to
+        //    the driver (the observation point) — so a driver that never pulled has not
+        //    observed the request/response, and the server must not be able to
+        //    `accept_with` it nor the client become `Established` on it. Decoding it
+        //    nonetheless advanced the inbound FSM past the section as a side effect, and
+        //    the consumed HEADERS bytes are gone with the per-call input — the stream
+        //    can never be observed afterwards, so it is permanently inert. Mark it
+        //    `request_abandoned` so every later observable path treats the request
+        //    stream as a no-op (no `Frame::Data` from a tunnel the driver never
+        //    established, no `PeerClosed` on a clean FIN), WITHOUT failing the
+        //    connection (a lazy drop is not a protocol violation; readiness simply stays
+        //    ungranted). KEEP scanning the rest of THIS call's input below — a trailing
+        //    forbidden frame routes through `fail_into`, and a coalesced DATA frame hits
+        //    the establishment gate in the DATA arm: an unobserved request never
+        //    established the tunnel, so that DATA is premature (RFC 9114 §4.4) and
+        //    `fail`s the connection. That §4.4 violation by the peer SUPERSEDES mere
+        //    abandonment (exactly as a trailing forbidden frame already supersedes it).
         Ok(Some(Advanced::Headers { .. })) => {
+          // A HEADERS once a prior section already completed is the SAME second-HEADERS
+          // placement violation the live path rejects (next/drain parity): the tunnel
+          // exchanges exactly one HEADERS each way. Route it through `fail` and stop.
+          if self.first_headers_seen {
+            Phase::fail_into(
+              self.phase,
+              self.close_pending,
+              self.events,
+              self.conn_error,
+              H3Error::FrameUnexpected,
+            );
+            return;
+          }
+          // The UNOBSERVED first HEADERS: mark the stream abandoned (no readiness on the
+          // drop path) and keep scanning for a trailing violation in this same input.
+          self.first_headers_seen = true;
           *self.request_abandoned = true;
         }
         // A DATA frame on the drop path passes the SAME establishment gate as
@@ -1901,6 +1949,10 @@ where
     EventBuf: AsMut<[Option<Event>]>,
   {
     let is_client = Ro::IS_CLIENT;
+    // Read whether a HEADERS section already completed BEFORE the FSM is moved into the
+    // carrier (an immutable read that ends before the `&mut self.request` split below),
+    // so the second-HEADERS guard works across `handle_stream` calls too.
+    let first_headers_seen = self.request.headers_seen();
     // Split-borrow the disjoint fields the iterator carries. All are distinct fields
     // from the request FSM (`self.request`), so these borrows are disjoint from it.
     let phase = &mut self.phase;
@@ -1925,6 +1977,7 @@ where
       establish_on_response,
       on_first_request,
       tunnel_established,
+      first_headers_seen,
     }
   }
 
