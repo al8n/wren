@@ -233,19 +233,21 @@ pub struct StreamEntry<'req, ReqBuf> {
   /// `RESET_STREAM` is connection-fatal on the tunnel, stream-scoped otherwise —
   /// RFC 9114 §4.1.2):
   ///
-  /// - `true` — the tunnel (or tunnel-ASSUMED, see below): the client establishes on
-  ///   the final response via the shared `Handshaking → Open` transition
-  ///   ([`Phase::establish_into`]: phase → `Open`, [`Event::Established`] enqueued,
-  ///   `established` set), and the server via [`accept_with`](Connection::accept_with).
-  ///   A stream error on it fails the WHOLE connection. Set on:
+  /// - `true` — the tunnel: the client establishes on the final response via the
+  ///   shared `Handshaking → Open` transition ([`Phase::establish_into`]: phase →
+  ///   `Open`, [`Event::Established`] enqueued, `established` set), and the server via
+  ///   [`accept_with`](Connection::accept_with). A stream error on it fails the WHOLE
+  ///   connection. Set on:
   ///   - the client tunnel path (`open_with` →
   ///     [`provide_stream`](Connection::provide_stream)); and
-  ///   - EVERY inbound server request stream at registration — the server cannot tell
-  ///     tunnel from general before any HEADERS, so it ASSUMES the tunnel (a protocol
-  ///     violation before it commits to a response stays connection-fatal, preserving
-  ///     the strict CONNECT-tunnel behavior). [`send_response`](Connection::send_response)
-  ///     (the general response path) then flips it to `false`; `accept_with` keeps it
-  ///     `true`.
+  ///   - an inbound server request stream registered while the connection is in
+  ///     [`Mode::Tunnel`] (the default) — the server cannot tell tunnel from general
+  ///     before any HEADERS, so the strict-CONNECT default keeps a pre-response protocol
+  ///     violation connection-fatal. In [`Mode::General`] the registration is `false`
+  ///     instead (a general server: a pre-response request error resets per-stream).
+  ///     Either way [`send_response`](Connection::send_response) (the general response
+  ///     path) makes/keeps it `false`; `accept_with` makes/keeps it `true` (the
+  ///     established tunnel). See [`Mode`].
   /// - `false` — a general stream (opened with
   ///   [`open_request`](Connection::open_request) on the client, or responded to with
   ///   [`send_response`](Connection::send_response) on the server): establishment is
@@ -1367,6 +1369,52 @@ enum Phase {
   Failed,
 }
 
+/// How inbound request-stream errors are SCOPED for the whole connection
+/// (RFC 9114 §4.1.2 per-stream error vs a connection-level error).
+///
+/// The mode is connection-level, set on the SERVER before [`start`](Connection::start)
+/// / [`provide_stream`](Connection::provide_stream), and it governs how a newly
+/// registered inbound request stream is classified (its private `is_tunnel` error
+/// scope): a request error before the server has committed to a response is connection-fatal
+/// in [`Tunnel`](Self::Tunnel) mode and stream-scoped in [`General`](Self::General)
+/// mode. It does not affect the CLIENT (which always knows whether it opened a
+/// CONNECT tunnel via [`open_with`](Connection::open_with) or a general request via
+/// [`open_request`](Connection::open_request)) nor an already-established server
+/// CONNECT tunnel (an [`accept_with`](Connection::accept_with) stream stays a tunnel).
+///
+/// The default is [`Tunnel`](Self::Tunnel) for backward compatibility with the
+/// shipped CONNECT-tunnel behavior; a general HTTP/3 server should select
+/// [`General`](Self::General) via [`set_mode`](Connection::set_mode).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, IsVariant, derive_more::Display)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+pub enum Mode {
+  /// One tunnel = one connection: an error on an inbound request stream is
+  /// CONNECTION-fatal. This is the strict CONNECT-tunnel scoping — a protocol
+  /// violation on the (single) tunnel stream fails the whole connection rather
+  /// than resetting just that stream. The default, preserving the behavior of a
+  /// connection dedicated to one CONNECT tunnel.
+  #[default]
+  Tunnel,
+  /// A general HTTP/3 server: an error on an inbound request stream is
+  /// STREAM-scoped — it resets just that stream (RFC 9114 §4.1.2,
+  /// `RESET_STREAM`) and the connection survives, so other concurrent request
+  /// streams are unaffected. Select this on a general server (it governs the
+  /// pre-response window before [`send_response`](Connection::send_response)).
+  General,
+}
+
+impl Mode {
+  /// A stable, lower-case name for the mode (logging / diagnostics).
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Tunnel => "tunnel",
+      Self::General => "general",
+    }
+  }
+}
+
 impl Phase {
   /// The `Handshaking → Open` establish transition body, operating on disjoint
   /// borrows of the phase, the event queue, and the `tunnel_established` flag so it
@@ -1753,6 +1801,14 @@ pub struct Connection<
   /// carrier's borrow of it stays disjoint from `phase` / `events` / `close_pending` /
   /// `conn_error`.
   pending_reset: Option<(StreamId, u64)>,
+  /// How inbound request-stream errors are scoped for this connection (see [`Mode`]).
+  /// Read by the SERVER's [`provide_request_stream`](Self::provide_request_stream) to
+  /// classify a newly registered request stream's
+  /// [`is_tunnel`](StreamEntry::is_tunnel) marker, so it must be set (via
+  /// [`set_mode`](Self::set_mode)) before the first inbound request stream is provided.
+  /// Defaults to [`Mode::Tunnel`] (strict CONNECT-tunnel scoping); the CLIENT paths and
+  /// `accept_with` ignore it (they know their stream's scope directly).
+  mode: Mode,
   _ro: PhantomData<fn() -> Ro>,
   _storage: PhantomData<(
     &'req mut (),
@@ -1909,6 +1965,7 @@ where
       close_pending: false,
       conn_error: None,
       pending_reset: None,
+      mode: Mode::Tunnel,
       _ro: PhantomData,
       _storage: PhantomData,
     }
@@ -1949,6 +2006,30 @@ where
   /// Whether the CONNECT HEADERS exchange has completed (the tunnel is open).
   pub const fn is_established(&self) -> bool {
     self.phase.is_open()
+  }
+
+  /// This connection's request-error scoping [`Mode`] (default [`Mode::Tunnel`]).
+  #[inline(always)]
+  pub const fn mode(&self) -> Mode {
+    self.mode
+  }
+
+  /// Selects how inbound request-stream errors are scoped (see [`Mode`]), returning
+  /// `&mut Self` so it chains with other configuration.
+  ///
+  /// This must be set BEFORE [`start`](Self::start) /
+  /// [`provide_stream`](Self::provide_stream): it governs how the SERVER registers a
+  /// newly inbound request stream (it derives the new entry's private `is_tunnel` error
+  /// scope from the mode), so changing it after a request stream is already registered
+  /// does not reclassify that stream. The default is
+  /// [`Mode::Tunnel`] (strict CONNECT-tunnel scoping); a general HTTP/3 server should
+  /// call `set_mode(`[`Mode::General`]`)`. The CLIENT paths and
+  /// [`accept_with`](Self::accept_with) ignore the mode (they know their stream's
+  /// scope directly).
+  #[inline(always)]
+  pub const fn set_mode(&mut self, mode: Mode) -> &mut Self {
+    self.mode = mode;
+    self
   }
 
   /// Whether the connection is winding down or terminal (phase `Closing` or
@@ -2186,38 +2267,32 @@ where
       return;
     }
     if role.is_request() {
-      // Register as the CONNECT tunnel (`is_tunnel = true`) — the connection-fatal
-      // default for an error-scoping standpoint (RFC 9114 §4.1.2 vs a connection error):
+      // Classify the new request entry's `is_tunnel` (its error scope: RFC 9114
+      // §4.1.2 per-stream vs a connection error) by SIDE and connection [`Mode`]:
       //
       // - The CLIENT reaches `provide_stream(Request, …)` only via the CONNECT tunnel
       //   path (`open_with` → `OpenRequest` → the driver registers the minted id here),
       //   so a client stream provided this way IS the tunnel. The general client opens
       //   streams through `open_request` instead, which registers them
-      //   `is_tunnel = false` directly.
-      // - The SERVER cannot tell tunnel from general at registration (the id is bound
-      //   before any HEADERS), so it ASSUMES the tunnel — a protocol violation before it
-      //   has committed to a response stays connection-fatal, preserving the strict
-      //   CONNECT-tunnel behavior. The general server response path
-      //   [`send_response`](Self::send_response) flips the entry to `is_tunnel = false`
-      //   (a stream-scoped error then resets just that stream); `accept_with` keeps it
-      //   `true` (the established tunnel).
+      //   `is_tunnel = false` directly. So the client always passes `true` here, and
+      //   `self.mode` (a server-side knob, default `Tunnel`) leaves that unchanged.
+      // - The SERVER cannot tell tunnel from general from the id alone (it is bound
+      //   before any HEADERS), so it uses the connection-level [`Mode`]:
+      //   [`Mode::Tunnel`] (the default) ⇒ `is_tunnel = true`, so a protocol violation
+      //   before it commits to a response is connection-fatal (strict CONNECT-tunnel
+      //   scoping: one tunnel = one connection); [`Mode::General`] ⇒ `is_tunnel = false`,
+      //   so a pre-response malformed request resets just that stream and the connection
+      //   survives. Either way the general server response path
+      //   [`send_response`](Self::send_response) keeps the entry `is_tunnel = false`,
+      //   and [`accept_with`](Self::accept_with) keeps it `true` (the established tunnel).
       //
-      // NOTE (Phase-0 limitation — DOCUMENTED, not fixed here): the server's
-      // "assume tunnel, flip on `send_response`" heuristic is `is_tunnel`-per-stream,
-      // so there is a window with the wrong scope. A GENERAL server that receives a
-      // MALFORMED request BEFORE it has called `send_response` (the flip to
-      // `is_tunnel = false`) sees that request error treated as CONNECTION-fatal
-      // rather than the RFC 9114 §4.1.2 per-stream error a general request stream
-      // deserves — the entry is still tunnel-assumed, so `fail_or_reset` /
-      // `fail_or_reset_stream` take the connection-fatal branch. (A client never hits
-      // this: it knows whether it opened a tunnel or a general stream.) The
-      // principled fix is a CONNECTION-LEVEL tunnel-mode (the connection, not the
-      // individual stream, is tunnel or general: a tunnel-mode connection FAILS on a
-      // stream error, a general-mode connection RESETS), which removes the
-      // pre-response ambiguity entirely. That is deferred beyond Phase 0; for now the
-      // strict-CONNECT default is intentional, and every CONNECT-tunnel test stays
-      // green.
-      self.provide_request_stream(id, true);
+      // This is the connection-level tunnel-mode that resolves the former Phase-0
+      // limitation (a general server's PRE-response window mis-scoped the error): a
+      // `General`-mode connection now resets a pre-response request error per-stream
+      // instead of failing the whole connection. The default stays `Tunnel`, so every
+      // CONNECT-tunnel test keeps the connection-fatal behavior unchanged; a general
+      // HTTP/3 server opts in via [`set_mode`](Self::set_mode)`(`[`Mode::General`]`)`.
+      self.provide_request_stream(id, self.mode.is_tunnel());
       return;
     }
     // Critical (control / QPACK) streams stay write-once-singular in `roles`.
@@ -2244,11 +2319,14 @@ where
   /// [`provide_stream`](Self::provide_stream).
   ///
   /// `is_tunnel` marks the new entry's
-  /// [`StreamEntry::is_tunnel`](StreamEntry::is_tunnel): `true` on the CONNECT tunnel /
-  /// tunnel-assumed inbound path (the client's establish split then picks
-  /// connection-scoped establishment, and a protocol error is connection-fatal),
-  /// `false` for a general client `open_request` stream (per-stream establishment, a
-  /// stream-scoped error reset). A re-provide does not change an existing entry's marker.
+  /// [`StreamEntry::is_tunnel`](StreamEntry::is_tunnel): `true` on the CONNECT tunnel
+  /// path (the client tunnel, or a server inbound stream while in [`Mode::Tunnel`] —
+  /// the client's establish split then picks connection-scoped establishment, and a
+  /// protocol error is connection-fatal), `false` for a general client `open_request`
+  /// stream or a server inbound stream in [`Mode::General`] (per-stream establishment,
+  /// a stream-scoped error reset — RFC 9114 §4.1.2). The caller derives it from the
+  /// side and connection [`Mode`] (see [`provide_stream`](Self::provide_stream)). A
+  /// re-provide does not change an existing entry's marker.
   #[allow(private_bounds)]
   fn provide_request_stream(&mut self, id: StreamId, is_tunnel: bool)
   where
@@ -3871,13 +3949,14 @@ where
         write_headers_frame(out, response, limit)
       })
       .map_err(map_tx)?;
-    // Confirm the tunnel slot's entry as the CONNECT tunnel: the server registered it
-    // `is_tunnel = true` (tunnel-assumed) at `provide_stream` time, and `accept_with` is
-    // the tunnel-establishing path, so it stays `true` (re-asserted here for clarity).
-    // The marker keeps the entry's establishment connection-scoped (matching the
-    // `Event::Established` this enqueues) and feeds the per-stream-vs-connection reset
-    // split (a tunnel error is connection-fatal). The general `send_response` path
-    // instead clears it.
+    // Confirm the tunnel slot's entry as the CONNECT tunnel: `accept_with` is the
+    // tunnel-establishing path, so its entry is `is_tunnel = true` regardless of the
+    // connection [`Mode`] that classified it at `provide_stream` time (`Tunnel` ⇒ `true`
+    // already; `General` ⇒ `false`, re-asserted to `true` here — accepting a CONNECT
+    // makes this stream the tunnel). The marker keeps the entry's establishment
+    // connection-scoped (matching the `Event::Established` this enqueues) and feeds the
+    // per-stream-vs-connection reset split (a tunnel error is connection-fatal). The
+    // general `send_response` path instead clears it.
     if let Some(entry) = self.streams.get_mut(id) {
       entry.is_tunnel = true;
     }
@@ -3940,10 +4019,11 @@ where
       })
       .map_err(map_tx)?;
     // Responding via the GENERAL path marks the entry NON-tunnel (`is_tunnel = false`):
-    // the server registered it `true` (tunnel-assumed) since it could not tell tunnel
-    // from general before any HEADERS, and committing to a general response is what makes
-    // it general — a later stream error then resets just this stream rather than failing
-    // the connection (RFC 9114 §4.1.2). `accept_with` is the tunnel path and keeps it
+    // committing to a general response is what makes the stream general — a later stream
+    // error then resets just this stream rather than failing the connection (RFC 9114
+    // §4.1.2). This is also what made the entry general in `Mode::Tunnel` (the default,
+    // where `provide_stream` registered it `true`); in `Mode::General` it was already
+    // `false`, so this is a no-op re-assert. `accept_with` is the tunnel path and keeps it
     // `true`. The FINAL response also marks the entry established (gating `Frame::Data`)
     // but pushes NO connection `Event` — general streams are not connection-scoped (see
     // the doc above); an interim response leaves it unestablished. A missing entry was

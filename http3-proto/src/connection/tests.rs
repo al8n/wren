@@ -764,6 +764,100 @@ fn incomplete_message_fin_before_headers_is_error() {
   ));
 }
 
+// The `Mode::General` contrast to the tunnel-default test above: a GENERAL HTTP/3
+// server that receives a MALFORMED request (FIN before any HEADERS) BEFORE it has
+// responded scopes the error PER-STREAM (RFC 9114 §4.1.2) rather than failing the
+// whole connection — the connection-level tunnel-mode fix for the former Phase-0
+// pre-response ambiguity. The offending stream is reset (`RESET_STREAM`) and freed,
+// the connection survives (no `Event::ConnError`, `!is_failed()`), and a SECOND
+// concurrent general request stream stays fully usable end to end. In the default
+// `Mode::Tunnel` the same FIN-before-HEADERS is connection-fatal
+// (`incomplete_message_fin_before_headers_is_error`, above).
+#[test]
+fn general_mode_malformed_request_before_response_resets_alone() {
+  let mut h = Harness::new();
+  // Select general scoping on the server BEFORE start (`exchange_settings` calls it):
+  // the mode governs how inbound request streams are registered.
+  h.server.set_mode(Mode::General);
+  assert!(
+    h.server.mode().is_general(),
+    "the server is in general mode"
+  );
+  h.exchange_settings();
+  let id_a = StreamId::new(0);
+  let id_b = StreamId::new(4);
+  // Stream A: registered on the server but kept HEADERS-less — the malformed stream.
+  // (Registered directly so no valid HEADERS ever arrive on it, unlike B below.)
+  h.server.provide_stream(StreamRole::Request, id_a);
+  assert!(
+    !h.server.stream_is_gone(id_a),
+    "stream A is registered before the FIN"
+  );
+  // Stream B: a real concurrent general request the client opens, the server observes,
+  // and (below) responds to end to end.
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id_b, get).unwrap();
+  h.pump();
+  assert_eq!(
+    h.server_request_ids,
+    std::vec![id_b],
+    "the server observed B's request"
+  );
+  // Drain any transmits queued so far (the SETTINGS setup) so the only transmit left
+  // after the malformed FIN is A's stream-scoped reset.
+  while h.server.poll_transmit().is_some() {}
+  // Stream A is now malformed BEFORE the server responds: a FIN before ANY HEADERS
+  // (`RequestIncomplete`) — exactly the scenario the tunnel-default test treats as
+  // connection-fatal. In general mode this is stream-scoped, not connection-fatal.
+  h.server.handle_stream_fin(id_a);
+  // The connection is NOT failed and surfaces NO terminal `ConnError`.
+  assert!(
+    !h.server.is_failed(),
+    "a malformed pre-response request must NOT fail a general-mode connection"
+  );
+  assert!(
+    !matches!(h.server.poll_event(), Some(Event::ConnError(_))),
+    "no connection error is surfaced for a stream-scoped reset"
+  );
+  // A `RESET_STREAM` for stream A is enqueued and A's slot freed. Copy the transmit's
+  // facts out so its borrow of the server ends before the `stream_is_gone` read below.
+  let (kind, empty, no_fin) = {
+    let t = h.server.poll_transmit().expect("a reset transmit for A");
+    (t.kind(), t.bytes().is_empty(), !t.fin())
+  };
+  assert!(
+    matches!(kind, StreamKind::ResetStream { id, code }
+      if id == id_a && code == H3Error::RequestIncomplete.code()),
+    "a RESET_STREAM(RequestIncomplete) for stream A is enqueued, got {kind:?}"
+  );
+  assert!(empty, "a RESET_STREAM carries no bytes");
+  assert!(no_fin, "a RESET_STREAM is not a FIN");
+  assert!(h.server.stream_is_gone(id_a), "the reset stream A is freed");
+  // Stream B is fully usable end to end: the server responds, and the client receives a
+  // body the server sends on B — proving the connection survived A's stream-scoped reset.
+  h.server
+    .send_response(id_b, &[(":status", "200")][..], true)
+    .expect("send_response on the surviving stream B");
+  h.server
+    .send_data_on(id_b, bytes::Bytes::from_static(b"still-ok"))
+    .expect("server body on B");
+  h.pump();
+  assert_eq!(
+    h.client_rx_for(id_b),
+    b"still-ok",
+    "stream B works end to end after A's stream-scoped reset"
+  );
+  assert!(
+    !h.server.is_failed() && !h.client.is_failed(),
+    "neither side failed"
+  );
+}
+
 #[test]
 fn general_client_final_response_establishes_per_stream_without_connection_event() {
   // A GENERAL client stream's FINAL response sets up `Frame::Data` flow (the per-stream

@@ -94,7 +94,7 @@ pub mod connection;
 pub use connection::StreamSlot;
 pub use connection::{
   BorrowedConnection, Client, Connection, DefaultCtrlBuf, DefaultEventBuf, DefaultReqBuf,
-  DefaultStreamStore, DefaultTxBuf, DefaultUniBuf, Frame, Frames, Role, Server, StreamEntry,
+  DefaultStreamStore, DefaultTxBuf, DefaultUniBuf, Frame, Frames, Mode, Role, Server, StreamEntry,
   UniSlot,
 };
 
