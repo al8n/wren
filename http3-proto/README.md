@@ -138,8 +138,8 @@ let mut scratch = [0u8; 4096]; // Huffman decode scratch (bare tier: stack)
 let mut frames = conn.handle_stream(stream_id, bytes, &mut scratch)?;
 while let Some(frame) = frames.next()? {
     match frame {
-        http3_proto::Frame::Response(hs) => {
-            // Check hs for :status 200 — tunnel established.
+        http3_proto::Frame::Response { headers, .. } => {
+            // Check headers for :status 200 — tunnel established.
         }
         http3_proto::Frame::Data(chunk) => {
             // Forward chunk to the WebSocket layer.
