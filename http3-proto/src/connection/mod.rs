@@ -193,10 +193,86 @@ pub enum Frame<'a> {
   Data(&'a [u8]),
 }
 
-/// Per-stream connection-side state: the inbound recv FSM plus the lifecycle
-/// markers that used to be singular [`Connection`] fields (now one set PER
-/// stream, held in the [`StreamStore`]). The CONNECT tunnel uses exactly one
-/// entry, keyed by the tunnel's `request_id`.
+/// The per-stream LOCAL send half-FSM: the single source of truth for what the
+/// local endpoint may legally enqueue NEXT on a stream, so no public-call sequence
+/// can put protocol-invalid frame ordering on the wire (RFC 9114 §4.1 / §4.1.2).
+/// It replaces the former ad-hoc `final_response_sent` / `local_send_closed`
+/// booleans; every send guard validates against it and every successful send
+/// transitions it. It is orthogonal to the inbound recv FSM and to the PEER's
+/// half-close (`peer_closed`).
+///
+/// The legal sequence is role-shaped (the role is `Ro::IS_CLIENT`, so one enum
+/// covers both; a server entry never holds [`RequestSent`](Self::RequestSent) and a
+/// client entry never holds [`Idle`](Self::Idle) / [`FinalSent`](Self::FinalSent)):
+///
+/// - **Server response side:** [`Idle`](Self::Idle) (no leading section yet, or only
+///   interim 1xx leading sections — both reject body / trailers / FIN) → a FINAL
+///   response (a 2xx–5xx [`send_response`](Connection::send_response), or the tunnel
+///   [`accept_with`](Connection::accept_with) 2xx) moves to
+///   [`FinalSent`](Self::FinalSent), after which body / trailers may flow; interim 1xx
+///   responses are allowed only while [`Idle`](Self::Idle) (none after the final).
+/// - **Client request side:** [`RequestSent`](Self::RequestSent) (set at registration —
+///   the request HEADERS are already enqueued) allows request body BEFORE any response,
+///   with NO server-style final-response gate.
+/// - **Both roles:** a trailing section ([`send_trailers`](Connection::send_trailers))
+///   moves to [`TrailersSent`](Self::TrailersSent), which rejects any further body /
+///   trailers (RFC 9114: at most one trailing section, nothing after it but the FIN);
+///   [`finish`](Connection::finish) moves to [`Closed`](Self::Closed), after which
+///   nothing may follow the FIN.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SendState {
+  /// SERVER, no FINAL response sent yet (the start state, and the state across zero or
+  /// more interim 1xx responses). Body / trailers / FIN are rejected here (premature
+  /// DATA / a FIN before the response — RFC 9114 §4.1); only another
+  /// [`send_response`](Connection::send_response) (interim or the one final) /
+  /// [`accept_with`](Connection::accept_with) is legal. Never held by a client entry.
+  Idle,
+  /// CLIENT, request HEADERS enqueued (set at stream registration). Request body /
+  /// trailers / FIN are all legal here, BEFORE any response — the client has no
+  /// final-response gate. Never held by a server entry.
+  RequestSent,
+  /// SERVER, the FINAL response leading section has been sent (a 2xx–5xx
+  /// [`send_response`](Connection::send_response) or the tunnel
+  /// [`accept_with`](Connection::accept_with) 2xx). Body / trailers / FIN may now flow;
+  /// a further [`send_response`](Connection::send_response) (interim OR final) is
+  /// rejected (at most one final, none after it). Never held by a client entry.
+  FinalSent,
+  /// A trailing HEADERS section has been sent (either role). Only
+  /// [`finish`](Connection::finish) is legal now — further body / trailers are rejected
+  /// (at most one trailing section, and nothing follows it but the FIN).
+  TrailersSent,
+  /// [`finish`](Connection::finish) enqueued the terminating FIN (either role). The
+  /// terminal state: every further local send is rejected (nothing follows the FIN).
+  Closed,
+}
+
+impl SendState {
+  /// Whether body / trailers may be enqueued in this state: the CLIENT request body
+  /// window ([`RequestSent`](Self::RequestSent)) or the SERVER post-final-response
+  /// window ([`FinalSent`](Self::FinalSent)). [`Idle`](Self::Idle) (server pre-final),
+  /// [`TrailersSent`](Self::TrailersSent), and [`Closed`](Self::Closed) reject them.
+  const fn can_send_body(self) -> bool {
+    matches!(self, Self::RequestSent | Self::FinalSent)
+  }
+}
+
+/// Which general per-stream send a [`guard_send_on`](Connection::guard_send_on) call is
+/// validating against the [`SendState`], so the one guard can apply the right transition
+/// rule: a DATA body, a trailing HEADERS section, or the terminating FIN.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SendOp {
+  /// A DATA-frame body chunk ([`send_data_on`](Connection::send_data_on)).
+  Body,
+  /// A trailing HEADERS section ([`send_trailers`](Connection::send_trailers)).
+  Trailers,
+  /// The terminating empty FIN ([`finish`](Connection::finish)).
+  Finish,
+}
+
+/// Per-stream connection-side state: the inbound recv FSM, the local send half-FSM
+/// (`SendState`), plus the lifecycle markers that used to be singular
+/// [`Connection`] fields (now one set PER stream, held in the [`StreamStore`]). The
+/// CONNECT tunnel uses exactly one entry, keyed by the tunnel's `request_id`.
 ///
 /// Its fields are private connection bookkeeping; the type is `pub` only so the
 /// bare-tier caller can name `StreamSlot` when allocating
@@ -237,25 +313,14 @@ pub struct StreamEntry<'req, ReqBuf> {
   /// never surfaces tunnel data / grants readiness). (Was the singular
   /// `request_abandoned`.)
   abandoned: bool,
-  /// Server-only LOCAL send state: a FINAL response leading section has been SENT on
-  /// this stream — set by [`accept_with`](Connection::accept_with) (the CONNECT tunnel
-  /// 2xx) and by [`send_response`](Connection::send_response)`(last = true)`, NOT by an
-  /// interim `send_response(last = false)`. It gates the server's body / trailers / FIN
-  /// send paths ([`guard_send_on`](Connection::guard_send_on)): a server must not enqueue
-  /// response DATA / trailers / FIN before its final response HEADERS, or the peer would
-  /// read premature DATA / malformed frame ordering (RFC 9114 §4.1 — `H3_FRAME_UNEXPECTED`).
-  /// Unused on the CLIENT, whose request body legitimately follows the request HEADERS
-  /// before any response (the gate is role-aware).
-  final_response_sent: bool,
-  /// LOCAL send-half closed: [`finish`](Connection::finish) enqueued the terminating FIN
-  /// on this stream (either role). Once set, EVERY further local send on the stream is
-  /// rejected — no body / trailers / FIN after the FIN ([`guard_send_on`](Connection::guard_send_on)),
-  /// and no response HEADERS after it ([`guard_send_response`](Connection::guard_send_response)) —
-  /// so the local send sequence cannot put anything on the wire past its own end-of-stream
-  /// (RFC 9114 §4.1: a stream's frames end at the FIN; nothing legal follows). This is the
-  /// terminal state of the per-stream LOCAL send machine, orthogonal to the inbound recv
-  /// FSM and to `peer_closed` (the PEER's half-close).
-  local_send_closed: bool,
+  /// The per-stream LOCAL send half-FSM: the single source of truth for what may be
+  /// enqueued NEXT on this stream's send half, replacing the former
+  /// `final_response_sent` / `local_send_closed` booleans. Every send guard validates
+  /// against it and every successful send transitions it, so no public-call sequence can
+  /// produce protocol-invalid frame ordering (RFC 9114 §4.1 / §4.1.2). See [`SendState`]
+  /// for the full role-shaped transition table; it is orthogonal to the inbound recv FSM
+  /// and to `peer_closed` (the PEER's half-close).
+  send: SendState,
   /// Whether this stream is the CONNECT tunnel (vs a general request/response
   /// stream). It drives BOTH the establish split (connection-scoped for the tunnel,
   /// per-stream otherwise) and the error-scope split (a protocol violation /
@@ -288,10 +353,14 @@ pub struct StreamEntry<'req, ReqBuf> {
 }
 
 impl<'req, ReqBuf> StreamEntry<'req, ReqBuf> {
-  /// A fresh entry wrapping the recv FSM `fsm`, with every lifecycle marker clear.
-  /// `is_tunnel` marks whether this is the CONNECT tunnel slot (set only on the
-  /// tunnel path) — it drives the connection-scoped vs per-stream establish split.
-  fn new(fsm: Stream<'req, ReqBuf>, is_tunnel: bool) -> Self {
+  /// A fresh entry wrapping the recv FSM `fsm`, with every recv-side lifecycle marker
+  /// clear and the send half-FSM seeded to `send`. `is_tunnel` marks whether this is
+  /// the CONNECT tunnel slot (set only on the tunnel path) — it drives the
+  /// connection-scoped vs per-stream establish split. `send` is the role-shaped start
+  /// state: [`SendState::RequestSent`] for a CLIENT-opened stream (its request HEADERS
+  /// are already enqueued, so request body may follow) or [`SendState::Idle`] for an
+  /// inbound SERVER request stream (no response sent yet).
+  fn new(fsm: Stream<'req, ReqBuf>, is_tunnel: bool, send: SendState) -> Self {
     Self {
       fsm,
       observed: false,
@@ -300,8 +369,7 @@ impl<'req, ReqBuf> StreamEntry<'req, ReqBuf> {
       peer_closed: false,
       peer_fin_pending: false,
       abandoned: false,
-      final_response_sent: false,
-      local_send_closed: false,
+      send,
       is_tunnel,
     }
   }
@@ -2518,7 +2586,16 @@ where
     // empty slice, so it supports only the seeded tunnel stream — bare multi-stream
     // buffering is a later task.)
     let buf = self.req_seed.take().unwrap_or_else(ReqBuf::fresh);
-    let entry = StreamEntry::new(Stream::with_buffer(buf), is_tunnel);
+    // Seed the send half-FSM by role: a CLIENT registers a stream only when it has
+    // already enqueued the request HEADERS (`open_request` / `open_with`), so it starts
+    // in `RequestSent` (request body may follow); an inbound SERVER request stream has
+    // sent no response yet, so it starts in `Idle` (body gated until the final response).
+    let send = if Ro::IS_CLIENT {
+      SendState::RequestSent
+    } else {
+      SendState::Idle
+    };
+    let entry = StreamEntry::new(Stream::with_buffer(buf), is_tunnel, send);
     if self.streams.insert(id, entry).is_err() {
       // At store capacity: drop the overflow stream and reset it with
       // `H3_REQUEST_REJECTED` so the peer learns the request was not accepted (and may
@@ -3378,7 +3455,7 @@ where
     B: Into<crate::backend::DataBuf>,
   {
     use core::ops::Deref;
-    self.guard_send_on(id)?;
+    self.guard_send_on(id, SendOp::Body)?;
     let body = body.into();
     let body_len = body.deref().len();
     self
@@ -3409,7 +3486,7 @@ where
   where
     TxBuf: AsMut<[u8]>,
   {
-    self.guard_send_on(id)?;
+    self.guard_send_on(id, SendOp::Body)?;
     self
       .tx
       .enqueue(StreamKind::Existing(id), false, |out| {
@@ -3431,9 +3508,13 @@ where
 
   /// Sends a trailing HEADERS section (trailers) on the request stream `id`, in
   /// either direction (request trailers from a client, response trailers from a
-  /// server). A single trailing section is allowed after the body. The driver owns
-  /// trailer validity; the core stays semantics-agnostic (the full validator is a
-  /// later task).
+  /// server). EXACTLY ONE trailing section is allowed, after the body: on a successful
+  /// enqueue the stream's `SendState` moves to `SendState::TrailersSent`, so a
+  /// following [`send_data_on`](Self::send_data_on) (DATA after trailers) or a second
+  /// `send_trailers` (two trailing sections) is rejected with
+  /// [`Error::Protocol`]`(`[`H3Error::FrameUnexpected`]`)` — only [`finish`](Self::finish)
+  /// (the FIN) may follow (RFC 9114 §4.1). The driver owns trailer validity; the core
+  /// stays semantics-agnostic (the full validator is a later task).
   ///
   /// Returns the same `Err` set as [`send_data_on`](Self::send_data_on), plus
   /// [`Error::FieldSectionTooLarge`] when the trailers' decoded field-section size
@@ -3446,7 +3527,7 @@ where
   where
     TxBuf: AsMut<[u8]>,
   {
-    self.guard_send_on(id)?;
+    self.guard_send_on(id, SendOp::Trailers)?;
     // The peer's SETTINGS bound the trailers' field-section size, as for any HEADERS
     // frame. When they have not arrived the size is unbounded locally; matching the
     // request/response paths, block until they do.
@@ -3459,7 +3540,14 @@ where
       .enqueue(StreamKind::Existing(id), false, |out| {
         write_headers_frame(out, headers, limit)
       })
-      .map_err(map_tx)
+      .map_err(map_tx)?;
+    // The trailing section is queued: move the send half to `TrailersSent` so nothing but
+    // the FIN may follow (no DATA-after-trailers, no second trailing section). Only reached
+    // on success, so a `WouldBlock` retry does not advance the state.
+    if let Some(entry) = self.streams.get_mut(id) {
+      entry.send = SendState::TrailersSent;
+    }
+    Ok(())
   }
 
   /// Half-closes the request stream `id` by enqueuing an empty FIN transmit on it —
@@ -3471,17 +3559,17 @@ where
   /// Returns the same `Err` set as [`send_data_on`](Self::send_data_on) (a full ring
   /// is [`Error::WouldBlock`] — retry after [`poll_transmit`](Self::poll_transmit)).
   ///
-  /// Closes the stream's LOCAL send half exactly once: on a successful enqueue the entry
-  /// is marked `local_send_closed`, after which every further local send on `id` (body /
-  /// trailers / a second `finish` / a response) is rejected with
+  /// Closes the stream's LOCAL send half exactly once: on a successful enqueue the entry's
+  /// `SendState` moves to `SendState::Closed`, after which every further local send on
+  /// `id` (body / trailers / a second `finish` / a response) is rejected with
   /// [`Error::Protocol`]`(`[`H3Error::FrameUnexpected`]`)`. A [`Error::WouldBlock`] (full
-  /// ring) does NOT mark it closed — the caller retries the same `finish` — so the FIN is
-  /// enqueued, and the half closed, exactly once.
+  /// ring) does NOT advance the state — the caller retries the same `finish` — so the FIN
+  /// is enqueued, and the half closed, exactly once.
   pub fn finish(&mut self, id: StreamId) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
   {
-    self.guard_send_on(id)?;
+    self.guard_send_on(id, SendOp::Finish)?;
     // An empty FIN: zero bytes, fin = true. The fill closure writes nothing, so its
     // error type is the uninhabited-in-practice `()`; a full ring is the only failure
     // and maps to `WouldBlock` (retry after `poll_transmit`).
@@ -3495,42 +3583,40 @@ where
     // The FIN is queued: close the local send half so nothing follows it on the wire.
     // Only reached on success, so a backpressure retry does not double-close.
     if let Some(entry) = self.streams.get_mut(id) {
-      entry.local_send_closed = true;
+      entry.send = SendState::Closed;
     }
     Ok(())
   }
 
   /// Shared precondition for the general per-stream send paths
   /// ([`send_data_on`](Self::send_data_on) / [`send_trailers`](Self::send_trailers) /
-  /// [`finish`](Self::finish)): the connection must be non-terminal and past setup,
-  /// and `id` must name a known request stream. A terminal/`Created` connection or an
-  /// unknown `id` is [`Error::Closed`].
+  /// [`finish`](Self::finish)): the connection must be non-terminal and past setup, `id`
+  /// must name a known request stream, and the stream's [`SendState`] must permit `op`.
+  /// A terminal/`Created` connection or an unknown `id` is [`Error::Closed`].
   ///
-  /// Materializes a deferred stream-scoped reset FIRST (`apply_pending_reset`), so a
+  /// Materializes a deferred stream-scoped reset FIRST (`reconcile_pending_resets`), so a
   /// stream condemned by a `Frames` carrier (e.g. a malformed General-mode request that
   /// recorded a `pending_reset`) is already removed from `streams` before the membership
   /// check — its `id` then reads as unknown (`Error::Closed`), so a condemned stream can
   /// never be sent on by any of these paths.
   ///
-  /// Two send-state gates apply, in order:
+  /// The send-state gate is the [`SendState`] transition table for `op` (a local refusal
+  /// — [`Error::Protocol`]`(`[`H3Error::FrameUnexpected`]`)`, the connection stays live):
   ///
-  /// 1. **After-`finish` (BOTH roles).** Once [`finish`](Self::finish) closed this
-  ///    stream's local send half (`entry.local_send_closed`), no further frame may follow
-  ///    the FIN — a body / trailers / second FIN after the end-of-stream is
-  ///    [`Error::Protocol`]`(`[`H3Error::FrameUnexpected`]`)` (RFC 9114 §4.1: a stream's
-  ///    frames end at the FIN). This makes double-`finish` and body/trailers-after-`finish`
-  ///    impossible on either role.
-  /// 2. **Server-before-final-response.** On the SERVER a body / trailers / FIN may flow
-  ///    only AFTER the stream's FINAL response leading section (`entry.final_response_sent`,
-  ///    set by [`accept_with`](Connection::accept_with) /
-  ///    [`send_response`](Connection::send_response)`(last = true)` — NOT by an interim
-  ///    1xx): sending response DATA before the final response HEADERS would put premature
-  ///    DATA / malformed frame ordering on the wire (RFC 9114 §4.1 —
-  ///    `H3_FRAME_UNEXPECTED`), rejected with the same error (a local refusal — the
-  ///    connection stays live). The CLIENT has NO such requirement: its request body
-  ///    legitimately follows the request HEADERS before any response, so the client gate
-  ///    stops after the after-`finish` check.
-  fn guard_send_on(&mut self, id: StreamId) -> Result<(), Error>
+  /// - **Body / trailers** ([`SendOp::Body`] / [`SendOp::Trailers`]) require a body-open
+  ///   state ([`SendState::can_send_body`]): the CLIENT request-body window
+  ///   ([`SendState::RequestSent`]) or the SERVER post-final-response window
+  ///   ([`SendState::FinalSent`]). They are rejected before the SERVER's final response
+  ///   ([`SendState::Idle`] — premature DATA / malformed ordering, RFC 9114 §4.1), after a
+  ///   trailing section ([`SendState::TrailersSent`] — at most one trailing section,
+  ///   nothing after it), and after the FIN ([`SendState::Closed`]).
+  /// - **FIN** ([`SendOp::Finish`]) is legal from any state that can still terminate the
+  ///   send half — the body-open states OR [`SendState::TrailersSent`] (a clean FIN after
+  ///   the trailers) — and rejected only from [`SendState::Idle`] (a SERVER FIN before any
+  ///   response leaves the response with no HEADERS) and [`SendState::Closed`] (a second
+  ///   FIN). The CLIENT never holds [`SendState::Idle`], so its request body / trailers /
+  ///   FIN before any response stay legal (no over-restriction).
+  fn guard_send_on(&mut self, id: StreamId, op: SendOp) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
   {
@@ -3542,12 +3628,14 @@ where
     let Some(entry) = self.streams.get(id) else {
       return Err(Error::Closed);
     };
-    // After-`finish` gate (both roles): nothing may follow the local FIN.
-    if entry.local_send_closed {
-      return Err(Error::Protocol(H3Error::FrameUnexpected));
-    }
-    // Server-only send-state gate: no body / trailers / FIN before the final response.
-    if !Ro::IS_CLIENT && !entry.final_response_sent {
+    let allowed = match op {
+      // A FIN may terminate the send half from a body-open state or after the trailing
+      // section; a body / trailers require the body-open window (and never re-open after
+      // trailers / FIN). `Idle` (server pre-final) and `Closed` reject everything here.
+      SendOp::Finish => entry.send.can_send_body() || entry.send == SendState::TrailersSent,
+      SendOp::Body | SendOp::Trailers => entry.send.can_send_body(),
+    };
+    if !allowed {
       return Err(Error::Protocol(H3Error::FrameUnexpected));
     }
     Ok(())
@@ -4349,10 +4437,10 @@ where
     // general `send_response` path instead clears it.
     if let Some(entry) = self.streams.get_mut(id) {
       entry.is_tunnel = true;
-      // The CONNECT 2xx IS this stream's final response: arm the server send-state gate so
-      // tunnel DATA / FIN may now flow (`send_data` / `finish`). Without this the tunnel's
-      // own body would be rejected as premature by `guard_send_on`.
-      entry.final_response_sent = true;
+      // The CONNECT 2xx IS this stream's FINAL response: move the send half to `FinalSent`
+      // so tunnel DATA / FIN may now flow (`send_data` / `finish`). Without this the
+      // tunnel's own body would be rejected as premature by `guard_send_on`.
+      entry.send = SendState::FinalSent;
     }
     // The single `Handshaking → Open` transition: flips the phase and enqueues
     // `Event::Established` exactly once — only after the response is committed.
@@ -4368,18 +4456,29 @@ where
   /// and seen via [`handle_stream`](Connection::handle_stream)). The `:status` is the
   /// driver's to choose; the core stays status-agnostic.
   ///
-  /// `last` distinguishes an interim from the final response:
-  /// - `last == false` — an interim (1xx informational) response: more responses
-  ///   follow, the stream is NOT marked established, and no body may flow yet.
-  /// - `last == true` — the final response: the per-stream entry is marked
-  ///   `established`, which gates yielding [`Frame::Data`] (request/response bodies)
-  ///   on this stream.
+  /// Interim vs final is derived from the response's `:status`, NOT from `last`: the
+  /// SAME classifier the connection applies to a CLIENT's RECEIVED response
+  /// ([`validate::status_class_is_interim`]) decides it here — `1xx` ⇒ interim, `2xx`–`5xx`
+  /// ⇒ final. `last` is kept in the signature but treated as a CHECKED ASSERTION the
+  /// caller makes about that class: it must equal the derived finality (`last == true` for
+  /// a final `:status`, `last == false` for an interim), or the call is a caller bug and
+  /// is rejected with [`Error::Protocol`]`(`[`H3Error::MessageError`]`)` — so a
+  /// `send_response(:status 200, last = false)` or `(:status 103, last = true)` can never
+  /// put a misclassified response on the wire. A response with no `:status`, or a
+  /// non-numeric / out-of-range one, is likewise [`H3Error::MessageError`] (it cannot be
+  /// classified).
+  ///
+  /// - **Interim** (`1xx`): more responses follow, the stream is NOT marked established,
+  ///   and no body may flow yet (`SendState::Idle` is unchanged).
+  /// - **Final** (`2xx`–`5xx`): the per-stream entry is marked `established` (gating
+  ///   yielding [`Frame::Data`] on this stream) and its `SendState` moves to
+  ///   `SendState::FinalSent` (response body / trailers / FIN may now follow).
   ///
   /// The legal server response sequence is enforced (RFC 9114 §4.1.2): zero or more
-  /// interim `send_response(last = false)`, then exactly ONE final
-  /// `send_response(last = true)`. A second `send_response` of EITHER kind after the
-  /// final response, or any `send_response` after [`finish`](Connection::finish) closed
-  /// the local send half, is rejected with
+  /// interim responses (`SendState::Idle`), then exactly ONE final response. A second
+  /// `send_response` of EITHER kind after the final (`SendState::FinalSent` /
+  /// `SendState::TrailersSent`), or any `send_response` after [`finish`](Connection::finish)
+  /// closed the local send half (`SendState::Closed`), is rejected with
   /// [`Error::Protocol`]`(`[`H3Error::FrameUnexpected`]`)` (a local refusal — the
   /// connection stays live).
   ///
@@ -4400,6 +4499,8 @@ where
   /// - [`Error::Protocol`]`(`[`H3Error::FrameUnexpected`]`)` — an out-of-sequence
   ///   response: a second response after the final one, or any response after
   ///   [`finish`](Connection::finish) (see the sequence rule above).
+  /// - [`Error::Protocol`]`(`[`H3Error::MessageError`]`)` — the response cannot be
+  ///   classified or `last` contradicts the `:status` class (see the derivation above).
   /// - [`Error::FieldSectionTooLarge`] — the response's decoded field-section size
   ///   exceeds the peer's advertised `MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2),
   ///   enforced in the single encode+measure pass exactly as `accept_with` does.
@@ -4415,11 +4516,21 @@ where
   {
     // The guard materializes any deferred stream-scoped reset first, so a stream
     // condemned for reset (e.g. a malformed General-mode request) is gone before the
-    // response can be enqueued — see `guard_send_response`.
+    // response can be enqueued — see `guard_send_response`. It also rejects a response
+    // out of sequence (after the final, or after `finish`).
     let limit = self.guard_send_response(id)?;
+    // Finality is DERIVED from `:status` (the same rule applied to a received response),
+    // NOT taken from `last`; `last` is asserted to match. A misclassified or unclassifiable
+    // response is rejected BEFORE anything is enqueued, so it never reaches the wire.
+    let interim = classify_response_status(headers)?;
+    if last == interim {
+      // `last` contradicts the `:status` class: a final status with `last = false`, or an
+      // interim status with `last = true`. A caller bug — refuse without sending.
+      return Err(Error::Protocol(H3Error::MessageError));
+    }
     // Size-checked in the single encode pass (see `accept_with` / `open_with`): on a
     // too-large section `write_headers_frame` errors, the slot is discarded, and the
-    // `established` flip below is NOT reached.
+    // `established` / `SendState` transition below is NOT reached.
     self
       .tx
       .enqueue(StreamKind::Existing(id), false, |out| {
@@ -4438,13 +4549,13 @@ where
     // already rejected by the guard.
     if let Some(entry) = self.streams.get_mut(id) {
       entry.is_tunnel = false;
-      if last {
+      if !interim {
         entry.established = true;
-        // The final response leading section is now SENT: arm the server send-state gate so
-        // response body / trailers / FIN may follow (`send_data_on` / `send_trailers` /
-        // `finish`). An interim (`last == false`) response leaves it disarmed — a body
-        // before the FINAL response would be premature DATA (RFC 9114 §4.1).
-        entry.final_response_sent = true;
+        // The FINAL response leading section is now SENT: move the send half to `FinalSent`
+        // so response body / trailers / FIN may follow (`send_data_on` / `send_trailers` /
+        // `finish`). An interim response leaves it `Idle` — a body before the FINAL response
+        // would be premature DATA (RFC 9114 §4.1).
+        entry.send = SendState::FinalSent;
       }
     }
     Ok(())
@@ -4464,19 +4575,16 @@ where
   /// `observed` (the flip runs only AFTER validation), so the two defenses compose.
   ///
   /// Enforces the SERVER leading-HEADERS sequence (RFC 9114 §4.1.2: zero or more interim
-  /// 1xx, then exactly one final response):
-  ///
-  /// - once a FINAL response has been sent (`entry.final_response_sent`), a further
-  ///   `send_response` — interim OR final — is a placement violation
-  ///   [`Error::Protocol`]`(`[`H3Error::FrameUnexpected`]`)` (no second leading section
-  ///   after the final, and no interim after the final); and
-  /// - once the stream's local send half is closed by [`finish`](Self::finish)
-  ///   (`entry.local_send_closed`), no response may follow the FIN
-  ///   (`H3Error::FrameUnexpected`).
-  ///
-  /// Both are DEFINITIVE refusals (the connection stays live), distinct from the
-  /// retriable `WouldBlock` readiness gates. Several interim `send_response(last = false)`
-  /// before the first final stay allowed (neither flag set).
+  /// 1xx, then exactly one final response) via the stream's [`SendState`]: a response is
+  /// legal only from [`SendState::Idle`] (no final response yet — the start state and the
+  /// state across interim responses). Once the FINAL response has been sent
+  /// ([`SendState::FinalSent`]), or trailers / FIN have followed it
+  /// ([`SendState::TrailersSent`] / [`SendState::Closed`]), a further `send_response` —
+  /// interim OR final — is a placement violation
+  /// [`Error::Protocol`]`(`[`H3Error::FrameUnexpected`]`)` (no second leading section after
+  /// the final, none after the FIN). A DEFINITIVE refusal (the connection stays live),
+  /// distinct from the retriable `WouldBlock` readiness gates. Several interim responses
+  /// before the first final stay allowed (each leaves the state [`SendState::Idle`]).
   fn guard_send_response(&mut self, id: StreamId) -> Result<Option<u64>, Error>
   where
     TxBuf: AsMut<[u8]>,
@@ -4494,9 +4602,10 @@ where
         if !entry.observed {
           return Err(Error::WouldBlock);
         }
-        // No response after the local FIN, and no leading section after the final
-        // response: the final response is the last leading section on the stream.
-        if entry.local_send_closed || entry.final_response_sent {
+        // A response is the FIRST/interim leading section: legal only from `Idle`. Any
+        // later send-state (the final sent, trailers/FIN after it) rejects a further
+        // response — no second leading section after the final, none after the FIN.
+        if entry.send != SendState::Idle {
           return Err(Error::Protocol(H3Error::FrameUnexpected));
         }
         // The peer's SETTINGS gate the response for its `MAX_FIELD_SECTION_SIZE`.
@@ -4537,12 +4646,13 @@ where
         if !entry.observed {
           return Err(Error::WouldBlock);
         }
-        // A final response was already sent on this stream by the general
-        // `send_response(last = true)`, or the local send half was `finish`ed: a second
-        // leading section (here the CONNECT 2xx) is out of sequence. The all-`Open`
-        // idempotent repeat is handled above; this catches the mixed general-then-tunnel
-        // misuse on the same stream while still in `Handshaking`.
-        if entry.final_response_sent || entry.local_send_closed {
+        // The CONNECT 2xx is a FINAL leading section: legal only from `Idle`. A non-`Idle`
+        // send-state means a final response was already sent on this stream by the general
+        // `send_response`, or trailers / a FIN already followed it — a second leading section
+        // (here the CONNECT 2xx) is out of sequence. The all-`Open` idempotent repeat is
+        // handled above; this catches the mixed general-then-tunnel misuse on the same
+        // stream while still in `Handshaking`.
+        if entry.send != SendState::Idle {
           return Err(Error::Protocol(H3Error::FrameUnexpected));
         }
         // The peer's SETTINGS gate the response, exactly as in `open_with`: its
@@ -4581,6 +4691,32 @@ fn write_control_settings(out: &mut [u8], settings: &Settings) -> Result<usize, 
 /// `TX_CAP - HEADERS_HDR_RESERVE` bytes, its length varint is far smaller than
 /// this, so header + field section is guaranteed to fit one transmit slot.
 const HEADERS_HDR_RESERVE: usize = CTRL_HDR_CAP;
+
+/// Classifies an OUTBOUND response by its `:status`: `Ok(true)` interim (`1xx`),
+/// `Ok(false)` final (`2xx`–`5xx`). The send-side twin of the connection's inbound
+/// `classify_response` — both route through [`validate::status_class_is_interim`], so a
+/// SERVER derives interim-vs-final by EXACTLY the rule applied to a CLIENT's received
+/// response (RFC 9114 §4.3.2 / §15.2). A response that cannot be classified — no `:status`,
+/// or a non-numeric / out-of-range one — is [`Error::Protocol`]`(`[`H3Error::MessageError`]`)`
+/// (a malformed response, a local caller bug). A [`Headers`] supplier that aborts the scan
+/// surfaces its own [`Error`].
+fn classify_response_status<H: Headers + ?Sized>(response: &H) -> Result<bool, Error> {
+  // Read the FIRST `:status` via the supplier's `for_each` (the only access `Headers`
+  // gives), classifying it with the inbound rule. `seen` distinguishes "no `:status`" from
+  // "an invalid `:status`"; both are `MessageError`, but keeping them apart documents intent
+  // and lets the first occurrence win (a duplicate is the validator's concern, not this).
+  let mut seen: Option<Option<bool>> = None;
+  response.for_each(&mut |name, value| {
+    if name == ":status" && seen.is_none() {
+      seen = Some(validate::status_class_is_interim(value));
+    }
+  })?;
+  match seen {
+    Some(Some(interim)) => Ok(interim),
+    // An out-of-range / non-numeric `:status`, or none at all: unclassifiable.
+    Some(None) | None => Err(Error::Protocol(H3Error::MessageError)),
+  }
+}
 
 /// Writes a HEADERS frame (`[header][QPACK field section]`) for `headers` into
 /// `out`, enforcing the peer's `MAX_FIELD_SECTION_SIZE` (`limit`, when advertised)

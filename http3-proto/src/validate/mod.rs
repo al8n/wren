@@ -170,6 +170,21 @@ fn classify_status(value: &str) -> StatusClass {
   }
 }
 
+/// Whether a `:status` value is interim (`Some(true)`, `100..=199`) or final
+/// (`Some(false)`, `>= 200`); `None` for a non-numeric / out-of-range value.
+///
+/// The outbound-side twin of [`response_is_interim`] (which classifies a DECODED
+/// inbound section): both route through the one `classify_status`, so a SERVER's
+/// `send_response` derives interim-vs-final from the `:status` it is about to encode
+/// by exactly the rule the connection applies to a CLIENT's received response.
+pub fn status_class_is_interim(value: &str) -> Option<bool> {
+  match classify_status(value) {
+    StatusClass::Interim => Some(true),
+    StatusClass::Final => Some(false),
+    StatusClass::Invalid => None,
+  }
+}
+
 /// Enforces the §4.2 field rules on one regular (non-pseudo) field: a lowercase
 /// name, no connection-specific field, and `TE` (which cannot appear here as a
 /// regular field name unless lowercase) restricted to `trailers`.

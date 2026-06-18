@@ -1965,8 +1965,8 @@ fn server_body_before_final_response_is_rejected() {
 #[test]
 fn client_request_body_before_any_response_is_allowed() {
   // The role-aware gate must NOT regress the CLIENT: a client legitimately sends its request
-  // body right after the request HEADERS, before any response — no `final_response_sent`
-  // requirement applies to the client side.
+  // body right after the request HEADERS, before any response — a client entry starts the
+  // send FSM in `RequestSent` (body-open), with no server-style final-response gate.
   let mut h = Harness::new();
   h.exchange_settings();
   let id = StreamId::new(0);
@@ -2381,6 +2381,226 @@ fn client_sends_after_finish_are_rejected_but_body_before_response_ok() {
     "a second client finish is rejected"
   );
   assert!(!h.client.is_failed(), "the client side stays live");
+}
+
+// ── R5 #2: a trailing section CLOSES the send state for further body / trailers. The
+// per-stream send FSM moves to `TrailersSent` on a successful `send_trailers`, so a
+// following `send_data_on` (DATA after trailers) or a second `send_trailers` (a second
+// trailing section) is rejected — only the FIN may follow (RFC 9114 §4.1). Pre-FSM the
+// guard never advanced on trailers, so both slipped onto the wire.
+
+#[test]
+fn send_trailers_then_data_is_rejected() {
+  // DATA after a trailing section is invalid: the trailers are the last field section, and
+  // only the FIN may follow them.
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  h.server
+    .send_data_on(id, bytes::Bytes::from_static(b"body"))
+    .expect("body after the final response is allowed");
+  h.server
+    .send_trailers(id, &[("x-checksum", "abc")][..])
+    .expect("a single trailing section after the body is allowed");
+  assert_eq!(
+    h.server
+      .send_data_on(id, bytes::Bytes::from_static(b"after-trailers")),
+    Err(Error::Protocol(H3Error::FrameUnexpected)),
+    "DATA after the trailing section is rejected"
+  );
+  assert!(!h.server.is_failed(), "the refusal is local, not fatal");
+}
+
+#[test]
+fn send_trailers_then_trailers_is_rejected() {
+  // A SECOND trailing section is invalid: at most one trailing section per stream.
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  h.server
+    .send_data_on(id, bytes::Bytes::from_static(b"body"))
+    .expect("body after the final response is allowed");
+  h.server
+    .send_trailers(id, &[("x-checksum", "abc")][..])
+    .expect("the first trailing section is allowed");
+  assert_eq!(
+    h.server.send_trailers(id, &[("x-extra", "z")][..]),
+    Err(Error::Protocol(H3Error::FrameUnexpected)),
+    "a second trailing section is rejected"
+  );
+  // `finish` (the FIN) is the ONLY legal follow-up after a trailing section.
+  h.server
+    .finish(id)
+    .expect("a FIN after the trailing section is allowed");
+  // ...and after the FIN, even trailers are rejected (the send half is closed).
+  assert_eq!(
+    h.server.send_trailers(id, &[("x", "y")][..]),
+    Err(Error::Protocol(H3Error::FrameUnexpected)),
+    "trailers after the FIN are rejected"
+  );
+  assert!(!h.server.is_failed(), "the refusals are local, not fatal");
+}
+
+#[test]
+fn client_trailers_then_body_is_rejected() {
+  // The trailers-terminal rule is role-symmetric: a CLIENT that sent request trailers
+  // cannot then send more request body (only the FIN may follow).
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  let post: &[(&str, &str)] = &[
+    (":method", "POST"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, post).unwrap();
+  h.client
+    .send_data_on(id, bytes::Bytes::from_static(b"req-body"))
+    .expect("client request body is allowed");
+  h.client
+    .send_trailers(id, &[("x-checksum", "abc")][..])
+    .expect("client request trailers are allowed");
+  assert_eq!(
+    h.client
+      .send_data_on(id, bytes::Bytes::from_static(b"more-body")),
+    Err(Error::Protocol(H3Error::FrameUnexpected)),
+    "client body after its own trailers is rejected"
+  );
+  // The FIN is still legal after the trailing section.
+  h.client
+    .finish(id)
+    .expect("client FIN after trailers is allowed");
+  assert!(!h.client.is_failed(), "the client side stays live");
+}
+
+// ── R5 #3: finality is DERIVED from the response `:status`, not taken from `last`. The
+// SAME classifier used on a received response (1xx ⇒ interim, 2xx–5xx ⇒ final) decides it;
+// `last` is asserted to MATCH and a contradiction is a caller bug (`MessageError`), never
+// trusted. Pre-FSM `last` alone drove finality, so a `(:status 200, last = false)` left the
+// stream "interim" (a second final could follow) and a `(:status 103, last = true)` armed
+// the body gate after an interim — both producing invalid wire output.
+
+#[test]
+fn send_response_final_status_with_last_false_is_rejected() {
+  // `:status 200` is final, but `last = false` claims interim: the assertion fails, so the
+  // response is refused before anything reaches the wire.
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, get).unwrap();
+  h.pump();
+  assert_eq!(h.server_request_ids, std::vec![id], "request observed");
+  assert_eq!(
+    h.server.send_response(id, &[(":status", "200")][..], false),
+    Err(Error::Protocol(H3Error::MessageError)),
+    "a final :status with last = false is a caller-bug contradiction"
+  );
+  assert!(!h.server.is_failed(), "the refusal is local, not fatal");
+  // The contradiction did not advance the send state: the correct final response still works.
+  h.server
+    .send_response(id, &[(":status", "200")][..], true)
+    .expect("the correctly-classified final response is accepted");
+}
+
+#[test]
+fn send_response_interim_status_with_last_true_is_rejected() {
+  // `:status 103` is interim, but `last = true` claims final: the assertion fails. Sending
+  // body afterwards would be premature DATA — exactly what deriving finality from `:status`
+  // prevents.
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, get).unwrap();
+  h.pump();
+  assert_eq!(h.server_request_ids, std::vec![id], "request observed");
+  assert_eq!(
+    h.server.send_response(id, &[(":status", "103")][..], true),
+    Err(Error::Protocol(H3Error::MessageError)),
+    "an interim :status with last = true is a caller-bug contradiction"
+  );
+  // The contradiction did not arm the body gate: a body is still premature (the stream
+  // never reached the final-response state).
+  assert_eq!(
+    h.server
+      .send_data_on(id, bytes::Bytes::from_static(b"early")),
+    Err(Error::Protocol(H3Error::FrameUnexpected)),
+    "no body after a rejected (contradictory) interim response"
+  );
+  assert!(!h.server.is_failed(), "the refusals are local, not fatal");
+}
+
+#[test]
+fn send_response_without_status_is_rejected() {
+  // A response with no `:status` cannot be classified interim vs final, so it is a malformed
+  // response (a caller bug) regardless of `last`.
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, get).unwrap();
+  h.pump();
+  assert_eq!(h.server_request_ids, std::vec![id], "request observed");
+  assert_eq!(
+    h.server
+      .send_response(id, &[("x-only", "no-status")][..], true),
+    Err(Error::Protocol(H3Error::MessageError)),
+    "a response with no :status is unclassifiable"
+  );
+  assert!(!h.server.is_failed(), "the refusal is local, not fatal");
+}
+
+#[test]
+fn interims_with_consistent_last_then_final_accepted() {
+  // The positive path of the `:status`-derived finality: interim responses with the matching
+  // `last = false`, then a final with `last = true`, all flow; a body follows the final.
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, get).unwrap();
+  h.pump();
+  assert_eq!(h.server_request_ids, std::vec![id], "request observed");
+  h.server
+    .send_response(id, &[(":status", "100")][..], false)
+    .expect("interim 100 accepted");
+  h.server
+    .send_response(id, &[(":status", "103")][..], false)
+    .expect("interim 103 accepted");
+  // Body before the final is still premature even after interims.
+  assert_eq!(
+    h.server
+      .send_data_on(id, bytes::Bytes::from_static(b"early")),
+    Err(Error::Protocol(H3Error::FrameUnexpected)),
+    "body after interims but before the final is premature"
+  );
+  h.server
+    .send_response(id, &[(":status", "200")][..], true)
+    .expect("final 200 accepted");
+  h.server
+    .send_data_on(id, bytes::Bytes::from_static(b"ok"))
+    .expect("body after the final response is allowed");
+  assert!(!h.server.is_failed(), "the connection stays live");
 }
 
 #[test]
