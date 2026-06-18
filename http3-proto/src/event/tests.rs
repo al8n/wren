@@ -11,6 +11,45 @@ fn transmit_accessors() {
   assert_eq!(t.kind(), StreamKind::OpenRequest);
   assert_eq!(t.bytes(), b"hi");
   assert!(t.fin());
+  // A `new` transmit is single-segment: one slice, `bytes()` == segment 0.
+  assert_eq!(t.segments(), &[b"hi".as_slice()]);
+  assert_eq!(t.len(), 2);
+  assert!(!t.is_empty());
+}
+
+#[test]
+fn vectored_transmit_segments_and_len() {
+  let header = b"\x00\x05";
+  let body = b"hello";
+  let t = Transmit::with_segments(
+    StreamKind::Existing(StreamId::new(2)),
+    [header.as_slice(), body.as_slice()],
+    2,
+    false,
+  );
+  let segs = t.segments();
+  assert_eq!(segs.len(), 2);
+  assert_eq!(segs[0], header);
+  assert_eq!(segs[1], body);
+  // `bytes()` stays the single-segment view (segment 0 = the frame header).
+  assert_eq!(t.bytes(), header);
+  assert_eq!(t.len(), header.len() + body.len());
+  assert!(!t.is_empty());
+}
+
+#[test]
+fn vectored_transmit_seg_count_is_clamped() {
+  // An out-of-range `seg_count` cannot widen the exposed slice past the array.
+  let t = Transmit::with_segments(StreamKind::OpenRequest, [b"a", b"b"], 9, false);
+  assert_eq!(t.segments().len(), 2);
+}
+
+#[test]
+fn empty_transmit_is_empty() {
+  let t = Transmit::new(StreamKind::Existing(StreamId::new(1)), &[], true);
+  assert!(t.is_empty());
+  assert_eq!(t.len(), 0);
+  assert!(t.fin());
 }
 
 #[test]

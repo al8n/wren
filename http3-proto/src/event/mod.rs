@@ -112,19 +112,56 @@ pub enum StreamKind {
   },
 }
 
-/// Bytes the driver must write on a stream (and whether to FIN afterwards).
+/// Bytes the driver must write on a stream, as an ordered vector of slices (so a
+/// DATA frame's body is never copied just to concatenate it onto its header), the
+/// target stream, and whether to FIN afterwards.
+///
+/// Most transmits are single-segment: SETTINGS, the QPACK stream preambles,
+/// HEADERS (request / response / trailers), and an empty FIN each carry one slice
+/// (with [`segments`](Self::segments) of length 1). A DATA transmit is
+/// **vectored**: segment 0 is the DATA frame header (type + length varints) and
+/// segment 1 is the body, so the body slice points straight at the held buffer
+/// (zero-copy) — write the two in order with a vectored `writev`. A
+/// [`StreamKind::ResetStream`] transmit carries no slices (an abort: the driver
+/// issues `reset_stream(id, code)` instead of writing).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Transmit<'a> {
   kind: StreamKind,
-  bytes: &'a [u8],
+  segments: [&'a [u8]; 2],
+  seg_count: usize,
   fin: bool,
 }
 
 impl<'a> Transmit<'a> {
-  /// Construct a transmit intent.
+  /// Constructs a single-segment transmit (one slice). Used by the header / FIN /
+  /// reset paths; DATA uses [`with_segments`](Self::with_segments).
   #[inline(always)]
   pub const fn new(kind: StreamKind, bytes: &'a [u8], fin: bool) -> Self {
-    Self { kind, bytes, fin }
+    Self {
+      kind,
+      segments: [bytes, &[]],
+      seg_count: 1,
+      fin,
+    }
+  }
+
+  /// Constructs a vectored transmit from `segments[..seg_count]` (segment 0 then
+  /// segment 1). `seg_count` is clamped to the segment array length, so an
+  /// out-of-range count cannot widen the exposed slice.
+  #[inline(always)]
+  pub const fn with_segments(
+    kind: StreamKind,
+    segments: [&'a [u8]; 2],
+    seg_count: usize,
+    fin: bool,
+  ) -> Self {
+    let seg_count = if seg_count > 2 { 2 } else { seg_count };
+    Self {
+      kind,
+      segments,
+      seg_count,
+      fin,
+    }
   }
 
   /// Which stream to write on / open.
@@ -133,16 +170,44 @@ impl<'a> Transmit<'a> {
     self.kind
   }
 
-  /// The bytes to write.
+  /// The slices to write, in order (use with a vectored `writev`). A DATA transmit
+  /// yields `[frame-header, body]`; every other transmit yields a single slice.
   #[inline(always)]
-  pub const fn bytes(&self) -> &'a [u8] {
-    self.bytes
+  pub fn segments(&self) -> &[&'a [u8]] {
+    self.segments.get(..self.seg_count).unwrap_or(&[])
+  }
+
+  /// The first segment, for single-segment callers (SETTINGS / QPACK / HEADERS /
+  /// FIN). For a multi-segment DATA transmit this is just the frame header; use
+  /// [`segments`](Self::segments) to get the body too.
+  #[inline(always)]
+  pub fn bytes(&self) -> &'a [u8] {
+    match self.segments.first() {
+      Some(seg) => seg,
+      None => &[],
+    }
   }
 
   /// Whether to FIN the stream after writing.
   #[inline(always)]
   pub const fn fin(&self) -> bool {
     self.fin
+  }
+
+  /// The total byte length across every segment.
+  #[inline]
+  pub fn len(&self) -> usize {
+    let mut total = 0usize;
+    for seg in self.segments() {
+      total = total.saturating_add(seg.len());
+    }
+    total
+  }
+
+  /// Whether the transmit carries no bytes (e.g. an empty FIN or a reset).
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
   }
 }
 

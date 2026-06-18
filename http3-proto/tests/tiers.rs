@@ -119,9 +119,18 @@ fn bare_tier_open_and_drain() {
 fn bare_tier_default_connection_type_is_small() {
   let connection_size = core::mem::size_of::<StaticConnection<Client>>();
   let request_stream_size = core::mem::size_of::<RequestStream<'static>>();
+  // On the bare tier the transmit ring holds no refcounted DATA body, so the
+  // connection stays under 1 KiB. `--all-features --all-targets` also compiles
+  // this test on the heap tiers, where the ring additionally holds one optional
+  // `DataBuf` handle per slot (for vectored zero-copy DATA), widening it; allow
+  // that larger ceiling there.
+  #[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+  let max_connection_size = 1024;
+  #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
+  let max_connection_size = 1280;
   assert!(
-    connection_size < 1024,
-    "bare default Connection should store borrowed buffer handles, got {connection_size}"
+    connection_size < max_connection_size,
+    "default Connection should store buffer handles, got {connection_size}"
   );
   assert!(
     request_stream_size < 128,
