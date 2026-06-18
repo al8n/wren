@@ -32,7 +32,9 @@ fn reads_headers_then_data() {
   {
     let mut items = s.handle(&req, &mut scratch);
     match items.next().unwrap().unwrap() {
-      StreamItem::Headers(mut hs) => {
+      StreamItem::Headers {
+        headers: mut hs, ..
+      } => {
         let p = hs.next().unwrap().unwrap();
         assert_eq!((p.name(), p.value()), (":method", "CONNECT"));
         let p = hs.next().unwrap().unwrap();
@@ -61,7 +63,10 @@ fn split_reads_reassemble() {
   for b in &req {
     let mut items = s.handle(core::slice::from_ref(b), &mut scratch);
     while let Some(item) = items.next().unwrap() {
-      if let StreamItem::Headers(mut hs) = item {
+      if let StreamItem::Headers {
+        headers: mut hs, ..
+      } = item
+      {
         assert_eq!(hs.next().unwrap().unwrap().name(), ":method");
         saw = true;
       }
@@ -97,7 +102,10 @@ fn fragmented_headers_decode_with_fresh_scratch_each_call() {
     let mut scratch = [0u8; 512]; // fresh, distinct buffer per call
     let mut items = s.handle(core::slice::from_ref(b), &mut scratch);
     while let Some(item) = items.next().unwrap() {
-      if let StreamItem::Headers(mut hs) = item {
+      if let StreamItem::Headers {
+        headers: mut hs, ..
+      } = item
+      {
         while let Some(p) = hs.next().unwrap() {
           let want = expected.get(idx).expect("more pairs than expected");
           assert_eq!((p.name(), p.value()), *want, "pair {idx} mismatch");
@@ -130,7 +138,10 @@ fn fragmented_huffman_headers_decode_with_fresh_scratch_each_call() {
     let mut scratch = [0u8; 512]; // fresh per call
     let mut items = s.handle(core::slice::from_ref(b), &mut scratch);
     while let Some(item) = items.next().unwrap() {
-      if let StreamItem::Headers(mut hs) = item {
+      if let StreamItem::Headers {
+        headers: mut hs, ..
+      } = item
+      {
         let p = hs.next().unwrap().unwrap();
         assert_eq!((p.name(), p.value()), (":authority", "www.example.com"));
         saw = true;
@@ -205,7 +216,13 @@ fn data_before_headers_is_unexpected() {
 }
 
 #[test]
-fn second_headers_is_unexpected() {
+fn second_leading_headers_is_a_second_initial_section() {
+  // A second HEADERS section with no intervening DATA is no longer an FSM-level
+  // placement error (it is an interim-1xx repeat candidate): the FSM stays in the
+  // leading-HEADERS phase and tags it `Initial` again, leaving the
+  // "only one final response" decision to the connection/validator (decided by
+  // `:status`). Compare the OLD single-stream FSM, which rejected any second
+  // HEADERS outright.
   let mut scratch = [0u8; 512];
   let mut s = RequestStream::new();
   let req = headers_frame(&[(":method", "CONNECT")]);
@@ -216,8 +233,11 @@ fn second_headers_is_unexpected() {
   let second = headers_frame(&[(":status", "200")]);
   let mut items = s.handle(&second, &mut scratch);
   assert!(matches!(
-    items.next(),
-    Err(crate::error::H3Error::FrameUnexpected)
+    items.next().unwrap().unwrap(),
+    StreamItem::Headers {
+      kind: HeadersKind::Initial,
+      ..
+    }
   ));
 }
 
@@ -281,7 +301,11 @@ fn unknown_frame_is_skipped() {
   buf.extend_from_slice(&headers_frame(&[(":method", "CONNECT")]));
   let mut items = s.handle(&buf, &mut scratch);
   match items.next().unwrap().unwrap() {
-    StreamItem::Headers(mut hs) => assert_eq!(hs.next().unwrap().unwrap().name(), ":method"),
+    StreamItem::Headers {
+      headers: mut hs, ..
+    } => {
+      assert_eq!(hs.next().unwrap().unwrap().name(), ":method")
+    }
     _ => panic!("expected Headers after skipping GREASE"),
   }
 }
@@ -452,10 +476,92 @@ fn decodes_huffman_value_through_fsm() {
   let mut s = RequestStream::new();
   let mut items = s.handle(&frame, &mut scratch);
   match items.next().unwrap().unwrap() {
-    StreamItem::Headers(mut hs) => {
+    StreamItem::Headers {
+      headers: mut hs, ..
+    } => {
       let p = hs.next().unwrap().unwrap();
       assert_eq!((p.name(), p.value()), (":authority", "www.example.com"));
     }
     _ => panic!("expected Headers"),
   }
+}
+
+// A field section after a DATA frame is a trailers section, tagged Trailers.
+#[test]
+fn headers_then_data_then_trailers_are_tagged() {
+  // HEADERS(0x01) len=3 [0x00,0x00,0xd1 = :method: GET], DATA(0x00) len=2 [b"hi"],
+  // HEADERS(0x01) len=3 [trailers field section: indexed static :status not valid
+  // for trailers, but the FSM only checks PLACEMENT here, so reuse 0x00,0x00,0xd1].
+  let mut s = Stream::new();
+  let bytes = [
+    0x01, 0x03, 0x00, 0x00, 0xd1, // HEADERS (final, per placement = first)
+    0x00, 0x02, b'h', b'i', // DATA
+    0x01, 0x03, 0x00, 0x00, 0xd1, // HEADERS after DATA = trailers
+  ];
+  let mut scratch = [0u8; 256];
+  let mut items = s.handle(&bytes, &mut scratch);
+  // First item: a header section, placement-kind Initial.
+  let first = items.next().expect("ok").expect("some");
+  let StreamItem::Headers { kind, .. } = first else {
+    panic!("expected Headers, got Data");
+  };
+  assert_eq!(kind, HeadersKind::Initial);
+  // Second item: the DATA chunk.
+  assert!(matches!(items.next().expect("ok").expect("some"), StreamItem::Data(b) if b == b"hi"));
+  // Third item: a trailers section.
+  let third = items.next().expect("ok").expect("some");
+  let StreamItem::Headers { kind, .. } = third else {
+    panic!("expected trailers Headers");
+  };
+  assert_eq!(kind, HeadersKind::Trailers);
+  assert!(items.next().expect("ok").is_none());
+}
+
+// A second non-trailers HEADERS with no intervening DATA is still allowed at the
+// FSM level (interim 1xx are repeated HEADERS); the FSM tags both Initial and lets
+// the connection/validator decide interim-vs-final by status.
+#[test]
+fn repeated_initial_headers_before_data_are_allowed() {
+  let mut s = Stream::new();
+  let bytes = [
+    0x01, 0x03, 0x00, 0x00, 0xd1, // HEADERS #1 (interim candidate)
+    0x01, 0x03, 0x00, 0x00, 0xd1, // HEADERS #2 (final candidate)
+  ];
+  let mut scratch = [0u8; 256];
+  let mut items = s.handle(&bytes, &mut scratch);
+  assert!(matches!(
+    items.next().expect("ok").expect("some"),
+    StreamItem::Headers {
+      kind: HeadersKind::Initial,
+      ..
+    }
+  ));
+  assert!(matches!(
+    items.next().expect("ok").expect("some"),
+    StreamItem::Headers {
+      kind: HeadersKind::Initial,
+      ..
+    }
+  ));
+  assert!(items.next().expect("ok").is_none());
+}
+
+// A HEADERS after trailers is a frame-placement error (nothing follows trailers).
+#[test]
+fn data_after_trailers_is_frame_unexpected() {
+  let mut s = Stream::new();
+  let bytes = [
+    0x01, 0x03, 0x00, 0x00, 0xd1, // HEADERS (initial)
+    0x00, 0x01, b'x', // DATA
+    0x01, 0x03, 0x00, 0x00, 0xd1, // trailers
+    0x00, 0x01, b'y', // DATA after trailers — illegal
+  ];
+  let mut scratch = [0u8; 256];
+  let mut items = s.handle(&bytes, &mut scratch);
+  let _ = items.next(); // Initial
+  let _ = items.next(); // Data
+  let _ = items.next(); // Trailers
+  // `StreamItem` does not implement `Debug` (its `HeaderSet` holds borrowed Huffman
+  // scratch), so match the error rather than `unwrap_err()` (which needs `Ok: Debug`).
+  assert!(matches!(items.next(), Err(H3Error::FrameUnexpected)));
 }

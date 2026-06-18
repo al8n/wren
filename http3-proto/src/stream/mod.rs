@@ -1,11 +1,12 @@
-//! The request-stream inbound FSM: parses one HEADERS frame then DATA frames
-//! off the bidirectional request stream, handling split reads, enforcing frame
-//! placement (RFC 9114 §7.1/§7.2), and yielding decoded headers + data chunks.
-//! Read-side only; the connection builds the outbound frames.
+//! The inbound stream FSM: parses the RFC 9114 §4.1 sequence
+//! `HEADERS(interim)* HEADERS(final) DATA* HEADERS(trailers)?` off a bidirectional
+//! request/response stream, handling split reads, enforcing frame placement
+//! (RFC 9114 §7.1/§7.2), and yielding placement-tagged decoded headers + data
+//! chunks. Read-side only; the connection builds the outbound frames.
 
 use core::marker::PhantomData;
 
-use derive_more::{IsVariant, TryUnwrap, Unwrap};
+use derive_more::IsVariant;
 
 use crate::{
   HeaderSet,
@@ -51,10 +52,37 @@ pub(crate) fn default_req_buf() -> DefaultReqBuf<'static> {
   std::vec![0u8; HDR_CAP]
 }
 
-/// Phase of the read side.
+/// Which placement a decoded HEADERS section occupies in the RFC 9114 §4.1
+/// request-stream sequence `HEADERS(interim)* HEADERS(final) DATA* HEADERS(trailers)?`.
+///
+/// The recv FSM classifies by *placement* only: the first HEADERS section(s) are
+/// [`Initial`](Self::Initial) (the connection/validator decide interim-vs-final
+/// by `:status`); a HEADERS section that arrives after any DATA frame is
+/// [`Trailers`](Self::Trailers). The request/response direction is decided by the
+/// connection from its role, not here.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, IsVariant)]
+#[non_exhaustive]
+pub enum HeadersKind {
+  /// A leading HEADERS section (request, final response, or an interim 1xx —
+  /// disambiguated by `:status` at a higher layer). Repeats are allowed (interim
+  /// responses) until the first DATA frame.
+  Initial,
+  /// A trailing HEADERS section after the body (trailers). At most one; nothing
+  /// may follow it.
+  Trailers,
+}
+
+/// Phase of the read (recv) side, tracking the RFC 9114 §4.1 sequence.
 enum Phase {
-  AwaitingHeaders,
-  Tunnel,
+  /// Awaiting the first HEADERS; repeated leading HEADERS (interim 1xx) keep the
+  /// FSM here until the first DATA frame.
+  Headers,
+  /// At least one HEADERS section seen and at least one DATA frame seen (or the
+  /// body has begun): DATA frames and an optional trailing HEADERS are allowed.
+  Body,
+  /// A trailing HEADERS (trailers) section was seen: the recv message is complete;
+  /// nothing further may arrive on the recv half.
+  Trailers,
 }
 
 /// The frame currently being consumed (after its header has been parsed).
@@ -62,30 +90,48 @@ enum Cur {
   /// At a frame boundary; the next bytes begin a frame header.
   None,
   /// Accumulating a HEADERS field section into the FSM-owned `hdr_acc[0..acc]`.
-  Headers { remaining: u64, acc: usize },
+  /// `trailers` records whether the placement match classified this section as a
+  /// trailing (post-DATA) HEADERS, so the completion arm reports the right
+  /// [`HeadersKind`] and enters the right [`Phase`].
+  Headers {
+    remaining: u64,
+    acc: usize,
+    trailers: bool,
+  },
   /// Streaming a DATA payload.
   Data { remaining: u64 },
   /// Discarding an unknown (GREASE / extension) frame's payload.
   Skip { remaining: u64 },
 }
 
-/// Parses inbound frames on the request stream. Feed bytes via [`handle`] and on
-/// the QUIC stream FIN call [`fin`].
+/// Parses inbound frames on a bidirectional request/response stream. Feed bytes
+/// via [`handle`] and on the QUIC stream FIN call [`fin`].
 ///
-/// The read side begins expecting exactly one HEADERS frame (the CONNECT request
-/// on a server, or the response on a client), then a sequence of DATA frames
-/// carrying the tunnel payload. Unknown frame types are skipped (RFC 9114 §9);
-/// DATA before HEADERS, a second HEADERS, or SETTINGS are protocol violations.
+/// The read side models the RFC 9114 §4.1 sequence
+/// `HEADERS(interim 1xx)* HEADERS(final) DATA* HEADERS(trailers)?`: one or more
+/// leading HEADERS sections (the CONNECT request / response, plus any interim 1xx
+/// responses), then a sequence of DATA frames, then an optional trailing HEADERS
+/// (trailers). Each decoded section is tagged with a [`HeadersKind`] by placement
+/// (leading vs post-DATA); interim-vs-final is decided at a higher layer by
+/// `:status`. The CONNECT tunnel is the specialization: one leading HEADERS, then
+/// DATA. Unknown frame types are skipped (RFC 9114 §9); DATA before any HEADERS, a
+/// frame after trailers, PUSH_PROMISE, or control-stream frames are protocol
+/// violations.
 ///
 /// A naturally-fragmented HEADERS frame is accumulated into FSM-owned storage
 /// (`hdr_acc`), so the caller's `scratch` is needed only as transient
 /// Huffman-decode space and may be a fresh buffer on every [`handle`] call.
 ///
-/// [`handle`]: RequestStream::handle
-/// [`fin`]: RequestStream::fin
-pub struct RequestStream<'a, B = DefaultReqBuf<'a>> {
+/// [`handle`]: Stream::handle
+/// [`fin`]: Stream::fin
+pub struct Stream<'a, B = DefaultReqBuf<'a>> {
   phase: Phase,
   cur: Cur,
+  /// Whether at least one HEADERS section has completed. A clean FIN before the
+  /// first HEADERS is [`H3Error::RequestIncomplete`]; once any HEADERS completed,
+  /// a frame-boundary FIN is a clean half-close even before any DATA (a body-less
+  /// response, or the CONNECT 2xx with no payload yet).
+  headers_seen: bool,
   /// Partial frame-header bytes (type varint + length varint, `<= 16`).
   hdr_buf: [u8; MAX_HEADER_LEN],
   hdr_len: usize,
@@ -96,31 +142,42 @@ pub struct RequestStream<'a, B = DefaultReqBuf<'a>> {
   /// alloc/std owned constructor uses [`HDR_CAP`]; borrowed storage uses the
   /// caller-provided slice length. Oversize is a graceful [`H3Error::FrameError`].
   ///
-  /// [`handle`]: RequestStream::handle
+  /// [`handle`]: Stream::handle
   hdr_acc: B,
   _storage: PhantomData<&'a mut ()>,
 }
 
-/// One parsed item, borrowed from the current [`RequestStream::handle`] call.
+/// Back-compat alias: the CONNECT tunnel's single request stream is a [`Stream`].
+pub type RequestStream<'a, B = DefaultReqBuf<'a>> = Stream<'a, B>;
+
+/// One parsed item, borrowed from the current [`Stream::handle`] call.
 ///
 /// Valid only until the next [`Items::next`] call (lending iterator): a `Data`
 /// chunk borrows the fed input and a `Headers` set borrows the FSM-owned field
 /// accumulator plus the caller's Huffman scratch.
-#[derive(IsVariant, TryUnwrap, Unwrap)]
-#[unwrap(ref, ref_mut)]
-#[try_unwrap(ref, ref_mut)]
+///
+// `Unwrap`/`TryUnwrap` are not derived: `derive_more` cannot generate them for a
+// struct (anonymous-record) variant, and nothing in the crate unwraps a
+// `StreamItem` — callers match it directly. `IsVariant` supports struct variants.
+#[derive(IsVariant)]
 #[non_exhaustive]
 pub enum StreamItem<'a> {
-  /// A decoded HEADERS field section (drain it before the next `next()`).
-  Headers(HeaderSet<'a>),
+  /// A decoded HEADERS field section, tagged by placement (drain it before the
+  /// next `next()`).
+  Headers {
+    /// The placement (initial vs trailers).
+    kind: HeadersKind,
+    /// The decoded field lines (borrows the field accumulator + scratch).
+    headers: HeaderSet<'a>,
+  },
   /// A chunk of DATA-frame payload (borrows the input).
   Data(&'a [u8]),
 }
 
-/// A lending iterator over the items produced by one [`RequestStream::handle`]
+/// A lending iterator over the items produced by one [`Stream::handle`]
 /// call. Drive it with [`Items::next`] until it returns `Ok(None)`.
 pub struct Items<'a, 'buf, B = DefaultReqBuf<'buf>> {
-  fsm: &'a mut RequestStream<'buf, B>,
+  fsm: &'a mut Stream<'buf, B>,
   input: &'a [u8],
   pos: usize,
   scratch: &'a mut [u8],
@@ -134,16 +191,16 @@ pub struct Items<'a, 'buf, B = DefaultReqBuf<'buf>> {
 /// FSM has already advanced past the described item when this is returned.
 pub(crate) enum Advanced {
   /// A completed HEADERS field section now lives in the FSM-owned `hdr_acc[..acc_end]`
-  /// (already validated by [`Items::advance`]); decode it with
+  /// (already validated by [`Items::advance`]), tagged by placement; decode it with
   /// [`Items::decode_buffered_headers`].
-  Headers { acc_end: usize },
+  Headers { acc_end: usize, kind: HeadersKind },
   /// A DATA-frame payload chunk occupies `input[start..end]` (an empty `start == end`
   /// for a zero-length DATA frame). Re-slice it with [`Items::input`].
   Data { start: usize, end: usize },
 }
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-impl RequestStream<'static> {
+impl Stream<'static> {
   /// A fresh read FSM expecting a HEADERS frame first.
   ///
   /// No `Default` is implemented: in the bare no-alloc tier the default storage
@@ -156,13 +213,14 @@ impl RequestStream<'static> {
   }
 }
 
-impl<'buf, B> RequestStream<'buf, B> {
+impl<'buf, B> Stream<'buf, B> {
   /// A fresh read FSM backed by caller-provided persistent HEADERS storage.
   #[inline]
   pub fn with_buffer(hdr_acc: B) -> Self {
     Self {
-      phase: Phase::AwaitingHeaders,
+      phase: Phase::Headers,
       cur: Cur::None,
+      headers_seen: false,
       hdr_buf: [0u8; MAX_HEADER_LEN],
       hdr_len: 0,
       hdr_acc,
@@ -192,27 +250,42 @@ impl<'buf, B> RequestStream<'buf, B> {
 
   /// Signal the QUIC stream FIN.
   ///
-  /// - `Ok(())` — a clean half-close at a frame boundary *after* the mandatory
-  ///   CONNECT HEADERS were decoded (the FSM reached the tunnel phase). The peer
-  ///   ended its send side of an established tunnel (RFC 9114 §7.1).
+  /// - `Ok(())` — a clean half-close at a frame boundary once at least one HEADERS
+  ///   section has completed (the recv half of the message is well-formed): after
+  ///   the body has begun, after a trailing section, or after a leading HEADERS even
+  ///   before any DATA (a body-less response, or the CONNECT 2xx before any DATA).
+  ///   The peer ended its send side (RFC 9114 §7.1).
   /// - `Err(`[`H3Error::RequestIncomplete`]`)` — a frame-boundary FIN while still
   ///   awaiting the first HEADERS: the request / response field section never
-  ///   arrived, so the request is incomplete (the connection cannot proceed).
+  ///   arrived, so the message is incomplete (RFC 9114 §8.1).
   /// - `Err(`[`H3Error::FrameError`]`)` — a FIN mid-frame (a header or payload was
   ///   cut off), which is malformed framing.
   #[inline]
   pub fn fin(&self) -> Result<(), H3Error> {
     match (self.hdr_len, &self.cur) {
-      // A clean frame boundary: a half-close after the HEADERS is graceful, but a
-      // FIN that arrives before the mandatory CONNECT HEADERS leaves the request
-      // incomplete (RFC 9114 §8.1) — the tunnel never had its field section.
       (0, Cur::None) => match self.phase {
-        Phase::Tunnel => Ok(()),
-        Phase::AwaitingHeaders => Err(H3Error::RequestIncomplete),
+        // Body / Trailers (or Headers AFTER at least one section) = clean half-close.
+        Phase::Body | Phase::Trailers => Ok(()),
+        // Still in the leading-HEADERS phase: clean once one section completed, but a
+        // FIN before the first HEADERS leaves the message incomplete (RFC 9114 §8.1).
+        Phase::Headers if self.headers_seen => Ok(()),
+        Phase::Headers => Err(H3Error::RequestIncomplete),
       },
       // Mid-frame: a header or payload was truncated by the FIN (malformed).
       _ => Err(H3Error::FrameError),
     }
+  }
+
+  /// Whether at least one HEADERS section has completed on the recv half.
+  ///
+  /// The connection uses this to enforce the CONNECT-tunnel "exactly one HEADERS
+  /// exchange" rule: a HEADERS that arrives once a prior section already completed
+  /// is a frame-placement violation at the tunnel layer (the general per-stream
+  /// interim/trailers acceptance is wired in a later task). The recv FSM itself
+  /// allows repeated leading HEADERS (interim 1xx) and a trailing section.
+  #[inline]
+  pub(crate) fn headers_seen(&self) -> bool {
+    self.headers_seen
   }
 }
 
@@ -243,9 +316,10 @@ where
   pub fn next(&mut self) -> Result<Option<StreamItem<'_>>, H3Error> {
     match self.advance()? {
       None => Ok(None),
-      Some(Advanced::Headers { acc_end }) => Ok(Some(StreamItem::Headers(
-        self.decode_buffered_headers(acc_end)?,
-      ))),
+      Some(Advanced::Headers { acc_end, kind }) => Ok(Some(StreamItem::Headers {
+        kind,
+        headers: self.decode_buffered_headers(acc_end)?,
+      })),
       Some(Advanced::Data { start, end }) => {
         let chunk = self.input.get(start..end).ok_or(H3Error::FrameError)?;
         Ok(Some(StreamItem::Data(chunk)))
@@ -307,9 +381,10 @@ where
       pos,
       scratch,
     } = self;
-    let RequestStream {
+    let Stream {
       phase,
       cur,
+      headers_seen,
       hdr_buf,
       hdr_len,
       hdr_acc,
@@ -345,16 +420,44 @@ where
               Ok((_, hdr)) => {
                 *hdr_len = 0;
                 match (&*phase, hdr.kind()) {
-                  (Phase::AwaitingHeaders, FrameKind::Headers) => {
+                  // A leading HEADERS section: stays in Headers (interim 1xx repeat)
+                  // until the first DATA frame.
+                  (Phase::Headers, FrameKind::Headers) => {
                     *cur = Cur::Headers {
                       remaining: hdr.length(),
                       acc: 0,
+                      trailers: false,
                     };
                   }
-                  (Phase::Tunnel, FrameKind::Data) => {
+                  // First DATA after a leading HEADERS: the body has begun. (DATA stays
+                  // legal in Body for subsequent frames.) DATA before ANY HEADERS is
+                  // illegal — guarded by `headers_seen`, since a completed leading
+                  // HEADERS keeps the phase in `Headers` until this transition.
+                  (Phase::Headers, FrameKind::Data) if *headers_seen => {
+                    *phase = Phase::Body;
                     *cur = Cur::Data {
                       remaining: hdr.length(),
                     };
+                  }
+                  (Phase::Body, FrameKind::Data) => {
+                    *cur = Cur::Data {
+                      remaining: hdr.length(),
+                    };
+                  }
+                  // A HEADERS section after the body has begun: trailers (at most one;
+                  // the Body→Trailers transition on completion guards a second one).
+                  (Phase::Body, FrameKind::Headers) => {
+                    *cur = Cur::Headers {
+                      remaining: hdr.length(),
+                      acc: 0,
+                      trailers: true,
+                    };
+                  }
+                  // DATA before any HEADERS (RFC 9114 §4.1), and nothing may follow
+                  // trailers: both are frame-placement violations.
+                  (Phase::Headers, FrameKind::Data)
+                  | (Phase::Trailers, FrameKind::Headers | FrameKind::Data) => {
+                    return Err(H3Error::FrameUnexpected);
                   }
                   // GREASE / unknown extension frames are ignored (RFC 9114 §9).
                   (_, FrameKind::Unknown) => {
@@ -369,16 +472,12 @@ where
                   // not a placement (FrameUnexpected) error.
                   (_, FrameKind::PushPromise) => return Err(H3Error::IdError),
                   // Every remaining type is forbidden on the request stream
-                  // (RFC 9114 §7.2 frame placement): DATA before HEADERS or a
-                  // second HEADERS (only one HEADERS exchange per tunnel);
-                  // SETTINGS / CANCEL_PUSH / GOAWAY / MAX_PUSH_ID (control-stream
-                  // frames); and the HTTP/2-reserved types (§7.2.8). All are
-                  // H3_FRAME_UNEXPECTED.
+                  // (RFC 9114 §7.2 frame placement): SETTINGS / CANCEL_PUSH / GOAWAY
+                  // / MAX_PUSH_ID (control-stream frames); and the HTTP/2-reserved
+                  // types (§7.2.8). All are H3_FRAME_UNEXPECTED.
                   (
                     _,
-                    FrameKind::Data
-                    | FrameKind::Headers
-                    | FrameKind::Settings
+                    FrameKind::Settings
                     | FrameKind::CancelPush
                     | FrameKind::GoAway
                     | FrameKind::MaxPushId
@@ -392,7 +491,11 @@ where
             }
           }
         }
-        Cur::Headers { remaining, acc } => {
+        Cur::Headers {
+          remaining,
+          acc,
+          trailers,
+        } => {
           let avail = input.len().saturating_sub(*pos);
           let take = usize::try_from(remaining).unwrap_or(usize::MAX).min(avail);
           let end = pos.checked_add(take).ok_or(H3Error::FrameError)?;
@@ -408,32 +511,49 @@ where
           let taken = u64::try_from(take).unwrap_or(u64::MAX);
           let remaining = remaining.saturating_sub(taken);
           if remaining == 0 {
-            // The complete field section lives in the owned `hdr_acc[..acc_end]`.
-            let fs = hdr_acc.get(..acc_end).ok_or(H3Error::FrameError)?;
-            // Validate the ENTIRE field section up front. The yielded `HeaderSet`
-            // is a lazy lending iterator, so a QPACK error in a LATER field line
-            // (e.g. a dynamic/post-base reference after a valid `:status`) would
-            // otherwise surface only if the driver fully drains it — a driver that
-            // reads one field and stops could enter tunnel mode on a malformed
-            // section. So decode + drain a throwaway pass here, propagating any
-            // error UNCONDITIONALLY. The caller re-decodes a fresh pass over the
-            // same owned `hdr_acc` via `decode_buffered_headers`.
-            {
+            // Eager-validate the FIRST field section up front: the yielded `HeaderSet`
+            // is a lazy lending iterator, so a QPACK error in a LATER field line (e.g. a
+            // dynamic/post-base reference after a valid `:status`) would otherwise
+            // surface only if the driver fully drains it — a driver that reads one field
+            // and stops could act on a malformed section. So decode + drain a throwaway
+            // pass here, propagating any error UNCONDITIONALLY. The caller re-decodes a
+            // fresh pass over the same owned `hdr_acc` via `decode_buffered_headers`.
+            //
+            // A NON-first section (a repeated leading / interim or a trailing HEADERS,
+            // i.e. `headers_seen` already set) is NOT eager-validated here: it is
+            // reported by placement first, so the caller can apply its own placement
+            // policy (the CONNECT tunnel rejects any second HEADERS as
+            // `FrameUnexpected`) BEFORE a body decode — matching the legacy
+            // reject-on-frame-kind ordering. Such a caller decodes/validates the section
+            // itself (via `decode_buffered_headers` / the validator) only if it accepts
+            // the placement.
+            if !*headers_seen {
+              let fs = hdr_acc.get(..acc_end).ok_or(H3Error::FrameError)?;
               let mut probe =
                 qpack::decode_field_section_into(fs, scratch).map_err(|e| e.to_h3())?;
               while probe.next().map_err(|e| e.to_h3())?.is_some() {}
             }
-            // Validation fully succeeded: only now commit the phase transition and
-            // report the completed section's length. The bytes stay in `hdr_acc`
-            // (only one HEADERS frame ever arrives, so they are not overwritten),
-            // so the caller's fresh decode reads them back.
+            // Validation passed (or was deferred): only now commit the phase transition
+            // and report the completed section's length + placement. The bytes stay in
+            // `hdr_acc` until the next HEADERS frame overwrites them (an initial /
+            // trailers pair never overlap in time), so the caller's fresh decode reads
+            // them back. A trailing section ends the recv message (Phase::Trailers);
+            // a leading section keeps us in Phase::Headers (a later interim 1xx
+            // repeats), and the first DATA frame is what moves us to Phase::Body.
             *cur = Cur::None;
-            *phase = Phase::Tunnel;
-            return Ok(Some(Advanced::Headers { acc_end }));
+            *headers_seen = true;
+            let kind = if trailers {
+              *phase = Phase::Trailers;
+              HeadersKind::Trailers
+            } else {
+              HeadersKind::Initial
+            };
+            return Ok(Some(Advanced::Headers { acc_end, kind }));
           }
           *cur = Cur::Headers {
             remaining,
             acc: acc_end,
+            trailers,
           };
           return Ok(None); // need more
         }
