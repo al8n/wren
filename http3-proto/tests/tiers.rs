@@ -14,6 +14,12 @@ use http3_proto::{
   event::{StreamId, StreamRole},
   stream::{HDR_CAP, RequestStream},
 };
+// The bare-tier stream store is caller-provided slots; this slot type is exported
+// only on the bare tier (heap tiers grow the store internally). `--all-features
+// --all-targets` also compiles this test under `std`, where `BorrowedConnection`
+// uses the heap store, so the slot type and its `with_buffers` arg are bare-only.
+#[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+use http3_proto::StreamSlot;
 
 type StaticConnection<Ro> = Connection<'static, 'static, 'static, 'static, 'static, Ro>;
 
@@ -35,6 +41,21 @@ fn bare_tier_open_and_drain() {
   let mut tx_bytes = [0u8; TX_BYTES_CAP];
   let mut event_slots = [None; EVENT_QUEUE_CAP];
   let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+  // The bare-tier stream store is a caller-provided fixed-capacity slice; the CONNECT
+  // tunnel needs one slot. (Under `std`/`alloc`/`no-atomic` the store grows
+  // internally, so `with_buffers` takes no slots there.)
+  #[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+  let mut stream_slots: [StreamSlot<'_, &mut [u8]>; 1] = [StreamSlot::EMPTY];
+  #[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+  let mut conn = BorrowedConnection::<Client>::with_buffers(
+    &mut request_headers[..],
+    &mut control_payload[..],
+    &mut tx_bytes[..],
+    &mut event_slots[..],
+    &mut uni_slots[..],
+    &mut stream_slots[..],
+  );
+  #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
   let mut conn = BorrowedConnection::<Client>::with_buffers(
     &mut request_headers[..],
     &mut control_payload[..],
