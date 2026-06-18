@@ -228,26 +228,31 @@ pub struct StreamEntry<'req, ReqBuf> {
   /// `request_abandoned`.)
   abandoned: bool,
   /// Whether this stream is the CONNECT tunnel (vs a general request/response
-  /// stream). Establishment is connection-scoped for the tunnel and per-stream for
-  /// everything else:
+  /// stream). It drives BOTH the establish split (connection-scoped for the tunnel,
+  /// per-stream otherwise) and the error-scope split (a protocol violation /
+  /// `RESET_STREAM` is connection-fatal on the tunnel, stream-scoped otherwise —
+  /// RFC 9114 §4.1.2):
   ///
-  /// - `true` — the tunnel: the client establishes on the final response via the
-  ///   shared `Handshaking → Open` transition ([`Phase::establish_into`]: phase →
-  ///   `Open`, [`Event::Established`] enqueued, `established` set), and the server via
-  ///   [`accept_with`](Connection::accept_with). Set ONLY on the tunnel path
-  ///   (`open_with` → [`provide_stream`](Connection::provide_stream) on the client;
-  ///   `accept_with` on the server).
+  /// - `true` — the tunnel (or tunnel-ASSUMED, see below): the client establishes on
+  ///   the final response via the shared `Handshaking → Open` transition
+  ///   ([`Phase::establish_into`]: phase → `Open`, [`Event::Established`] enqueued,
+  ///   `established` set), and the server via [`accept_with`](Connection::accept_with).
+  ///   A stream error on it fails the WHOLE connection. Set on:
+  ///   - the client tunnel path (`open_with` →
+  ///     [`provide_stream`](Connection::provide_stream)); and
+  ///   - EVERY inbound server request stream at registration — the server cannot tell
+  ///     tunnel from general before any HEADERS, so it ASSUMES the tunnel (a protocol
+  ///     violation before it commits to a response stays connection-fatal, preserving
+  ///     the strict CONNECT-tunnel behavior). [`send_response`](Connection::send_response)
+  ///     (the general response path) then flips it to `false`; `accept_with` keeps it
+  ///     `true`.
   /// - `false` — a general stream (opened with
   ///   [`open_request`](Connection::open_request) on the client, or responded to with
   ///   [`send_response`](Connection::send_response) on the server): establishment is
   ///   purely per-stream — the final response sets `established` (gating
   ///   [`Frame::Data`]) and NOTHING else (no connection [`Event::Established`], no
   ///   `Phase::Open` transition), because [`Event`]s are connection-scoped and a
-  ///   general request stream is not.
-  ///
-  /// This is also the per-stream-vs-connection reset marker a later task uses to scope
-  /// a non-tunnel `RESET_STREAM` to one stream; it is pulled forward here to drive the
-  /// establish split.
+  ///   general request stream is not. A stream error on it resets ONLY that stream.
   is_tunnel: bool,
 }
 
@@ -356,6 +361,11 @@ pub struct Frames<
 struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
   drain_on_drop: fn(&mut RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf>),
   items: crate::stream::Items<'a, 'req, ReqBuf>,
+  /// The id of the request stream this carrier drives. Names the stream to free +
+  /// `RESET_STREAM` when a NON-tunnel stream error is recorded into `pending_reset`
+  /// (see [`fail_or_reset`](Self::fail_or_reset)); on the tunnel it is unused (a
+  /// tunnel error fails the connection instead).
+  id: StreamId,
   /// A disjoint borrow of the connection's lifecycle phase (see the struct docs).
   phase: &'a mut Phase,
   /// A disjoint borrow of the connection's event queue (see the struct docs).
@@ -372,6 +382,16 @@ struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
   /// non-droppable slot the eager fail paths use. Another distinct `Connection`
   /// field, so the borrow stays disjoint from `phase` / `events` / `close_pending`.
   conn_error: &'a mut Option<H3Error>,
+  /// A disjoint borrow of the connection's `pending_reset` slot — the stream-scoped
+  /// twin of `conn_error`. On a NON-tunnel stream a request-FSM / validator error is
+  /// a STREAM error (RFC 9114 §4.1.2): it resets only this stream, leaving the
+  /// connection live. The carrier holds per-entry borrows, not `streams` / `tx`, so
+  /// it cannot do the reset in place; it records `(id, code)` here and the next
+  /// `&mut self` API entry materializes it via
+  /// [`reset_stream`](Connection::reset_stream). Yet another distinct `Connection`
+  /// field, so the borrow stays disjoint from `phase` / `events` / `close_pending` /
+  /// `conn_error` / `request_abandoned`. See [`fail_or_reset`](Self::fail_or_reset).
+  pending_reset: &'a mut Option<(StreamId, u64)>,
   /// A disjoint borrow of the connection's `request_abandoned` flag. The drop-drain
   /// ([`drain_for_errors`](Self::drain_for_errors)) sets it when it decodes the first
   /// HEADERS UNOBSERVED (the driver dropped [`Frames`] before any `next()` yielded
@@ -475,6 +495,14 @@ where
     if rf.phase.is_failed() {
       return Ok(None);
     }
+    // Stream-scoped twin of the `is_failed()` fuse above: once THIS carrier recorded a
+    // stream reset for its (non-tunnel) stream, it is inert — yield nothing more, so no
+    // `Frame` surfaces on a stream that has been aborted. The connection stays live; the
+    // reset materializes (slot freed + `RESET_STREAM` enqueued) at the next `&mut self`
+    // API entry. Mirrors `drain_for_errors`' top guard (next/drain parity).
+    if rf.stream_reset_recorded() {
+      return Ok(None);
+    }
     // Drive the request FSM via the borrow-free `advance` (it reports each item as
     // owned offsets / a section length, not a borrow), looping ONLY to skip an
     // established-but-empty DATA frame; for a yieldable item the borrow is re-derived
@@ -485,15 +513,16 @@ where
     // borrow crosses the loop back-edge.
     let headers = loop {
       // A lazily-surfaced request-FSM error (a second HEADERS, DATA before HEADERS,
-      // malformed QPACK, PUSH_PROMISE → IdError, …) is connection-fatal exactly like
-      // the eager `handle_stream` errors: route it through the centralized fail
-      // transition (phase → `Failed`, one `ConnError`) BEFORE returning it, so the
-      // connection becomes terminal and a later `send_data` reports `Closed`. Still
-      // returns the `Err` so the driver learns the code. Idempotent via `fail_into`.
+      // malformed QPACK, PUSH_PROMISE → IdError, malformed framing, …) is routed by
+      // SCOPE via `fail_or_reset` BEFORE returning it: connection-fatal on the CONNECT
+      // tunnel (phase → `Failed`, one `ConnError`, so a later `send_data` reports
+      // `Closed`), or a stream-scoped reset on a general request stream (RFC 9114
+      // §4.1.2 — the connection stays live; only this stream is aborted). Still returns
+      // the `Err` so the driver learns the code.
       let advanced = match rf.items.advance() {
         Ok(advanced) => advanced,
         Err(e) => {
-          Phase::fail_into(rf.phase, rf.close_pending, rf.events, rf.conn_error, e);
+          rf.fail_or_reset(e);
           return Err(e);
         }
       };
@@ -534,13 +563,10 @@ where
               rf.first_headers_seen
             };
           if second_initial_illegal {
-            Phase::fail_into(
-              rf.phase,
-              rf.close_pending,
-              rf.events,
-              rf.conn_error,
-              H3Error::FrameUnexpected,
-            );
+            // Frame-placement violation from a request FSM (RFC 9114 §4.1.2): scoped
+            // by `fail_or_reset` — connection-fatal on the tunnel, a stream reset on a
+            // general stream.
+            rf.fail_or_reset(H3Error::FrameUnexpected);
             return Err(H3Error::FrameUnexpected);
           }
           // Record that a leading section has been observed (gates the server's
@@ -565,15 +591,9 @@ where
           // DATA, while a `close()` during `Handshaking` (→ `Closing`, never
           // established) does not re-leak it. Premature DATA — empty or not — is a
           // malformed message (RFC 9114 §4.1.2): the shared `fail_if_premature_data`
-          // routes it through the centralized fail transition exactly like the lazy
-          // request-FSM error above, then we return the code so the driver learns it.
-          if RequestFrames::<ReqBuf, EventBuf>::fail_if_premature_data(
-            *rf.tunnel_established,
-            rf.phase,
-            rf.close_pending,
-            rf.events,
-            rf.conn_error,
-          ) {
+          // routes it by scope (connection-fatal on the tunnel, a stream reset on a
+          // general stream), then we return the code so the driver learns it.
+          if rf.fail_if_premature_data() {
             return Err(H3Error::MessageError);
           }
           // Established. An empty DATA frame is a real (consumed, gate-passed)
@@ -628,20 +648,14 @@ where
       // malformed QPACK section (e.g. a second/interim section the FSM did not eagerly
       // validate) as an error at the yield point.
       // A response with no `:status` is a malformed message (it cannot be tagged
-      // interim/final): route it through the fail path like a lazy FSM error (the
-      // full `validate` below would also reject it, but the interim/final tag the
-      // yield needs requires a `:status` first).
+      // interim/final): route it by scope like a lazy FSM error (the full `validate`
+      // below would also reject it, but the interim/final tag the yield needs requires
+      // a `:status` first).
       let interim =
         match validate::response_is_interim(&mut rf.items.decode_buffered_headers(acc_end)?)? {
           Some(interim) => interim,
           None => {
-            Phase::fail_into(
-              rf.phase,
-              rf.close_pending,
-              rf.events,
-              rf.conn_error,
-              H3Error::MessageError,
-            );
+            rf.fail_or_reset(H3Error::MessageError);
             return Err(H3Error::MessageError);
           }
         };
@@ -694,13 +708,63 @@ where
 }
 
 impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
+  /// Routes a request-FSM / validator / placement error by SCOPE — the single
+  /// decision point shared by [`Frames::next`] and
+  /// [`drain_for_errors`](Self::drain_for_errors) so the two paths cannot drift:
+  ///
+  /// - the CONNECT **tunnel** stream ([`is_tunnel`](Self::is_tunnel)): the error is
+  ///   connection-fatal (one tunnel = one connection), routed through
+  ///   [`Phase::fail_into`] — phase → `Failed`, `close_pending` cleared, the stale
+  ///   event queue cleared, exactly one terminal `ConnError` recorded — exactly as
+  ///   before this scoping existed, keeping every tunnel assertion green.
+  /// - a **general** (non-tunnel) request stream: the error is a STREAM error
+  ///   (RFC 9114 §4.1.2 — a malformed message / validator violation / premature DATA
+  ///   / frame-placement on one request stream). It resets ONLY that stream, leaving
+  ///   the connection and every other stream live. The carrier holds per-entry
+  ///   borrows, not `streams` / `tx`, so it records `(id, code)` into `pending_reset`
+  ///   (the stream-scoped twin of `conn_error`); the next `&mut self` API entry
+  ///   materializes the real [`reset_stream`](Connection::reset_stream). The
+  ///   connection `phase` is UNCHANGED.
+  ///
+  /// The caller still returns the `Err(error)` so the driver learns the code; only
+  /// the connection-level effect differs by scope. Operates on `&mut self` (no `items`
+  /// borrow is live at any call site).
+  fn fail_or_reset(&mut self, error: H3Error)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
+    if self.is_tunnel {
+      Phase::fail_into(
+        self.phase,
+        self.close_pending,
+        self.events,
+        self.conn_error,
+        error,
+      );
+    } else {
+      // First stream error wins (a later error on the same already-reset stream does
+      // not overwrite the recorded code); the carrier also stops yielding once this is
+      // set (see `Frames::next` / `drain_for_errors`).
+      if self.pending_reset.is_none() {
+        *self.pending_reset = Some((self.id, error.code()));
+      }
+    }
+  }
+
+  /// Whether this carrier already recorded a stream-scoped reset for its
+  /// (non-tunnel) stream. Once set, the carrier stops yielding / scanning — the
+  /// stream-scoped twin of the `phase.is_failed()` fuse the tunnel path uses, keeping
+  /// [`Frames::next`] and [`drain_for_errors`](Self::drain_for_errors) at parity.
+  fn stream_reset_recorded(&self) -> bool {
+    self.pending_reset.is_some()
+  }
+
   /// Runs the semantic validator over the just-completed HEADERS section (a fresh,
-  /// dedicated decode pass over the buffered bytes), routing a violation through the
-  /// centralized fail transition — exactly like a lazy request-FSM error — before
-  /// returning it. A semantic violation is a STREAM error (RFC 9114 §4.1.2); the
-  /// per-stream reset scoping is a later task, so for now it is connection-fatal via
-  /// [`Phase::fail_into`] (the existing fail path) so it is at least surfaced. The
-  /// decode pass is independent of the yield decode the caller performs next (each
+  /// dedicated decode pass over the buffered bytes), routing a violation by SCOPE via
+  /// [`fail_or_reset`](Self::fail_or_reset) — connection-fatal on the tunnel, a
+  /// stream-scoped reset on a general request stream (RFC 9114 §4.1.2) — before
+  /// returning it. The decode pass is independent of the yield decode the caller
+  /// performs next (each
   /// [`decode_buffered_headers`](crate::stream::Items::decode_buffered_headers) is a
   /// fresh, idempotent decode over the same owned bytes).
   fn validate_section(&mut self, kind: MessageKind, acc_end: usize) -> Result<(), H3Error>
@@ -710,13 +774,7 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   {
     let mut hs = self.items.decode_buffered_headers(acc_end)?;
     if let Err(e) = validate::validate(kind, &mut hs) {
-      Phase::fail_into(
-        self.phase,
-        self.close_pending,
-        self.events,
-        self.conn_error,
-        e,
-      );
+      self.fail_or_reset(e);
       return Err(e);
     }
     Ok(())
@@ -759,35 +817,25 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   /// NOT established is premature: the peer sent DATA before the
   /// 2xx response (server before [`accept_with`](Connection::accept_with), or any
   /// request stream whose tunnel was never established), which is a malformed message
-  /// (RFC 9114 §4.4 / §4.1.2). Routes through the centralized fail transition (phase
-  /// → `Failed`, one terminal `ConnError`) exactly like a lazy request-FSM error, and
-  /// returns whether the DATA was premature (so the caller can `Err`/`return`):
+  /// (RFC 9114 §4.4 / §4.1.2). Routes through [`fail_or_reset`](Self::fail_or_reset) —
+  /// connection-fatal `MessageError` on the tunnel, a stream-scoped reset on a general
+  /// request stream — and returns whether the DATA was premature (so the caller can
+  /// `Err`/`return`):
   ///
-  /// - `true`  → premature: the connection was just `fail`ed with `MessageError`;
+  /// - `true`  → premature: the tunnel was `fail`ed, or the general stream's reset was
+  ///   recorded, both with `MessageError`;
   /// - `false` → established: the caller handles the (possibly empty) DATA chunk.
   ///
-  /// Operates on disjoint field borrows rather than `&mut self` so [`Frames::next`]
-  /// can call it while the yielded chunk still borrows `items`.
-  fn fail_if_premature_data(
-    tunnel_established: bool,
-    phase: &mut Phase,
-    close_pending: &mut bool,
-    events: &mut BoundedQueue<'_, Event, EventBuf>,
-    conn_error: &mut Option<H3Error>,
-  ) -> bool
+  /// Called on `&mut self` at a point where no `items` borrow is live (the DATA chunk
+  /// is re-sliced only after this returns `false`).
+  fn fail_if_premature_data(&mut self) -> bool
   where
     EventBuf: AsMut<[Option<Event>]>,
   {
-    if tunnel_established {
+    if *self.tunnel_established {
       return false;
     }
-    Phase::fail_into(
-      phase,
-      close_pending,
-      events,
-      conn_error,
-      H3Error::MessageError,
-    );
+    self.fail_or_reset(H3Error::MessageError);
     true
   }
 }
@@ -837,6 +885,12 @@ where
     if self.phase.is_failed() {
       return;
     }
+    // Stream-scoped twin of the `is_failed()` guard (next/drain parity): this carrier
+    // already recorded a stream reset for its (non-tunnel) stream, so the stream is
+    // being aborted — stop scanning. The connection stays live.
+    if self.stream_reset_recorded() {
+      return;
+    }
     loop {
       match self.items.advance() {
         // No protocol error in the remaining bytes: every supplied byte is now
@@ -881,13 +935,9 @@ where
               self.first_headers_seen
             };
           if second_initial_illegal {
-            Phase::fail_into(
-              self.phase,
-              self.close_pending,
-              self.events,
-              self.conn_error,
-              H3Error::FrameUnexpected,
-            );
+            // Same scope split as the live path (`fail_or_reset`): connection-fatal on
+            // the tunnel, a stream reset on a general stream.
+            self.fail_or_reset(H3Error::FrameUnexpected);
             return;
           }
           // The UNOBSERVED first `Initial`: mark the stream abandoned (no readiness on
@@ -912,27 +962,16 @@ where
         // gate (the FSM yields empty occurrences too). Established DATA is discarded
         // (the driver abandoned it) and the scan continues.
         Ok(Some(Advanced::Data { .. })) => {
-          if RequestFrames::<ReqBuf, EventBuf>::fail_if_premature_data(
-            *self.tunnel_established,
-            self.phase,
-            self.close_pending,
-            self.events,
-            self.conn_error,
-          ) {
+          if self.fail_if_premature_data() {
             return;
           }
         }
         Err(e) => {
-          // The same centralized fatal transition the drained path uses: phase →
-          // `Failed`, `close_pending` cleared, the stale event queue cleared, and
-          // exactly one terminal ConnError recorded. Stop.
-          Phase::fail_into(
-            self.phase,
-            self.close_pending,
-            self.events,
-            self.conn_error,
-            e,
-          );
+          // The same scope split the live path uses (`fail_or_reset`): connection-fatal
+          // on the tunnel (phase → `Failed`, `close_pending` cleared, the stale event
+          // queue cleared, one terminal ConnError), a stream reset on a general stream.
+          // Stop.
+          self.fail_or_reset(e);
           return;
         }
       }
@@ -1699,6 +1738,21 @@ pub struct Connection<
   /// is delivered exactly once; the fail transition also clears the pending event
   /// queue, so no stale graceful event precedes the terminal `ConnError`.
   conn_error: Option<H3Error>,
+  /// A stream-scoped reset recorded by the lending [`Frames`] carrier (its
+  /// [`RequestFrames`]) when a non-tunnel general request stream hits a stream error
+  /// — a malformed message / validator violation / premature DATA — that resets only
+  /// that stream rather than failing the connection. The carrier holds disjoint
+  /// borrows of the per-stream entry's fields and cannot reach `streams` / `tx` to do
+  /// the real reset (remove the slot + enqueue the `RESET_STREAM` transmit), so it
+  /// records `(id, code)` here; the next `&mut self` API entry
+  /// ([`apply_pending_reset`](Self::apply_pending_reset), run from
+  /// [`handle_stream`](Self::handle_stream) / [`poll_transmit`](Self::poll_transmit) /
+  /// [`poll_event`](Self::poll_event)) drains it through
+  /// [`reset_stream`](Self::reset_stream). This is the stream-scoped twin of
+  /// `conn_error` (the connection-fatal slot): a distinct `Connection` field so the
+  /// carrier's borrow of it stays disjoint from `phase` / `events` / `close_pending` /
+  /// `conn_error`.
+  pending_reset: Option<(StreamId, u64)>,
   _ro: PhantomData<fn() -> Ro>,
   _storage: PhantomData<(
     &'req mut (),
@@ -1854,6 +1908,7 @@ where
       request_sent: false,
       close_pending: false,
       conn_error: None,
+      pending_reset: None,
       _ro: PhantomData,
       _storage: PhantomData,
     }
@@ -2022,7 +2077,7 @@ where
 
   /// Whether `id` no longer names a tracked request stream (its [`StreamEntry`] was
   /// removed from the [`StreamStore`]). Test-only probe: drives the per-stream-reset
-  /// isolation assertions (a reset stream is freed) that a later task completes.
+  /// isolation assertions (a reset stream is freed).
   #[cfg(all(test, any(feature = "std", feature = "alloc")))]
   pub(crate) fn stream_is_gone(&self, id: StreamId) -> bool {
     self.streams.get(id).is_none()
@@ -2094,10 +2149,9 @@ where
   /// the critical streams, a request stream is **not** write-once-singular: each new
   /// request `id` gets its own store entry (the multi-stream core). Re-providing the
   /// SAME request `id` re-binds in place (idempotent). At store capacity the insert
-  /// is dropped via `reset_stream` — NOT connection-fatal (the
-  /// driver should reset the overflow stream with
-  /// [`H3Error::RequestRejected`]; per-stream
-  /// resets are wired in a later task). The FIRST request id also records
+  /// is dropped via [`reset_stream`](Self::reset_stream) — NOT connection-fatal: the
+  /// overflow stream is reset with [`H3Error::RequestRejected`] (a `RESET_STREAM`
+  /// transmit) while the connection stays live. The FIRST request id also records
   /// `request_id`, the CONNECT tunnel-slot pointer the tunnel send paths use.
   ///
   /// Binding a *critical* (control / QPACK) role stays write-once: each maps to
@@ -2120,6 +2174,7 @@ where
   where
     EventBuf: AsMut<[Option<Event>]>,
     ReqBuf: ReqBufAlloc,
+    TxBuf: AsMut<[u8]>,
   {
     // A `Failed` connection is terminal: registering a new stream id on it serves
     // no purpose and must not happen — the driver should not be opening streams
@@ -2131,15 +2186,22 @@ where
       return;
     }
     if role.is_request() {
-      // The CLIENT reaches `provide_stream(Request, …)` only via the CONNECT tunnel
-      // path: `open_with` enqueues an `OpenRequest`, and the driver then registers the
-      // minted id here — so a client request stream provided this way IS the tunnel. The
-      // general client opens streams through `open_request` instead (which marks the
-      // entry non-tunnel). The SERVER cannot tell tunnel from general at registration
-      // (the request id is bound before any HEADERS), so it registers non-tunnel and
-      // `accept_with` later flips the tunnel marker (a general server uses
-      // `send_response`, which does not).
-      self.provide_request_stream(id, Ro::IS_CLIENT);
+      // Register as the CONNECT tunnel (`is_tunnel = true`) — the connection-fatal
+      // default for an error-scoping standpoint (RFC 9114 §4.1.2 vs a connection error):
+      //
+      // - The CLIENT reaches `provide_stream(Request, …)` only via the CONNECT tunnel
+      //   path (`open_with` → `OpenRequest` → the driver registers the minted id here),
+      //   so a client stream provided this way IS the tunnel. The general client opens
+      //   streams through `open_request` instead, which registers them
+      //   `is_tunnel = false` directly.
+      // - The SERVER cannot tell tunnel from general at registration (the id is bound
+      //   before any HEADERS), so it ASSUMES the tunnel — a protocol violation before it
+      //   has committed to a response stays connection-fatal, preserving the strict
+      //   CONNECT-tunnel behavior. The general server response path
+      //   [`send_response`](Self::send_response) flips the entry to `is_tunnel = false`
+      //   (a stream-scoped error then resets just that stream); `accept_with` keeps it
+      //   `true` (the established tunnel).
+      self.provide_request_stream(id, true);
       return;
     }
     // Critical (control / QPACK) streams stay write-once-singular in `roles`.
@@ -2166,13 +2228,16 @@ where
   /// [`provide_stream`](Self::provide_stream).
   ///
   /// `is_tunnel` marks the new entry's
-  /// [`StreamEntry::is_tunnel`](StreamEntry::is_tunnel) — `true` only on the CONNECT
-  /// tunnel path so the client's establish split picks connection-scoped vs per-stream
-  /// establishment. A re-provide does not change an existing entry's marker.
+  /// [`StreamEntry::is_tunnel`](StreamEntry::is_tunnel): `true` on the CONNECT tunnel /
+  /// tunnel-assumed inbound path (the client's establish split then picks
+  /// connection-scoped establishment, and a protocol error is connection-fatal),
+  /// `false` for a general client `open_request` stream (per-stream establishment, a
+  /// stream-scoped error reset). A re-provide does not change an existing entry's marker.
   #[allow(private_bounds)]
   fn provide_request_stream(&mut self, id: StreamId, is_tunnel: bool)
   where
     ReqBuf: ReqBufAlloc,
+    TxBuf: AsMut<[u8]>,
   {
     // Idempotent re-provide of an already-registered request id: the entry (and its
     // in-flight recv FSM) is kept as-is.
@@ -2200,14 +2265,86 @@ where
     }
   }
 
-  /// Locally resets the request stream `id` with application error `code` — the seam
-  /// for both the at-capacity overflow backstop (reset with
-  /// [`H3Error::RequestRejected`]) and a driver-requested per-stream cancel. A stub
-  /// for now: emitting the `RESET_STREAM` transmit and freeing the slot (stream-scoped,
-  /// NOT connection-fatal, so the tunnel — one slot — and sibling streams are
-  /// unaffected) is wired in a later task. The signature already carries `code` so the
-  /// concurrent-streams reset-isolation test can drive that work; here it is a no-op.
-  fn reset_stream(&mut self, _id: StreamId, _code: u64) {}
+  /// Resets request stream `id` with application error `code`: enqueues a
+  /// [`StreamKind::ResetStream`] transmit (a QUIC `RESET_STREAM` abort — no bytes,
+  /// the driver issues `reset_stream(id, code)` on QUIC), frees the stream's
+  /// [`StreamStore`] slot, and leaves the connection and every OTHER stream live.
+  /// This is the stream-scoped counterpart to the connection-fatal `fail` transition:
+  /// the connection `phase` is unchanged (it stays `Open` / `Handshaking` / `Closing`)
+  /// and no [`Event::ConnError`] is enqueued.
+  ///
+  /// Used for stream-scoped errors on a GENERAL (non-tunnel) request stream — a
+  /// malformed message / validator violation / premature DATA (RFC 9114 §4.1.2), or
+  /// the capacity backstop ([`H3Error::RequestRejected`]) — and as the
+  /// driver-requested per-stream cancel. A fatal on the CONNECT **tunnel** stream is
+  /// connection-fatal instead (one tunnel = one connection), failing the whole
+  /// connection rather than resetting here.
+  ///
+  /// A no-op if `id` is not a tracked request stream or the connection is already
+  /// `Failed` (a reset is moot then, and a stale `RESET_STREAM` transmit must not
+  /// follow the terminal `ConnError`). If `id` was the tunnel-slot pointer
+  /// (`request_id`) it is cleared.
+  #[allow(private_bounds)]
+  pub fn reset_stream(&mut self, id: StreamId, code: u64)
+  where
+    TxBuf: AsMut<[u8]>,
+  {
+    if self.phase.is_failed() {
+      return;
+    }
+    if self.streams.remove(id).is_some() {
+      // The reset is a QUIC `RESET_STREAM` abort: empty bytes, `fin = false`. A full
+      // ring drops the transmit (the slot is already freed; the driver bounds streams
+      // via `MAX_STREAMS` anyway), so the enqueue result is intentionally ignored.
+      let _ = self
+        .tx
+        .enqueue(StreamKind::ResetStream { id, code }, false, |_out| {
+          Ok::<usize, ()>(0)
+        });
+      if self.request_id == Some(id) {
+        self.request_id = None;
+      }
+    }
+  }
+
+  /// Drains a stream-scoped reset the lending [`Frames`] carrier recorded into
+  /// `pending_reset` (a non-tunnel stream error it could not reset in place — it
+  /// holds only disjoint per-entry borrows, not `streams` / `tx`), performing the
+  /// real [`reset_stream`](Self::reset_stream) now that `&mut self` is whole again.
+  /// Run at the head of every `&mut self` entry that can observe the effect —
+  /// [`handle_stream`](Self::handle_stream), [`poll_transmit`](Self::poll_transmit),
+  /// [`poll_event`](Self::poll_event) — so the freed slot and the `RESET_STREAM`
+  /// transmit are in place before the driver looks. Idempotent: `pending_reset` is
+  /// `take`n, so a second call is a no-op.
+  fn apply_pending_reset(&mut self)
+  where
+    TxBuf: AsMut<[u8]>,
+  {
+    if let Some((id, code)) = self.pending_reset.take() {
+      self.reset_stream(id, code);
+    }
+  }
+
+  /// Routes an eager request-stream error by SCOPE — the `&mut self` twin of the
+  /// lending carrier's [`RequestFrames::fail_or_reset`], shared by the request-stream
+  /// FIN branches of [`handle_stream_fin`](Self::handle_stream_fin):
+  ///
+  /// - the CONNECT **tunnel** (`is_tunnel`): connection-fatal via [`fail`](Self::fail)
+  ///   (one tunnel = one connection);
+  /// - a **general** request stream: a stream-scoped [`reset_stream`](Self::reset_stream)
+  ///   with the error's [`code`](H3Error::code) (free the slot + enqueue `RESET_STREAM`,
+  ///   RFC 9114 §4.1.2), leaving the connection live.
+  fn fail_or_reset_stream(&mut self, id: StreamId, is_tunnel: bool, error: H3Error)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+    TxBuf: AsMut<[u8]>,
+  {
+    if is_tunnel {
+      self.fail(error);
+    } else {
+      self.reset_stream(id, error.code());
+    }
+  }
 
   /// The control-and-SETTINGS transmit plus the two idle QPACK uni streams.
   /// Shared by [`start`](Self::start) on both roles.
@@ -2351,6 +2488,7 @@ where
       events,
       close_pending,
       conn_error,
+      pending_reset,
       ..
     } = self;
     let entry = streams.get_mut(id)?;
@@ -2370,10 +2508,12 @@ where
     Some(RequestFrames {
       drain_on_drop: RequestFrames::<ReqBuf, EventBuf>::drain_for_errors,
       items,
+      id,
       phase,
       events,
       close_pending,
       conn_error,
+      pending_reset,
       request_abandoned,
       is_client,
       establish_on_response,
@@ -2702,8 +2842,14 @@ where
     ReqBuf: AsMut<[u8]>,
     CtrlBuf: AsMut<[u8]>,
     EventBuf: AsMut<[Option<Event>]>,
+    TxBuf: AsMut<[u8]>,
     UniBuf: AsRef<[UniSlot]> + AsMut<[UniSlot]>,
   {
+    // Materialize a stream-scoped reset a prior `Frames` carrier deferred (free the
+    // slot + enqueue the `RESET_STREAM`) before routing these bytes, so a reset stream
+    // is already gone — new bytes on it then read as a fresh/unknown id, never the
+    // half-reset entry.
+    self.apply_pending_reset();
     // A `Failed` connection is terminal: it must neither process nor yield any
     // inbound bytes, on ANY stream (request, control, QPACK, uni). The terminal
     // `ConnError` is the last observable signal — surfacing application DATA (or
@@ -3007,18 +3153,21 @@ where
   /// same `resolve_non_request_close` body) — with each `id` matching at most one
   /// case:
   ///
-  /// - **Request stream**: a reset of the established tunnel is a teardown. On the
-  ///   abandoned (lazily-dropped, never-observed) request stream it is a no-op: a
-  ///   `RESET_STREAM` is a stream ABORT carrying no frame bytes, so — unlike a FIN, which
-  ///   [`handle_stream_fin`](Self::handle_stream_fin) still validates for mid-frame
-  ///   truncation — there is no framing to validate, and the stream is already inert (no
-  ///   `Reset` event, since the tunnel was never observed). Otherwise, while not
-  ///   already terminal, enqueue [`Event::Reset`] exactly once and transition to
-  ///   `Closing` via the phase-only `begin_close`; a reset arriving while already
-  ///   `Closing` is a no-op (a redundant `Reset`). Unlike
-  ///   [`close`](Self::close) this does NOT arm a local FIN: the peer already reset
-  ///   the stream, so FINing it would be spurious. This is the phase transition (and
-  ///   the `Reset` signal) only.
+  /// - **Request stream**, scoped by whether it is the CONNECT tunnel (the entry's
+  ///   private `is_tunnel` marker):
+  ///   - a **general** (non-tunnel) request stream is stream-scoped: free its store
+  ///     slot and leave the connection (and every OTHER stream) live — NO
+  ///     [`Event::Reset`], NO phase change. A `RESET_STREAM` carries no frame bytes,
+  ///     and we do not echo a reset back (the peer already aborted its side).
+  ///   - the **CONNECT tunnel** is connection-scoped (one tunnel = one connection): a
+  ///     reset of the established tunnel is a teardown. On the abandoned
+  ///     (lazily-dropped, never-observed) tunnel stream it is a no-op (there is no
+  ///     framing to validate and the stream is already inert). Otherwise, while not
+  ///     already terminal, enqueue [`Event::Reset`] exactly once and transition to
+  ///     `Closing` via the phase-only `begin_close`; a reset arriving while already
+  ///     `Closing` is a no-op (a redundant `Reset`). Unlike [`close`](Self::close)
+  ///     this does NOT arm a local FIN: the peer already reset the stream, so FINing it
+  ///     would be spurious. This is the phase transition (and the `Reset` signal) only.
   /// - **An outbound critical stream** we opened (control or QPACK encoder/decoder,
   ///   tracked in `roles`): resetting it is
   ///   [`Event::ConnError`]`(`[`H3Error::ClosedCriticalStream`]`)` (RFC 9114 §6.2.1),
@@ -3045,17 +3194,33 @@ where
       return;
     }
     if let Some(entry) = self.streams.get(id) {
-      // An abandoned request stream is inert and a `RESET_STREAM` carries no frame
-      // bytes, so — unlike a FIN (which `handle_stream_fin` still validates for
-      // mid-frame truncation) — there is nothing to validate here: no `Reset` event
-      // (the tunnel was never observed), no failure (a lazy drop is not a violation).
-      if entry.abandoned {
+      let is_tunnel = entry.is_tunnel;
+      let abandoned = entry.abandoned;
+      if !is_tunnel {
+        // A GENERAL request stream the peer reset is stream-scoped: free its slot and
+        // leave the connection (and every other stream) live — NO `Event::Reset`, NO
+        // phase change. A `RESET_STREAM` carries no frame bytes (nothing to validate),
+        // and we do not echo a reset back (the peer already aborted its side). If it was
+        // the tunnel-slot pointer it is cleared. (The tunnel branch below keeps the
+        // connection-scoped teardown.)
+        self.streams.remove(id);
+        if self.request_id == Some(id) {
+          self.request_id = None;
+        }
         return;
       }
-      // Push `Reset` exactly once — only while NOT already terminal (`Failed` is
-      // handled above; this guards the redundant reset-while-`Closing` case) — then
-      // enter `Closing` via the phase-only transition. No deferred FIN is armed: the
-      // peer already reset the request stream, so FINing it would be spurious.
+      // An abandoned tunnel request stream is inert and a `RESET_STREAM` carries no
+      // frame bytes, so — unlike a FIN (which `handle_stream_fin` still validates for
+      // mid-frame truncation) — there is nothing to validate here: no `Reset` event
+      // (the tunnel was never observed), no failure (a lazy drop is not a violation).
+      if abandoned {
+        return;
+      }
+      // The CONNECT tunnel (one tunnel = one connection): a reset is a teardown. Push
+      // `Reset` exactly once — only while NOT already terminal (`Failed` is handled
+      // above; this guards the redundant reset-while-`Closing` case) — then enter
+      // `Closing` via the phase-only transition. No deferred FIN is armed: the peer
+      // already reset the request stream, so FINing it would be spurious.
       if !self.is_terminal() {
         let _ = self.events.push(Event::Reset(code));
         let _ = self.begin_close();
@@ -3079,11 +3244,13 @@ where
   ///     does NOT make the connection terminal. Idempotent: a second clean FIN on
   ///     the (already half-closed) request stream enqueues no duplicate
   ///     `PeerClosed` (the peer FINs its send side at most once);
-  ///   - a clean end at a frame boundary BEFORE the mandatory CONNECT HEADERS is an
-  ///     incomplete request: [`Event::ConnError`]`(`[`H3Error::RequestIncomplete`]`)`
-  ///     (RFC 9114 §8.1), terminal;
-  ///   - an end mid-frame is [`Event::ConnError`]`(`[`H3Error::FrameError`]`)`
-  ///     (RFC 9114 §7.1), terminal.
+  ///   - a malformed FIN — at a frame boundary BEFORE the mandatory CONNECT HEADERS
+  ///     ([`H3Error::RequestIncomplete`], RFC 9114 §8.1) or mid-frame
+  ///     ([`H3Error::FrameError`], RFC 9114 §7.1) — is scoped by whether the stream is
+  ///     the CONNECT tunnel (the entry's private `is_tunnel` marker): on the tunnel it
+  ///     is connection-fatal ([`Event::ConnError`], terminal); on a **general** request
+  ///     stream it is a stream-scoped reset (free the slot + a `RESET_STREAM` transmit,
+  ///     RFC 9114 §4.1.2) that leaves the connection live.
   /// - **An outbound critical stream** (control or QPACK encoder/decoder we
   ///   opened, tracked in `roles`): closing it is
   ///   [`Event::ConnError`]`(`[`H3Error::ClosedCriticalStream`]`)` (RFC 9114
@@ -3102,6 +3269,7 @@ where
   pub fn handle_stream_fin(&mut self, id: StreamId)
   where
     EventBuf: AsMut<[Option<Event>]>,
+    TxBuf: AsMut<[u8]>,
     UniBuf: AsMut<[UniSlot]>,
   {
     // A `Failed` connection is terminal: a FIN on any stream is moot. Do nothing —
@@ -3119,21 +3287,23 @@ where
       // of `self`).
       let fin = entry.fsm.fin();
       let abandoned = entry.abandoned;
+      let is_tunnel = entry.is_tunnel;
       // An abandoned request stream: a prior `handle_stream` decoded its first HEADERS
       // on the drop-drain without the driver observing it, advancing the FSM into its
       // tunnel phase. It is permanently inert to the DRIVER (the tunnel was never
       // observed / established), but — exactly as for inbound bytes above — abandonment
       // is NOT terminal, so the FIN must still be VALIDATED rather than blindly ignored.
-      // A malformed FIN (mid-frame / pre-HEADERS) is a real framing violation and
-      // `fail`s the connection; a CLEAN FIN is validated but SUPPRESSED — no
-      // `PeerClosed`, because the tunnel was never observed/established (a clean FIN on
-      // an abandoned stream is therefore inert but not a fault, so the connection stays
-      // non-terminal). Only a `Failed` connection (above) skips this validation
-      // entirely. Scoped to the request stream so a FIN on a critical stream below
-      // still fails; sits alongside the `Failed` (above) and `peer_closed` guards.
+      // A malformed FIN (mid-frame / pre-HEADERS) is a real framing violation: on the
+      // tunnel it `fail`s the connection; on a general stream it resets only that stream
+      // (RFC 9114 §4.1.2). A CLEAN FIN is validated but SUPPRESSED — no `PeerClosed`,
+      // because the tunnel was never observed/established (a clean FIN on an abandoned
+      // stream is therefore inert but not a fault, so the connection stays non-terminal).
+      // Only a `Failed` connection (above) skips this validation entirely. Scoped to the
+      // request stream so a FIN on a critical stream below still fails; sits alongside
+      // the `Failed` (above) and `peer_closed` guards.
       if abandoned {
         if let Err(e) = fin {
-          self.fail(e);
+          self.fail_or_reset_stream(id, is_tunnel, e);
         }
         return;
       }
@@ -3178,10 +3348,11 @@ where
             }
           }
         }
-        // Connection-fatal: a FIN before the mandatory CONNECT HEADERS
-        // (`RequestIncomplete`) or mid-frame (`FrameError`). Make the connection
-        // terminal (so a later send is rejected) and signal it exactly once.
-        Err(e) => self.fail(e),
+        // A FIN before the mandatory CONNECT HEADERS (`RequestIncomplete`) or mid-frame
+        // (`FrameError`), scoped by `is_tunnel`: connection-fatal on the tunnel (make it
+        // terminal so a later send is rejected, signalled once), a stream-scoped reset
+        // on a general stream (RFC 9114 §4.1.2 — free + `RESET_STREAM`, connection live).
+        Err(e) => self.fail_or_reset_stream(id, is_tunnel, e),
       }
       return;
     }
@@ -3272,6 +3443,11 @@ where
   where
     TxBuf: AsRef<[u8]> + AsMut<[u8]>,
   {
+    // Materialize any stream-scoped reset the lending `Frames` carrier deferred (free
+    // the slot + enqueue the `RESET_STREAM`) BEFORE the `Failed` guard and the poll,
+    // so the abort transmit is in the ring for the driver to observe. A stream reset
+    // does not fail the connection, so this runs on a live (non-`Failed`) connection.
+    self.apply_pending_reset();
     if self.phase.is_failed() {
       return None;
     }
@@ -3574,11 +3750,13 @@ where
         write_headers_frame(out, response, limit)
       })
       .map_err(map_tx)?;
-    // Mark the tunnel slot's entry as the CONNECT tunnel: the server registered it
-    // non-tunnel at `provide_stream` time (it could not yet tell tunnel from general),
-    // and `accept_with` is the tunnel-establishing path. The marker keeps the entry's
-    // establishment connection-scoped (matching the `Event::Established` this enqueues)
-    // and feeds the later per-stream-vs-connection reset split.
+    // Confirm the tunnel slot's entry as the CONNECT tunnel: the server registered it
+    // `is_tunnel = true` (tunnel-assumed) at `provide_stream` time, and `accept_with` is
+    // the tunnel-establishing path, so it stays `true` (re-asserted here for clarity).
+    // The marker keeps the entry's establishment connection-scoped (matching the
+    // `Event::Established` this enqueues) and feeds the per-stream-vs-connection reset
+    // split (a tunnel error is connection-fatal). The general `send_response` path
+    // instead clears it.
     if let Some(entry) = self.streams.get_mut(id) {
       entry.is_tunnel = true;
     }
@@ -3640,12 +3818,20 @@ where
         write_headers_frame(out, headers, limit)
       })
       .map_err(map_tx)?;
-    // The final response marks the per-stream entry established (gating `Frame::Data`)
+    // Responding via the GENERAL path marks the entry NON-tunnel (`is_tunnel = false`):
+    // the server registered it `true` (tunnel-assumed) since it could not tell tunnel
+    // from general before any HEADERS, and committing to a general response is what makes
+    // it general — a later stream error then resets just this stream rather than failing
+    // the connection (RFC 9114 §4.1.2). `accept_with` is the tunnel path and keeps it
+    // `true`. The FINAL response also marks the entry established (gating `Frame::Data`)
     // but pushes NO connection `Event` — general streams are not connection-scoped (see
-    // the doc above). An interim response leaves it unestablished. A missing entry was
+    // the doc above); an interim response leaves it unestablished. A missing entry was
     // already rejected by the guard.
-    if last && let Some(entry) = self.streams.get_mut(id) {
-      entry.established = true;
+    if let Some(entry) = self.streams.get_mut(id) {
+      entry.is_tunnel = false;
+      if last {
+        entry.established = true;
+      }
     }
     Ok(())
   }
