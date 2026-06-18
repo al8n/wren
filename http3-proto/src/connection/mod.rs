@@ -2986,11 +2986,30 @@ where
       return Err(Error::Closed);
     }
     let id = self.request_id.ok_or(Error::Closed)?;
-    self.send_data_on(id, payload)
+    // The tunnel keeps its `send_data(&[u8])` arity. On heap tiers the general
+    // entry point takes an owned `DataBuf`, so the borrowed slice is copied into
+    // one here (the caller did not hand us a buffer to hold zero-copy); on bare it
+    // forwards the slice to the copy-into-ring path.
+    #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+    {
+      self.send_data_on(id, crate::backend::copy_from_slice(payload))
+    }
+    #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
+    {
+      self.send_data_on(id, payload)
+    }
   }
 
   /// Sends a chunk of DATA-frame payload (request/response body, or tunnel bytes) on
   /// the request stream `id` — the GENERAL per-stream DATA entry point.
+  ///
+  /// On the heap tiers (`alloc` / `std` / `no-atomic`) `body` is anything that
+  /// converts into the refcounted [`DataBuf`](crate::backend::DataBuf) (e.g.
+  /// `bytes::Bytes` / `portable_atomic_util::Arc<[u8]>`); it is held **zero-copy**
+  /// as the DATA frame's body segment (a cheap clone, not a memcpy into the ring),
+  /// so only the small frame header is bounded by the per-slot capacity — a large
+  /// body no longer has to fit one transmit slot. The driver writes the resulting
+  /// two-segment [`Transmit`] (header + body) with a vectored `writev`.
   ///
   /// Distinct in name from the tunnel [`send_data`](Self::send_data) because Rust
   /// cannot overload by arity and the tunnel keeps its `send_data(&[u8])` (a thin
@@ -3002,8 +3021,42 @@ where
   ///   has not run, or `id` is not a known request stream;
   /// - [`Err`]`(`[`Error::WouldBlock`]`)` when the transmit ring is momentarily full
   ///   — drain it with [`poll_transmit`](Self::poll_transmit) and retry;
+  /// - [`Err`]`(`[`Error::Protocol`]`(`[`H3Error::FrameError`]`))` when the DATA
+  ///   frame header does not fit a transmit slot (only the header is so bounded).
+  #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+  pub fn send_data_on<B>(&mut self, id: StreamId, body: B) -> Result<(), Error>
+  where
+    TxBuf: AsMut<[u8]>,
+    B: Into<crate::backend::DataBuf>,
+  {
+    use core::ops::Deref;
+    self.guard_send_on(id)?;
+    let body = body.into();
+    let body_len = body.deref().len();
+    self
+      .tx
+      .enqueue_data(StreamKind::Existing(id), false, body, |out| {
+        write_data_header(out, body_len)
+      })
+      .map_err(map_tx)
+  }
+
+  /// Sends a chunk of DATA-frame payload on the request stream `id` — the GENERAL
+  /// per-stream DATA entry point (bare `no_std` tier).
+  ///
+  /// With no refcounted buffer type available, `payload` is copied into the
+  /// caller-provided transmit storage as a single framed DATA segment (the v1
+  /// no-alloc bound: the framed payload must fit one transmit slot). See the heap
+  /// tiers' [`send_data_on`](Self::send_data_on) for the zero-copy variant.
+  ///
+  /// Returns:
+  /// - [`Err`]`(`[`Error::Closed`]`)` when the connection is closing/failed, setup
+  ///   has not run, or `id` is not a known request stream;
+  /// - [`Err`]`(`[`Error::WouldBlock`]`)` when the transmit ring is momentarily full
+  ///   — drain it with [`poll_transmit`](Self::poll_transmit) and retry;
   /// - [`Err`]`(`[`Error::Protocol`]`(`[`H3Error::FrameError`]`))` when the framed
   ///   payload does not fit a single transmit slot (the v1 no-alloc bound).
+  #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
   pub fn send_data_on(&mut self, id: StreamId, payload: &[u8]) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
@@ -3015,6 +3068,17 @@ where
         write_data_frame(out, payload)
       })
       .map_err(map_tx)
+  }
+
+  /// Reports that the driver wrote `n` bytes of the transmit last returned by
+  /// [`poll_transmit`](Self::poll_transmit) — a partial QUIC `writev`. The next
+  /// `poll_transmit` re-yields that transmit's remaining segments (re-sliced past
+  /// the `n` already-written bytes); the transmit is only dropped once every byte
+  /// is written. A `poll_transmit` with no intervening `consume_transmit`
+  /// acknowledges the previous transmit as fully written (the "driver re-polls"
+  /// model). Calling this with no transmit in flight is a no-op.
+  pub fn consume_transmit(&mut self, n: usize) {
+    self.tx.consume(n);
   }
 
   /// Sends a trailing HEADERS section (trailers) on the request stream `id`, in
@@ -3986,10 +4050,20 @@ fn write_headers_frame<H: Headers + ?Sized>(
   Ok(frame_len)
 }
 
-/// Writes a DATA frame (`[header][payload]`) for `payload`.
+/// Writes a DATA frame (`[header][payload]`) for `payload` — the bare-tier path
+/// that copies the whole framed DATA into one transmit slot (no refcounted body).
+#[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
 fn write_data_frame(out: &mut [u8], payload: &[u8]) -> Result<usize, Error> {
   let at = write_frame_header(out, 0, FrameType::Data, payload.len())?;
   copy_into(out, at, payload)
+}
+
+/// Writes ONLY a DATA frame header (type + length varints) for a body of
+/// `body_len` bytes — the heap-tier vectored path, whose body segment is the held
+/// [`DataBuf`](crate::backend::DataBuf) and so is never copied into the ring.
+#[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+fn write_data_header(out: &mut [u8], body_len: usize) -> Result<usize, Error> {
+  write_frame_header(out, 0, FrameType::Data, body_len)
 }
 
 /// Writes a frame header of `(ty, length)` at `out[at..]`, returning the new

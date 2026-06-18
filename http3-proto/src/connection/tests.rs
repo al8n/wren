@@ -29,12 +29,18 @@ const RESPONSE: [(&str, &str); 1] = [(":status", "200")];
 fn connection_value_is_small_with_handle_backed_storage() {
   let borrowed = core::mem::size_of::<StaticBorrowedConnection<Client>>();
   let default = core::mem::size_of::<StaticConnection<Client>>();
+  // The connection stores buffer *handles* and state inline — never the byte
+  // buffers. On the heap tiers the transmit ring additionally holds one optional
+  // refcounted DATA body (`DataBuf`) per slot so queued DATA is vectored
+  // zero-copy; those are still small handles (a refcounted pointer each), but
+  // `TX_N` of them widen the inline ring past the original 1 KiB bound — hence the
+  // slightly larger ceiling here.
   assert!(
-    borrowed < 1024,
+    borrowed < 1280,
     "borrowed connection should only store buffer handles and state, got {borrowed}"
   );
   assert!(
-    default < 1024,
+    default < 1280,
     "default std/alloc connection should only store buffer handles and state, got {default}"
   );
 }
@@ -246,11 +252,20 @@ impl Harness {
         };
         match conn_tx {
           None => break,
-          Some(t) => Captured {
-            kind: t.kind(),
-            bytes: t.bytes().to_vec(),
-            fin: t.fin(),
-          },
+          Some(t) => {
+            // A DATA transmit is vectored (`[frame-header, body]`); concatenate the
+            // segments so the receiver sees the framed DATA as on the wire. Every
+            // other transmit is single-segment, so this is just its one slice.
+            let mut bytes = Vec::new();
+            for seg in t.segments() {
+              bytes.extend_from_slice(seg);
+            }
+            Captured {
+              kind: t.kind(),
+              bytes,
+              fin: t.fin(),
+            }
+          }
         }
       };
       self.route(from, captured);
@@ -577,13 +592,87 @@ fn request_body_and_response_body_flow_both_directions() {
   // SETTINGS + open GET on a driver-minted id + 200 final; returns the id.
   let id = h.establish_general_get(StreamId::new(0));
   // Client sends a request body chunk AFTER the request headers.
-  h.client.send_data_on(id, b"ping").expect("client body");
+  h.client
+    .send_data_on(id, bytes::Bytes::from_static(b"ping"))
+    .expect("client body");
   h.pump();
   assert_eq!(h.server_rx, b"ping");
   // Server sends a response body chunk.
-  h.server.send_data_on(id, b"pong").expect("server body");
+  h.server
+    .send_data_on(id, bytes::Bytes::from_static(b"pong"))
+    .expect("server body");
   h.pump();
   assert_eq!(h.client_rx, b"pong");
+}
+
+#[test]
+fn send_data_zero_copy_vectored_output() {
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  // Heap tier: send_data_on takes impl Into<DataBuf> (Bytes). Zero-copy: the body
+  // slice in the transmit points into the held buffer.
+  let body = bytes::Bytes::from_static(b"hello world");
+  h.client.send_data_on(id, body).expect("send");
+  // The transmit is vectored: segment 0 = DATA frame header, segment 1 = body.
+  let t = h.client.poll_transmit().expect("transmit");
+  let segs = t.segments();
+  assert_eq!(segs.len(), 2);
+  assert!(!segs[0].is_empty(), "frame header segment");
+  assert_eq!(segs[1], b"hello world", "body segment (zero-copy)");
+}
+
+#[test]
+fn partial_write_resumes_from_offset() {
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  h.client
+    .send_data_on(id, bytes::Bytes::from_static(b"abcdef"))
+    .unwrap();
+  // First poll: full vector. Simulate the driver writing only 2 total bytes.
+  let total = h.client.poll_transmit().expect("t").len();
+  assert!(total > 2);
+  h.client.consume_transmit(2);
+  // Next poll resumes: the same transmit, fewer remaining bytes.
+  let remaining = h.client.poll_transmit().expect("t2").len();
+  assert_eq!(remaining, total - 2);
+  // Finish writing it.
+  h.client.consume_transmit(remaining);
+  assert!(h.client.poll_transmit().is_none());
+}
+
+#[test]
+fn partial_write_mid_body_yields_only_remaining_body() {
+  // A partial write that has fully written the frame header resumes mid-body: the
+  // next poll's header segment is empty and the body segment is the unwritten tail.
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  h.client
+    .send_data_on(id, bytes::Bytes::from_static(b"abcdef"))
+    .unwrap();
+  let first = h.client.poll_transmit().expect("t");
+  let header_len = first.segments().first().map(|s| s.len()).expect("header");
+  let total = first.len();
+  // Consume the whole header plus the first body byte.
+  h.client.consume_transmit(header_len + 1);
+  let t2 = h.client.poll_transmit().expect("t2");
+  assert_eq!(t2.len(), total - header_len - 1);
+  let segs = t2.segments();
+  assert_eq!(segs.len(), 2, "still a vectored DATA transmit");
+  assert!(segs[0].is_empty(), "header fully written");
+  assert_eq!(segs[1], b"bcdef", "only the unwritten body tail remains");
+}
+
+#[test]
+fn bare_tier_send_data_on_copies() {
+  // Bare tier path is exercised by tiers.rs; here just assert &[u8] arity on the
+  // heap tier still compiles via Into<DataBuf> for a slice copy.
+  // (Heap: bytes::Bytes::copy_from_slice path.)
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  h.client
+    .send_data_on(id, bytes::Bytes::copy_from_slice(b"x"))
+    .unwrap();
+  assert!(h.client.poll_transmit().is_some());
 }
 
 #[test]
@@ -621,7 +710,9 @@ fn interim_1xx_precedes_final_response() {
 fn trailers_after_body_both_directions() {
   let mut h = Harness::new();
   let id = h.establish_general_get(StreamId::new(0));
-  h.client.send_data_on(id, b"x").unwrap();
+  h.client
+    .send_data_on(id, bytes::Bytes::from_static(b"x"))
+    .unwrap();
   h.client
     .send_trailers(id, &[("x-checksum", "abc")][..])
     .unwrap();
@@ -661,9 +752,11 @@ fn general_client_final_response_establishes_per_stream_without_connection_event
     "a general stream must NOT flip the connection to Open"
   );
   // Yet the per-stream entry IS established: DATA flows both ways.
-  h.client.send_data_on(id, b"req-body").expect("client body");
+  h.client
+    .send_data_on(id, bytes::Bytes::from_static(b"req-body"))
+    .expect("client body");
   h.server
-    .send_data_on(id, b"resp-body")
+    .send_data_on(id, bytes::Bytes::from_static(b"resp-body"))
     .expect("server body");
   h.pump();
   assert_eq!(h.server_rx, b"req-body");
@@ -699,15 +792,23 @@ fn two_concurrent_request_streams_are_isolated() {
   h.server
     .send_response(id_b, &[(":status", "200")][..], true)
     .unwrap();
-  h.client.send_data_on(id_a, b"a-body").unwrap();
-  h.client.send_data_on(id_b, b"b-body").unwrap();
+  h.client
+    .send_data_on(id_a, bytes::Bytes::from_static(b"a-body"))
+    .unwrap();
+  h.client
+    .send_data_on(id_b, bytes::Bytes::from_static(b"b-body"))
+    .unwrap();
   h.pump();
   assert_eq!(h.server_rx_for(id_a), b"a-body");
   assert_eq!(h.server_rx_for(id_b), b"b-body");
   // Both streams remain usable: a trailing server→client body on each lands on the
   // right stream, proving per-stream isolation of the DATA path.
-  h.server.send_data_on(id_a, b"a-tail").unwrap();
-  h.server.send_data_on(id_b, b"b-tail").unwrap();
+  h.server
+    .send_data_on(id_a, bytes::Bytes::from_static(b"a-tail"))
+    .unwrap();
+  h.server
+    .send_data_on(id_b, bytes::Bytes::from_static(b"b-tail"))
+    .unwrap();
   h.pump();
   assert_eq!(h.client_rx_for(id_a), b"a-tail");
   assert_eq!(h.client_rx_for(id_b), b"b-tail");
@@ -751,7 +852,9 @@ fn two_concurrent_request_streams_reset_is_isolated() {
     "connection survives a per-stream reset"
   );
   assert!(h.server.stream_is_gone(id_a), "reset stream A is freed");
-  h.server.send_data_on(id_b, b"still-ok").unwrap();
+  h.server
+    .send_data_on(id_b, bytes::Bytes::from_static(b"still-ok"))
+    .unwrap();
   h.pump();
   assert_eq!(
     h.client_rx_for(id_b),
@@ -821,7 +924,9 @@ fn malformed_response_on_general_client_stream_resets_alone() {
   assert!(no_fin, "a RESET_STREAM is not a FIN");
   assert!(h.client.stream_is_gone(id_a), "reset stream A is freed");
   // Stream B is undisturbed: a trailing server body lands on it end to end.
-  h.server.send_data_on(id_b, b"still-ok").unwrap();
+  h.server
+    .send_data_on(id_b, bytes::Bytes::from_static(b"still-ok"))
+    .unwrap();
   h.pump();
   assert_eq!(
     h.client_rx_for(id_b),
@@ -1000,17 +1105,26 @@ fn data_split_across_transmits_reassembles() {
 }
 
 #[test]
-fn send_data_payload_larger_than_slot_errors_not_panics() {
+fn send_data_body_larger_than_slot_is_zero_copy_not_an_error() {
+  // On the heap tiers the DATA body is held zero-copy in the refcounted `DataBuf`,
+  // so only the small frame header is bounded by a transmit slot — a body larger
+  // than `TX_CAP` is no longer the v1 no-alloc error it is on the bare tier; it is
+  // sent as a vectored transmit whose body segment is the whole payload.
   let mut h = Harness::new();
   h.run_until_established();
-  // A payload that, even before its frame header, cannot fit one transmit slot.
-  let big = std::vec![0u8; super::queue::TX_CAP + 1];
-  let err = h
-    .client
+  let big = std::vec![7u8; super::queue::TX_CAP + 1];
+  h.client
     .send_data(&big)
-    .expect_err("oversized send must error");
-  // The too-large case is the framing/protocol error, not WouldBlock.
-  assert!(matches!(err, Error::Protocol(H3Error::FrameError)));
+    .expect("an over-slot body is fine on heap tiers (held zero-copy)");
+  let t = h.client.poll_transmit().expect("vectored DATA transmit");
+  let segs = t.segments();
+  assert_eq!(segs.len(), 2, "DATA is vectored: [header, body]");
+  assert_eq!(
+    segs[1].len(),
+    big.len(),
+    "body segment is the whole payload"
+  );
+  assert!(segs[1].iter().all(|&b| b == 7));
 }
 
 #[test]

@@ -32,6 +32,30 @@ cfg_heap! {
   pub use imp::DataBuf;
 }
 
+/// Copies `src` into an owned, refcounted [`DataBuf`] (the tier-neutral
+/// "slice → buffer" constructor — `Bytes::copy_from_slice` on the native-atomic
+/// tier, `Arc::<[u8]>::from` on the portable-atomic tier). Used by the tunnel's
+/// `send_data(&[u8])` wrapper, where the caller passes a borrowed slice rather
+/// than an owned buffer to hold zero-copy.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "alloc", feature = "std", feature = "no-atomic")))
+)]
+pub fn copy_from_slice(src: &[u8]) -> DataBuf {
+  bytes::Bytes::copy_from_slice(src)
+}
+
+/// Copies `src` into an owned, refcounted [`DataBuf`] (portable-atomic tier).
+#[cfg(all(feature = "no-atomic", not(any(feature = "alloc", feature = "std"))))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "alloc", feature = "std", feature = "no-atomic")))
+)]
+pub fn copy_from_slice(src: &[u8]) -> DataBuf {
+  portable_atomic_util::Arc::<[u8]>::from(src)
+}
+
 /// Zero-sized DATA-buffer placeholder for the bare `no_std` tier (no allocator,
 /// no refcount type): DATA bytes are copied into caller TX storage instead.
 #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
