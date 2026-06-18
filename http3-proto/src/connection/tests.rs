@@ -551,6 +551,37 @@ fn client_server_connect_then_tunnel() {
 }
 
 #[test]
+fn connect_tunnel_is_specialization_of_general_stream() {
+  // A full CONNECT establish leaves exactly one stream in the store, flagged as
+  // the tunnel; tunnel send_data routes through the general per-id DATA path.
+  let mut h = Harness::new();
+  h.run_until_established();
+  let id = h.request_id.expect("request id");
+  // Exactly one stream on each side, and it is the one named by the tunnel-slot
+  // pointer (`request_id`): the CONNECT tunnel IS the general per-id stream, not a
+  // separate channel.
+  assert_eq!(h.client.streams.len(), 1, "tunnel is the one client stream");
+  assert_eq!(h.server.streams.len(), 1, "tunnel is the one server stream");
+  // Both sides flag that single stream `is_tunnel` (the client via `open_with`, the
+  // server via `accept_with`): the specialization marker that scopes its errors
+  // connection-fatal and drove the connection-wide `Event::Established`.
+  assert!(
+    h.client.streams.get(id).expect("client entry").is_tunnel,
+    "client tunnel stream is flagged is_tunnel"
+  );
+  assert!(
+    h.server.streams.get(id).expect("server entry").is_tunnel,
+    "server tunnel stream is flagged is_tunnel"
+  );
+  // Tunnel send_data works and the byte reaches the server: it is a thin wrapper
+  // over the general `send_data_on(request_id, ..)`, so the DATA frame travels the
+  // SAME per-id path the general body tests exercise.
+  h.client.send_data(b"tunneled").expect("tunnel send_data");
+  h.pump();
+  assert_eq!(h.server_rx, b"tunneled");
+}
+
+#[test]
 fn general_request_response_headers_roundtrip() {
   // Client opens a normal GET; server sees Frame::Request, sends a final 200.
   let mut h = Harness::new();
