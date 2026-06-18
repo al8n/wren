@@ -2077,6 +2077,92 @@ fn poll_transmit_does_not_strand_reset_returning_none_first() {
   );
 }
 
+// Round 5, finding #1 (reset-delivery LIVENESS, held-front class): a reset for stream B
+// queued BEHIND a held front transmit on stream A must still reach the wire. The old design
+// modeled `RESET_STREAM` as a byte-ring slot, so B's abort competed with A's bytes for ring
+// capacity and could be stranded behind the held front — `drain_leading_tombstones` was a
+// no-op while a front was held, so the freed-by-purge capacity never opened, and a driver
+// draining to the first `None` never saw B's reset. The dedicated reset control channel
+// emits the abort FIRST and unconditionally (never byte-ring-gated), so it is impossible to
+// strand behind a held front.
+
+/// Brings up a second GENERAL request/response stream on `id` to its final response, on a
+/// harness whose first general stream is already established. Returns `id`.
+fn add_general_get(h: &mut Harness, id: StreamId) -> StreamId {
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, get).expect("open_request B");
+  h.pump();
+  h.server
+    .send_response(id, &[(":status", "200")][..], true)
+    .expect("send_response final B");
+  h.pump();
+  id
+}
+
+#[test]
+fn reset_not_stranded_behind_held_front_transmit() {
+  let mut h = Harness::new();
+  h.server.set_mode(Mode::General);
+  // Two established general streams: A (the held-front stream) and B (the reset target).
+  let id_a = h.establish_general_get(StreamId::new(0));
+  let id_b = add_general_get(&mut h, StreamId::new(4));
+  // Drain setup + HEADERS so the ring holds only the DATA queued below.
+  while h.server.poll_transmit().is_some() {}
+  // FILL the ring: A's DATA at the head, then B's DATA in every remaining slot. Polling A
+  // sets the held front; reset_stream(B) then purges every B slot but the abort cannot fit
+  // the (still-full) ring — the exact pre-fix hazard.
+  h.server
+    .send_data_on(id_a, bytes::Bytes::from_static(b"aaaa"))
+    .expect("DATA on A (head)");
+  let mut filled = false;
+  for _ in 0..super::queue::TX_N {
+    if h
+      .server
+      .send_data_on(id_b, bytes::Bytes::from_static(b"bbbb"))
+      .is_err()
+    {
+      filled = true;
+      break;
+    }
+  }
+  assert!(filled, "the ring is full (A at the head, B in the rest)");
+  // Poll A: A's slot is now HELD at the ring front. While a front is held the pre-fix
+  // `drain_leading_tombstones` was a no-op, so the freed-by-purge capacity never opened.
+  let first = h.server.poll_transmit().expect("A's DATA").kind();
+  assert!(
+    matches!(first, StreamKind::Existing(rid) if rid == id_a),
+    "the held front is A's DATA, got {first:?}"
+  );
+  // Reset B (queued behind the held front, ring full). Purges B's DATA, records the abort.
+  h.server.reset_stream(id_b, H3Error::RequestRejected.code());
+  assert!(h.server.stream_is_gone(id_b), "B is freed");
+  // Drive the driver's poll loop, STOPPING on the first `None` (no `consume_transmit`: the
+  // "re-poll advances" model drains A and B's purged slots). Pre-fix, the first poll
+  // advanced past the held A, drained B's tombstones to empty, and returned `None` with
+  // B's abort still queued — stranded. The dedicated reset channel emits B's RESET_STREAM
+  // FIRST, before any `None`.
+  let mut saw_reset_b = false;
+  let mut polls = 0usize;
+  while let Some(t) = h.server.poll_transmit() {
+    if matches!(t.kind(), StreamKind::ResetStream { id: rid, code }
+      if rid == id_b && code == H3Error::RequestRejected.code())
+    {
+      saw_reset_b = true;
+    }
+    polls = polls.saturating_add(1);
+    assert!(polls < 32, "the poll loop terminates");
+  }
+  assert!(
+    saw_reset_b,
+    "B's reset reaches the wire despite A's held front (never stranded behind it)"
+  );
+}
+
 // Round 4, finding #2 (reset-delivery EXACTLY-ONCE + reconcile): a carrier-recorded pending
 // reset must be reconciled at the head of EVERY public method that observes/mutates
 // request-stream membership. Pre-fix `reset_stream` / `handle_stream_fin` / `handle_stream_reset`

@@ -129,59 +129,48 @@ where
   }
 }
 
-/// Whether a queued stream reset still needs its [`StreamStore`] slot bookkeeping
-/// (free the slot + clear the tunnel-slot pointer) or only its wire `RESET_STREAM`.
-///
-/// [`StreamStore`]: crate::stream_store::StreamStore
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ResetKind {
-  /// A carrier-deferred stream reset: the lending `Frames` carrier recorded a
-  /// stream-scoped error on a tracked stream it could not reset in place. Draining
-  /// it does the slot bookkeeping (remove the entry, clear `request_id` if it was the
-  /// tunnel-slot pointer) AND enqueues the wire `RESET_STREAM`.
-  Carrier,
-  /// A wire-only reset: the stream was never inserted (the capacity backstop's
-  /// overflow stream) or its slot bookkeeping already ran (a `Carrier` reset whose
-  /// wire enqueue then hit a full ring and was re-queued). Draining it only enqueues
-  /// the wire `RESET_STREAM`.
-  WireOnly,
-}
-
-/// One queued stream reset: the stream `id`, its application error `code`, and
-/// whether it still needs slot bookkeeping ([`ResetKind`]).
+/// One pending stream reset: the stream `id` and its application error `code`. The
+/// abort is emitted as a wire `RESET_STREAM` directly from the dedicated reset
+/// channel (it is never stored in the byte [`TxRing`]).
 #[derive(Clone, Copy)]
 pub(crate) struct PendingReset {
   pub(crate) id: StreamId,
   pub(crate) code: u64,
-  pub(crate) kind: ResetKind,
 }
 
-/// The number of stream resets the bounded retry queue holds. Resets are rare — a
-/// stream-scoped protocol error or a capacity rejection — and the queue normally
-/// holds 0–1 entries (a carrier records at most one per `handle_stream`, drained at
-/// the head of the next API entry). It only grows when the transmit ring is
-/// persistently full and `RESET_STREAM`s cannot flush; a handful of slots is generous
-/// headroom for that. Exceeding it is itself a load condition (a peer flooding streams
-/// against a full ring), so it fails the connection closed ([`H3Error::ExcessiveLoad`])
-/// rather than silently dropping a reset. Kept small so the inline queue does not
+/// The number of distinct stream resets the dedicated reset channel holds.
+///
+/// A stream reset is a per-stream control SIGNAL, not bytes: it is recorded here and
+/// emitted as a `RESET_STREAM` directly by [`poll_transmit`], so — unlike the byte
+/// [`TxRing`] — it is NEVER gated by ring slot capacity. The channel dedups by stream
+/// id (at most one entry per stream, FIRST code wins), and [`poll_transmit`] drains
+/// one entry per call, so it cannot hold more than the number of distinct live streams
+/// reset since the last poll. A handful of slots is generous headroom; exceeding it is
+/// pathological (a flood of distinct streams reset without a single intervening
+/// `poll_transmit`), so the connection fails closed ([`H3Error::ExcessiveLoad`])
+/// rather than silently dropping a reset. Kept small so the inline channel does not
 /// bloat the connection value (see `connection_value_is_small_*`).
 ///
+/// [`poll_transmit`]: crate::connection::Connection::poll_transmit
 /// [`H3Error::ExcessiveLoad`]: crate::error::H3Error::ExcessiveLoad
 pub(crate) const RESET_CAP: usize = 4;
 
-/// A small bounded FIFO of stream resets awaiting materialization, generalizing the
-/// connection's former single `pending_reset` slot.
+/// A small bounded, id-keyed FIFO of stream resets — the dedicated reset
+/// control-signal channel, the SOLE source of `RESET_STREAM`.
 ///
-/// Two sources feed it (see [`ResetKind`]): the lending `Frames` carrier records a
-/// stream-scoped error it cannot reset in place, and the capacity backstop records a
-/// `RESET_STREAM(RequestRejected)` whose direct enqueue lost to a full transmit ring.
-/// The connection drains it at the head of every `&mut self` entry that can observe
-/// the effect (`handle_stream` / `poll_transmit` / the send guards), retrying the
-/// wire enqueue so a backpressured reset is never lost.
+/// A stream reset is modeled as a per-stream SIGNAL rather than queued bytes:
+/// [`poll_transmit`] emits one entry per call FIRST and unconditionally (before
+/// polling the byte [`TxRing`]), so an abort can never be byte-ring-gated, dropped, or
+/// stranded behind a held front transmit. Two sources feed it: the lending `Frames`
+/// carrier records a stream-scoped error it cannot reset in place, and the capacity
+/// backstop records a `RESET_STREAM(RequestRejected)` for an at-capacity stream.
 ///
-/// A FIFO ring rather than `BoundedQueue` because draining must be able to re-queue a
-/// just-popped entry (its wire enqueue lost to a still-full ring) at the FRONT, so the
-/// reset is retried before any later one — `BoundedQueue` only pushes to the back.
+/// Recording is DEDUPED by stream id ([`record`](Self::record)): at most one entry per
+/// stream, the FIRST code wins (exactly-once per RFC 9114 §4.1.2). FIFO is incidental —
+/// emission order among distinct streams does not matter; the queue exists only so a
+/// recorded abort survives until the next `poll_transmit`.
+///
+/// [`poll_transmit`]: crate::connection::Connection::poll_transmit
 pub(crate) struct PendingResets {
   slots: [Option<PendingReset>; RESET_CAP],
   head: usize,
@@ -189,7 +178,7 @@ pub(crate) struct PendingResets {
 }
 
 impl PendingResets {
-  /// An empty reset queue.
+  /// An empty reset channel.
   pub(crate) const fn new() -> Self {
     Self {
       slots: [None; RESET_CAP],
@@ -198,16 +187,8 @@ impl PendingResets {
     }
   }
 
-  /// Whether the queue holds no pending resets. Drives the `poll_transmit`
-  /// drain-then-retry fixpoint: it keeps freeing tombstoned capacity and retrying only
-  /// while resets remain.
-  pub(crate) fn is_empty(&self) -> bool {
-    self.len == 0
-  }
-
-  /// Whether a reset for `id` is already queued (any [`ResetKind`]). The carrier's
-  /// "first stream error wins" guard and the capacity path use this so a stream is
-  /// never reset twice.
+  /// Whether a reset for `id` is already recorded. The carrier's "first stream error
+  /// wins" guard and the reset call sites use this so a stream is never reset twice.
   pub(crate) fn contains(&self, id: StreamId) -> bool {
     self
       .slots
@@ -215,15 +196,36 @@ impl PendingResets {
       .any(|s| matches!(s, Some(r) if r.id == id))
   }
 
-  /// Pushes a reset to the BACK, returning `false` if the queue is full (the caller
-  /// then fails the connection closed — `RESET_CAP` resets is already pathological).
-  pub(crate) fn push_back(&mut self, reset: PendingReset) -> bool {
+  /// Snapshots the ids of every recorded reset into a fixed array (trailing slots stay
+  /// `None`). The reconcile (`reconcile_pending_resets`) copies the ids out FIRST and
+  /// then iterates them, so it can call `&mut self` store / ring methods per id without
+  /// holding a borrow of this channel across the call.
+  pub(crate) fn ids(&self) -> [Option<StreamId>; RESET_CAP] {
+    let mut out = [None; RESET_CAP];
+    let mut n = 0usize;
+    for reset in self.slots.iter().flatten() {
+      if let Some(dst) = out.get_mut(n) {
+        *dst = Some(reset.id);
+        n = n.saturating_add(1);
+      }
+    }
+    out
+  }
+
+  /// Records a reset for `id` with `code`, DEDUPED by id (FIRST code wins): a no-op
+  /// returning `true` if `id` is already recorded. Returns `false` only when the
+  /// channel is full of distinct other streams (the caller then fails the connection
+  /// closed — `RESET_CAP` distinct undrained resets is pathological).
+  pub(crate) fn record(&mut self, id: StreamId, code: u64) -> bool {
+    if self.contains(id) {
+      return true;
+    }
     if self.len >= RESET_CAP {
       return false;
     }
     let tail = wrap_add(self.head, self.len, RESET_CAP);
     if let Some(slot) = self.slots.get_mut(tail) {
-      *slot = Some(reset);
+      *slot = Some(PendingReset { id, code });
       self.len = self.len.saturating_add(1);
       true
     } else {
@@ -231,29 +233,10 @@ impl PendingResets {
     }
   }
 
-  /// Re-queues a just-popped reset at the FRONT (its wire enqueue lost to a full
-  /// ring), so it is retried before any later reset. The slot it was popped from is
-  /// free, so this never overflows after a `pop_front`.
-  pub(crate) fn push_front(&mut self, reset: PendingReset) -> bool {
-    if self.len >= RESET_CAP {
-      return false;
-    }
-    // One step back from `head`, wrapping, without `-1 % cap`.
-    self.head = if self.head == 0 {
-      RESET_CAP.saturating_sub(1)
-    } else {
-      self.head.saturating_sub(1)
-    };
-    if let Some(slot) = self.slots.get_mut(self.head) {
-      *slot = Some(reset);
-      self.len = self.len.saturating_add(1);
-      true
-    } else {
-      false
-    }
-  }
-
-  /// Pops the front reset, or `None` if empty.
+  /// Pops the front reset, or `None` if empty. Used by [`poll_transmit`] to emit one
+  /// pending abort per call.
+  ///
+  /// [`poll_transmit`]: crate::connection::Connection::poll_transmit
   pub(crate) fn pop_front(&mut self) -> Option<PendingReset> {
     if self.len == 0 {
       return None;
@@ -473,35 +456,6 @@ where
     self.build_transmit(self.head, consumed)
   }
 
-  /// Drains every leading tombstoned slot, freeing the `len` they hold WITHOUT
-  /// lending a transmit. The liveness half of the reset-delivery state machine: a
-  /// reset that [`purge_stream`](Self::purge_stream)d a full ring of same-stream DATA
-  /// cannot fit the still-full ring at enqueue time (tombstones count against `len`
-  /// until drained), so the connection must free that tombstoned capacity BEFORE it
-  /// retries the reset enqueue — otherwise [`poll`](Self::poll) drains the tombstones
-  /// itself, returns `None`, and a driver that stops on `None` strands the reset.
-  ///
-  /// Returns the number of slots freed, so the caller can re-attempt a pending reset
-  /// only when capacity actually opened (a fixpoint, since purging a second reset's
-  /// head DATA can create fresh leading tombstones). A no-op while a transmit is held
-  /// in `front` (a partial `writev` not yet acked): that slot is live and must not be
-  /// advanced past here — the next `poll` resolves the front first. `purge_stream`
-  /// clears `front` whenever it tombstones the head, so a held front is never a
-  /// tombstone.
-  pub(crate) fn drain_leading_tombstones(&mut self) -> usize {
-    if self.front.is_some() {
-      return 0;
-    }
-    let capacity = self.capacity();
-    debug_assert!(capacity <= TX_N);
-    if capacity == 0 {
-      return 0;
-    }
-    let before = self.len;
-    self.drop_head_tombstones(capacity);
-    before.saturating_sub(self.len)
-  }
-
   /// Advances the head past any leading tombstoned slots (freeing each held body),
   /// so [`poll`](Self::poll) lands on the next live transmit or empties the ring.
   fn drop_head_tombstones(&mut self, capacity: usize) {
@@ -578,22 +532,27 @@ where
 
   /// Tombstones every queued ordinary transmit targeting request stream `id`
   /// ([`StreamKind::Existing`] DATA / FIN), freeing each held [`DataBuf`] body so a
-  /// reset SUPERSEDES — not queues behind — its stream's stale bytes.
-  /// [`poll`](Self::poll) then skips the tombstones, so no `Existing(id)` transmit
-  /// precedes the `RESET_STREAM` the caller enqueues next (RFC 9114 §4.1.2: the reset
-  /// abandons the stream's data).
+  /// reset SUPERSEDES — not leaves behind — its stream's stale bytes.
+  /// [`poll`](Self::poll) then skips the tombstones, so no `Existing(id)` transmit is
+  /// ever yielded once the stream is reset (RFC 9114 §4.1.2: the reset abandons the
+  /// stream's data).
+  ///
+  /// This is the DATA-purge half of a reset and is DECOUPLED from emitting the
+  /// `RESET_STREAM`: the abort is emitted directly from the dedicated reset channel
+  /// (never from this byte ring), so it reaches the wire regardless of whether/when
+  /// these tombstones drain. The purge only guarantees no stale same-stream DATA is
+  /// yielded; it does not gate, and is not gated by, the abort.
   ///
   /// Tombstone-and-skip rather than compaction: the byte ring is positionally indexed
   /// (slot `i`'s bytes live at `i * TX_CAP`), so removing interior slots would mean
-  /// moving survivors' bytes; marking them skip-on-poll avoids that while keeping the
-  /// ordering guarantee. Tombstoned slots still count against `len` until `poll` drains
-  /// them, so a reset that cannot fit the (still-full) ring immediately is re-queued
-  /// (never dropped) and materializes once `poll` skips a tombstone and frees a slot.
+  /// moving survivors' bytes; marking them skip-on-poll avoids that. Tombstoned slots
+  /// count against `len` until `poll` drains them (a no-op to the driver: `poll` skips
+  /// straight past them to the next live transmit or to empty).
   ///
   /// Held-front edge case: if the in-flight front transmit (a partial `writev` recorded
   /// via [`consume`](Self::consume)) is `id`'s data, it is tombstoned too and `front` is
   /// cleared — the already-written prefix is on the wire, but the reset abandons the
-  /// stream, so the queue must yield no further `id` bytes before the reset.
+  /// stream, so the queue must yield no further `id` bytes.
   pub(crate) fn purge_stream(&mut self, id: StreamId) {
     let capacity = self.capacity_via_mut();
     debug_assert!(capacity <= TX_N);

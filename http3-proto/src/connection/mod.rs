@@ -46,7 +46,7 @@ mod queue;
 use core::marker::PhantomData;
 
 use derive_more::IsVariant;
-use queue::{BoundedQueue, PendingReset, PendingResets, ResetKind, TX_CAP, TxError, TxRing};
+use queue::{BoundedQueue, PendingResets, TX_CAP, TxError, TxRing};
 
 use crate::{
   Error, HeaderSet,
@@ -416,15 +416,16 @@ struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
   /// non-droppable slot the eager fail paths use. Another distinct `Connection`
   /// field, so the borrow stays disjoint from `phase` / `events` / `close_pending`.
   conn_error: &'a mut Option<H3Error>,
-  /// A disjoint borrow of the connection's `pending_resets` queue — the stream-scoped
+  /// A disjoint borrow of the connection's `pending_resets` channel — the stream-scoped
   /// twin of `conn_error`. On a NON-tunnel stream a request-FSM / validator error is
   /// a STREAM error (RFC 9114 §4.1.2): it resets only this stream, leaving the
-  /// connection live. The carrier holds per-entry borrows, not `streams` / `tx`, so
-  /// it cannot do the reset in place; it records a [`ResetKind::Carrier`] entry here
-  /// and the next `&mut self` API entry materializes it via
-  /// [`reset_stream`](Connection::reset_stream). Yet another distinct `Connection`
-  /// field, so the borrow stays disjoint from `phase` / `events` / `close_pending` /
-  /// `conn_error` / `request_abandoned`. See [`fail_or_reset`](Self::fail_or_reset).
+  /// connection live. The carrier holds per-entry borrows, not `streams` / `tx`, so it
+  /// cannot do the reset's slot bookkeeping / DATA purge in place; it only RECORDS the
+  /// abort `(id, code)` here, and the next `&mut self` API entry reconciles it (frees the
+  /// slot, purges the stream's DATA) while `poll_transmit` emits the `RESET_STREAM`
+  /// directly from the channel. Yet another distinct `Connection` field, so the borrow
+  /// stays disjoint from `phase` / `events` / `close_pending` / `conn_error` /
+  /// `request_abandoned`. See [`fail_or_reset`](Self::fail_or_reset).
   pending_resets: &'a mut PendingResets,
   /// A disjoint borrow of the connection's `request_abandoned` flag. The drop-drain
   /// ([`drain_for_errors`](Self::drain_for_errors)) sets it when it decodes the first
@@ -747,27 +748,24 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
         error,
       );
     } else {
-      // First stream error wins (a later error on the same already-reset stream does
-      // not overwrite the recorded code); the carrier also stops yielding once this is
-      // set (see `Frames::next` / `drain_for_errors`). A `Carrier` entry: the slot
-      // bookkeeping still has to run when it is drained. A full reset queue is
-      // pathological (`RESET_CAP` resets in flight); fail the connection closed rather
-      // than silently drop the reset.
-      if !self.pending_resets.contains(self.id) {
-        let reset = PendingReset {
-          id: self.id,
-          code: error.code(),
-          kind: ResetKind::Carrier,
-        };
-        if !self.pending_resets.push_back(reset) {
-          Phase::fail_into(
-            self.phase,
-            self.close_pending,
-            self.events,
-            self.conn_error,
-            H3Error::ExcessiveLoad,
-          );
-        }
+      // Record the abort into the dedicated reset channel (deduped by id, FIRST code
+      // wins — a later error on the same already-condemned stream neither overwrites
+      // the code nor adds a duplicate). The carrier holds only per-entry borrows, not
+      // `streams` / `tx`, so it cannot free the slot or purge the stream's queued DATA
+      // here; the next `&mut self` API entry reconciles that (see
+      // `Connection::reconcile_pending_resets`), and `poll_transmit` emits the abort
+      // directly from this channel — never byte-ring-gated. The carrier also stops
+      // yielding once this is set (see `Frames::next` / `drain_for_errors`). A full
+      // channel is pathological (`RESET_CAP` distinct undrained resets); fail the
+      // connection closed rather than silently drop the reset.
+      if !self.pending_resets.record(self.id, error.code()) {
+        Phase::fail_into(
+          self.phase,
+          self.close_pending,
+          self.events,
+          self.conn_error,
+          H3Error::ExcessiveLoad,
+        );
       }
     }
   }
@@ -1927,29 +1925,31 @@ pub struct Connection<
   /// is delivered exactly once; the fail transition also clears the pending event
   /// queue, so no stale graceful event precedes the terminal `ConnError`.
   conn_error: Option<H3Error>,
-  /// A small bounded FIFO of stream-scoped resets awaiting materialization (free the
-  /// slot + enqueue the `RESET_STREAM` transmit). Two sources feed it:
+  /// The dedicated reset control-signal channel: a small bounded, id-keyed queue of
+  /// stream-scoped `RESET_STREAM` aborts, the SOLE source of `RESET_STREAM`. A reset is
+  /// modeled as a per-stream SIGNAL, not bytes: it is recorded here and emitted directly
+  /// by [`poll_transmit`](Self::poll_transmit) (FIRST, one per call, never gated by byte
+  /// [`TxRing`] slot capacity), so an abort can never be ring-gated, dropped, or stranded
+  /// behind a held front transmit. Two sources feed it:
   ///
   /// - the lending [`Frames`] carrier (its [`RequestFrames`]) on a non-tunnel stream
-  ///   error — a malformed message / validator violation / premature DATA — that
-  ///   resets only that stream rather than failing the connection. The carrier holds
-  ///   disjoint borrows of the per-stream entry's fields and cannot reach `streams` /
-  ///   `tx` to do the real reset, so it records a [`ResetKind::Carrier`] entry here;
-  ///   and
+  ///   error — a malformed message / validator violation / premature DATA — that resets
+  ///   only that stream rather than failing the connection. The carrier holds disjoint
+  ///   borrows of the per-stream entry's fields and cannot reach `streams` / `tx`, so it
+  ///   only RECORDS the abort here; and
   /// - the capacity backstop ([`provide_request_stream`](Self::provide_request_stream)):
-  ///   when an at-capacity request stream is rejected and the direct
-  ///   `RESET_STREAM(RequestRejected)` enqueue loses to a full transmit ring, the reset
-  ///   is recorded as a [`ResetKind::WireOnly`] entry rather than dropped, so it is
-  ///   retried (RFC 9114 §4.1 — `H3_REQUEST_REJECTED` lets the peer safely retry).
+  ///   an at-capacity request stream is rejected and its `RESET_STREAM(RequestRejected)`
+  ///   recorded here (RFC 9114 §4.1 — `H3_REQUEST_REJECTED` lets the peer safely retry).
   ///
-  /// Drained by [`apply_pending_resets`](Self::apply_pending_resets) at the head of
-  /// every `&mut self` entry that can observe the effect
-  /// ([`handle_stream`](Self::handle_stream) /
-  /// [`poll_transmit`](Self::poll_transmit) / the send guards): each entry's slot
-  /// bookkeeping runs (carrier entries only, exactly once) and the wire enqueue is
-  /// retried, so a backpressured reset is never lost. A FIFO ring (not the
-  /// `BoundedQueue` the events / tx ring use) because a drain whose wire enqueue still
-  /// loses to a full ring re-queues the entry at the FRONT for the next retry.
+  /// Recording is DEDUPED by stream id (FIRST code wins — exactly-once per RFC 9114
+  /// §4.1.2). The slot bookkeeping (free the entry, clear `request_id`) and DATA purge a
+  /// recorded reset still needs run in [`reconcile_pending_resets`](Self::reconcile_pending_resets),
+  /// at the head of every `&mut self` entry that can observe the effect
+  /// ([`handle_stream`](Self::handle_stream) / [`poll_transmit`](Self::poll_transmit) /
+  /// the send guards), DECOUPLED from the abort emission — the abort lives in this channel
+  /// regardless of whether the DATA tombstones have drained. A full channel is
+  /// pathological (`RESET_CAP` distinct undrained resets), so it fails the connection
+  /// closed rather than silently dropping an abort.
   ///
   /// This is the stream-scoped twin of `conn_error` (the connection-fatal slot): a
   /// distinct `Connection` field so the carrier's borrow of it stays disjoint from
@@ -2425,7 +2425,7 @@ where
     // `provide_request_stream` below. Otherwise a condemned `id` would read as an
     // idempotent re-provide (kept as-is) while its abort is still queued; reconciling
     // first lets a same-id re-provide register a clean fresh stream instead.
-    self.apply_pending_resets();
+    self.reconcile_pending_resets();
     if role.is_request() {
       // Classify the new request entry's `is_tunnel` (its error scope: RFC 9114
       // §4.1.2 per-stream vs a connection error) by SIDE and connection [`Mode`]:
@@ -2523,12 +2523,12 @@ where
       // At store capacity: drop the overflow stream and reset it with
       // `H3_REQUEST_REJECTED` so the peer learns the request was not accepted (and may
       // retry it). The entry was never inserted, so `reset_stream`'s `streams.remove`
-      // would no-op — route through the SINGLE never-drop `enqueue_stream_reset` so the
-      // `RESET_STREAM` IS emitted (purge is a no-op: an uninserted id has no queued DATA),
-      // and on a full ring the wire enqueue is deferred into the bounded retry queue (NOT
-      // dropped — RFC 9114 §4.1, `H3_REQUEST_REJECTED` lets the peer safely retry),
-      // materialized on a later `poll_transmit`. NOT connection-fatal; the driver also
-      // bounds concurrency via QUIC `MAX_STREAMS`.
+      // would no-op — record the abort directly via `enqueue_stream_reset`, which puts it
+      // in the dedicated reset channel (purge is a no-op: an uninserted id has no queued
+      // DATA). `poll_transmit` emits it FIRST and unconditionally — never byte-ring-gated,
+      // so it is delivered even under a full ring (RFC 9114 §4.1 — `H3_REQUEST_REJECTED`
+      // lets the peer safely retry). NOT connection-fatal; the driver also bounds
+      // concurrency via QUIC `MAX_STREAMS`.
       self.enqueue_stream_reset(id, H3Error::RequestRejected.code());
       return RequestRegister::Rejected;
     }
@@ -2539,35 +2539,32 @@ where
     RequestRegister::Inserted
   }
 
-  /// Resets request stream `id` with application error `code`: enqueues a
-  /// [`StreamKind::ResetStream`] transmit (a QUIC `RESET_STREAM` abort — no bytes,
-  /// the driver issues `reset_stream(id, code)` on QUIC), frees the stream's
-  /// [`StreamStore`] slot, and leaves the connection and every OTHER stream live.
-  /// This is the stream-scoped counterpart to the connection-fatal `fail` transition:
-  /// the connection `phase` is unchanged (it stays `Open` / `Handshaking` / `Closing`)
-  /// and no [`Event::ConnError`] is enqueued.
+  /// Resets request stream `id` with application error `code`: records the abort in the
+  /// dedicated reset channel (the SOLE source of `RESET_STREAM` — a QUIC `RESET_STREAM`
+  /// carrying no bytes, the driver issues `reset_stream(id, code)` on QUIC), purges the
+  /// stream's already-queued DATA/FIN from the transmit ring, frees the stream's
+  /// [`StreamStore`] slot, and leaves the connection and every OTHER stream live. This
+  /// is the stream-scoped counterpart to the connection-fatal `fail` transition: the
+  /// connection `phase` is unchanged (it stays `Open` / `Handshaking` / `Closing`) and
+  /// no [`Event::ConnError`] is enqueued.
   ///
   /// Used for stream-scoped errors on a GENERAL (non-tunnel) request stream — a
   /// malformed message / validator violation / premature DATA (RFC 9114 §4.1.2) — and
-  /// as the driver-requested per-stream cancel. The capacity backstop
-  /// ([`H3Error::RequestRejected`]) does NOT route through here (its overflow stream was
-  /// never inserted, so `streams.remove` would be a no-op); it enqueues the wire-only
-  /// `RESET_STREAM` directly so the rejected stream IS reset. A fatal on the CONNECT
-  /// **tunnel** stream is connection-fatal instead (one tunnel = one connection), failing
-  /// the whole connection rather than resetting here.
+  /// as the driver-requested per-stream cancel. A fatal on the CONNECT **tunnel** stream
+  /// is connection-fatal instead (one tunnel = one connection), failing the whole
+  /// connection rather than resetting here.
   ///
   /// A no-op if `id` is not a tracked request stream or the connection is already
-  /// `Failed` (a reset is moot then, and a stale `RESET_STREAM` transmit must not
-  /// follow the terminal `ConnError`). If `id` was the tunnel-slot pointer
-  /// (`request_id`) it is cleared.
+  /// `Failed` (a reset is moot then, and a stale `RESET_STREAM` must not follow the
+  /// terminal `ConnError`). If `id` was the tunnel-slot pointer (`request_id`) it is
+  /// cleared.
   ///
-  /// EXACTLY-ONCE: a carrier-recorded reset for `id` is reconciled FIRST (any deferred
-  /// stream reset is materialized), so a stream a `Frames` carrier already condemned is
-  /// gone from `streams` before the membership check below — this call then no-ops on it
-  /// rather than emitting a SECOND `RESET_STREAM` with a possibly-different `code`. As a
-  /// second guard, an `id` whose reset is still pending (e.g. a backpressured retry) is
-  /// left to that reset: the FIRST error code wins, at most one `RESET_STREAM` per stream
-  /// (RFC 9114 §4.1.2).
+  /// EXACTLY-ONCE (RFC 9114 §4.1.2 — at most one `RESET_STREAM` per stream): a
+  /// carrier-recorded reset for `id` is reconciled FIRST (its slot freed + DATA purged),
+  /// so a stream a `Frames` carrier already condemned is gone from `streams` before the
+  /// membership check below. As a second guard, an `id` already in the reset channel is
+  /// left to that recorded abort — the FIRST code wins; this call does not record a
+  /// second with a possibly-different `code`.
   #[allow(private_bounds)]
   pub fn reset_stream(&mut self, id: StreamId, code: u64)
   where
@@ -2578,11 +2575,12 @@ where
       return;
     }
     // Reconcile any deferred reset for `id` (and every other condemned stream) before
-    // touching `streams`: a carrier reset materializes here (entry removed, its abort
-    // queued with the ORIGINAL code), so the `remove` below sees `id` as already gone.
-    self.apply_pending_resets();
-    // A reset for `id` still pending (a backpressured retry) already owns this stream's
-    // single abort — do not enqueue a duplicate with a different code.
+    // touching `streams`: a carrier reset's slot bookkeeping runs here (entry removed,
+    // DATA purged) while its abort stays recorded in the channel, so the `remove` below
+    // sees `id` as already gone.
+    self.reconcile_pending_resets();
+    // A reset for `id` already recorded already owns this stream's single abort — do not
+    // record a duplicate with a different code (first code wins).
     if self.pending_resets.contains(id) {
       return;
     }
@@ -2590,135 +2588,78 @@ where
       if self.request_id == Some(id) {
         self.request_id = None;
       }
-      // Route through the SINGLE never-drop reset path: it purges this stream's queued
-      // DATA/FIN so the abort supersedes them, then enqueues the `RESET_STREAM` (or, under
-      // a full ring, records a bounded retry materialized on a later `poll_transmit`). The
-      // driver also issues the QUIC `reset_stream` and bounds concurrency via `MAX_STREAMS`,
-      // but the wire `RESET_STREAM` must NOT be dropped — a general-stream FIN error (via
-      // `fail_or_reset_stream`) reaches here, and silently dropping its abort would leave
-      // the peer never told (RFC 9114 §4.1.2).
       self.enqueue_stream_reset(id, code);
     }
   }
 
-  /// The SINGLE never-drop reset-emission path every reset call site routes through, so a
-  /// queued `RESET_STREAM` can never be lost under transmit backpressure. It
-  /// [`purge`](TxRing::purge_stream)s the stream's already-queued ordinary transmits (so
-  /// the abort supersedes — does not queue behind — its stale DATA/FIN, RFC 9114 §4.1.2)
-  /// via [`try_enqueue_reset_wire`](Self::try_enqueue_reset_wire), then, if the ring was
-  /// full, records a [`ResetKind::WireOnly`] retry in the bounded `pending_resets` queue
-  /// (materialized at the head of a later [`poll_transmit`](Self::poll_transmit) once the
-  /// ring drains). Enqueues NOTHING WITHOUT requiring an existing [`StreamStore`] entry —
-  /// the capacity backstop's at-capacity stream was never inserted yet must still be reset
-  /// on the wire (RFC 9114 §4.1 — `H3_REQUEST_REJECTED` lets the peer retry).
+  /// Records `id`'s abort into the dedicated reset channel and purges the stream's
+  /// already-queued ordinary transmits ([`Existing(id)`](StreamKind::Existing) DATA/FIN,
+  /// freeing held bodies) from the byte [`TxRing`], so no stale same-stream transmit is
+  /// ever yielded once the stream is reset (RFC 9114 §4.1.2). The abort itself is emitted
+  /// LATER, directly from the channel by [`poll_transmit`](Self::poll_transmit) — never
+  /// from the byte ring — so it can never be ring-slot-gated, dropped, or stranded behind
+  /// a held front transmit. The purge is therefore DECOUPLED from the abort: it only
+  /// drops stale DATA and neither gates nor is gated by emission.
   ///
-  /// Callers do their own slot bookkeeping first (free the entry, clear `request_id`); this
-  /// owns ONLY the wire half + its never-drop retry. The one caller that retries the wire
-  /// itself is [`apply_pending_resets`](Self::apply_pending_resets) (it re-queues at the
-  /// FRONT to preserve order), so it calls the raw
-  /// [`try_enqueue_reset_wire`](Self::try_enqueue_reset_wire) instead.
+  /// Requires NO existing [`StreamStore`] entry — the capacity backstop's at-capacity
+  /// stream was never inserted, yet must still be reset on the wire (RFC 9114 §4.1 —
+  /// `H3_REQUEST_REJECTED` lets the peer retry); its purge is a harmless no-op (an
+  /// uninserted id queued no DATA). Callers do their own slot bookkeeping first (free the
+  /// entry, clear `request_id`). A no-op when already `Failed` (a reset is moot — a stale
+  /// `RESET_STREAM` must not follow the terminal `ConnError`). Recording is deduped by id
+  /// (FIRST code wins); a full channel is pathological (`RESET_CAP` distinct undrained
+  /// resets), so the connection fails closed ([`H3Error::ExcessiveLoad`]) rather than
+  /// silently dropping the abort.
   fn enqueue_stream_reset(&mut self, id: StreamId, code: u64)
   where
     TxBuf: AsMut<[u8]>,
     EventBuf: AsMut<[Option<Event>]>,
   {
-    if !self.try_enqueue_reset_wire(id, code) {
-      self.queue_reset_retry(id, code, ResetKind::WireOnly);
-    }
-  }
-
-  /// The raw one-shot wire half of a reset: PURGE the stream's queued ordinary transmits
-  /// ([`Existing(id)`](StreamKind::Existing) DATA/FIN — freeing held bodies) so no stale
-  /// same-stream transmit precedes the abort, then enqueue the `RESET_STREAM` transmit
-  /// (empty bytes, `fin = false`). The purge is the structural half of the ordering
-  /// guarantee: it is impossible to enqueue a `RESET_STREAM` here without first dropping
-  /// that id's ordinary transmits from the ring.
-  ///
-  /// Returns whether the `RESET_STREAM` was enqueued: `true` on success OR when already
-  /// `Failed` (a reset is moot then — a stale `RESET_STREAM` must not follow the terminal
-  /// `ConnError`, so the caller treats it as done); `false` only when the ring was full, so
-  /// the caller records / re-queues a retry rather than dropping the reset. The purge still
-  /// runs on a full ring (its tombstones count against the ring until `poll` drains them,
-  /// which then frees a slot for the retried abort).
-  fn try_enqueue_reset_wire(&mut self, id: StreamId, code: u64) -> bool
-  where
-    TxBuf: AsMut<[u8]>,
-  {
     if self.phase.is_failed() {
-      return true;
+      return;
     }
+    // Purge the stream's queued DATA/FIN so `poll` never yields stale same-stream bytes;
+    // decoupled from the abort, which emits from the channel below.
     self.tx.purge_stream(id);
-    self
-      .tx
-      .enqueue(StreamKind::ResetStream { id, code }, false, |_out| {
-        Ok::<usize, ()>(0)
-      })
-      .is_ok()
-  }
-
-  /// Records a stream reset into the bounded `pending_resets` retry queue, failing the
-  /// connection closed ([`H3Error::ExcessiveLoad`]) if the queue is full rather than
-  /// silently dropping the reset (`RESET_CAP` in-flight resets is pathological — a
-  /// persistently full ring). The single never-drop reset path
-  /// ([`enqueue_stream_reset`](Self::enqueue_stream_reset)) calls this when the wire enqueue
-  /// loses to a full ring; the carrier-deferred path records a `Carrier` entry directly
-  /// (see [`RequestFrames::fail_or_reset`]).
-  fn queue_reset_retry(&mut self, id: StreamId, code: u64, kind: ResetKind)
-  where
-    EventBuf: AsMut<[Option<Event>]>,
-  {
-    if !self
-      .pending_resets
-      .push_back(PendingReset { id, code, kind })
-    {
+    if !self.pending_resets.record(id, code) {
       self.fail(H3Error::ExcessiveLoad);
     }
   }
 
-  /// Drains the `pending_resets` retry queue: materializes every stream-scoped reset
-  /// recorded by the lending [`Frames`] carrier (a non-tunnel stream error it could not
-  /// reset in place — it holds only disjoint per-entry borrows, not `streams` / `tx`)
-  /// or by the capacity backstop, now that `&mut self` is whole again. Run at the head
-  /// of every `&mut self` entry that can observe the effect —
-  /// [`handle_stream`](Self::handle_stream), [`poll_transmit`](Self::poll_transmit), the
-  /// send guards — so the freed slot and the `RESET_STREAM` transmit are in place before
-  /// the driver looks. (`poll_event` does not call this: a stream reset produces no
-  /// `Event`.)
+  /// Reconciles the dedicated reset channel against `streams` / the transmit ring,
+  /// idempotently, WITHOUT emitting (or removing) any abort. For every recorded reset it
+  /// frees the [`StreamStore`] slot (clearing the tunnel-slot pointer `request_id` if it
+  /// matched) and purges the stream's already-queued DATA/FIN from the ring. The recorded
+  /// aborts stay in the channel; [`poll_transmit`](Self::poll_transmit) emits them.
   ///
-  /// Each entry's slot bookkeeping (a [`ResetKind::Carrier`] entry) runs exactly once,
-  /// THEN the wire enqueue is attempted. If the wire enqueue loses to a still-full ring
-  /// the entry is re-queued at the FRONT as [`ResetKind::WireOnly`] (slot bookkeeping
-  /// already done) and the drain STOPS — the ring is full, so retrying later entries is
-  /// pointless and would reorder the freed-slot/wire effects. The next
-  /// [`poll_transmit`](Self::poll_transmit) (after the driver drains the ring) retries.
-  fn apply_pending_resets(&mut self)
+  /// Run at the head of every `&mut self` entry that can observe the effect —
+  /// [`handle_stream`](Self::handle_stream), [`poll_transmit`](Self::poll_transmit), the
+  /// send guards — so a stream the lending [`Frames`] carrier condemned (it holds only
+  /// disjoint per-entry borrows, not `streams` / `tx`, so it could only record the abort)
+  /// reads as GONE before the driver looks: `send_data_on` / `send_response` on it are
+  /// rejected, and no stale same-stream DATA precedes the abort. Idempotent — `remove`
+  /// no-ops on an already-freed slot and re-purging already-tombstoned slots is harmless —
+  /// so running it on every entry is safe. (`poll_event` does not call it: a stream reset
+  /// produces no `Event`.)
+  fn reconcile_pending_resets(&mut self)
   where
     TxBuf: AsMut<[u8]>,
   {
-    while let Some(reset) = self.pending_resets.pop_front() {
-      // `Carrier` entries still need the slot freed (and the tunnel-slot pointer
-      // cleared) before the wire enqueue; that bookkeeping cannot fail and must run
-      // even if the ring is full, so a condemned stream's id reads as gone at the send
-      // guards regardless of backpressure. `WireOnly` entries already had it done.
-      if reset.kind == ResetKind::Carrier
-        && self.streams.remove(reset.id).is_some()
-        && self.request_id == Some(reset.id)
-      {
+    // Snapshot the ids first so the per-id `&mut self` store / ring calls below do not
+    // hold a borrow of `pending_resets`. At most `RESET_CAP` ids; the aborts stay
+    // recorded for `poll_transmit` to emit.
+    for id in self.pending_resets.ids().into_iter().flatten() {
+      // Free the slot (idempotent) so a condemned stream's id reads as gone at the send
+      // guards, and clear the tunnel-slot pointer if this was it. The carrier could not
+      // do this in place; the capacity backstop already did (its stream was never
+      // inserted), so this no-ops there.
+      if self.streams.remove(id).is_some() && self.request_id == Some(id) {
         self.request_id = None;
       }
-      // Try the wire half (which purges the stream's queued DATA/FIN first, so a condemned
-      // general stream's stale bytes never precede its abort). On a full ring, re-queue at
-      // the FRONT as `WireOnly` (the slot bookkeeping is already done) and stop — the next
-      // `poll_transmit` retries once the ring drains. The raw one-shot is used here (not the
-      // never-drop `enqueue_stream_reset`) because this owns the ordered FRONT re-queue.
-      if !self.try_enqueue_reset_wire(reset.id, reset.code) {
-        let _ = self.pending_resets.push_front(PendingReset {
-          id: reset.id,
-          code: reset.code,
-          kind: ResetKind::WireOnly,
-        });
-        return;
-      }
+      // Drop the stream's queued DATA/FIN so `poll` never yields stale same-stream bytes
+      // ahead of (or after) the abort. Decoupled from emission — purging here does not
+      // gate the abort, which `poll_transmit` emits from the channel regardless.
+      self.tx.purge_stream(id);
     }
   }
 
@@ -3248,7 +3189,7 @@ where
     // slot + enqueue the `RESET_STREAM`) before routing these bytes, so a reset stream
     // is already gone — new bytes on it then read as a fresh/unknown id, never the
     // half-reset entry.
-    self.apply_pending_resets();
+    self.reconcile_pending_resets();
     // A `Failed` connection is terminal: it must neither process nor yield any
     // inbound bytes, on ANY stream (request, control, QPACK, uni). The terminal
     // `ConnError` is the last observable signal — surfacing application DATA (or
@@ -3593,7 +3534,7 @@ where
   where
     TxBuf: AsMut<[u8]>,
   {
-    self.apply_pending_resets();
+    self.reconcile_pending_resets();
     match self.phase {
       Phase::Closing | Phase::Failed | Phase::Created => return Err(Error::Closed),
       Phase::Handshaking | Phase::Open => {}
@@ -3726,7 +3667,7 @@ where
     // on the still-present condemned entry — re-resetting it or pushing a spurious
     // `Reset` — while its original reset is still queued (a duplicate / wrong-code abort
     // on the wire). A stream reset does not fail the connection, so this runs live.
-    self.apply_pending_resets();
+    self.reconcile_pending_resets();
     if let Some(entry) = self.streams.get(id) {
       let is_tunnel = entry.is_tunnel;
       let abandoned = entry.abandoned;
@@ -3822,7 +3763,7 @@ where
     // abort / spurious event. A stream reset does not fail the connection, so this runs
     // live; the condemned `id` then reads as unknown here (handled by the non-request
     // fallthrough, which ignores it).
-    self.apply_pending_resets();
+    self.reconcile_pending_resets();
     if let Some(entry) = self.streams.get(id) {
       // Read the per-stream FIN outcome + markers into locals so the `entry` (and thus
       // `self.streams`) borrow ends before any `self.fail` / `self.events` mutation
@@ -3982,31 +3923,42 @@ where
   ///
   /// Lending: the returned [`Transmit`] borrows the connection's transmit ring
   /// and is valid until the next `poll_transmit`.
+  ///
+  /// Reset ordering & LIVENESS: a stream reset is a per-stream control SIGNAL, not
+  /// bytes. Pending `RESET_STREAM` aborts come from the dedicated reset channel and are
+  /// emitted FIRST — one per call, BEFORE the byte ring — and unconditionally: an abort
+  /// is never gated by ring slot capacity, so `poll_transmit` can ALWAYS emit a recorded
+  /// abort and can NEVER return `None` while one is pending. This dissolves the whole
+  /// reset-stranding class (a full ring, tombstone ordering, a held front transmit) by
+  /// construction. The stream's stale queued DATA was already purged from the ring when
+  /// the reset was recorded (and re-asserted by the reconcile below), so the abort
+  /// supersedes — never trails — it.
   pub fn poll_transmit(&mut self) -> Option<Transmit<'_>>
   where
     TxBuf: AsRef<[u8]> + AsMut<[u8]>,
   {
-    // Materialize any stream-scoped reset the lending `Frames` carrier deferred (free
-    // the slot + enqueue the `RESET_STREAM`) BEFORE the `Failed` guard and the poll,
-    // so the abort transmit is in the ring for the driver to observe. A stream reset
-    // does not fail the connection, so this runs on a live (non-`Failed`) connection.
-    //
-    // LIVENESS (the never-strand invariant): a mandatory pending reset must reach the
-    // wire even if the driver stops its poll loop on the first `None`. The hazard is a
-    // reset that purged a full ring of same-stream DATA: those purged slots are
-    // tombstoned but still count against the ring's `len` until drained, so the reset's
-    // own enqueue cannot fit and it is re-queued. If we then polled, `tx.poll` would
-    // drain the tombstones, find `len == 0`, and return `None` with the reset stranded.
-    // So drain the tombstoned capacity FIRST, retry the reset into the freed slots, and
-    // repeat to a fixpoint (purging a second reset's head DATA can free a fresh leading
-    // tombstone) — `poll_transmit` never returns `None` while a pending reset exists and
-    // tombstone draining just freed capacity for it.
-    self.apply_pending_resets();
-    while self.tx.drain_leading_tombstones() > 0 && !self.pending_resets.is_empty() {
-      self.apply_pending_resets();
-    }
+    // Reconcile any deferred stream-scoped reset (free the slot + purge the stream's
+    // queued DATA) BEFORE the `Failed` guard, so a condemned stream reads as gone and no
+    // stale same-stream DATA is yielded. A stream reset does not fail the connection, so
+    // this runs on a live (non-`Failed`) connection.
+    self.reconcile_pending_resets();
     if self.phase.is_failed() {
       return None;
+    }
+    // Emit one pending abort FIRST, directly from the dedicated reset channel — never the
+    // byte ring, so it is never slot-gated and never stranded. A `RESET_STREAM` carries
+    // no bytes (`fin = false`); the driver issues the QUIC `reset_stream(id, code)`. The
+    // stream's DATA was purged when the reset was recorded / by the reconcile above, so
+    // no `Existing(id)` transmit precedes the abort.
+    if let Some(reset) = self.pending_resets.pop_front() {
+      return Some(Transmit::new(
+        StreamKind::ResetStream {
+          id: reset.id,
+          code: reset.code,
+        },
+        &[],
+        false,
+      ));
     }
     // Retry a close FIN that could not be enqueued under backpressure, so it is
     // delivered once the ring drains (never lost).
@@ -4208,7 +4160,7 @@ where
     // call would write its HEADERS onto an entry whose abort is still queued. After
     // reconciling, the condemned entry is gone — re-opening `id` is then a clean fresh
     // stream (a legitimate id reuse after the reset).
-    self.apply_pending_resets();
+    self.reconcile_pending_resets();
     // Preflight the one transmit slot the request HEADERS need BEFORE registering the
     // stream, so a full ring registers NOTHING (no entry lingers without its leading
     // HEADERS, and the construction-time seed buffer is not consumed) and the caller
@@ -4529,7 +4481,7 @@ where
   where
     TxBuf: AsMut<[u8]>,
   {
-    self.apply_pending_resets();
+    self.reconcile_pending_resets();
     match self.phase {
       // Terminal, or setup not yet run: the response must not be sent.
       Phase::Closing | Phase::Failed | Phase::Created => Err(Error::Closed),
