@@ -58,6 +58,7 @@ use crate::{
   settings::Settings,
   stream::{Advanced, ReqBufAlloc, Stream},
   stream_store::StreamStore,
+  validate::{self, MessageKind},
   varint,
 };
 
@@ -600,6 +601,11 @@ where
     // error at the yield point (the FSM eager-validates only the FIRST section; later
     // accepted sections are decoded here).
     if kind.is_trailers() {
+      // Validate the trailers section (no pseudo-headers, no connection-specific
+      // fields) on a dedicated decode pass before the yield decode. A violation is
+      // a stream error (RFC 9114 §4.1.2 / §4.2) routed through the same fail path
+      // as a lazy FSM error (Task 8 scopes it per-stream).
+      rf.validate_section(MessageKind::Trailers, acc_end)?;
       let hs = rf.items.decode_buffered_headers(acc_end)?;
       return Ok(Some(Frame::Trailers(hs)));
     }
@@ -621,7 +627,33 @@ where
       // idempotent decode over the same owned bytes). Decoding here also surfaces a
       // malformed QPACK section (e.g. a second/interim section the FSM did not eagerly
       // validate) as an error at the yield point.
-      let interim = is_interim_status(rf.items.decode_buffered_headers(acc_end)?)?;
+      // A response with no `:status` is a malformed message (it cannot be tagged
+      // interim/final): route it through the fail path like a lazy FSM error (the
+      // full `validate` below would also reject it, but the interim/final tag the
+      // yield needs requires a `:status` first).
+      let interim =
+        match validate::response_is_interim(&mut rf.items.decode_buffered_headers(acc_end)?)? {
+          Some(interim) => interim,
+          None => {
+            Phase::fail_into(
+              rf.phase,
+              rf.close_pending,
+              rf.events,
+              rf.conn_error,
+              H3Error::MessageError,
+            );
+            return Err(H3Error::MessageError);
+          }
+        };
+      // Validate the leading response section under the kind its `:status` class
+      // selects (interim 1xx vs final), before establishing or yielding. A
+      // violation routes through the fail path like a lazy FSM error.
+      let kind = if interim {
+        MessageKind::Interim
+      } else {
+        MessageKind::Response
+      };
+      rf.validate_section(kind, acc_end)?;
       // Establish on the FIRST FINAL response (the observation point). An interim 1xx
       // establishes NOTHING — it leaves the carrier armed so a later final response
       // still establishes. Armed only when entered in `Handshaking` (see
@@ -651,6 +683,10 @@ where
         headers: hs,
       }))
     } else {
+      // Validate the leading request section (pseudo-header presence/ordering,
+      // CONNECT / Extended-CONNECT shape, field rules) before yielding. A violation
+      // routes through the fail path like a lazy FSM error.
+      rf.validate_section(MessageKind::Request, acc_end)?;
       let hs = rf.items.decode_buffered_headers(acc_end)?;
       Ok(Some(Frame::Request(hs)))
     }
@@ -658,6 +694,34 @@ where
 }
 
 impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
+  /// Runs the semantic validator over the just-completed HEADERS section (a fresh,
+  /// dedicated decode pass over the buffered bytes), routing a violation through the
+  /// centralized fail transition — exactly like a lazy request-FSM error — before
+  /// returning it. A semantic violation is a STREAM error (RFC 9114 §4.1.2); the
+  /// per-stream reset scoping is a later task, so for now it is connection-fatal via
+  /// [`Phase::fail_into`] (the existing fail path) so it is at least surfaced. The
+  /// decode pass is independent of the yield decode the caller performs next (each
+  /// [`decode_buffered_headers`](crate::stream::Items::decode_buffered_headers) is a
+  /// fresh, idempotent decode over the same owned bytes).
+  fn validate_section(&mut self, kind: MessageKind, acc_end: usize) -> Result<(), H3Error>
+  where
+    ReqBuf: AsRef<[u8]> + AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
+  {
+    let mut hs = self.items.decode_buffered_headers(acc_end)?;
+    if let Err(e) = validate::validate(kind, &mut hs) {
+      Phase::fail_into(
+        self.phase,
+        self.close_pending,
+        self.events,
+        self.conn_error,
+        e,
+      );
+      return Err(e);
+    }
+    Ok(())
+  }
+
   /// The SERVER's handshake-READINESS side effect of the driver OBSERVING the first
   /// request HEADERS, run the moment [`Frames::next`] YIELDS the first
   /// [`Frame::Request`] to the driver — and ONLY then. This is deliberately NOT run
@@ -3734,29 +3798,6 @@ fn write_headers_frame<H: Headers + ?Sized>(
     out.copy_within(HEADERS_HDR_RESERVE..src_end, at);
   }
   Ok(frame_len)
-}
-
-/// Whether a decoded response field section is an interim (1xx informational)
-/// response, decided by its `:status` pseudo-header (RFC 9110 §15.2): a status in
-/// the `100..=199` range. A response without a `:status`, or with one outside the
-/// 1xx range, is final (`false`). The full pseudo-header validation (presence,
-/// uniqueness, position) is the semantic validator's job (a later task); this is
-/// the minimal placement check the response tagging in [`Frames::next`] needs to
-/// set [`Frame::Response::interim`].
-///
-/// Consumes the lending [`HeaderSet`] iterator (scanning every line for `:status`),
-/// so the caller re-decodes the section for the yield. A QPACK error mid-section
-/// surfaces here.
-fn is_interim_status(mut headers: HeaderSet<'_>) -> Result<bool, H3Error> {
-  while let Some(pair) = headers.next().map_err(|e| e.to_h3())? {
-    if pair.name() == ":status" {
-      // A 1xx status is exactly three ASCII digits beginning with '1'. Parse the
-      // numeric value and test the `100..=199` range; a non-numeric or out-of-range
-      // value is not interim (final or, ultimately, a validator error).
-      return Ok(matches!(pair.value().parse::<u16>(), Ok(100..=199)));
-    }
-  }
-  Ok(false)
 }
 
 /// Writes a DATA frame (`[header][payload]`) for `payload`.
