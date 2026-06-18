@@ -97,6 +97,14 @@ pub enum H3Error {
   /// (type 0x01) is this error.
   #[error("H3_ID_ERROR")]
   IdError,
+  /// `H3_REQUEST_REJECTED` (0x010b): the request was rejected without being
+  /// processed. Used as a capacity backstop — a stream the driver presents
+  /// beyond the core's `StreamStore` capacity is reset with this code
+  /// (RFC 9114 §8.1) without failing the connection, since HTTP/3 has no
+  /// `SETTINGS_MAX_CONCURRENT_STREAMS` and the real bound is QUIC's
+  /// `MAX_STREAMS`.
+  #[error("H3_REQUEST_REJECTED")]
+  RequestRejected,
   /// `H3_EXCESSIVE_LOAD` (0x0107): the peer placed an implausibly large load on a
   /// bounded resource. Two cases: it opened more inbound unidirectional streams
   /// than the bounded tracking table holds (returned instead of silently dropping
@@ -129,6 +137,7 @@ impl H3Error {
       Self::FrameUnexpected => 0x0105,
       Self::FrameError => 0x0106,
       Self::RequestIncomplete => 0x010d,
+      Self::RequestRejected => 0x010b,
       Self::MessageError => 0x010e,
       Self::SettingsError => 0x0109,
       Self::MissingSettings => 0x010a,
@@ -196,6 +205,7 @@ mod tests {
   fn h3_error_codes() {
     assert_eq!(H3Error::FrameUnexpected.code(), 0x0105);
     assert_eq!(H3Error::RequestIncomplete.code(), 0x010d);
+    assert_eq!(H3Error::RequestRejected.code(), 0x010b);
     assert_eq!(H3Error::MessageError.code(), 0x010e);
     assert_eq!(H3Error::StreamCreation.code(), 0x0103);
     assert_eq!(H3Error::ClosedCriticalStream.code(), 0x0104);
@@ -239,5 +249,11 @@ mod tests {
   #[test]
   fn message_error_display() {
     assert_eq!(H3Error::MessageError.to_string(), "H3_MESSAGE_ERROR");
+  }
+
+  #[test]
+  fn request_rejected_code_and_display() {
+    assert_eq!(H3Error::RequestRejected.code(), 0x010b);
+    assert_eq!(H3Error::RequestRejected.to_string(), "H3_REQUEST_REJECTED");
   }
 }

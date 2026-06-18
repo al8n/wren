@@ -15,8 +15,21 @@ categories = ["network-programming", "no-std", "embedded", "web-programming"]
 
 [features]
 default = ["std"]
-std = ["thiserror/default"]
-alloc = []
+std = ["thiserror/default", "dep:bytes", "bytes/std", "dep:slab", "slab/std", "dep:hashbrown"]
+alloc = ["dep:bytes", "dep:slab", "dep:hashbrown"]
+# `no-atomic`: the alloc tier for cores WITHOUT native atomic CAS (Cortex-M0+ /
+# thumbv6m / RP2040). Same state machine as `alloc`, but the refcounted DATA
+# buffer uses `portable_atomic_util::Arc<[u8]>` (cheap clone via
+# `portable-atomic` + a `critical-section` impl provided by the final binary)
+# instead of `bytes::Bytes`. Mutually exclusive with `alloc` / `std`.
+no-atomic = [
+  "dep:portable-atomic",
+  "dep:portable-atomic-util",
+  "portable-atomic/critical-section",
+  "dep:slab",
+  "dep:hashbrown",
+]
+slab = ["dep:slab"]
 # Internal: exposes `pub(crate)` hot paths so `tests/no_panic.rs` can wrap them
 # in `#[no_panic]` shims. Implies `std` (the test driver is std-only). Not for
 # downstream use — the re-exports are doc-hidden and unstable.
@@ -25,6 +38,11 @@ test-no-panic = ["std"]
 [dependencies]
 thiserror.workspace = true
 derive_more.workspace = true
+bytes = { workspace = true, optional = true }
+slab = { version = "0.4", default-features = false, optional = true }
+hashbrown = { version = "0.16", default-features = false, optional = true }
+portable-atomic = { workspace = true, optional = true }
+portable-atomic-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1"

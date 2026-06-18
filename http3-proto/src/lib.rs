@@ -22,18 +22,32 @@
   )
 )]
 
-// Aliased so alloc-gated modules can name heap items via `std::` on both the
-// `std` and `no_std + alloc` tiers (the QPACK decoder's owned scratch is a
-// consumer).
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+// Aliased so alloc-gated modules can name heap items via `std::` on the `std`,
+// `no_std + alloc`, and `no-atomic` (a no-`std` heap) tiers (the QPACK decoder's
+// owned scratch is a consumer). The `no-atomic` tier carries the alias for the
+// heap-backed stores wired in later phases; until then it has no consumer on
+// that tier, so the unused-crate lint is suppressed here rather than letting the
+// gate drift between tiers.
+#[cfg_attr(
+  all(not(feature = "std"), feature = "no-atomic", not(feature = "alloc")),
+  allow(unused_extern_crates)
+)]
+#[cfg(all(not(feature = "std"), any(feature = "alloc", feature = "no-atomic")))]
 extern crate alloc as std;
 
 #[cfg(feature = "std")]
 extern crate std;
 
+// Must precede any module that uses `cfg_heap!` (e.g. `backend`).
+#[macro_use]
+mod macros;
+
 /// Cross-cutting error building blocks + the HTTP/3 error-code enum.
 pub mod error;
 pub use error::{BufferTooSmallDetail, Error, H3Error, TruncatedDetail};
+
+/// Storage-backend alias for outbound DATA payload bytes (tier-selected).
+pub mod backend;
 
 /// QUIC variable-length integer codec (RFC 9000 §16).
 pub mod varint;
