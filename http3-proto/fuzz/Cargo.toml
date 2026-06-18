@@ -39,5 +39,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "validate_section"
+path = "fuzz_targets/validate_section.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone: not a member of the websockit workspace.
 [workspace]

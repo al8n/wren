@@ -136,6 +136,27 @@ fn qpack_decode_runs_clean() {
   assert!(qpack_decode_run(&[0xff, 0xfe, 0xfd, 0xfc]));
 }
 
+// ── semantic validator ────────────────────────────────────────────────────────
+//
+// NOTE — `validate::validate` is NOT wrapped in `#[no_panic]`. It scans a
+// (lending) decoded field section, so its call tree fans through the QPACK
+// field-line iterator (the same too-deep-to-inline tree as the QPACK smoke
+// above). Its panic-freedom is held by the crate-wide clippy lint wall in
+// `lib.rs`; this smoke still *runs* the validator in release so any panic would
+// surface as a test failure. `validate` is a public free function, so the test
+// calls it directly (no `__no_panic_internals` forwarder needed).
+
+#[test]
+fn validate_runs_clean() {
+  use http3_proto::{MessageKind, qpack::decode_field_section_into, validate::validate};
+  // Valid 2-byte prefix (RIC=0, base=0) + indexed static entry 17 = ":method: GET".
+  let bytes: &[u8] = &[0x00, 0x00, 0xd1];
+  let mut scratch = [0u8; 256];
+  if let Ok(mut hs) = decode_field_section_into(bytes, &mut scratch) {
+    let _ = validate(MessageKind::Request, &mut hs); // any Result, no panic
+  }
+}
+
 // ── connection handle + drain (client role) ───────────────────────────────────
 
 type StaticConnection<Ro> =

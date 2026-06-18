@@ -14,6 +14,11 @@ use http3_proto::{
   event::{StreamId, StreamRole},
   stream::{HDR_CAP, RequestStream},
 };
+// `Server` is used only by the bare multi-stream smoke; on the heap tiers (where
+// `--all-features --all-targets` also compiles this file) that test is cfg'd out,
+// so gate the import to match and avoid an unused-import warning under `-D warnings`.
+#[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+use http3_proto::Server;
 // The bare-tier stream store is caller-provided slots; this slot type is exported
 // only on the bare tier (heap tiers grow the store internally). `--all-features
 // --all-targets` also compiles this test under `std`, where `BorrowedConnection`
@@ -112,6 +117,61 @@ fn bare_tier_open_and_drain() {
   assert!(!req.bytes().is_empty());
 
   // No error events on this (conformant) opt-in path.
+  assert!(conn.poll_event().is_none());
+}
+
+/// Multi-slot stream storage on the bare tier: two request streams registered
+/// over caller-provided `StreamSlot`s are tracked independently, and a partial
+/// read on one does not panic or disturb the other.
+///
+/// This is a **partial-read smoke**, not a full second-stream GET. On the bare
+/// tier only the single seeded tunnel stream owns a real HEADERS buffer; every
+/// ADDITIONAL request stream gets an empty (`&mut []`) HEADERS buffer, so it can
+/// hold multi-slot state and tolerate a partial read, but it cannot accept a
+/// *full* HEADERS section (that would graceful-`FrameError` on the empty buffer).
+/// Full bare multi-stream therefore needs caller-supplied per-stream HEADERS
+/// buffers — a future enhancement beyond Phase 0; the CONNECT tunnel (one stream,
+/// seeded buffer) is the fully-driven bare path (see `bare_tier_open_and_drain`).
+/// The slab/heap tiers grow real per-stream buffers internally, so they drive
+/// concurrent streams to completion (covered by `connection::tests`).
+///
+/// We feed only `&[0x01, 0x03]` — a HEADERS frame header (type `0x01`, length 3)
+/// with no payload — so the recv FSM parses the frame header and waits for the
+/// body without ever touching the empty HEADERS buffer.
+#[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+#[test]
+fn bare_tier_two_streams_independent() {
+  let mut request_headers = [0u8; HDR_CAP];
+  let mut control_payload = [0u8; CTRL_CAP];
+  let mut tx_bytes = [0u8; TX_BYTES_CAP];
+  let mut event_slots = [None; EVENT_QUEUE_CAP];
+  let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+  // Caller-provided stream storage: 2 slots (the multi-stream store capacity).
+  let mut stream_slots: [StreamSlot<'_, &mut [u8]>; 2] = [StreamSlot::EMPTY; 2];
+  let mut conn = BorrowedConnection::<Server>::with_buffers(
+    &mut request_headers[..],
+    &mut control_payload[..],
+    &mut tx_bytes[..],
+    &mut event_slots[..],
+    &mut uni_slots[..],
+    &mut stream_slots[..],
+  );
+  conn.start().expect("start failed");
+  // Two independent inbound request streams (server-side ids 0 and 4).
+  conn.provide_stream(StreamRole::Request, StreamId::new(0));
+  conn.provide_stream(StreamRole::Request, StreamId::new(4));
+
+  // A partial HEADERS read on each: the frame header parses, the body is awaited;
+  // neither call panics and neither disturbs the other's tracked slot.
+  let mut scratch = [0u8; 1024];
+  if let Ok(mut frames) = conn.handle_stream(StreamId::new(0), &[0x01, 0x03], &mut scratch) {
+    while let Ok(Some(_)) = frames.next() {}
+  }
+  if let Ok(mut frames) = conn.handle_stream(StreamId::new(4), &[0x01, 0x03], &mut scratch) {
+    while let Ok(Some(_)) = frames.next() {}
+  }
+  // No frame completed and no connection-scoped event fired (a partial leading
+  // section yields nothing; general streams never push `Event::Established`).
   assert!(conn.poll_event().is_none());
 }
 
