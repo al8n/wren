@@ -5,8 +5,8 @@
 //! - bare `no_std`: [`ArrayStore`] — a fixed inline `[ArraySlot<S>; N]` or a
 //!   caller-provided `&mut [ArraySlot<S>]`, linear scan + slot reuse, zero alloc
 //!   (same shape as the connection's inbound-uni table).
-//! - `alloc`/`std`/`no-atomic`: `SlabStore` (Task 3) — `slab::Slab` + a hash
-//!   index, O(1) and dynamically growing.
+//! - `alloc`/`std`/`no-atomic`: `SlabStore` — `slab::Slab` + a hash index, O(1)
+//!   and dynamically growing.
 //!
 //! HTTP/3 has no `SETTINGS_MAX_CONCURRENT_STREAMS`; the real bound is QUIC's
 //! `MAX_STREAMS`. The driver sets that from [`StreamStore::capacity`]; a stream

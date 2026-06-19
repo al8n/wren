@@ -217,12 +217,11 @@ fn data_before_headers_is_unexpected() {
 
 #[test]
 fn second_leading_headers_is_a_second_initial_section() {
-  // A second HEADERS section with no intervening DATA is no longer an FSM-level
+  // A second HEADERS section with no intervening DATA is not an FSM-level
   // placement error (it is an interim-1xx repeat candidate): the FSM stays in the
   // leading-HEADERS phase and tags it `Initial` again, leaving the
   // "only one final response" decision to the connection/validator (decided by
-  // `:status`). Compare the OLD single-stream FSM, which rejected any second
-  // HEADERS outright.
+  // `:status`).
   let mut scratch = [0u8; 512];
   let mut s = RequestStream::new();
   let req = headers_frame(&[(":method", "CONNECT")]);
@@ -316,10 +315,8 @@ fn fin_after_leading_headers_without_complete_signal_is_request_incomplete() {
   // `Phase::Headers` until the connection signals the leading message complete
   // (`complete_leading`, fired only on the final response / request, never on an interim
   // 1xx). A FIN here — the shape of `[interim 1xx] FIN`, where no `complete_leading` ran —
-  // is `RequestIncomplete`, NOT a clean half-close. (Pre-fix `fin` returned `Ok` for any
-  // `headers_seen`, so a `103`-then-FIN read as a clean pre-establishment half-close — the
-  // silent forever-deferred half-close of Finding #2. The clean case requires the signal;
-  // see `complete_leading_then_fin_is_clean_half_close`.)
+  // is `RequestIncomplete`, NOT a clean half-close. The clean case requires the signal;
+  // see `complete_leading_then_fin_is_clean_half_close`.
   let mut scratch = [0u8; 512];
   let mut s = RequestStream::new();
   let req = headers_frame(&[(":method", "CONNECT")]);

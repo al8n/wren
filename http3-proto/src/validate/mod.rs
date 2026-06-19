@@ -62,6 +62,25 @@ struct Scan {
   protocol: bool,
 }
 
+impl Scan {
+  /// A fresh scan with nothing observed (the `const` twin of the derived
+  /// `Default`, so the outbound accumulator can be `const`-constructed).
+  const fn new() -> Self {
+    Self {
+      saw_regular: false,
+      unknown_pseudo: false,
+      dup_pseudo: false,
+      any_pseudo: false,
+      method: None,
+      scheme: false,
+      path: false,
+      authority: false,
+      status: None,
+      protocol: false,
+    }
+  }
+}
+
 /// The class of a `:status` pseudo-header value, used to enforce the response
 /// rules without retaining a borrow into the section.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -110,14 +129,87 @@ pub fn validate(kind: MessageKind, headers: &mut HeaderSet<'_>) -> Result<(), H3
       scan.saw_regular = true;
     }
   }
+  finish(&scan, kind)
+}
+
+/// The shared finalizer for a completed [`Scan`]: the duplicate-pseudo check then
+/// the per-[`MessageKind`] rule set. Run after every field has been observed, by
+/// BOTH the inbound [`validate`] draining a [`HeaderSet`] and the outbound
+/// single-pass [`OutboundScan`] accumulating the encoder's `for_each` — so the
+/// rules a SENT field section is held to are byte-for-byte the rules a RECEIVED one
+/// is, with no second rule set.
+fn finish(scan: &Scan, kind: MessageKind) -> Result<(), H3Error> {
   if scan.dup_pseudo {
     return Err(H3Error::MessageError);
   }
   match kind {
-    MessageKind::Request => check_request(&scan),
-    MessageKind::Response => check_response(&scan, false),
-    MessageKind::Interim => check_response(&scan, true),
-    MessageKind::Trailers => check_trailers(&scan),
+    MessageKind::Request => check_request(scan),
+    MessageKind::Response => check_response(scan, false),
+    MessageKind::Interim => check_response(scan, true),
+    MessageKind::Trailers => check_trailers(scan),
+  }
+}
+
+/// A borrow-free accumulator that validates an OUTBOUND field section in the SAME
+/// single traversal that QPACK-encodes it, instead of a second pass over the
+/// non-replayable [`Headers`](crate::headers::Headers) supplier.
+///
+/// The connection's outbound encoder visits every `(name, value)` exactly once
+/// (its `for_each` both writes the wire bytes and bounds the decoded size); each
+/// visited pair is fed to [`observe`](Self::observe), which applies the SAME
+/// pseudo-ordering rule, [`record_pseudo`], and [`check_field`] the inbound
+/// [`validate`] loop applies. After the pass [`finish`](Self::finish) runs the
+/// SHARED [`finish`] finalizer for the section's [`MessageKind`]. A field that
+/// fails the inline §4.2 rules is remembered (the encoder's visitor cannot return
+/// a `Result`) and surfaced by [`finish`](Self::finish), so the outcome matches
+/// the inbound validator's even though the iteration is push-style.
+#[derive(Default)]
+pub(crate) struct OutboundScan {
+  scan: Scan,
+  /// The first inline field-rule (§4.2) violation seen during the pass. The
+  /// push-style visitor cannot return early, so a failing [`check_field`] is
+  /// recorded here and reported by [`finish`](Self::finish).
+  field_err: bool,
+}
+
+impl OutboundScan {
+  /// A fresh accumulator with no field observed yet.
+  pub(crate) const fn new() -> Self {
+    Self {
+      scan: Scan::new(),
+      field_err: false,
+    }
+  }
+
+  /// Observes one outbound `(name, value)` pair, mirroring the inbound
+  /// [`validate`] loop body: a pseudo-header must precede every regular field and
+  /// is recorded via [`record_pseudo`]; a regular field is checked against the
+  /// §4.2 rules via [`check_field`], a failure latched into `field_err`.
+  pub(crate) fn observe(&mut self, name: &str, value: &str) {
+    if let Some(pseudo) = name.strip_prefix(':') {
+      // A pseudo after a regular field is a placement violation (the inbound loop
+      // returns immediately here); record it so `finish` rejects the section.
+      if self.scan.saw_regular {
+        self.field_err = true;
+      }
+      self.scan.any_pseudo = true;
+      record_pseudo(&mut self.scan, pseudo, value);
+    } else {
+      if check_field(name, value).is_err() {
+        self.field_err = true;
+      }
+      self.scan.saw_regular = true;
+    }
+  }
+
+  /// Finalizes the accumulated scan for `kind`: any latched inline field-rule
+  /// violation, then the SHARED [`finish`] finalizer (duplicate-pseudo + per-kind
+  /// rules). `Ok(())` iff the outbound section is well-formed.
+  pub(crate) fn finish(&self, kind: MessageKind) -> Result<(), H3Error> {
+    if self.field_err {
+      return Err(H3Error::MessageError);
+    }
+    finish(&self.scan, kind)
   }
 }
 
