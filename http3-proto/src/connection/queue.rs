@@ -248,6 +248,170 @@ impl PendingResets {
   }
 }
 
+/// The bare (`no_std`, no-alloc) tier's reset-tombstone capacity.
+///
+/// A reset of a BIDIRECTIONAL request id frees its [`StreamStore`] slot, but the driver
+/// may still deliver buffered bytes (or a FIN) on that id afterwards. The tombstone set
+/// lets [`handle_stream`] recognize such a just-reset id and ABSORB those late bytes,
+/// instead of letting the now-store-absent id fall through to the inbound-uni path and
+/// misparse its first byte as a uni stream type.
+///
+/// On the bare tier the [`StreamStore`] is a small caller-provided array (the seeded
+/// CONNECT tunnel stream — bare multi-stream buffering is a later task), so at most ONE
+/// request stream is ever reset-but-unclosed at a time; this capacity has ample margin.
+/// The bound is the actual concurrent-stream limit's worth of reset-unclosed ids — the
+/// reset-unclosed set can never exceed the live-stream limit, because a stream stays
+/// reset-unclosed (counting against QUIC `MAX_STREAMS`, which the driver derives from the
+/// store capacity) until the driver reports it closed. Recording past the bound FAILS THE
+/// CONNECTION CLOSED (it NEVER evicts a live tombstone, which would re-open the
+/// uni-misclassify bug under churn); the heap tiers grow instead and never reach it. Kept
+/// small so the inline set does not bloat the bare connection value
+/// (see `connection_value_is_small_*`).
+///
+/// [`StreamStore`]: crate::stream_store::StreamStore
+/// [`handle_stream`]: crate::connection::Connection::handle_stream
+#[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
+pub(crate) const RESET_TOMBSTONE_CAP: usize = RESET_CAP;
+
+/// A set of reset request-stream ids — the tombstones that keep a just-reset
+/// BIDIRECTIONAL request id from re-classifying as a fresh inbound uni stream.
+///
+/// [`handle_stream`] routes by [`StreamStore`] membership: a request id is keyed in the
+/// store, every other id is a non-request (control / QPACK / inbound-uni) stream. A
+/// stream-scoped reset FREES the request entry, so without this set the reset id would
+/// read as unknown and its next buffered bytes would be parsed as a brand-new uni
+/// stream's leading type varint — a DATA frame's `0x00` type byte aliases the control
+/// stream type, corrupting control/QPACK state or failing the whole connection. The set
+/// is consulted in `handle_stream` BEFORE that fallthrough so the bytes (and a FIN) are
+/// absorbed instead.
+///
+/// Lifecycle: [`record`](Self::record) at every reset-removal site (the driver-requested
+/// `reset_stream`, the carrier-deferred `reconcile_pending_resets`, the peer
+/// `handle_stream_reset` general branch, and the at-capacity backstop whose stream was
+/// never inserted but is still reset on the wire); [`remove`](Self::remove) when the
+/// stream is reported fully closed, keeping the live set tracking only reset-but-unclosed
+/// ids.
+///
+/// STRUCTURAL no-evict invariant: a live tombstone is NEVER evicted to make room. The
+/// reset-unclosed set is bounded by the actual concurrent-stream limit (a reset id keeps
+/// counting against QUIC `MAX_STREAMS` — derived from the store capacity — until the
+/// driver reports it closed), so on the heap tiers it is backed by an unbounded
+/// [`Vec`](std::vec::Vec) that simply grows (matching the unbounded slab `StreamStore`),
+/// and on the bare tier by a fixed array that FAILS CLOSED at [`RESET_TOMBSTONE_CAP`]
+/// (the caller fails the connection — see [`record`](Self::record)). Either way a reset
+/// bidi request id is absorbed, never uni-classified, under any churn until it is closed.
+///
+/// [`StreamStore`]: crate::stream_store::StreamStore
+/// [`handle_stream`]: crate::connection::Connection::handle_stream
+#[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+pub(crate) struct ResetTombstones {
+  /// Unbounded on the heap tiers: it grows with the live reset-unclosed set, which the
+  /// unbounded slab `StreamStore` already permits, so a tombstone is never evicted.
+  ids: std::vec::Vec<StreamId>,
+}
+
+#[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+impl ResetTombstones {
+  /// An empty tombstone set.
+  pub(crate) const fn new() -> Self {
+    Self {
+      ids: std::vec::Vec::new(),
+    }
+  }
+
+  /// Whether `id` is a tombstoned reset request id (consulted by `handle_stream` /
+  /// `handle_stream_fin` before the non-request fallthrough).
+  pub(crate) fn contains(&self, id: StreamId) -> bool {
+    self.ids.contains(&id)
+  }
+
+  /// Records `id` as a reset tombstone, idempotently (a no-op if already present).
+  /// Always succeeds on the heap tiers (the backing `Vec` grows), returning `true` so the
+  /// caller need not fail the connection; a live tombstone is never evicted.
+  pub(crate) fn record(&mut self, id: StreamId) -> bool {
+    if !self.contains(id) {
+      self.ids.push(id);
+    }
+    true
+  }
+
+  /// Clears `id`'s tombstone (the stream was reported fully closed), keeping the live
+  /// set bounded to reset-but-not-yet-closed ids. A no-op if `id` is not tombstoned.
+  pub(crate) fn remove(&mut self, id: StreamId) {
+    if let Some(pos) = self.ids.iter().position(|&t| t == id) {
+      self.ids.swap_remove(pos);
+    }
+  }
+
+  /// The number of live (reset-but-not-yet-closed) tombstones. Test-only probe: drives
+  /// the assertion that a PEER reset records NO tombstone (it is the close signal), so
+  /// repeated peer resets cannot grow the set unbounded. Gated to the same cfg as the
+  /// test module that consumes it.
+  #[cfg(all(test, any(feature = "std", feature = "alloc")))]
+  pub(crate) fn len(&self) -> usize {
+    self.ids.len()
+  }
+}
+
+/// A fixed-capacity, FAIL-CLOSED set of reset request-stream ids (the bare `no_std`,
+/// no-alloc tier). See the heap-tier [`ResetTombstones`] for the role; this twin differs
+/// only in storage — a fixed array sized to [`RESET_TOMBSTONE_CAP`] — and in its overflow
+/// policy: it FAILS CLOSED rather than allocate, and NEVER evicts a live tombstone.
+///
+/// Backed by a plain fixed array used as an unordered set (arbitrary `remove` by id on
+/// close rules out a head/len FIFO, which only drains at the front): `record` fills the
+/// first free slot, `remove` nulls the matching one. There is no eviction cursor — an
+/// overflow returns `false` so the caller fails the connection.
+///
+/// [`StreamStore`]: crate::stream_store::StreamStore
+#[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
+pub(crate) struct ResetTombstones {
+  slots: [Option<StreamId>; RESET_TOMBSTONE_CAP],
+}
+
+#[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
+impl ResetTombstones {
+  /// An empty tombstone set.
+  pub(crate) const fn new() -> Self {
+    Self {
+      slots: [None; RESET_TOMBSTONE_CAP],
+    }
+  }
+
+  /// Whether `id` is a tombstoned reset request id (consulted by `handle_stream` /
+  /// `handle_stream_fin` before the non-request fallthrough).
+  pub(crate) fn contains(&self, id: StreamId) -> bool {
+    self.slots.contains(&Some(id))
+  }
+
+  /// Records `id` as a reset tombstone, idempotently (a no-op returning `true` if already
+  /// present). Fills the first free slot. When every slot is full of distinct other ids it
+  /// returns `false` — the caller FAILS THE CONNECTION CLOSED rather than evict a live
+  /// tombstone (evicting one would re-open the uni-misclassify bug under churn). On the
+  /// bare tier only one request stream exists, so this overflow is unreachable in practice.
+  pub(crate) fn record(&mut self, id: StreamId) -> bool {
+    if self.contains(id) {
+      return true;
+    }
+    if let Some(slot) = self.slots.iter_mut().find(|s| s.is_none()) {
+      *slot = Some(id);
+      return true;
+    }
+    false
+  }
+
+  /// Clears `id`'s tombstone (the stream was reported fully closed), keeping the live
+  /// set bounded to reset-but-not-yet-closed ids. A no-op if `id` is not tombstoned.
+  pub(crate) fn remove(&mut self, id: StreamId) {
+    for slot in &mut self.slots {
+      if *slot == Some(id) {
+        *slot = None;
+        return;
+      }
+    }
+  }
+}
+
 /// The byte capacity of a single transmit slot. A queued transmit — including a
 /// DATA payload plus its frame header — must fit this; larger `send_data` calls
 /// error. This is the v1 no-alloc bound.
@@ -340,7 +504,7 @@ const fn empty_tx_meta() -> TxMeta {
 ///
 /// `consume_seen` means "a [`consume`](TxRing::consume) happened SINCE THE LAST
 /// `poll`". It distinguishes "the driver re-polled without acking a partial write"
-/// (treated as a full write of the previously yielded segments — the legacy
+/// (treated as a full write of the previously yielded segments — the
 /// poll-advances model) from "the driver reported a partial write via
 /// [`consume`](TxRing::consume)" (re-yield the remaining segments). `poll` clears
 /// it the moment it re-yields the remainder, so the cleared-then-re-polled state is
@@ -358,11 +522,11 @@ struct TxFront {
 /// lends a [`Transmit`] borrowing the front slot; the borrow is valid until the
 /// next `poll`.
 ///
-/// A polled transmit is held in `front` until fully written. The "driver re-polls"
-/// model is preserved: a `poll` with no intervening [`consume`](TxRing::consume)
-/// acknowledges the previously polled transmit as fully written and advances to
-/// the next; a `consume(n)` records a partial write so the next `poll` re-yields
-/// the remaining segments (re-sliced by `consumed`).
+/// A polled transmit is held in `front` until fully written, following the
+/// "driver re-polls" model: a `poll` with no intervening
+/// [`consume`](TxRing::consume) acknowledges the previously polled transmit as
+/// fully written and advances to the next; a `consume(n)` records a partial write
+/// so the next `poll` re-yields the remaining segments (re-sliced by `consumed`).
 pub(crate) struct TxRing<'a, B = DefaultTxBuf<'a>> {
   bytes: B,
   slots: [TxMeta; TX_N],
@@ -415,7 +579,7 @@ where
   /// Lends the front transmit (borrowing its bytes / held body), or `None` if the
   /// ring is empty. The borrow is valid until the next call.
   ///
-  /// The "driver re-polls" model is preserved: a `poll` not preceded by a
+  /// Under the "driver re-polls" model: a `poll` not preceded by a
   /// [`consume`](Self::consume) since the last `poll` acknowledges the previously
   /// polled transmit as fully written and advances to the next; after a *partial*
   /// `consume(n)` the same transmit is re-yielded with its already-written prefix

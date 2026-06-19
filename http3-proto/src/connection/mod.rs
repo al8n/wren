@@ -46,7 +46,7 @@ mod queue;
 use core::marker::PhantomData;
 
 use derive_more::IsVariant;
-use queue::{BoundedQueue, PendingResets, TX_CAP, TxError, TxRing};
+use queue::{BoundedQueue, PendingResets, ResetTombstones, TX_CAP, TxError, TxRing};
 
 use crate::{
   Error, HeaderSet,
@@ -101,8 +101,8 @@ impl Role for Server {
 /// mixing the tunnel and general APIs is a COMPILE error. Sealed: only [`Tunnel`]
 /// and [`General`] implement it.
 ///
-/// `IS_TUNNEL` is the single source of truth for the two identity splits a
-/// connection used to guess per stream:
+/// `IS_TUNNEL` is the single source of truth for the connection's two per-stream
+/// identity splits:
 ///
 /// - **error scope** (RFC 9114 §4.1.2): a protocol violation on a [`Tunnel`]
 ///   connection is connection-fatal (one tunnel = one connection); on a
@@ -239,10 +239,9 @@ pub enum Frame<'a> {
 /// The per-stream LOCAL send half-FSM: the single source of truth for what the
 /// local endpoint may legally enqueue NEXT on a stream, so no public-call sequence
 /// can put protocol-invalid frame ordering on the wire (RFC 9114 §4.1 / §4.1.2).
-/// It replaces the former ad-hoc `final_response_sent` / `local_send_closed`
-/// booleans; every send guard validates against it and every successful send
-/// transitions it. It is orthogonal to the inbound recv FSM and to the PEER's
-/// half-close (`peer_closed`).
+/// Every send guard validates against it and every successful send transitions it.
+/// It is orthogonal to the inbound recv FSM and to the PEER's half-close
+/// (`peer_closed`).
 ///
 /// The legal sequence is role-shaped (the role is `Ro::IS_CLIENT`, so one enum
 /// covers both; a server entry never holds [`RequestSent`](Self::RequestSent) and a
@@ -313,9 +312,9 @@ enum SendOp {
 }
 
 /// Per-stream connection-side state: the inbound recv FSM, the local send half-FSM
-/// (`SendState`), plus the lifecycle markers that used to be singular
-/// [`Connection`] fields (now one set PER stream, held in the [`StreamStore`]). The
-/// CONNECT tunnel uses exactly one entry, keyed by the tunnel's `tunnel_id`.
+/// (`SendState`), plus the per-stream lifecycle markers (one set PER stream, held
+/// in the [`StreamStore`]). The CONNECT tunnel uses exactly one entry, keyed by the
+/// tunnel's `tunnel_id`.
 ///
 /// Its fields are private connection bookkeeping; the type is `pub` only so the
 /// bare-tier caller can name `StreamSlot` when allocating
@@ -323,15 +322,14 @@ enum SendOp {
 /// is a public opaque handle around private parser state).
 pub struct StreamEntry<'req, ReqBuf> {
   /// The inbound recv FSM for this stream (the read side of the request/response
-  /// exchange). Was the singular `Connection::request`.
+  /// exchange).
   fsm: Stream<'req, ReqBuf>,
   /// The first HEADERS was OBSERVED (yielded to the driver via [`Frames::next`]),
   /// not merely decoded. Server: gates [`accept_with`](Connection::accept_with).
-  /// (Was the singular `request_received`.)
   observed: bool,
   /// The message exchange reached "established"/open for this stream (CONNECT 2xx
   /// seen/sent). Gates yielding [`Frame::Data`]; stays `true` across a later
-  /// `Closing`. (Was the singular `tunnel_established`.)
+  /// `Closing`.
   established: bool,
   /// Client-only PLACEMENT state: a FINAL (non-interim) response leading section was
   /// accepted on this stream. Distinct from `established` (the readiness / DATA-gate
@@ -344,24 +342,20 @@ pub struct StreamEntry<'req, ReqBuf> {
   /// one leading section, gated by `first_headers_seen`).
   final_response_seen: bool,
   /// The peer FIN'd its send half on this stream and the clean half-close already
-  /// surfaced [`Event::PeerClosed`] (de-dups a second clean FIN). (Was the
-  /// singular `peer_closed`.)
+  /// surfaced [`Event::PeerClosed`] (de-dups a second clean FIN).
   peer_closed: bool,
   /// A clean pre-establishment peer FIN, deferred until establish so
-  /// [`Event::PeerClosed`] never precedes [`Event::Established`]. (Was the
-  /// singular `peer_fin_pending`.)
+  /// [`Event::PeerClosed`] never precedes [`Event::Established`].
   peer_fin_pending: bool,
   /// The stream was abandoned: its first HEADERS was decoded by the drop-drain
   /// UNOBSERVED, so the stream is permanently inert to the driver (validated, but
-  /// never surfaces tunnel data / grants readiness). (Was the singular
-  /// `request_abandoned`.)
+  /// never surfaces tunnel data / grants readiness).
   abandoned: bool,
   /// The per-stream LOCAL send half-FSM: the single source of truth for what may be
-  /// enqueued NEXT on this stream's send half, replacing the former
-  /// `final_response_sent` / `local_send_closed` booleans. Every send guard validates
-  /// against it and every successful send transitions it, so no public-call sequence can
-  /// produce protocol-invalid frame ordering (RFC 9114 §4.1 / §4.1.2). See [`SendState`]
-  /// for the full role-shaped transition table; it is orthogonal to the inbound recv FSM
+  /// enqueued NEXT on this stream's send half. Every send guard validates against it
+  /// and every successful send transitions it, so no public-call sequence can produce
+  /// protocol-invalid frame ordering (RFC 9114 §4.1 / §4.1.2). See [`SendState`] for
+  /// the full role-shaped transition table; it is orthogonal to the inbound recv FSM
   /// and to `peer_closed` (the PEER's half-close).
   send: SendState,
 }
@@ -799,9 +793,10 @@ enum RequestRegister {
   /// The entry is tracked: freshly inserted, or already present (an idempotent
   /// re-provide). The caller may enqueue HEADERS on `id`.
   Inserted,
-  /// The store was at capacity: the overflow stream was reset with
-  /// [`H3Error::RequestRejected`] and is NOT tracked. The caller must NOT enqueue
-  /// HEADERS on `id`.
+  /// The stream is NOT tracked and the caller must NOT enqueue HEADERS on `id`,
+  /// for one of two reasons: the store was at capacity (the overflow stream was reset
+  /// with [`H3Error::RequestRejected`]), or `id` is a reset-but-not-yet-closed id
+  /// (still tombstoned, single-use per RFC 9114 §4.1 — no fresh entry, no new reset).
   Rejected,
 }
 
@@ -1091,18 +1086,32 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   /// The premature-DATA decision, shared by [`Frames::next`] and
   /// [`drain_for_errors`](Self::drain_for_errors) so the two DATA gates cannot drift:
   /// the yield path, the drop-drain, and a zero-length DATA frame all resolve through
-  /// this single check. A DATA frame — empty or not — observed while the tunnel is
-  /// NOT established is premature: the peer sent DATA before the
-  /// 2xx response (server before [`accept_with`](Connection::accept_with), or any
-  /// request stream whose tunnel was never established), which is a malformed message
-  /// (RFC 9114 §4.4 / §4.1.2). Routes through [`fail_or_reset`](Self::fail_or_reset) —
-  /// connection-fatal `MessageError` on the tunnel, a stream-scoped reset on a general
-  /// request stream — and returns whether the DATA was premature (so the caller can
-  /// `Err`/`return`):
+  /// this single check (next/drain parity). It is ROLE/MODE-aware — the gate that opens
+  /// the recv body differs by which message the body FOLLOWS:
+  ///
+  /// - **SERVER + `General`** — a normal request body follows the request HEADERS BEFORE
+  ///   the server responds (RFC 9114 §4.1: `HEADERS DATA*`). The gate is the recv FSM's
+  ///   LEADING section having completed ([`Items::leading_complete`] — the FSM left
+  ///   `Phase::Headers` via `complete_leading` on the request), NOT `established` (which
+  ///   the server only sets in `send_response`). An interim-only state never reaches this
+  ///   arm (the server is the request RECEIVER), and the FSM still rejects DATA before any
+  ///   HEADERS, so a leading-complete request body is legitimate, not premature.
+  /// - **SERVER + `Tunnel`** — no tunnel DATA before the 2xx (`accept_with` commits it):
+  ///   gate on `established` (set on the single establish transition). A peer that
+  ///   coalesces the CONNECT request HEADERS and DATA in one read is premature (RFC 9114
+  ///   §4.4) — `accept_with` cannot run while this borrow is held.
+  /// - **CLIENT (any mode)** — the response body follows the FINAL response (the tunnel
+  ///   2xx or the general final), so gate on `established`, set only on the first FINAL
+  ///   (non-interim) response. An interim 1xx does NOT open the body gate.
+  ///
+  /// DATA that fails the role/mode gate — empty or not — is a malformed message and routes
+  /// through [`fail_or_reset`](Self::fail_or_reset): connection-fatal `MessageError` on the
+  /// tunnel, a stream-scoped reset on a general request stream. Returns whether the DATA
+  /// was premature (so the caller can `Err`/`return`):
   ///
   /// - `true`  → premature: the tunnel was `fail`ed, or the general stream's reset was
   ///   recorded, both with `MessageError`;
-  /// - `false` → established: the caller handles the (possibly empty) DATA chunk.
+  /// - `false` → the gate is open: the caller handles the (possibly empty) DATA chunk.
   ///
   /// Called on `&mut self` at a point where no `items` borrow is live (the DATA chunk
   /// is re-sliced only after this returns `false`).
@@ -1110,7 +1119,16 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   where
     EventBuf: AsMut<[Option<Event>]>,
   {
-    if *self.tunnel_established {
+    // A SERVER receiving a `General` request body keys on the LEADING section being
+    // complete (the request HEADERS); every other path (the CONNECT tunnel either role,
+    // and the client's response body) keys on `established`. The connection marker
+    // (`is_tunnel`) + role (`is_client`) pick the gate — not a per-entry guess.
+    let gate_open = if !self.is_client && !self.is_tunnel {
+      self.items.leading_complete()
+    } else {
+      *self.tunnel_established
+    };
+    if gate_open {
       return false;
     }
     self.fail_or_reset(H3Error::MessageError);
@@ -2037,6 +2055,28 @@ pub struct Connection<
   /// distinct `Connection` field so the carrier's borrow of it stays disjoint from
   /// `phase` / `events` / `close_pending` / `conn_error`.
   pending_resets: PendingResets,
+  /// Tombstones for reset BIDIRECTIONAL request ids — the set that keeps a just-reset
+  /// request id from re-classifying as a fresh inbound uni stream.
+  ///
+  /// [`handle_stream`](Self::handle_stream) routes by [`StreamStore`] membership, but a
+  /// stream-scoped reset FREES the request entry, so the reset id reads as unknown and
+  /// its next buffered bytes would otherwise fall through to the inbound-uni path and
+  /// misparse their first byte as a uni stream type (a DATA frame's `0x00` aliases the
+  /// control stream type — corrupting control/QPACK state or failing the connection,
+  /// breaking stream-scoped isolation). An id is recorded here at every reset-removal
+  /// site and consulted in `handle_stream` (and `handle_stream_fin`) BEFORE that
+  /// fallthrough, so the late bytes / FIN are absorbed instead. Cleared when the stream
+  /// is reported fully closed, so the set tracks only reset-but-not-yet-closed ids.
+  ///
+  /// STRUCTURAL: a live tombstone is NEVER evicted (that would re-open the
+  /// uni-misclassify bug under churn). The set is bounded by the actual concurrent-stream
+  /// limit — a reset id keeps counting against QUIC `MAX_STREAMS` (derived from the store
+  /// capacity) until closed — so on the heap tiers it grows unbounded with the slab
+  /// `StreamStore`, and on the bare tier it fails the connection closed on overflow rather
+  /// than drop a tombstone (`tombstone_reset`). See [`ResetTombstones`].
+  ///
+  /// [`StreamStore`]: crate::stream_store::StreamStore
+  reset_tombstones: ResetTombstones,
   _ro: PhantomData<fn() -> Ro>,
   _mo: PhantomData<fn() -> Mo>,
   _storage: PhantomData<(
@@ -2197,6 +2237,7 @@ where
       close_pending: false,
       conn_error: None,
       pending_resets: PendingResets::new(),
+      reset_tombstones: ResetTombstones::new(),
       _ro: PhantomData,
       _mo: PhantomData,
       _storage: PhantomData,
@@ -2244,15 +2285,14 @@ where
   /// Whether the connection is winding down or terminal (phase `Closing` or
   /// `Failed`): a local [`close`](Self::close), a clean peer reset, or a fatal
   /// error have all made it so. The send paths are terminal (`Err(Closed)`) here.
-  /// This is the `Phase`-derived successor to the old `closing` flag.
   pub(crate) const fn is_terminal(&self) -> bool {
     matches!(self.phase, Phase::Closing | Phase::Failed)
   }
 
   /// Whether [`start`](Self::start) has queued the setup (phase past `Created`).
-  /// The `Phase`-derived successor to the old `started` flag, used by the
-  /// lifecycle tests to assert the setup-before-traffic ordering. Gated to the
-  /// same cfg as the test module that consumes it (the bare tier omits both).
+  /// Used by the lifecycle tests to assert the setup-before-traffic ordering, and
+  /// gated to the same cfg as the test module that consumes it (the bare tier
+  /// omits both).
   #[cfg(all(test, any(feature = "std", feature = "alloc")))]
   pub(crate) const fn is_started(&self) -> bool {
     !self.phase.is_created()
@@ -2379,6 +2419,15 @@ where
   #[cfg(all(test, any(feature = "std", feature = "alloc")))]
   pub(crate) fn stream_is_gone(&self, id: StreamId) -> bool {
     self.streams.get(id).is_none()
+  }
+
+  /// The number of live reset tombstones (reset-but-not-yet-closed request ids).
+  /// Test-only probe: a PEER reset is itself the close signal, so it records NO
+  /// tombstone — this drives the assertion that repeated peer resets cannot grow the set
+  /// unbounded (only LOCAL resets, where the peer may still have in-flight bytes, do).
+  #[cfg(all(test, any(feature = "std", feature = "alloc")))]
+  pub(crate) fn reset_tombstone_count(&self) -> usize {
+    self.reset_tombstones.len()
   }
 
   /// The graceful-close phase transition `{Created, Handshaking, Open} → Closing`.
@@ -2546,8 +2595,18 @@ where
     TxBuf: AsMut<[u8]>,
     EventBuf: AsMut<[Option<Event>]>,
   {
-    // Idempotent re-provide of an already-registered request id: the entry (and its
-    // in-flight recv FSM) is kept as-is.
+    // REJECT a reused id whose prior stream is RESET-but-not-yet-closed (still
+    // tombstoned). A QUIC stream id is single-use (RFC 9114 §4.1): a reset bidi id
+    // must NOT register a fresh entry — its late buffered bytes are still being
+    // absorbed by the tombstone, and the driver was told the stream was reset. No new
+    // entry, no RESET (it is already tombstoned/reset), no `tunnel_id`. The peer's
+    // (or driver's) re-use of a spent id is refused here; `open_request` pre-checks the
+    // same set and reports `StreamCreation`.
+    if self.reset_tombstones.contains(id) {
+      return RequestRegister::Rejected;
+    }
+    // Idempotent re-provide of an already-registered LIVE request id: the entry (and
+    // its in-flight recv FSM) is kept as-is.
     if self.streams.get(id).is_some() {
       return RequestRegister::Inserted;
     }
@@ -2580,6 +2639,10 @@ where
       // lets the peer safely retry). NOT connection-fatal; the driver also bounds
       // concurrency via QUIC `MAX_STREAMS`.
       self.enqueue_stream_reset(id, H3Error::RequestRejected.code());
+      // The rejected id was never inserted, so it is absent from the store exactly like a
+      // freed reset id: tombstone it so the peer's already-in-flight bytes on this id are
+      // absorbed, not misparsed as a fresh inbound uni stream (see `reset_tombstones`).
+      self.tombstone_reset(id);
       return RequestRegister::Rejected;
     }
     // On a `Tunnel` connection the first registered request id names the single CONNECT
@@ -2639,6 +2702,9 @@ where
       if self.tunnel_id == Some(id) {
         self.tunnel_id = None;
       }
+      // Tombstone the freed request id so late buffered bytes are absorbed, not
+      // re-classified as a fresh inbound uni stream (see `reset_tombstones`).
+      self.tombstone_reset(id);
       self.enqueue_stream_reset(id, code);
     }
   }
@@ -2691,10 +2757,12 @@ where
   /// rejected, and no stale same-stream DATA precedes the abort. Idempotent — `remove`
   /// no-ops on an already-freed slot and re-purging already-tombstoned slots is harmless —
   /// so running it on every entry is safe. (`poll_event` does not call it: a stream reset
-  /// produces no `Event`.)
+  /// produces no `Event` — except the fail-closed [`H3Error::ExcessiveLoad`] a bare-tier
+  /// tombstone overflow would raise, which `poll_event` never needs to trigger.)
   fn reconcile_pending_resets(&mut self)
   where
     TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
   {
     // Snapshot the ids first so the per-id `&mut self` store / ring calls below do not
     // hold a borrow of `pending_resets`. At most `RESET_CAP` ids; the aborts stay
@@ -2711,7 +2779,45 @@ where
       // ahead of (or after) the abort. Decoupled from emission — purging here does not
       // gate the abort, which `poll_transmit` emits from the channel regardless.
       self.tx.purge_stream(id);
+      // Tombstone the freed request id so its late buffered bytes are absorbed rather
+      // than re-classified as a fresh inbound uni stream (see `reset_tombstones`).
+      self.tombstone_reset(id);
     }
+  }
+
+  /// Records a reset BIDIRECTIONAL request `id` as a tombstone so its late buffered bytes
+  /// (or FIN) — delivered after the reset already freed the [`StreamStore`] entry — are
+  /// ABSORBED by [`handle_stream`](Self::handle_stream) / [`handle_stream_fin`](Self::handle_stream_fin)
+  /// instead of falling through to the inbound-uni path and misparsing as a uni stream
+  /// type (RFC 9114 §4.1.2 stream-scoped isolation). Called at every reset-removal site;
+  /// idempotent. The tombstone is CLEARED by [`clear_reset_tombstone`](Self::clear_reset_tombstone)
+  /// once the driver reports the stream fully closed, so the set tracks only
+  /// reset-but-not-yet-closed ids. See [`reset_tombstones`](Self::reset_tombstones).
+  ///
+  /// STRUCTURAL no-evict: the tombstone set never evicts a live entry to make room (that
+  /// would re-open the uni-misclassify bug under churn). It is bounded by the actual
+  /// concurrent-stream limit — a reset id keeps counting against QUIC `MAX_STREAMS`
+  /// (derived from the store capacity) until closed — so the heap-tier set grows with it
+  /// and never overflows, while the bare-tier fixed set FAILS THE CONNECTION CLOSED
+  /// ([`H3Error::ExcessiveLoad`]) on overflow rather than drop a live tombstone. On the
+  /// bare tier only the single seeded request stream exists, so this overflow is
+  /// unreachable in practice; it is a fail-closed backstop, mirroring
+  /// [`enqueue_stream_reset`](Self::enqueue_stream_reset)'s full-channel handling.
+  fn tombstone_reset(&mut self, id: StreamId)
+  where
+    EventBuf: AsMut<[Option<Event>]>,
+  {
+    if !self.reset_tombstones.record(id) {
+      self.fail(H3Error::ExcessiveLoad);
+    }
+  }
+
+  /// Clears `id`'s reset tombstone — the driver reported the stream fully closed (a FIN /
+  /// close on the reset id), so there can be no further late bytes to absorb. Keeps the
+  /// tombstone set bounded to reset-but-not-yet-closed ids; a no-op if `id` is not
+  /// tombstoned. The twin of [`tombstone_reset`](Self::tombstone_reset).
+  fn clear_reset_tombstone(&mut self, id: StreamId) {
+    self.reset_tombstones.remove(id);
   }
 
   /// Routes an eager request-stream error by SCOPE (derived from the connection's
@@ -3263,6 +3369,19 @@ where
     if self.phase.is_failed() {
       return Ok(Frames::empty());
     }
+    // A just-reset BIDIRECTIONAL request id: a stream-scoped reset REMOVED its store
+    // entry, but the driver may still deliver buffered bytes on it (QUIC streams are
+    // unordered). The id is now store-absent, so without this guard it would fall through
+    // to `handle_non_request` below and its first byte would be parsed as a fresh inbound
+    // uni stream's leading type varint — a DATA frame's `0x00` type byte aliases the
+    // control stream type, corrupting control/QPACK state or failing the connection,
+    // breaking the stream-scoped isolation the reset is supposed to guarantee. Absorb the
+    // bytes instead (validate-discard): no uni classification, no control/QPACK mutation,
+    // no connection failure. The tombstone clears once the driver reports the stream fully
+    // closed (`handle_stream_fin`). See `reset_tombstones`.
+    if self.reset_tombstones.contains(id) {
+      return Ok(Frames::empty());
+    }
     // Non-request streams (any id NOT in the stream store) are fully processed here
     // (mutating connection state) and yield no frames; their eager errors carry no
     // escaping borrow, so route them through `fail` and return empty/`Err` here. A
@@ -3392,12 +3511,11 @@ where
     TxBuf: AsMut<[u8]>,
   {
     // The tunnel precondition: DATA flows only while the tunnel is `Open`. This one
-    // phase check subsumes the old `!started || !established || closing` triple —
-    // `Created` / `Handshaking` (not yet open) and `Closing` / `Failed` (no longer
-    // open) all report `Closed`. It also pins setup-before-traffic: the control
-    // stream's SETTINGS reach the wire (in `Handshaking`) before any DATA frame
-    // (RFC 8441 / RFC 9114 ordering). This stays the TUNNEL gate; the general
-    // `send_data_on` enqueue is shared underneath.
+    // phase check covers every non-open state — `Created` / `Handshaking` (not yet
+    // open) and `Closing` / `Failed` (no longer open) all report `Closed`. It also
+    // pins setup-before-traffic: the control stream's SETTINGS reach the wire (in
+    // `Handshaking`) before any DATA frame (RFC 8441 / RFC 9114 ordering). This is
+    // the TUNNEL gate; the general `send_data_on` enqueue is shared underneath.
     if !self.phase.is_open() {
       return Err(Error::Closed);
     }
@@ -3479,6 +3597,7 @@ where
   pub fn send_data_on<B>(&mut self, id: StreamId, body: B) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
     B: Into<crate::backend::DataBuf>,
   {
     self.guard_send_on(id, SendOp::Body)?;
@@ -3504,6 +3623,7 @@ where
   pub fn send_data_on(&mut self, id: StreamId, payload: &[u8]) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
   {
     self.guard_send_on(id, SendOp::Body)?;
     self.enqueue_data_on(id, payload)
@@ -3521,7 +3641,11 @@ where
   ///
   /// Returns the same `Err` set as [`send_data_on`](Self::send_data_on), plus
   /// [`Error::FieldSectionTooLarge`] when the trailers' decoded field-section size
-  /// exceeds the peer's advertised `MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2).
+  /// exceeds the peer's advertised `MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2), and
+  /// [`Error::Protocol`]`(`[`H3Error::MessageError`]`)` when the trailing section is
+  /// malformed — a pseudo-header (none are allowed in trailers) or a forbidden
+  /// connection-specific / uppercase field (RFC 9114 §4.1 / §4.2), validated in the
+  /// single encode pass under `MessageKind::Trailers`. Nothing is committed on rejection.
   pub fn send_trailers<H: Headers + ?Sized>(
     &mut self,
     id: StreamId,
@@ -3529,6 +3653,7 @@ where
   ) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
   {
     self.guard_send_on(id, SendOp::Trailers)?;
     // The peer's SETTINGS bound the trailers' field-section size, as for any HEADERS
@@ -3538,10 +3663,18 @@ where
       .settings_peer
       .ok_or(Error::WouldBlock)?
       .max_field_section_size();
+    // Validate the trailing section in the SAME single encode pass the request/response
+    // paths use (`MessageKind::Trailers`: no pseudo-headers, no connection-specific
+    // fields), so a malformed trailers section is rejected BEFORE commit — symmetric with
+    // the inbound trailers validation. A failure errors the fill closure, discarding the
+    // slot, so the `TrailersSent` transition below is NOT reached.
+    let trailers = OutboundValidator::new(headers);
     self
       .tx
       .enqueue(StreamKind::Existing(id), false, |out| {
-        write_headers_frame(out, headers, limit)
+        let frame_len = write_headers_frame(out, &trailers, limit)?;
+        trailers.validate(MessageKind::Trailers)?;
+        Ok(frame_len)
       })
       .map_err(map_tx)?;
     // The trailing section is queued: move the send half to `TrailersSent` so nothing but
@@ -3571,6 +3704,7 @@ where
   pub fn finish(&mut self, id: StreamId) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
   {
     self.guard_send_on(id, SendOp::Finish)?;
     // An empty FIN: zero bytes, fin = true. The fill closure writes nothing, so its
@@ -3587,6 +3721,20 @@ where
     // Only reached on success, so a backpressure retry does not double-close.
     if let Some(entry) = self.streams.get_mut(id) {
       entry.send = SendState::Closed;
+      // Both halves are now done, so retire the entry — the mirror of the General
+      // full-close branch in `handle_stream_fin`. This `finish` is statically General
+      // (the tunnel half-closes via `close`, not here), so retiring on a full close is
+      // General-only by construction and pushes NO connection event (a General request
+      // stream's lifecycle is per-stream, never connection-scoped — RFC 9114 §2). The two
+      // close orders converge here and there: if the peer FINs LATER, `handle_stream_fin`
+      // sees `send == Closed` and removes the entry; if the peer already FINed (this
+      // branch), `peer_closed` is set and we remove it now — so a fully-closed general
+      // stream is retired exactly once whichever half closes last. A clean full close is
+      // normal completion, NOT a reset, so the id is NOT tombstoned (tombstones absorb a
+      // RESET's late bytes; a peer that FINed sends nothing more).
+      if entry.peer_closed {
+        self.streams.remove(id);
+      }
     }
     Ok(())
   }
@@ -3671,6 +3819,7 @@ where
   fn guard_send_on(&mut self, id: StreamId, op: SendOp) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
   {
     self.reconcile_pending_resets();
     match self.phase {
@@ -3789,6 +3938,20 @@ where
     // `Reset` — while its original reset is still queued (a duplicate / wrong-code abort
     // on the wire). A stream reset does not fail the connection, so this runs live.
     self.reconcile_pending_resets();
+    // A peer reset on a LOCALLY-reset BIDIRECTIONAL request id (we already reset /
+    // rejected it at capacity — tombstoning it; the peer now resets its side too, a
+    // double-close). The store entry is gone, so this is a definitive "stream fully
+    // closed" signal: a peer reset terminates the sending side, so no further late bytes
+    // will arrive on this id. Absorb it (no re-classification as a non-request close) and
+    // CLEAR the tombstone, keeping the set bounded. See `reset_tombstones`. (Only LOCAL
+    // resets tombstone — a peer reset is itself the close signal — so this fires for the
+    // local-then-peer double-close, not for a peer-only reset. `reconcile_pending_resets`
+    // above checks every condemned id; a DISTINCT id reset here does not touch this
+    // `id`'s tombstone.)
+    if self.reset_tombstones.contains(id) {
+      self.clear_reset_tombstone(id);
+      return;
+    }
     if let Some(entry) = self.streams.get(id) {
       let is_tunnel = Mo::IS_TUNNEL;
       let abandoned = entry.abandoned;
@@ -3799,6 +3962,15 @@ where
         // and we do not echo a reset back (the peer already aborted its side). If it was
         // the tunnel-slot pointer it is cleared. (The tunnel branch below keeps the
         // connection-scoped teardown.)
+        //
+        // NO tombstone: a peer RESET_STREAM terminates the peer's SENDING side, so the
+        // peer will deliver no further bytes on this id — there is nothing late to
+        // absorb, and unlike a LOCAL reset (`reset_stream`) the peer reset is itself the
+        // close signal, with no guaranteed later FIN/reset to clear a tombstone. So
+        // tombstoning here would leak: repeated peer resets would grow the set unbounded
+        // on the heap tiers and fail the bare-tier set closed. Tombstones are reserved
+        // for LOCAL resets, where the peer may still have in-flight bytes that must not
+        // re-classify as a fresh inbound uni stream (see `reset_tombstones`).
         self.streams.remove(id);
         if self.tunnel_id == Some(id) {
           self.tunnel_id = None;
@@ -3836,11 +4008,18 @@ where
   ///
   /// - **Request stream** (routed through [`Stream::fin`]):
   ///   - a clean end at a frame boundary once the leading message completed (the
-  ///     CONNECT request / final response, and the tunnel is established) enqueues
-  ///     [`Event::PeerClosed`] — a graceful half-close that does NOT make the
-  ///     connection terminal. Idempotent: a second clean FIN on the (already
-  ///     half-closed) request stream enqueues no duplicate `PeerClosed` (the peer FINs
-  ///     its send side at most once);
+  ///     CONNECT request / final response) is a graceful half-close that does NOT make
+  ///     the connection terminal; its SCOPE rides the `Mode` marker (`Mo::IS_TUNNEL`),
+  ///     exactly like [`Event::Established`] / [`Event::Reset`]:
+  ///     - a **CONNECT tunnel** (and the tunnel is established) enqueues the
+  ///       connection-level [`Event::PeerClosed`]. Idempotent: a second clean FIN on
+  ///       the (already half-closed) stream enqueues no duplicate (the peer FINs its
+  ///       send side at most once);
+  ///     - a **general** request stream records the per-stream half-close and enqueues
+  ///       NO connection event (RFC 9114 §2 — a stream-id-less `Event::PeerClosed`
+  ///       would read as the whole connection closing; a General connection has no
+  ///       connection-wide lifecycle). The stream is retired once its local send half is
+  ///       also closed (a full close);
   ///   - a malformed FIN — at a frame boundary while the leading message is still
   ///     incomplete (no HEADERS, or only interim 1xx leading sections —
   ///     [`H3Error::RequestIncomplete`], RFC 9114 §8.1) or mid-frame
@@ -3887,6 +4066,17 @@ where
     // live; the condemned `id` then reads as unknown here (handled by the non-request
     // fallthrough, which ignores it).
     self.reconcile_pending_resets();
+    // A FIN on a just-reset BIDIRECTIONAL request id: the reset already removed the store
+    // entry and emitted the `RESET_STREAM`, so this FIN is the driver reporting the stream
+    // fully closed. Absorb it cleanly — no `PeerClosed` (the stream was reset, not
+    // gracefully half-closed), no error, no re-classification as a non-request close — and
+    // CLEAR the tombstone: with the stream closed there can be no further late bytes to
+    // absorb, so the set stays bounded to reset-but-not-yet-closed ids. See
+    // `reset_tombstones`.
+    if self.reset_tombstones.contains(id) {
+      self.clear_reset_tombstone(id);
+      return;
+    }
     if let Some(entry) = self.streams.get(id) {
       // Read the per-stream FIN outcome + markers into locals so the `entry` (and thus
       // `self.streams`) borrow ends before any `self.fail` / `self.events` mutation
@@ -3915,43 +4105,67 @@ where
       }
       match fin {
         // A clean end at a frame boundary once the LEADING MESSAGE completed (the FSM
-        // left `Phase::Headers`): the peer half-closed its send side. A graceful
-        // tunnel-end signal, NOT a connection-fatal error, so the connection is not
-        // forced terminal here — a half-closed tunnel may still send locally (the
-        // request FSM models only the peer's direction). But `fin() == Ok(())` proves
-        // only that the leading message completed (the CONNECT request / final
-        // response, NOT merely an interim 1xx), NOT that the tunnel is established (open
-        // for DATA): on the SERVER the phase can still be `Handshaking` here, with the
-        // request HEADERS observed (`request_received`) but `accept_with` not yet called
-        // (it sends the 2xx and establishes). A tunnel-lifecycle `PeerClosed` must never
-        // precede `Established`, so gate on `tunnel_established` exactly like inbound
-        // tunnel DATA:
+        // left `Phase::Headers`): the peer half-closed its send side. NOT a
+        // connection-fatal error, so the connection is not forced terminal here — a
+        // half-closed stream may still send locally (the recv FSM models only the peer's
+        // direction). The SCOPE of the half-close rides the connection's `Mode` marker,
+        // exactly as `Event::Established` and `Event::Reset` do — a clean FIN is a
+        // PER-STREAM lifecycle event, so it may only become a connection-scoped
+        // `Event::PeerClosed` on a CONNECT TUNNEL (one tunnel = one connection):
         //
-        // - established → surface `PeerClosed` now. Idempotent: `RequestStream::fin()`
-        //   is a pure read that keeps returning `Ok(())` at a post-leading frame
-        //   boundary, so a second clean FIN would re-push `PeerClosed`; the
-        //   `peer_closed` flag emits it exactly once (the peer FINs its send side at
-        //   most once).
-        // - not yet established → DEFER it: record `peer_fin_pending` and emit nothing
-        //   now. This is a real half-close that must still surface, but only after the
-        //   tunnel opens — `establish` (which `accept_with` calls) emits the deferred
-        //   `PeerClosed` immediately after pushing `Established`, so `Established`
-        //   strictly precedes it. `peer_closed` stays `false` so that deferred emit
-        //   can still fire exactly once.
+        // - CONNECT TUNNEL (`Mo::IS_TUNNEL`): surface the connection-level
+        //   `Event::PeerClosed`. But `fin() == Ok(())` proves only that the leading
+        //   message completed (the CONNECT request / final response, NOT merely an
+        //   interim 1xx), NOT that the tunnel is established (open for DATA): on the
+        //   SERVER the phase can still be `Handshaking` here, with the request HEADERS
+        //   observed (`request_received`) but `accept_with` not yet called (it sends the
+        //   2xx and establishes). A tunnel-lifecycle `PeerClosed` must never precede
+        //   `Established`, so gate on the entry's `established` exactly like inbound
+        //   tunnel DATA:
+        //   - established → push `PeerClosed` now. Idempotent: `Stream::fin()` is a pure
+        //     read that keeps returning `Ok(())` at a post-leading frame boundary, so a
+        //     second clean FIN would re-push it; the `peer_closed` flag emits it exactly
+        //     once (the peer FINs its send side at most once).
+        //   - not yet established → DEFER it: record `peer_fin_pending`, emit nothing
+        //     now. This half-close must still surface, but only after the tunnel opens —
+        //     `establish` (which `accept_with` calls) emits the deferred `PeerClosed`
+        //     immediately after `Established`, so `Established` strictly precedes it.
+        //     `peer_closed` stays `false` so that deferred emit fires exactly once.
+        // - GENERAL connection: a request stream's clean FIN is PER-STREAM, never a
+        //   connection event (RFC 9114 §2 — events are connection-scoped; a General
+        //   connection has no connection-wide lifecycle, so a stream-id-less
+        //   `Event::PeerClosed` would read as the WHOLE connection closing). Record the
+        //   peer's receive-side half-close on the entry (`peer_closed`, idempotent — the
+        //   per-stream surface, also de-duping a second clean FIN), push NO event, and
+        //   RETIRE the stream when BOTH halves are done: once the local send half is also
+        //   `Closed` (our `finish` ran), the stream is fully closed, so free its slot.
+        //   A still-open local send half (body / trailers may follow) keeps the entry
+        //   live. (A General connection records no `tunnel_id`, so there is no pointer to
+        //   clear.) `establish` never flushes a General `peer_fin_pending` (it is
+        //   tunnel-gated), so General must not route through the defer arm.
         Ok(()) => {
-          // The per-stream markers live on the entry; borrow it and `self.events`
-          // (disjoint fields) to surface / defer the half-close exactly once.
-          let Self {
-            streams, events, ..
-          } = self;
-          if let Some(entry) = streams.get_mut(id) {
-            if entry.established {
-              if !entry.peer_closed {
-                entry.peer_closed = true;
-                let _ = events.push(Event::PeerClosed);
+          if Mo::IS_TUNNEL {
+            // The per-stream markers live on the entry; borrow it and `self.events`
+            // (disjoint fields) to surface / defer the tunnel half-close exactly once.
+            let Self {
+              streams, events, ..
+            } = self;
+            if let Some(entry) = streams.get_mut(id) {
+              if entry.established {
+                if !entry.peer_closed {
+                  entry.peer_closed = true;
+                  let _ = events.push(Event::PeerClosed);
+                }
+              } else {
+                entry.peer_fin_pending = true;
               }
-            } else {
-              entry.peer_fin_pending = true;
+            }
+          } else if let Some(entry) = self.streams.get_mut(id) {
+            entry.peer_closed = true;
+            // Retire only once the LOCAL send half is also closed (full close); a
+            // half-closed stream may still send locally, so keep its entry until then.
+            if entry.send == SendState::Closed {
+              self.streams.remove(id);
             }
           }
         }
@@ -4060,6 +4274,7 @@ where
   pub fn poll_transmit(&mut self) -> Option<Transmit<'_>>
   where
     TxBuf: AsRef<[u8]> + AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
   {
     // Reconcile any deferred stream-scoped reset (free the slot + purge the stream's
     // queued DATA) BEFORE the `Failed` guard, so a condemned stream reads as gone and no
@@ -4207,14 +4422,19 @@ where
     };
     // Encode and size-check the request HEADERS in a SINGLE traversal: the field
     // section is written into the transmit slot and its decoded size measured in
-    // the one pass, then validated against the peer's MAX_FIELD_SECTION_SIZE. On
-    // a too-large section `write_headers_frame` errors, so the slot is discarded
-    // (never committed) and `request_sent` below is NOT reached — the bytes we
-    // validated are exactly the bytes we would have sent.
+    // the one pass, then validated against the peer's MAX_FIELD_SECTION_SIZE. The
+    // same pass accumulates the full structural scan (`MessageKind::Request`), so a
+    // malformed CONNECT request (duplicate/misplaced pseudo, forbidden field, …) is
+    // rejected before commit. On a too-large or malformed section the closure errors,
+    // so the slot is discarded (never committed) and `request_sent` below is NOT
+    // reached — the bytes we validated are exactly the bytes we would have sent.
+    let request = OutboundValidator::new(request);
     self
       .tx
       .enqueue(StreamKind::OpenRequest, false, |out| {
-        write_headers_frame(out, request, limit)
+        let frame_len = write_headers_frame(out, &request, limit)?;
+        request.validate(MessageKind::Request)?;
+        Ok(frame_len)
       })
       .map_err(map_tx)?;
     self.request_sent = true;
@@ -4296,8 +4516,20 @@ where
   ///   `H3_REQUEST_REJECTED` (RFC 9114 §4.1; the request may be safely retried on a new
   ///   id) and NO HEADERS are enqueued for it — the open failed. NOT connection-fatal.
   /// - [`Error::FieldSectionTooLarge`] — the request's decoded field-section size
-  ///   exceeds the peer's advertised `MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2). A
-  ///   just-inserted entry is rolled back (no lingering entry without HEADERS).
+  ///   exceeds the peer's advertised `MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2). The
+  ///   HEADERS are encoded BEFORE the stream is registered, so a size failure leaves no
+  ///   entry and does not consume the construction-time recv-buffer seed.
+  /// - [`Error::Protocol`]`(`[`H3Error::StreamCreation`]`)` — `id` cannot be opened
+  ///   because it is single-use and already spent:
+  ///   - it is ALREADY a tracked LIVE request stream (a duplicate / retried open). Its
+  ///     leading HEADERS are already enqueued and its send half-FSM is past `Idle`, so
+  ///     opening it again would write a SECOND leading field section onto the same QUIC
+  ///     stream (an invalid `HEADERS HEADERS DATA` sequence, RFC 9114 §4.1); OR
+  ///   - it was RESET (locally or rejected at capacity) but the driver has not yet
+  ///     reported it fully closed, so it is still tombstoned. A QUIC stream id is
+  ///     single-use (RFC 9114 §4.1): a reset id must NOT be re-opened — the request
+  ///     must be retried on a NEW id. Rejected BEFORE any transmit or state change — no
+  ///     HEADERS, no entry, no rollback.
   #[allow(private_bounds)]
   pub fn open_request<H: Headers + ?Sized>(
     &mut self,
@@ -4313,14 +4545,34 @@ where
     // Extended-CONNECT opt-in (a normal request has no `:protocol`). Resolved before
     // any slot is registered so a not-ready call mutates no state.
     let limit = self.guard_open_request()?;
-    // Reconcile any deferred stream-scoped reset FIRST, so a stream a prior `Frames`
-    // carrier condemned (e.g. a malformed response on this client `id`) is freed before
-    // the `preexisting` / `provide_request_stream` membership checks below. Otherwise a
-    // condemned `id` would read as already-registered (`preexisting = true`) and this
-    // call would write its HEADERS onto an entry whose abort is still queued. After
-    // reconciling, the condemned entry is gone — re-opening `id` is then a clean fresh
-    // stream (a legitimate id reuse after the reset).
+    // Materialize any deferred stream-scoped reset FIRST so a stream a prior `Frames`
+    // carrier condemned (e.g. a malformed response on this client `id`) is freed AND
+    // tombstoned before the checks below. The freed entry then reads as gone (not a
+    // live duplicate), and the tombstone it left fences the id against reuse — a reset
+    // id is single-use, never re-openable as fresh (RFC 9114 §4.1).
     self.reconcile_pending_resets();
+    // REJECT a reused id whose prior stream is RESET-but-not-yet-closed. A
+    // stream-scoped reset frees the store entry but keeps the id in
+    // `reset_tombstones` until the driver reports it fully closed, so the
+    // duplicate check below (which keys only on `streams`) would NOT catch it —
+    // re-opening here would register a NEW entry and enqueue HEADERS on an
+    // already-reset QUIC stream id (single-use, RFC 9114 §4.1; and a later inbound
+    // byte would be swallowed by the tombstone guard before the store lookup,
+    // wedging the stream). A reset id is single-use: refuse it until the tombstone
+    // clears. (`reconcile_pending_resets` above also tombstoned any id a `Frames`
+    // carrier just condemned, so a freshly-condemned id is fenced here too.)
+    if self.reset_tombstones.contains(id) {
+      return Err(Error::Protocol(H3Error::StreamCreation));
+    }
+    // REJECT a duplicate / retried open of an already-tracked LIVE id BEFORE any
+    // transmit or state change. The existing entry's leading request HEADERS are
+    // already enqueued and its send half-FSM is past `Idle`, so re-providing here
+    // (an idempotent re-bind) and enqueueing again would emit a SECOND leading
+    // field section on the same QUIC stream — an invalid `HEADERS HEADERS DATA`
+    // sequence (RFC 9114 §4.1). No transmit, no rollback, no state touched.
+    if self.streams.get(id).is_some() {
+      return Err(Error::Protocol(H3Error::StreamCreation));
+    }
     // Preflight the one transmit slot the request HEADERS need BEFORE registering the
     // stream, so a full ring registers NOTHING (no entry lingers without its leading
     // HEADERS, and the construction-time seed buffer is not consumed) and the caller
@@ -4330,40 +4582,36 @@ where
     if !self.tx.has_capacity_mut(1) {
       return Err(Error::WouldBlock);
     }
-    // Whether `id` was already tracked (an idempotent re-provide): only an entry THIS
-    // call freshly inserts is rolled back below.
-    let preexisting = self.streams.get(id).is_some();
-    // Register the per-stream slot (recv FSM + lifecycle markers) keyed by the
-    // driver-minted `id`, mirroring an inbound `provide_stream(Request, id)`. This is a
-    // `General` connection (the marker is the single source of truth), so a request
-    // establishes per-stream (final response → the entry's `established`), never
-    // connection-wide (no `Event::Established`, no `Phase::Open`), and records no
-    // `tunnel_id` pointer — every id is an independent concurrent stream. An at-capacity
-    // STORE rejects the overflow stream (already reset with `H3_REQUEST_REJECTED` inside):
-    // the id is NOT tracked, so we must NOT enqueue HEADERS on it (the driver was told the
-    // request was rejected, not opened). Return the rejection error rather than both
-    // resetting and writing on the same untracked id.
+    // Encode + validate the request HEADERS into the preflighted ring slot BEFORE
+    // registering the stream, so the seed buffer is consumed only on a committed
+    // open. `tx.enqueue` bumps the queue length only after `fill` returns `Ok`, so a
+    // size / structure failure (`Fill`: the field section exceeds the peer's
+    // `MAX_FIELD_SECTION_SIZE`, or a malformed request — duplicate/misplaced pseudo,
+    // forbidden field, …) commits NOTHING to the ring AND leaves `req_seed` intact,
+    // so the next valid `open_request` on a borrowed/no-alloc (bare) tier still gets
+    // the seeded recv buffer (not `ReqBufAlloc::fresh()`'s empty `&mut []`). No entry
+    // exists yet, so there is nothing to roll back and no `RESET_STREAM` to send (the
+    // HEADERS never reached the wire). The single encode pass mirrors `open_with`.
+    let request = OutboundValidator::new(headers);
+    if let Err(e) = self.tx.enqueue(StreamKind::Existing(id), false, |out| {
+      let frame_len = write_headers_frame(out, &request, limit)?;
+      request.validate(MessageKind::Request)?;
+      Ok(frame_len)
+    }) {
+      return Err(map_tx(e));
+    }
+    // The HEADERS are committed; NOW register the per-stream slot (recv FSM +
+    // lifecycle markers) keyed by the driver-minted `id`, mirroring an inbound
+    // `provide_stream(Request, id)`. This is a `General` connection (the marker is the
+    // single source of truth), so a request establishes per-stream (final response →
+    // the entry's `established`), never connection-wide (no `Event::Established`, no
+    // `Phase::Open`), and records no `tunnel_id` pointer — every id is an independent
+    // concurrent stream. An at-capacity STORE rejects the overflow stream (already
+    // reset with `H3_REQUEST_REJECTED` inside, which also PURGES the HEADERS just
+    // enqueued on `id` so nothing for the rejected stream reaches the wire): the id is
+    // NOT tracked, so return the rejection rather than leaving stray HEADERS.
     if self.provide_request_stream(id) == RequestRegister::Rejected {
       return Err(Error::Protocol(H3Error::RequestRejected));
-    }
-    // Enqueue the request HEADERS on `id` (size-checked in the single encode pass, as in
-    // `open_with`). The ring slot was preflighted, so a failure here is a `Fill` error
-    // (the field section exceeds the peer's `MAX_FIELD_SECTION_SIZE`), not a full ring.
-    // Roll back a JUST-inserted entry on failure so it never lingers without its leading
-    // HEADERS — every later send path (`send_data_on` / `send_trailers` / `finish`) then
-    // reads `id` as unknown, so body-before-HEADERS is impossible. We do NOT enqueue a
-    // `RESET_STREAM`: the HEADERS never reached the wire, so there is nothing for the peer
-    // to reset (do not both reset and write).
-    if let Err(e) = self.tx.enqueue(StreamKind::Existing(id), false, |out| {
-      write_headers_frame(out, headers, limit)
-    }) {
-      if !preexisting {
-        self.streams.remove(id);
-        if self.tunnel_id == Some(id) {
-          self.tunnel_id = None;
-        }
-      }
-      return Err(map_tx(e));
     }
     Ok(())
   }
@@ -4410,13 +4658,19 @@ where
   /// A CONNECT tunnel is established only by a valid `2xx` final response (RFC 9114
   /// §4.4), so — unlike the status-agnostic general `send_response` —`accept_with`
   /// ENFORCES that `response`'s committed `:status` is a `2xx`. The `2xx` check rides
-  /// the SAME single-pass `StatusObserver` encode that `send_response` uses to classify
+  /// the SAME single-pass `OutboundValidator` encode that `send_response` uses to classify
   /// finality: a missing, malformed (not three ASCII digits in `100..=599`), interim
   /// (`1xx`), or non-`2xx` final (`3xx`–`5xx`) `:status` is rejected with
   /// [`Error::Protocol`]`(`[`H3Error::MessageError`]`)` (a local caller bug) BEFORE the
   /// response is committed — the transmit slot is discarded, the tunnel is NOT marked
   /// established, and NO [`Event::Established`] is pushed. To send a non-`2xx` (the
   /// CONNECT request was refused) use [`send_response`](Connection::send_response).
+  ///
+  /// The response section is ALSO held to the full RFC 9114 §4 structure (the SAME
+  /// `validate::OutboundScan` the inbound path uses, run under `MessageKind::Response`):
+  /// a duplicate / misplaced pseudo-header or a forbidden connection-specific / uppercase
+  /// field is rejected with the same `MessageError`, pre-commit, so a malformed acceptance
+  /// neither reaches the wire nor establishes the tunnel.
   ///
   /// The preconditions mirror the client's [`open_with`](Connection::open_with)
   /// (QUIC streams are unordered, so the request stream — and this call — can
@@ -4470,7 +4724,7 @@ where
     };
     // The committed `:status` is the source of truth for whether this is a CONNECT
     // acceptance, NOT the caller's word: a CONNECT tunnel is established only by a valid
-    // `2xx` final response (RFC 9114 §4.4). The `StatusObserver` records the first
+    // `2xx` final response (RFC 9114 §4.4). The `OutboundValidator` records the first
     // `:status`'s class DURING the single encode pass that produces the bytes — so the
     // bytes committed and the acceptance decision come from ONE pass, exactly as
     // `send_response` derives interim-vs-final. A missing / malformed / interim (`1xx`)
@@ -4478,21 +4732,26 @@ where
     // the transmit slot is discarded BEFORE commit: nothing reaches the wire, and the
     // `FinalSent` / `establish()` transitions below are NOT reached (no
     // `Event::Established`).
-    let observer = StatusObserver::new(response);
+    let observer = OutboundValidator::new(response);
     self
       .tx
       .enqueue(StreamKind::Existing(id), false, |out| {
         // Encode + size-check in ONE traversal (see `open_with`): a too-large section
         // errors here and discards the slot.
         let frame_len = write_headers_frame(out, &observer, limit)?;
+        // The same pass accumulated the full structural scan: reject a malformed
+        // RESPONSE section (duplicate/misplaced pseudo, forbidden field, …) BEFORE
+        // commit, discarding this slot.
+        observer.validate(MessageKind::Response)?;
         // The recorded class now reflects the EXACT encoded section. Reject anything but
         // a valid `2xx` — discarding this slot.
         observer.require_2xx()?;
         Ok(frame_len)
       })
       .map_err(map_tx)?;
-    // The slot is committed (the closure returned `Ok` only after `require_2xx`
-    // succeeded), so this re-read cannot diverge from the committed bytes.
+    // The slot is committed (the closure returned `Ok` only after structural
+    // validation and `require_2xx` succeeded), so this re-read cannot diverge from
+    // the committed bytes.
     observer.require_2xx()?;
     // `accept_with` runs only on a `Tunnel` connection, so the tunnel-vs-general identity
     // is already settled by the `Mo` marker — there is no per-entry flag to flip. The
@@ -4635,14 +4894,14 @@ where
     // out of sequence (after the final, or after `finish`).
     let limit = self.guard_send_response(id)?;
     // Finality is DERIVED from the `:status` of the field section ACTUALLY ENCODED,
-    // NOT taken from `last` and NOT from a separate traversal: the `StatusObserver`
+    // NOT taken from `last` and NOT from a separate traversal: the `OutboundValidator`
     // records the first `:status`'s class DURING the single encode pass that produces
     // the bytes, so the bytes committed and the finality decision come from one pass.
     // `last` is asserted to match that recorded class. A misclassified / unclassifiable
     // response, or a `last` that contradicts the encoded class, makes the fill closure
     // return `Err` so the transmit slot is discarded BEFORE commit — nothing reaches
     // the wire and the `established` / `SendState` transition below is NOT reached.
-    let observer = StatusObserver::new(headers);
+    let observer = OutboundValidator::new(headers);
     self
       .tx
       .enqueue(StreamKind::Existing(id), false, |out| {
@@ -4652,6 +4911,14 @@ where
         // The class now reflects the EXACT encoded section. Reject an unclassifiable
         // `:status` or a `last` that contradicts it — both discard this slot.
         let interim = observer.finality()?;
+        // The same pass accumulated the full structural scan: validate the RESPONSE
+        // section under the kind the recorded finality selects (interim 1xx vs final),
+        // rejecting a duplicate/misplaced pseudo, forbidden field, … before commit.
+        observer.validate(if interim {
+          MessageKind::Interim
+        } else {
+          MessageKind::Response
+        })?;
         if last == interim {
           // `last` contradicts the `:status` class: a final status with `last = false`,
           // or an interim status with `last = true`. A caller bug — refuse without
@@ -4711,6 +4978,7 @@ where
   fn guard_send_response(&mut self, id: StreamId) -> Result<Option<u64>, Error>
   where
     TxBuf: AsMut<[u8]>,
+    EventBuf: AsMut<[Option<Event>]>,
   {
     self.reconcile_pending_resets();
     match self.phase {
@@ -4765,24 +5033,34 @@ fn write_control_settings(out: &mut [u8], settings: &Settings) -> Result<usize, 
 /// this, so header + field section is guaranteed to fit one transmit slot.
 const HEADERS_HDR_RESERVE: usize = CTRL_HDR_CAP;
 
-/// A [`Headers`] adapter that records the FIRST `:status`'s interim/final class
-/// (via [`validate::status_class_is_interim`]) as it forwards the supplier's
-/// `for_each` to the encoder — so the recorded class comes from the EXACT SAME
-/// single traversal that produced the encoded bytes.
+/// A [`Headers`] adapter that runs the FULL outbound message validator
+/// ([`validate::OutboundScan`]) in the SAME single `for_each` traversal that
+/// encodes the field section, AND records the FIRST `:status`'s interim/final
+/// class + `2xx`-ness (via [`validate::status_class_is_interim`] /
+/// [`validate::status_is_2xx`]) from that one pass.
 ///
-/// This closes the classify-then-encode gap: a non-replayable / interior-mutable
-/// supplier (which the crate already treats as adversarial for outbound HEADERS)
-/// could yield one `:status` to a separate classifying traversal and a different
-/// one to the encoder. By classifying DURING the encode pass, `send_response`
-/// drives its finality decision from the `:status` of the field section it
-/// actually commits, never from a stale earlier reading.
+/// This covers BOTH outbound concerns in one traversal:
+/// - **Finality** (`:status` class): a non-replayable / interior-mutable supplier
+///   could yield one `:status` to a separate classifying traversal and a different
+///   one to the encoder. Classifying DURING the encode pass means the finality
+///   decision is driven by the `:status` of the bytes actually committed.
+/// - **Structure:** the same pass accumulates the borrow-free
+///   [`validate::OutboundScan`], so the section is held to the SAME RFC 9114 §4
+///   rules an INBOUND section is — duplicate/misplaced pseudo-headers, forbidden
+///   connection-specific fields, uppercase names, trailer rules — symmetric with
+///   [`validate::validate`], with no second traversal of the supplier.
 ///
 /// `status` distinguishes "no `:status` seen" (`None`) from "a `:status` seen,
 /// classified" (`Some(Option<bool>)`): `Some(Some(interim))` is a valid
 /// interim/final, `Some(None)` an unclassifiable value. The first `:status` wins
-/// (a duplicate is the validator's concern, not this).
-struct StatusObserver<'a, H: Headers + ?Sized> {
+/// for finality (a duplicate `:status` is rejected by `validate` via the scan).
+struct OutboundValidator<'a, H: Headers + ?Sized> {
   inner: &'a H,
+  /// The full structural scan, accumulated pair-by-pair during the encode pass.
+  /// Held in a `Cell` (taken and restored per visited field) because the encoder
+  /// drives `for_each(&self, …)` and the visitor cannot borrow `&mut self`; the
+  /// take/restore is panic-free (no `RefCell` borrow tracking).
+  scan: core::cell::Cell<validate::OutboundScan>,
   /// The first `:status`'s interim classification, recorded during the single encode
   /// pass: outer `None` = no `:status` seen; `Some(None)` = a `:status` that is not a
   /// valid `1xx`–`5xx`; `Some(Some(interim))` = a valid code's interim flag.
@@ -4793,13 +5071,25 @@ struct StatusObserver<'a, H: Headers + ?Sized> {
   is_2xx: core::cell::Cell<bool>,
 }
 
-impl<'a, H: Headers + ?Sized> StatusObserver<'a, H> {
+impl<'a, H: Headers + ?Sized> OutboundValidator<'a, H> {
   const fn new(inner: &'a H) -> Self {
     Self {
       inner,
+      scan: core::cell::Cell::new(validate::OutboundScan::new()),
       status: core::cell::Cell::new(None),
       is_2xx: core::cell::Cell::new(false),
     }
+  }
+
+  /// Runs the SHARED per-[`MessageKind`] finalizer on the section accumulated by
+  /// the encode pass, mapping a structural violation to
+  /// [`Error::Protocol`]`(`[`H3Error::MessageError`]`)`. Read only AFTER the encode
+  /// pass has run; the take/restore leaves the accumulated scan in place to read.
+  fn validate(&self, kind: MessageKind) -> Result<(), Error> {
+    let scan = self.scan.take();
+    let res = scan.finish(kind);
+    self.scan.set(scan);
+    res.map_err(Error::Protocol)
   }
 
   /// The recorded finality of the encoded section: `Ok(true)` interim (`1xx`),
@@ -4831,9 +5121,15 @@ impl<'a, H: Headers + ?Sized> StatusObserver<'a, H> {
   }
 }
 
-impl<H: Headers + ?Sized> Headers for StatusObserver<'_, H> {
+impl<H: Headers + ?Sized> Headers for OutboundValidator<'_, H> {
   fn for_each(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), Error> {
     self.inner.for_each(&mut |name, value| {
+      // Accumulate the structural scan for THIS pair (take/restore: the visitor
+      // holds `&self`, and this is panic-free).
+      let mut scan = self.scan.take();
+      scan.observe(name, value);
+      self.scan.set(scan);
+      // Record the first `:status`'s finality + 2xx-ness from the same pass.
       if name == ":status" && self.status.get().is_none() {
         self
           .status

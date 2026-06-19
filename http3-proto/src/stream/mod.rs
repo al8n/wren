@@ -366,6 +366,24 @@ impl<'buf, B> Stream<'buf, B> {
     self.headers_seen
   }
 
+  /// Whether the LEADING message has completed on the recv half — the FSM has left the
+  /// leading-HEADERS phase (`Phase::Headers`).
+  ///
+  /// True once the connection signalled the leading section complete via
+  /// [`complete_leading`](Self::complete_leading) (the SERVER's single request or the
+  /// CLIENT's FINAL non-interim response), OR a DATA frame began the body, OR trailers
+  /// arrived. It is the same "left `Phase::Headers`" predicate [`fin`](Self::fin) keys on
+  /// for a clean half-close, exposed for the connection's role/mode-aware
+  /// premature-DATA gate: a SERVER's `General` request body legitimately follows the
+  /// request HEADERS once the leading section is complete, with no `:status`-derived
+  /// response establishment to wait for. An interim 1xx does NOT complete the leading
+  /// message (the connection withholds `complete_leading`), so this stays `false` after
+  /// interims only — a body before the final still reads as premature.
+  #[inline]
+  pub(crate) fn leading_complete(&self) -> bool {
+    !matches!(self.phase, Phase::Headers)
+  }
+
   /// Signal that the leading message is complete: the connection classified the
   /// just-completed leading HEADERS section as the SERVER's single request or the
   /// CLIENT's FINAL (non-interim) response — NOT an interim 1xx. The FSM cannot decode
@@ -408,6 +426,14 @@ impl<'a, B> Items<'a, '_, B> {
   /// section even with no intervening DATA. A no-op outside the FSM's leading phase.
   pub(crate) fn complete_leading(&mut self) {
     self.fsm.complete_leading();
+  }
+
+  /// Whether the driven FSM's leading message has completed (see
+  /// [`Stream::leading_complete`]). The connection reads this through the [`Items`] it
+  /// already holds (the FSM is borrowed by it) for its role/mode-aware premature-DATA
+  /// gate, so it need not re-borrow the FSM separately.
+  pub(crate) fn leading_complete(&self) -> bool {
+    self.fsm.leading_complete()
   }
 }
 

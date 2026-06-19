@@ -5,7 +5,7 @@
 #![no_main]
 
 use http3_proto::{
-  Client, Connection, Server,
+  Client, Connection, General, Server,
   event::{StreamId, StreamRole},
 };
 use libfuzzer_sys::fuzz_target;
@@ -38,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
   let value = String::from_utf8_lossy(data);
 
   // ── 2) Client general request path: open_request + send_data_on. ─────────────
-  let mut client = Connection::<Client>::new();
+  let mut client = Connection::<Client, General>::new();
   let _ = client.start();
   // Opt the peer in so open_request reaches the encode path (id 2 = peer control).
   if let Ok(mut frames) = client.handle_stream(StreamId::new(2), PEER_SETTINGS, &mut scratch) {
@@ -60,7 +60,7 @@ fuzz_target!(|data: &[u8]| {
   while client.poll_event().is_some() {}
 
   // ── 3) Server general response path: provide_stream + send_response. ─────────
-  let mut server = Connection::<Server>::new();
+  let mut server = Connection::<Server, General>::new();
   let _ = server.start();
   if let Ok(mut frames) = server.handle_stream(StreamId::new(3), PEER_SETTINGS, &mut scratch) {
     while let Ok(Some(_)) = frames.next() {}
