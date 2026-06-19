@@ -23,8 +23,9 @@ use http3_proto::Server;
 // only on the bare tier (heap tiers grow the store internally). `--all-features
 // --all-targets` also compiles this test under `std`, where `BorrowedConnection`
 // uses the heap store, so the slot type and its `with_buffers` arg are bare-only.
+// `H3Error` / `StreamKind` back the bare capacity-overflow reset assertion.
 #[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
-use http3_proto::StreamSlot;
+use http3_proto::{H3Error, StreamKind, StreamSlot};
 
 type StaticConnection<Ro> = Connection<'static, 'static, 'static, 'static, 'static, Ro>;
 
@@ -173,6 +174,319 @@ fn bare_tier_two_streams_independent() {
   // No frame completed and no connection-scoped event fired (a partial leading
   // section yields nothing; general streams never push `Event::Established`).
   assert!(conn.poll_event().is_none());
+}
+
+/// Finding #3: an at-capacity request stream is reset with `H3_REQUEST_REJECTED` and the
+/// connection survives. A 1-slot stream store is filled by the first request stream, so a
+/// SECOND `provide_stream(Request, ..)` overflows the store (`insert` fails). That
+/// overflow stream's `StreamEntry` is never inserted, so the reset cannot go through
+/// `reset_stream` (its `streams.remove` would no-op); the connection emits a `RESET_STREAM`
+/// transmit DIRECTLY via `enqueue_stream_reset` so the peer learns the request was
+/// rejected. Before the fix the overflow path called `reset_stream`, which emitted nothing.
+///
+/// The bare tier is the natural home: its store is a caller-provided fixed-capacity slice
+/// (here length 1), whereas the heap tiers' `SlabStore` is unbounded and cannot overflow.
+#[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+#[test]
+fn bare_tier_capacity_overflow_resets_with_request_rejected() {
+  let mut request_headers = [0u8; HDR_CAP];
+  let mut control_payload = [0u8; CTRL_CAP];
+  let mut tx_bytes = [0u8; TX_BYTES_CAP];
+  let mut event_slots = [None; EVENT_QUEUE_CAP];
+  let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+  // A ONE-slot stream store: the first request stream fills it, the next overflows.
+  let mut stream_slots: [StreamSlot<'_, &mut [u8]>; 1] = [StreamSlot::EMPTY];
+  let mut conn = BorrowedConnection::<Server>::with_buffers(
+    &mut request_headers[..],
+    &mut control_payload[..],
+    &mut tx_bytes[..],
+    &mut event_slots[..],
+    &mut uni_slots[..],
+    &mut stream_slots[..],
+  );
+  conn.start().expect("start failed");
+  // Drain the setup transmits so the next `poll_transmit` returns only the reset.
+  while conn.poll_transmit().is_some() {}
+  // First request stream (id 0): takes the single store slot (and the seeded buffer).
+  conn.provide_stream(StreamRole::Request, StreamId::new(0));
+  // Second request stream (id 4): the store is full, so the insert overflows. The
+  // overflow stream must be reset with H3_REQUEST_REJECTED (a RESET_STREAM transmit).
+  let overflow = StreamId::new(4);
+  conn.provide_stream(StreamRole::Request, overflow);
+  // The reset IS emitted (not silently dropped): a RESET_STREAM(RequestRejected) for the
+  // overflow id, carrying no bytes. Copy the transmit's facts out so its borrow of `conn`
+  // ends before the `poll_event` read below.
+  let (kind, empty, no_fin) = {
+    let t = conn
+      .poll_transmit()
+      .expect("the overflow stream is reset with a RESET_STREAM transmit");
+    (t.kind(), t.bytes().is_empty(), !t.fin())
+  };
+  assert!(
+    matches!(kind, StreamKind::ResetStream { id, code }
+      if id == overflow && code == H3Error::RequestRejected.code()),
+    "the overflow stream is reset with H3_REQUEST_REJECTED",
+  );
+  assert!(empty, "a RESET_STREAM carries no bytes");
+  assert!(no_fin, "a RESET_STREAM is not a FIN");
+  // The connection survives: overflow is NOT connection-fatal, so no terminal `ConnError`
+  // is queued (a failed connection would surface one here) and the reset emits no
+  // connection-scoped event (it is stream-scoped). `poll_event` draining empty proves
+  // both — `is_failed` is a test-only accessor unavailable on the bare tier.
+  assert!(
+    conn.poll_event().is_none(),
+    "overflow is not connection-fatal: no ConnError, no event"
+  );
+}
+
+/// Finding #1 (round 2): a CLIENT `open_request` at stream-store capacity returns `Err`
+/// and enqueues NO request HEADERS for the over-capacity id (it does not both reset and
+/// write on an untracked id). The connection survives, and the over-capacity stream is
+/// reset with `H3_REQUEST_REJECTED`. Before the fix `open_request` ignored the rejected
+/// registration and enqueued HEADERS on the untracked id anyway, lying with `Ok`.
+///
+/// Bare tier: a 1-slot store, so the first `open_request` fills it (taking the seeded
+/// HEADERS buffer) and the second overflows.
+#[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+#[test]
+fn bare_tier_open_request_at_capacity_errs_without_headers() {
+  let mut request_headers = [0u8; HDR_CAP];
+  let mut control_payload = [0u8; CTRL_CAP];
+  let mut tx_bytes = [0u8; TX_BYTES_CAP];
+  let mut event_slots = [None; EVENT_QUEUE_CAP];
+  let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+  // A ONE-slot stream store: the first request stream fills it, the next overflows.
+  let mut stream_slots: [StreamSlot<'_, &mut [u8]>; 1] = [StreamSlot::EMPTY];
+  let mut conn = BorrowedConnection::<Client>::with_buffers(
+    &mut request_headers[..],
+    &mut control_payload[..],
+    &mut tx_bytes[..],
+    &mut event_slots[..],
+    &mut uni_slots[..],
+    &mut stream_slots[..],
+  );
+  conn.start().expect("start failed");
+  // Feed the peer's control SETTINGS so `open_request` is past its readiness gate.
+  let mut scratch = [0u8; 512];
+  let ctrl_bytes: &[u8] = &[0x00, 0x04, 0x02, 0x08, 0x01];
+  if let Ok(mut frames) = conn.handle_stream(StreamId::new(1), ctrl_bytes, &mut scratch) {
+    while let Ok(Some(_)) = frames.next() {}
+  }
+  // Drain the setup transmits so the only later transmit is the overflow reset.
+  while conn.poll_transmit().is_some() {}
+
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "example.com"),
+  ];
+  // First `open_request` takes the single store slot (and the seeded buffer) and succeeds.
+  let id0 = StreamId::new(0);
+  conn
+    .open_request(id0, get)
+    .expect("first open_request fits");
+  // Its request HEADERS are enqueued on id0. Copy the facts out so the borrow ends.
+  let (first_kind, first_nonempty) = {
+    let first = conn
+      .poll_transmit()
+      .expect("first request HEADERS enqueued");
+    (first.kind(), !first.bytes().is_empty())
+  };
+  assert!(matches!(first_kind, StreamKind::Existing(eid) if eid == id0));
+  assert!(first_nonempty, "the request HEADERS carry bytes");
+
+  // Second `open_request` overflows the 1-slot store: it must return Err and enqueue NO
+  // HEADERS for the over-capacity id.
+  let overflow = StreamId::new(4);
+  let err = conn
+    .open_request(overflow, get)
+    .expect_err("at-capacity open_request must error");
+  assert!(
+    matches!(err, http3_proto::Error::Protocol(H3Error::RequestRejected)),
+    "the over-capacity open is RequestRejected, got {err:?}"
+  );
+  // The ONLY transmit for the over-capacity id is its RESET_STREAM(RequestRejected) — never
+  // request HEADERS (no `Existing(overflow)`). Copy each transmit's facts out so the borrow
+  // ends before the next poll.
+  let mut saw_reset = false;
+  loop {
+    let next = {
+      match conn.poll_transmit() {
+        None => break,
+        Some(t) => (t.kind(), t.bytes().is_empty()),
+      }
+    };
+    let (kind, empty) = next;
+    match kind {
+      StreamKind::ResetStream { id, code } => {
+        assert_eq!(id, overflow, "the reset targets the over-capacity id");
+        assert_eq!(code, H3Error::RequestRejected.code(), "H3_REQUEST_REJECTED");
+        assert!(empty, "a RESET_STREAM carries no bytes");
+        saw_reset = true;
+      }
+      StreamKind::Existing(eid) => {
+        assert_ne!(eid, overflow, "NO request HEADERS for the over-capacity id");
+      }
+      _ => {}
+    }
+  }
+  assert!(
+    saw_reset,
+    "the over-capacity stream is reset with H3_REQUEST_REJECTED"
+  );
+  // The connection survives: overflow is not connection-fatal, so no terminal ConnError.
+  assert!(
+    conn.poll_event().is_none(),
+    "an at-capacity open is not connection-fatal: no ConnError"
+  );
+  // The rejected id is not tracked, so a send on it reads as closed (no lingering entry).
+  assert!(
+    matches!(
+      conn.send_data_on(overflow, &b"x"[..]),
+      Err(http3_proto::Error::Closed)
+    ),
+    "the rejected stream is untracked: a body on it is rejected (no body-before-HEADERS)"
+  );
+}
+
+/// Finding #3 (round 2): a capacity-rejection reset is NOT lost under transmit
+/// backpressure. With the transmit ring FULL at the moment a request stream overflows the
+/// store, the `RESET_STREAM(RequestRejected)` cannot be enqueued directly; instead it is
+/// recorded in the bounded pending-reset retry queue and materializes on a later
+/// `poll_transmit` once the ring drains. Before the fix `enqueue_stream_reset` dropped the
+/// failed enqueue, silently losing the reset.
+///
+/// The ring is sized for EXACTLY the three setup transmits, so it is full right after
+/// `start()`; the overflow reset must survive in the retry queue until the ring drains.
+#[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+#[test]
+fn bare_tier_capacity_reset_survives_full_tx_ring() {
+  use http3_proto::connection::TX_SLOT_CAP;
+  let mut request_headers = [0u8; HDR_CAP];
+  let mut control_payload = [0u8; CTRL_CAP];
+  // Exactly three transmit slots: full immediately after the three setup transmits.
+  let mut tx_bytes = [0u8; TX_SLOT_CAP * 3];
+  let mut event_slots = [None; EVENT_QUEUE_CAP];
+  let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+  let mut stream_slots: [StreamSlot<'_, &mut [u8]>; 1] = [StreamSlot::EMPTY];
+  let mut conn = BorrowedConnection::<Server>::with_buffers(
+    &mut request_headers[..],
+    &mut control_payload[..],
+    &mut tx_bytes[..],
+    &mut event_slots[..],
+    &mut uni_slots[..],
+    &mut stream_slots[..],
+  );
+  conn.start().expect("start failed");
+  // The ring now holds the three setup transmits and is FULL — do NOT drain it.
+  // First request stream fills the 1-slot store.
+  conn.provide_stream(StreamRole::Request, StreamId::new(0));
+  // Second request stream overflows the store. Its RESET_STREAM(RequestRejected) cannot be
+  // enqueued (ring full), so it is recorded in the retry queue rather than dropped.
+  let overflow = StreamId::new(4);
+  conn.provide_stream(StreamRole::Request, overflow);
+
+  // Drain every transmit, collecting whether the deferred reset materializes. The first
+  // polls yield the setup transmits; as the ring drains, the queued reset is re-enqueued at
+  // the head of `poll_transmit` and surfaces — it is NOT lost.
+  let mut saw_reset = false;
+  let mut total = 0usize;
+  loop {
+    let captured = match conn.poll_transmit() {
+      None => break,
+      Some(t) => (t.kind(), t.bytes().is_empty()),
+    };
+    total = total.saturating_add(1);
+    if let (StreamKind::ResetStream { id, code }, empty) = captured {
+      assert_eq!(
+        id, overflow,
+        "the deferred reset targets the over-capacity id"
+      );
+      assert_eq!(code, H3Error::RequestRejected.code(), "H3_REQUEST_REJECTED");
+      assert!(empty, "a RESET_STREAM carries no bytes");
+      saw_reset = true;
+    }
+    // Guard against a non-terminating loop if the retry logic regressed.
+    assert!(total < 16, "transmit drain should terminate");
+  }
+  assert!(
+    saw_reset,
+    "the backpressured RequestRejected reset materializes once the ring drains (not lost)"
+  );
+  // The connection survives: a capacity rejection under backpressure is not fatal.
+  assert!(
+    conn.poll_event().is_none(),
+    "a backpressured capacity rejection is not connection-fatal"
+  );
+}
+
+/// Finding #2 (round 3): resetting a stream PURGES its already-queued `Existing(id)`
+/// DATA/FIN from the transmit ring, so the `RESET_STREAM` supersedes — does not queue
+/// behind — the stale bytes. On the bare tier the DATA payload lives entirely in the byte
+/// ring (no refcounted body), so the tombstone-and-skip purge is what drops it: after the
+/// reset, `poll_transmit` yields the abort with NO `Existing(id)` transmit preceding it, and
+/// nothing after. Before the fix the queued DATA drained ahead of the reset.
+#[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
+#[test]
+fn bare_tier_reset_purges_queued_same_stream_data() {
+  let mut request_headers = [0u8; HDR_CAP];
+  let mut control_payload = [0u8; CTRL_CAP];
+  let mut tx_bytes = [0u8; TX_BYTES_CAP];
+  let mut event_slots = [None; EVENT_QUEUE_CAP];
+  let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
+  let mut stream_slots: [StreamSlot<'_, &mut [u8]>; 1] = [StreamSlot::EMPTY];
+  let mut conn = BorrowedConnection::<Client>::with_buffers(
+    &mut request_headers[..],
+    &mut control_payload[..],
+    &mut tx_bytes[..],
+    &mut event_slots[..],
+    &mut uni_slots[..],
+    &mut stream_slots[..],
+  );
+  conn.start().expect("start failed");
+  // Feed the peer's control SETTINGS so `open_request` is past its readiness gate.
+  let mut scratch = [0u8; 512];
+  let ctrl_bytes: &[u8] = &[0x00, 0x04, 0x02, 0x08, 0x01];
+  if let Ok(mut frames) = conn.handle_stream(StreamId::new(1), ctrl_bytes, &mut scratch) {
+    while let Ok(Some(_)) = frames.next() {}
+  }
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "POST"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "example.com"),
+  ];
+  conn.open_request(id, get).expect("open_request fits");
+  // Drain the setup transmits AND the request HEADERS, so the ring holds only the DATA we
+  // queue next (isolating the purge assertion).
+  while conn.poll_transmit().is_some() {}
+  // Queue request-body DATA on `id` (a client may send body before any response). On bare
+  // these bytes live in the ring.
+  for _ in 0..3 {
+    conn
+      .send_data_on(id, &b"stale-body"[..])
+      .expect("queue request body");
+  }
+  // Condemn the stream: purge its queued DATA and enqueue the RESET_STREAM.
+  conn.reset_stream(id, H3Error::RequestRejected.code());
+  // The FIRST (and only) transmit is the RESET_STREAM — NO `Existing(id)` DATA precedes it.
+  let first = {
+    let t = conn.poll_transmit().expect("a transmit after reset");
+    (t.kind(), t.bytes().is_empty())
+  };
+  assert!(
+    matches!(first.0, StreamKind::ResetStream { id: rid, code }
+      if rid == id && code == H3Error::RequestRejected.code()),
+    "the reset supersedes the queued DATA (first transmit), got {:?}",
+    first.0
+  );
+  assert!(first.1, "a RESET_STREAM carries no bytes");
+  assert!(
+    conn.poll_transmit().is_none(),
+    "the purged same-stream DATA is gone (only the reset remained)"
+  );
 }
 
 #[test]

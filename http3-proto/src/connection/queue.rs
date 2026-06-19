@@ -7,7 +7,7 @@ use core::{marker::PhantomData, ops::Range};
 
 #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
 use crate::backend::DataBuf;
-use crate::event::{Event, StreamKind, Transmit};
+use crate::event::{Event, StreamId, StreamKind, Transmit};
 
 /// Adds `a + b` and reduces it modulo `cap` without using `%` (which would trip
 /// the `arithmetic_side_effects` deny on a possible `% 0`). Callers guarantee
@@ -129,6 +129,142 @@ where
   }
 }
 
+/// Whether a queued stream reset still needs its [`StreamStore`] slot bookkeeping
+/// (free the slot + clear the tunnel-slot pointer) or only its wire `RESET_STREAM`.
+///
+/// [`StreamStore`]: crate::stream_store::StreamStore
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ResetKind {
+  /// A carrier-deferred stream reset: the lending `Frames` carrier recorded a
+  /// stream-scoped error on a tracked stream it could not reset in place. Draining
+  /// it does the slot bookkeeping (remove the entry, clear `request_id` if it was the
+  /// tunnel-slot pointer) AND enqueues the wire `RESET_STREAM`.
+  Carrier,
+  /// A wire-only reset: the stream was never inserted (the capacity backstop's
+  /// overflow stream) or its slot bookkeeping already ran (a `Carrier` reset whose
+  /// wire enqueue then hit a full ring and was re-queued). Draining it only enqueues
+  /// the wire `RESET_STREAM`.
+  WireOnly,
+}
+
+/// One queued stream reset: the stream `id`, its application error `code`, and
+/// whether it still needs slot bookkeeping ([`ResetKind`]).
+#[derive(Clone, Copy)]
+pub(crate) struct PendingReset {
+  pub(crate) id: StreamId,
+  pub(crate) code: u64,
+  pub(crate) kind: ResetKind,
+}
+
+/// The number of stream resets the bounded retry queue holds. Resets are rare — a
+/// stream-scoped protocol error or a capacity rejection — and the queue normally
+/// holds 0–1 entries (a carrier records at most one per `handle_stream`, drained at
+/// the head of the next API entry). It only grows when the transmit ring is
+/// persistently full and `RESET_STREAM`s cannot flush; a handful of slots is generous
+/// headroom for that. Exceeding it is itself a load condition (a peer flooding streams
+/// against a full ring), so it fails the connection closed ([`H3Error::ExcessiveLoad`])
+/// rather than silently dropping a reset. Kept small so the inline queue does not
+/// bloat the connection value (see `connection_value_is_small_*`).
+///
+/// [`H3Error::ExcessiveLoad`]: crate::error::H3Error::ExcessiveLoad
+pub(crate) const RESET_CAP: usize = 4;
+
+/// A small bounded FIFO of stream resets awaiting materialization, generalizing the
+/// connection's former single `pending_reset` slot.
+///
+/// Two sources feed it (see [`ResetKind`]): the lending `Frames` carrier records a
+/// stream-scoped error it cannot reset in place, and the capacity backstop records a
+/// `RESET_STREAM(RequestRejected)` whose direct enqueue lost to a full transmit ring.
+/// The connection drains it at the head of every `&mut self` entry that can observe
+/// the effect (`handle_stream` / `poll_transmit` / the send guards), retrying the
+/// wire enqueue so a backpressured reset is never lost.
+///
+/// A FIFO ring rather than `BoundedQueue` because draining must be able to re-queue a
+/// just-popped entry (its wire enqueue lost to a still-full ring) at the FRONT, so the
+/// reset is retried before any later one — `BoundedQueue` only pushes to the back.
+pub(crate) struct PendingResets {
+  slots: [Option<PendingReset>; RESET_CAP],
+  head: usize,
+  len: usize,
+}
+
+impl PendingResets {
+  /// An empty reset queue.
+  pub(crate) const fn new() -> Self {
+    Self {
+      slots: [None; RESET_CAP],
+      head: 0,
+      len: 0,
+    }
+  }
+
+  /// Whether the queue holds no pending resets. Drives the `poll_transmit`
+  /// drain-then-retry fixpoint: it keeps freeing tombstoned capacity and retrying only
+  /// while resets remain.
+  pub(crate) fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// Whether a reset for `id` is already queued (any [`ResetKind`]). The carrier's
+  /// "first stream error wins" guard and the capacity path use this so a stream is
+  /// never reset twice.
+  pub(crate) fn contains(&self, id: StreamId) -> bool {
+    self
+      .slots
+      .iter()
+      .any(|s| matches!(s, Some(r) if r.id == id))
+  }
+
+  /// Pushes a reset to the BACK, returning `false` if the queue is full (the caller
+  /// then fails the connection closed — `RESET_CAP` resets is already pathological).
+  pub(crate) fn push_back(&mut self, reset: PendingReset) -> bool {
+    if self.len >= RESET_CAP {
+      return false;
+    }
+    let tail = wrap_add(self.head, self.len, RESET_CAP);
+    if let Some(slot) = self.slots.get_mut(tail) {
+      *slot = Some(reset);
+      self.len = self.len.saturating_add(1);
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Re-queues a just-popped reset at the FRONT (its wire enqueue lost to a full
+  /// ring), so it is retried before any later reset. The slot it was popped from is
+  /// free, so this never overflows after a `pop_front`.
+  pub(crate) fn push_front(&mut self, reset: PendingReset) -> bool {
+    if self.len >= RESET_CAP {
+      return false;
+    }
+    // One step back from `head`, wrapping, without `-1 % cap`.
+    self.head = if self.head == 0 {
+      RESET_CAP.saturating_sub(1)
+    } else {
+      self.head.saturating_sub(1)
+    };
+    if let Some(slot) = self.slots.get_mut(self.head) {
+      *slot = Some(reset);
+      self.len = self.len.saturating_add(1);
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Pops the front reset, or `None` if empty.
+  pub(crate) fn pop_front(&mut self) -> Option<PendingReset> {
+    if self.len == 0 {
+      return None;
+    }
+    let item = self.slots.get_mut(self.head).and_then(Option::take);
+    self.head = wrap_add(self.head, 1, RESET_CAP);
+    self.len = self.len.saturating_sub(1);
+    item
+  }
+}
+
 /// The byte capacity of a single transmit slot. A queued transmit — including a
 /// DATA payload plus its frame header — must fit this; larger `send_data` calls
 /// error. This is the v1 no-alloc bound.
@@ -174,6 +310,11 @@ struct TxMeta {
   kind: StreamKind,
   fin: bool,
   body: Option<DataBuf>,
+  /// A purged slot ([`purge_stream`](TxRing::purge_stream)): its held body is freed
+  /// and [`poll`](TxRing::poll) skips it. Used to drop a reset stream's already-queued
+  /// `Existing(id)` DATA/FIN so no ordinary same-stream transmit precedes its
+  /// `RESET_STREAM`, without moving the ring's positionally-indexed bytes.
+  tombstone: bool,
 }
 
 /// Metadata for one queued transmit slot (bare tier: no refcounted body — the
@@ -184,6 +325,8 @@ struct TxMeta {
   len: usize,
   kind: StreamKind,
   fin: bool,
+  /// See the heap-tier [`TxMeta::tombstone`].
+  tombstone: bool,
 }
 
 #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
@@ -193,6 +336,7 @@ fn empty_tx_meta() -> TxMeta {
     kind: StreamKind::OpenRequest,
     fin: false,
     body: None,
+    tombstone: false,
   }
 }
 
@@ -202,6 +346,7 @@ const fn empty_tx_meta() -> TxMeta {
     len: 0,
     kind: StreamKind::OpenRequest,
     fin: false,
+    tombstone: false,
   }
 }
 
@@ -311,6 +456,12 @@ where
       None => 0,
     };
     if self.front.is_none() {
+      // Drop any purged (tombstoned) slots now at the head before lending the next
+      // transmit, so a reset stream's superseded `Existing(id)` DATA/FIN is never
+      // yielded. A still-in-flight slot (front set above) is never tombstoned —
+      // `purge_stream` clears `front` when it tombstones the head — so this only
+      // runs on a fresh head.
+      self.drop_head_tombstones(capacity);
       if self.len == 0 {
         return None;
       }
@@ -320,6 +471,48 @@ where
       });
     }
     self.build_transmit(self.head, consumed)
+  }
+
+  /// Drains every leading tombstoned slot, freeing the `len` they hold WITHOUT
+  /// lending a transmit. The liveness half of the reset-delivery state machine: a
+  /// reset that [`purge_stream`](Self::purge_stream)d a full ring of same-stream DATA
+  /// cannot fit the still-full ring at enqueue time (tombstones count against `len`
+  /// until drained), so the connection must free that tombstoned capacity BEFORE it
+  /// retries the reset enqueue — otherwise [`poll`](Self::poll) drains the tombstones
+  /// itself, returns `None`, and a driver that stops on `None` strands the reset.
+  ///
+  /// Returns the number of slots freed, so the caller can re-attempt a pending reset
+  /// only when capacity actually opened (a fixpoint, since purging a second reset's
+  /// head DATA can create fresh leading tombstones). A no-op while a transmit is held
+  /// in `front` (a partial `writev` not yet acked): that slot is live and must not be
+  /// advanced past here — the next `poll` resolves the front first. `purge_stream`
+  /// clears `front` whenever it tombstones the head, so a held front is never a
+  /// tombstone.
+  pub(crate) fn drain_leading_tombstones(&mut self) -> usize {
+    if self.front.is_some() {
+      return 0;
+    }
+    let capacity = self.capacity();
+    debug_assert!(capacity <= TX_N);
+    if capacity == 0 {
+      return 0;
+    }
+    let before = self.len;
+    self.drop_head_tombstones(capacity);
+    before.saturating_sub(self.len)
+  }
+
+  /// Advances the head past any leading tombstoned slots (freeing each held body),
+  /// so [`poll`](Self::poll) lands on the next live transmit or empties the ring.
+  fn drop_head_tombstones(&mut self, capacity: usize) {
+    while self.len > 0 {
+      let head = self.head;
+      let tombstone = self.slots.get(head).is_some_and(|s| s.tombstone);
+      if !tombstone {
+        return;
+      }
+      self.advance_head(head, capacity);
+    }
   }
 
   /// The total byte length (header + any held body) of the slot at `index`.
@@ -383,6 +576,48 @@ where
     self.capacity_via_mut().saturating_sub(self.len) >= n
   }
 
+  /// Tombstones every queued ordinary transmit targeting request stream `id`
+  /// ([`StreamKind::Existing`] DATA / FIN), freeing each held [`DataBuf`] body so a
+  /// reset SUPERSEDES — not queues behind — its stream's stale bytes.
+  /// [`poll`](Self::poll) then skips the tombstones, so no `Existing(id)` transmit
+  /// precedes the `RESET_STREAM` the caller enqueues next (RFC 9114 §4.1.2: the reset
+  /// abandons the stream's data).
+  ///
+  /// Tombstone-and-skip rather than compaction: the byte ring is positionally indexed
+  /// (slot `i`'s bytes live at `i * TX_CAP`), so removing interior slots would mean
+  /// moving survivors' bytes; marking them skip-on-poll avoids that while keeping the
+  /// ordering guarantee. Tombstoned slots still count against `len` until `poll` drains
+  /// them, so a reset that cannot fit the (still-full) ring immediately is re-queued
+  /// (never dropped) and materializes once `poll` skips a tombstone and frees a slot.
+  ///
+  /// Held-front edge case: if the in-flight front transmit (a partial `writev` recorded
+  /// via [`consume`](Self::consume)) is `id`'s data, it is tombstoned too and `front` is
+  /// cleared — the already-written prefix is on the wire, but the reset abandons the
+  /// stream, so the queue must yield no further `id` bytes before the reset.
+  pub(crate) fn purge_stream(&mut self, id: StreamId) {
+    let capacity = self.capacity_via_mut();
+    debug_assert!(capacity <= TX_N);
+    let mut purged_head = false;
+    for offset in 0..self.len.min(capacity) {
+      let index = wrap_add(self.head, offset, capacity);
+      let Some(slot) = self.slots.get_mut(index) else {
+        continue;
+      };
+      if matches!(slot.kind, StreamKind::Existing(sid) if sid == id) {
+        slot.tombstone = true;
+        clear_slot_body(slot);
+        if offset == 0 {
+          purged_head = true;
+        }
+      }
+    }
+    // The in-flight front transmit was just tombstoned: drop its partial-write cursor so
+    // the next `poll` starts fresh on the new head (and does not re-yield a freed slot).
+    if purged_head {
+      self.front = None;
+    }
+  }
+
   /// Reserves the next free slot's writable buffer and metadata, calling `fill`
   /// to write the bytes (it returns the number written). Errors if the ring is
   /// full or `fill` errors.
@@ -410,6 +645,7 @@ where
     slot.len = written.min(TX_CAP);
     slot.kind = kind;
     slot.fin = fin;
+    slot.tombstone = false;
     clear_slot_body(slot);
     self.len = self.len.saturating_add(1);
     Ok(())
@@ -448,6 +684,7 @@ where
     slot.len = written.min(TX_CAP);
     slot.kind = kind;
     slot.fin = fin;
+    slot.tombstone = false;
     slot.body = Some(body);
     self.len = self.len.saturating_add(1);
     Ok(())
