@@ -14,11 +14,12 @@ use http3_proto::{
   event::{StreamId, StreamRole},
   stream::{HDR_CAP, RequestStream},
 };
-// `Server` is used only by the bare multi-stream smoke; on the heap tiers (where
-// `--all-features --all-targets` also compiles this file) that test is cfg'd out,
-// so gate the import to match and avoid an unused-import warning under `-D warnings`.
+// `Server` (the bare multi-stream smoke) and `General` (the bare general-API tests) are
+// used only on the bare tier; on the heap tiers (where `--all-features --all-targets` also
+// compiles this file) those tests are cfg'd out, so gate the imports to match and avoid an
+// unused-import warning under `-D warnings`.
 #[cfg(not(any(feature = "std", feature = "alloc", feature = "no-atomic")))]
-use http3_proto::Server;
+use http3_proto::{General, Server};
 // The bare-tier stream store is caller-provided slots; this slot type is exported
 // only on the bare tier (heap tiers grow the store internally). `--all-features
 // --all-targets` also compiles this test under `std`, where `BorrowedConnection`
@@ -257,7 +258,7 @@ fn bare_tier_open_request_at_capacity_errs_without_headers() {
   let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
   // A ONE-slot stream store: the first request stream fills it, the next overflows.
   let mut stream_slots: [StreamSlot<'_, &mut [u8]>; 1] = [StreamSlot::EMPTY];
-  let mut conn = BorrowedConnection::<Client>::with_buffers(
+  let mut conn = BorrowedConnection::<Client, General>::with_buffers(
     &mut request_headers[..],
     &mut control_payload[..],
     &mut tx_bytes[..],
@@ -436,7 +437,7 @@ fn bare_tier_reset_purges_queued_same_stream_data() {
   let mut event_slots = [None; EVENT_QUEUE_CAP];
   let mut uni_slots = [UniSlot::EMPTY; UNI_TRACKING_CAP];
   let mut stream_slots: [StreamSlot<'_, &mut [u8]>; 1] = [StreamSlot::EMPTY];
-  let mut conn = BorrowedConnection::<Client>::with_buffers(
+  let mut conn = BorrowedConnection::<Client, General>::with_buffers(
     &mut request_headers[..],
     &mut control_payload[..],
     &mut tx_bytes[..],
