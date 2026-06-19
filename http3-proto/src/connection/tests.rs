@@ -672,6 +672,69 @@ fn partial_write_resumes_from_offset() {
 }
 
 #[test]
+fn partial_write_then_poll_without_consume_advances() {
+  // Regression: after a partial `consume` re-yields the remainder, a NEXT poll with NO
+  // intervening `consume` means "the remainder was fully written, advance" (the
+  // poll-advances model) — it must NOT re-yield the same remainder again. Before the
+  // fix, `consume_seen` stayed set on the re-yielded remainder, so the ring looped on
+  // the same bytes forever.
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  h.client
+    .send_data_on(id, bytes::Bytes::from_static(b"abcdef"))
+    .unwrap();
+  // Poll the full transmit, then report a partial write of 2 bytes.
+  let total = h.client.poll_transmit().expect("t").len();
+  assert!(total > 2);
+  h.client.consume_transmit(2);
+  // Poll re-yields the remainder once.
+  let remaining = h.client.poll_transmit().expect("t2").len();
+  assert_eq!(remaining, total - 2);
+  // The driver wrote the remainder fully and re-polls WITHOUT a consume: this must
+  // advance (the transmit is done), not re-yield the same remainder.
+  assert!(
+    h.client.poll_transmit().is_none(),
+    "a poll with no consume after re-yielding the remainder must advance, not duplicate"
+  );
+}
+
+#[test]
+fn partial_write_two_steps_then_advance_no_duplicate() {
+  // Two partial writes in a row each re-yield exactly the un-written tail (no
+  // duplication between them), and once fully written a poll-without-consume advances.
+  let mut h = Harness::new();
+  let id = h.establish_general_get(StreamId::new(0));
+  h.client
+    .send_data_on(id, bytes::Bytes::from_static(b"abcdef"))
+    .unwrap();
+  let total = h.client.poll_transmit().expect("t").len();
+  assert!(total > 4, "need room for two partial steps");
+  // Step 1: write 1 byte, re-poll → remainder shrinks by exactly 1.
+  h.client.consume_transmit(1);
+  let after1 = h.client.poll_transmit().expect("t after 1").len();
+  assert_eq!(
+    after1,
+    total - 1,
+    "first re-yield drops exactly the written byte"
+  );
+  // Step 2: write 1 more byte, re-poll → remainder shrinks by exactly 1 again (not
+  // reset, not duplicated).
+  h.client.consume_transmit(1);
+  let after2 = h.client.poll_transmit().expect("t after 2").len();
+  assert_eq!(
+    after2,
+    total - 2,
+    "second re-yield drops exactly one more byte"
+  );
+  // Now write the rest, then re-poll WITHOUT consume → advance.
+  h.client.consume_transmit(after2);
+  assert!(
+    h.client.poll_transmit().is_none(),
+    "the transmit is fully written; a bare poll advances to None"
+  );
+}
+
+#[test]
 fn partial_write_mid_body_yields_only_remaining_body() {
   // A partial write that has fully written the frame header resumes mid-body: the
   // next poll's header segment is empty and the body segment is the unwritten tail.
@@ -734,6 +797,54 @@ fn interim_1xx_precedes_final_response() {
       (true, std::vec![(":status".to_string(), "103".to_string())]),
       (false, std::vec![(":status".to_string(), "200".to_string())])
     ]
+  );
+}
+
+#[test]
+fn dropped_interim_does_not_abandon_later_final_still_establishes() {
+  // Regression: a CLIENT that receives ONLY an interim 1xx in one `handle_stream` and
+  // DROPS the iterator without pulling it must NOT permanently abandon the stream — an
+  // interim is optional and does NOT complete the leading message, so a LATER final
+  // response must still be observable and establish the stream. (Pre-fix the drop-drain
+  // marked EVERY accepted response abandoned, including interims, so the stream became
+  // validation-only forever: the later final response was swallowed by the abandoned path
+  // and the stream could never establish.)
+  let id = StreamId::new(0);
+  let mut h = general_client_after_open(id);
+  // Deliver ONLY an interim 100 response, dropped without pulling (the drain validates it).
+  let interim = request_headers_frame(&[(":status", "100")][..]);
+  let mut scratch = std::vec![0u8; 2048];
+  {
+    let _frames = h
+      .client
+      .handle_stream(id, &interim, &mut scratch)
+      .expect("builds iterator");
+    // Drop WITHOUT pulling: an interim alone must not abandon the stream.
+  }
+  assert!(
+    !h.client.is_failed(),
+    "an unobserved interim is not a protocol violation"
+  );
+  // A LATER read carrying the FINAL response HEADERS coalesced with a DATA frame: if the
+  // stream were wrongly abandoned, this read would route to the validation-only path and
+  // surface NOTHING (and the premature-DATA gate would even fail the connection, since an
+  // abandoned stream never establishes). Correctly, the final response surfaces and
+  // establishes the per-stream entry, so the following DATA surfaces as `Frame::Data`.
+  let mut tail = request_headers_frame(&[(":status", "200")][..]);
+  tail.extend_from_slice(&request_data_frame(b"resp-body"));
+  h.deliver(Side::Client, id, &tail);
+  assert!(
+    h.client_saw_response,
+    "the later FINAL response must still be observable after a dropped interim"
+  );
+  assert!(
+    !h.client.is_failed(),
+    "the final response establishes the stream, so the coalesced DATA is NOT premature"
+  );
+  assert_eq!(
+    h.client_rx_for(id),
+    b"resp-body",
+    "DATA flows on the now-established stream after the dropped interim"
   );
 }
 
@@ -886,6 +997,59 @@ fn general_client_final_response_establishes_per_stream_without_connection_event
   h.pump();
   assert_eq!(h.server_rx, b"req-body");
   assert_eq!(h.client_rx, b"resp-body");
+}
+
+#[test]
+fn post_tunnel_general_client_stream_establishes_per_stream_in_open() {
+  // Regression: a GENERAL client stream opened via `open_request` AFTER a CONNECT tunnel
+  // moved the connection to `Open` must STILL establish per-stream on its final response
+  // (gating `Frame::Data`), even though the connection phase is no longer `Handshaking`.
+  // Pre-fix `establish_on_response` was armed only while `Handshaking`, so the per-stream
+  // `established` flag was never set on a post-tunnel general stream and its first valid
+  // response DATA was (wrongly) treated as premature and reset the stream.
+  let mut h = Harness::new();
+  // Establish the CONNECT tunnel: the client flips to `Open` with `Event::Established`.
+  h.run_until_established();
+  assert!(
+    h.client_established,
+    "the tunnel emitted Event::Established"
+  );
+  assert!(h.client.is_established(), "the connection is Open");
+  // Open a GENERAL request on a NEW id while the connection is already `Open`.
+  let gid = StreamId::new(8);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client
+    .open_request(gid, get)
+    .expect("open_request in Open");
+  drain_transmits(&mut h.client);
+  // Deliver the general stream's FINAL response coalesced with a DATA frame directly to
+  // the client. The final response must establish the PER-STREAM entry (in `Open`), so the
+  // coalesced DATA surfaces as `Frame::Data`; if the per-stream flag were not set, this
+  // DATA would be premature (RFC 9114 §4.4) and reset the stream / surface nothing.
+  let mut tail = request_headers_frame(&[(":status", "200")][..]);
+  tail.extend_from_slice(&request_data_frame(b"post-tunnel"));
+  h.deliver(Side::Client, gid, &tail);
+  assert!(
+    !h.client.is_failed(),
+    "the post-tunnel general response establishes the stream; its DATA is not premature"
+  );
+  assert_eq!(
+    h.client_rx_for(gid),
+    b"post-tunnel",
+    "DATA flows on the per-stream-established general stream opened in Open"
+  );
+  // No SECOND connection-level establishment: a general stream emits no Event::Established
+  // and does not re-transition the phase (events are connection-scoped only).
+  assert_eq!(
+    h.client.poll_event(),
+    None,
+    "a general client final response must emit no further connection event"
+  );
 }
 
 // Two concurrent request streams (distinct driver-minted ids) exchange interleaved
@@ -1454,20 +1618,23 @@ fn drop_qpack_malformed_interim_on_tunnel_is_conn_error_like_next() {
   );
 }
 
-// ── finding #2 (round 2): a second leading (`Initial`) HEADERS AFTER the client's final
-//    response is a frame-placement violation rejected identically on the live
-//    (`Frames::next`) and DROP-drain (`drain_for_errors`) paths, via the per-entry
-//    `final_response_seen` PLACEMENT flag set in the shared `accept_headers_section`.
-//    Before the fix the client reject gated on `tunnel_established` (the readiness flag set
-//    only in `next`'s yield tail), so the drop path — which never establishes — accepted
-//    BOTH sections while `next` rejected the second: a residual next/drain parity gap.
-//    `[final 200][second leading 200]` (no DATA between → both `Initial`); the second is
-//    the violation.
+// ── a second HEADERS section AFTER the client's final response is the TRAILING section,
+//    even with NO intervening DATA (bodyless trailers, RFC 9114 §4.1): the connection
+//    signals the recv FSM leading-complete on the final response (`complete_leading`), so
+//    the next HEADERS is classified `Trailers` and validated under `MessageKind::Trailers`
+//    — on the live (`Frames::next`) AND DROP-drain (`drain_for_errors`) paths identically
+//    (the signal lives in the shared `accept_headers_section`). A `:status`-BEARING section
+//    is a pseudo-header in trailers, which the validator rejects with `MessageError` (a
+//    genuine malformed second leading section is therefore still rejected — bodyless
+//    trailers does not open a hole for it; only the error code is now the trailers-validator
+//    `MessageError` instead of the old placement `FrameUnexpected`).
+//    `[final 200][second 200]` (no DATA between → the second is bodyless trailers).
 
-/// `[valid final 200 response HEADERS][a second leading 200 HEADERS]`. No DATA separates
-/// them, so the FSM tags BOTH `Initial` (a second leading section, not trailers). The
-/// first is the final response (arms `final_response_seen`); the second is the illegal
-/// after-final leading section.
+/// `[valid final 200 response HEADERS][a second 200 HEADERS]`. No DATA separates them, so
+/// the second is BODYLESS trailers: the connection signals leading-complete on the final
+/// response, the FSM tags the second `Trailers`, and the validator rejects its `:status`
+/// pseudo-header as malformed trailers (`MessageError`). This is the regression guard that
+/// a genuine pseudo-header-bearing second section after the final is STILL rejected.
 fn final_then_second_leading() -> Vec<u8> {
   let mut bytes = request_headers_frame(&[(":status", "200")][..]);
   bytes.extend_from_slice(&request_headers_frame(&[(":status", "200")][..]));
@@ -1476,8 +1643,9 @@ fn final_then_second_leading() -> Vec<u8> {
 
 #[test]
 fn live_second_leading_after_final_on_general_resets() {
-  // Baseline (general, live): `next` rejects the second leading section after the final
-  // response as a stream-scoped `FrameUnexpected`; the connection survives.
+  // Baseline (general, live): the second `:status`-bearing section after the final
+  // response is BODYLESS trailers, rejected by the trailers validator (a pseudo-header is
+  // forbidden in trailers) as a stream-scoped `MessageError`; the connection survives.
   let id = StreamId::new(0);
   let mut h = general_client_after_open(id);
   let bytes = final_then_second_leading();
@@ -1487,24 +1655,25 @@ fn live_second_leading_after_final_on_general_resets() {
       .client
       .handle_stream(id, &bytes, &mut scratch)
       .expect("builds iterator");
-    // The final response yields first, then the second leading section surfaces the error.
+    // The final response yields first, then the malformed bodyless trailers surfaces.
     let mut saw_final = false;
     let err = loop {
       match frames.next() {
         Ok(Some(Frame::Response { interim: false, .. })) => saw_final = true,
-        Ok(Some(_)) => panic!("only the final response then the placement error"),
-        Ok(None) => panic!("the second leading section must surface an error, not Ok(None)"),
+        Ok(Some(_)) => panic!("only the final response then the trailers error"),
+        Ok(None) => panic!("the malformed bodyless trailers must surface an error"),
         Err(e) => break e,
       }
     };
     assert!(saw_final, "the final response is delivered first");
-    assert_eq!(err, H3Error::FrameUnexpected, "second-leading-after-final");
+    assert_eq!(
+      err,
+      H3Error::MessageError,
+      "a :status-bearing bodyless trailers section is malformed"
+    );
     drop(frames);
   }
-  assert!(
-    !h.client.is_failed(),
-    "a general placement error is not fatal"
-  );
+  assert!(!h.client.is_failed(), "a general stream error is not fatal");
   let kind = h
     .client
     .poll_transmit()
@@ -1512,18 +1681,19 @@ fn live_second_leading_after_final_on_general_resets() {
     .kind();
   assert!(
     matches!(kind, StreamKind::ResetStream { id: rid, code }
-      if rid == id && code == H3Error::FrameUnexpected.code()),
-    "a RESET_STREAM(FrameUnexpected) for the stream is enqueued"
+      if rid == id && code == H3Error::MessageError.code()),
+    "a RESET_STREAM(MessageError) for the stream is enqueued"
   );
   assert!(h.client.stream_is_gone(id), "the reset stream is freed");
 }
 
 #[test]
 fn drop_second_leading_after_final_on_general_resets_like_next() {
-  // Finding #2 (general, DROP): the SAME sequence DROPPED before consumption rejects the
-  // second leading section identically to `next` — the stream resets, the connection
-  // survives. Before the fix the drop path accepted BOTH sections (it never set the
-  // `tunnel_established` flag the OLD reject gated on), so this was silently accepted.
+  // DROP parity (general): the SAME sequence DROPPED before consumption classifies and
+  // rejects the bodyless trailers identically to `next` — the stream resets, the
+  // connection survives. The leading-complete signal lives in the shared
+  // `accept_headers_section`, so the FSM reaches its post-leading phase on the drop path
+  // too and the second section is validated as trailers (`MessageError`).
   let id = StreamId::new(0);
   let mut h = general_client_after_open(id);
   let bytes = final_then_second_leading();
@@ -1543,7 +1713,7 @@ fn drop_second_leading_after_final_on_general_resets_like_next() {
     .kind();
   assert!(
     matches!(kind, StreamKind::ResetStream { id: rid, code }
-      if rid == id && code == H3Error::FrameUnexpected.code()),
+      if rid == id && code == H3Error::MessageError.code()),
     "drop path resets the stream identically to next"
   );
   assert!(
@@ -1554,8 +1724,9 @@ fn drop_second_leading_after_final_on_general_resets_like_next() {
 
 #[test]
 fn live_second_leading_after_final_on_tunnel_is_conn_error() {
-  // Baseline (tunnel, live): on the CONNECT tunnel the second-leading-after-final is
-  // connection-fatal (one tunnel = one connection) — a terminal ConnError.
+  // Baseline (tunnel, live): on the CONNECT tunnel the malformed bodyless trailers after
+  // the final response is connection-fatal (one tunnel = one connection) — a terminal
+  // ConnError(MessageError) from the trailers validator.
   let mut c = Connection::<Client>::new();
   let id = StreamId::new(0);
   // A client `provide_stream(Request, ..)` is the tunnel stream (Mode::Tunnel default).
@@ -1567,26 +1738,26 @@ fn live_second_leading_after_final_on_tunnel_is_conn_error() {
     let err = loop {
       match frames.next() {
         Ok(Some(Frame::Response { interim: false, .. })) => {}
-        Ok(Some(_)) => panic!("only the final response then the placement error"),
-        Ok(None) => panic!("the second leading section must surface an error"),
+        Ok(Some(_)) => panic!("only the final response then the trailers error"),
+        Ok(None) => panic!("the malformed bodyless trailers must surface an error"),
         Err(e) => break e,
       }
     };
-    assert_eq!(err, H3Error::FrameUnexpected);
+    assert_eq!(err, H3Error::MessageError);
   }
-  assert!(c.is_terminal(), "a tunnel placement violation is fatal");
+  assert!(c.is_terminal(), "a tunnel trailers violation is fatal");
   assert_eq!(
     c.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected)),
-    "the tunnel second-leading-after-final surfaces as the terminal ConnError"
+    Some(Event::ConnError(H3Error::MessageError)),
+    "the tunnel malformed bodyless trailers surfaces as the terminal ConnError"
   );
 }
 
 #[test]
 fn drop_second_leading_after_final_on_tunnel_is_conn_error_like_next() {
-  // Finding #2 (tunnel, DROP): the SAME sequence DROPPED is connection-fatal identically
-  // to the live path. Before the fix the drop path accepted both sections (it never set
-  // `tunnel_established`), leaving this Tunnel-mode violation non-fatal — the parity gap.
+  // DROP parity (tunnel): the SAME sequence DROPPED is connection-fatal identically to the
+  // live path — the leading-complete signal in the shared `accept_headers_section` runs on
+  // the drop path too, so the second section is validated as trailers (`MessageError`).
   let mut c = Connection::<Client>::new();
   let id = StreamId::new(0);
   c.provide_stream(StreamRole::Request, id);
@@ -1597,13 +1768,224 @@ fn drop_second_leading_after_final_on_tunnel_is_conn_error_like_next() {
   }
   assert!(
     c.is_terminal(),
-    "drop path: a tunnel placement violation is still fatal"
+    "drop path: a tunnel trailers violation is still fatal"
   );
   assert_eq!(
     c.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected)),
+    Some(Event::ConnError(H3Error::MessageError)),
     "drop path surfaces the same terminal ConnError as next"
   );
+}
+
+// ── bodyless trailers: trailers that follow the leading message with ZERO intervening
+//    DATA (a bodyless final response / request, then trailers) are RFC 9114 §4.1-legal and
+//    must classify as `Frame::Trailers`, NOT be rejected as a second leading section. The
+//    recv FSM cannot decode `:status`, so the connection signals leading-complete via
+//    `complete_leading` (on the SERVER's request / the CLIENT's FINAL response, NOT an
+//    interim 1xx); the next HEADERS is then trailers even with no DATA between. Before the
+//    fix the FSM only entered its trailing phase via a DATA frame, so bodyless trailers were
+//    misclassified `Initial` and the conforming peer was rejected.
+
+/// A HEADERS frame carrying one VALID trailer field (a regular, non-pseudo lowercase field),
+/// so it passes the trailers validator (no pseudo-headers, no connection-specific fields).
+/// Distinct from `trailers_frame_with_pseudo_header` (which is malformed AS trailers).
+fn valid_trailers_frame() -> Vec<u8> {
+  request_headers_frame(&[("x-checksum", "abc")][..])
+}
+
+#[test]
+fn client_bodyless_final_response_then_trailers_yields_trailers() {
+  // CLIENT: a bodyless final response (`:status 200`, NO DATA) immediately followed by
+  // trailers must surface `Frame::Response { interim: false }` then `Frame::Trailers` — the
+  // trailers are recognised even though no DATA arrived. The connection is NOT failed (this
+  // would FAIL on the old FSM: the trailers section was tagged `Initial`, and after the
+  // final response a second `Initial` is the `final_response_seen` placement reject).
+  let id = StreamId::new(0);
+  let mut h = general_client_after_open(id);
+  let mut bytes = request_headers_frame(&[(":status", "200")][..]);
+  bytes.extend_from_slice(&valid_trailers_frame());
+  let mut scratch = std::vec![0u8; 2048];
+  let mut saw_final = false;
+  let mut saw_trailers = false;
+  {
+    let mut frames = h
+      .client
+      .handle_stream(id, &bytes, &mut scratch)
+      .expect("builds iterator");
+    while let Some(f) = frames.next().expect("a frame, never an error") {
+      match f {
+        Frame::Response { interim: false, .. } => saw_final = true,
+        Frame::Trailers(mut hs) => {
+          saw_trailers = true;
+          while hs.next().expect("trailer field").is_some() {}
+        }
+        other => panic!("unexpected frame: {:?}", other.is_data()),
+      }
+    }
+  }
+  assert!(saw_final, "the bodyless final response is observed");
+  assert!(
+    saw_trailers,
+    "the bodyless trailers are observed as Frame::Trailers, not rejected"
+  );
+  assert!(
+    !h.client.is_failed(),
+    "a conforming bodyless-final-then-trailers peer must NOT fail the connection"
+  );
+}
+
+#[test]
+fn server_bodyless_request_then_trailers_yields_trailers() {
+  // SERVER: a bodyless request (HEADERS, NO DATA) immediately followed by trailers must
+  // surface `Frame::Request` then `Frame::Trailers`. The single request completes the
+  // leading message (the connection signals `complete_leading`), so the following HEADERS
+  // is trailers even with no DATA. (Old FSM: the trailers were tagged `Initial`, a second
+  // request leading section → `first_headers_seen` placement reject.)
+  let mut s = server_request_registered_no_peer_settings();
+  let id = StreamId::new(0);
+  let mut bytes = request_headers_frame(&CONNECT_REQUEST[..]);
+  bytes.extend_from_slice(&valid_trailers_frame());
+  let mut scratch = std::vec![0u8; 2048];
+  let mut saw_request = false;
+  let mut saw_trailers = false;
+  {
+    let mut frames = s
+      .handle_stream(id, &bytes, &mut scratch)
+      .expect("builds iterator");
+    while let Some(f) = frames.next().expect("a frame, never an error") {
+      match f {
+        Frame::Request(mut hs) => {
+          saw_request = true;
+          while hs.next().expect("request field").is_some() {}
+        }
+        Frame::Trailers(mut hs) => {
+          saw_trailers = true;
+          while hs.next().expect("trailer field").is_some() {}
+        }
+        other => panic!("unexpected frame: {:?}", other.is_data()),
+      }
+    }
+  }
+  assert!(saw_request, "the bodyless request is observed");
+  assert!(
+    saw_trailers,
+    "the bodyless trailers are observed as Frame::Trailers, not rejected"
+  );
+  assert!(
+    !s.is_failed(),
+    "a conforming bodyless-request-then-trailers peer must NOT fail the connection"
+  );
+}
+
+#[test]
+fn client_interim_then_final_then_bodyless_trailers_classify_correctly() {
+  // CLIENT, no DATA ANYWHERE: `[interim 103][final 200][trailers]`. The interim stays a
+  // leading section (the FSM is NOT signalled on an interim), the final completes the
+  // leading message (signalled), and the trailers — bodyless — are recognised. So the
+  // client observes interim, then final, then `Frame::Trailers`, and the connection is not
+  // failed. This pins that the leading-complete signal fires on the FINAL response only,
+  // not the interim (an interim that signalled would make the FINAL look like trailers).
+  let id = StreamId::new(0);
+  let mut h = general_client_after_open(id);
+  let mut bytes = request_headers_frame(&[(":status", "103")][..]);
+  bytes.extend_from_slice(&request_headers_frame(&[(":status", "200")][..]));
+  bytes.extend_from_slice(&valid_trailers_frame());
+  let mut scratch = std::vec![0u8; 2048];
+  let mut seq: Vec<&'static str> = Vec::new();
+  {
+    let mut frames = h
+      .client
+      .handle_stream(id, &bytes, &mut scratch)
+      .expect("builds iterator");
+    while let Some(f) = frames.next().expect("a frame, never an error") {
+      match f {
+        Frame::Response {
+          interim: true,
+          mut headers,
+        } => {
+          seq.push("interim");
+          while headers.next().expect("interim field").is_some() {}
+        }
+        Frame::Response {
+          interim: false,
+          mut headers,
+        } => {
+          seq.push("final");
+          while headers.next().expect("final field").is_some() {}
+        }
+        Frame::Trailers(mut hs) => {
+          seq.push("trailers");
+          while hs.next().expect("trailer field").is_some() {}
+        }
+        Frame::Data(_) | Frame::Request(_) => panic!("no DATA / Request expected"),
+      }
+    }
+  }
+  assert_eq!(
+    seq,
+    std::vec!["interim", "final", "trailers"],
+    "interim stays leading, final completes the leading message, trailers follow bodyless"
+  );
+  assert!(
+    !h.client.is_failed(),
+    "the conforming sequence must not fail"
+  );
+}
+
+#[test]
+fn client_malformed_second_leading_after_final_still_rejected_as_trailers() {
+  // REGRESSION: bodyless trailers must NOT open a hole for a genuine invalid second LEADING
+  // section. A `:status`-bearing section after the final response is now the trailing
+  // section — and a pseudo-header is forbidden in trailers, so the validator rejects it with
+  // `MessageError` (a stream-scoped reset on this general client stream). The final response
+  // is still delivered first; the connection survives. (This is the trailers-validated twin
+  // of the old `final_response_seen` placement reject — the malformed second section is
+  // still caught, only with the trailers code.)
+  let id = StreamId::new(0);
+  let mut h = general_client_after_open(id);
+  let bytes = final_then_second_leading();
+  let mut scratch = std::vec![0u8; 2048];
+  {
+    let mut frames = h
+      .client
+      .handle_stream(id, &bytes, &mut scratch)
+      .expect("builds iterator");
+    let mut saw_final = false;
+    let err = loop {
+      match frames.next() {
+        Ok(Some(Frame::Response { interim: false, .. })) => saw_final = true,
+        Ok(Some(_)) => panic!("only the final response then the trailers error"),
+        Ok(None) => panic!("the malformed bodyless trailers must surface an error"),
+        Err(e) => break e,
+      }
+    };
+    assert!(
+      saw_final,
+      "the final response is delivered before the error"
+    );
+    assert_eq!(
+      err,
+      H3Error::MessageError,
+      "a pseudo-header-bearing second section is rejected by the trailers validator"
+    );
+  }
+  assert!(
+    !h.client.is_failed(),
+    "a stream-scoped trailers violation is not connection-fatal on a general stream"
+  );
+  // The stream-scoped reset materializes at the next &mut self entry (poll_transmit
+  // reconciles the pending reset and emits the RESET_STREAM), freeing the slot.
+  let kind = h
+    .client
+    .poll_transmit()
+    .expect("a reset transmit materializes")
+    .kind();
+  assert!(
+    matches!(kind, StreamKind::ResetStream { id: rid, code }
+      if rid == id && code == H3Error::MessageError.code()),
+    "a RESET_STREAM(MessageError) for the offending stream is enqueued"
+  );
+  assert!(h.client.stream_is_gone(id), "the offending stream is reset");
 }
 
 #[test]
@@ -1779,6 +2161,89 @@ fn send_data_on_condemned_general_stream_is_rejected() {
   assert!(
     matches!(kind, StreamKind::ResetStream { id: rid, code } if rid == id && code == H3Error::MessageError.code()),
     "the condemned stream's RESET_STREAM is emitted"
+  );
+}
+
+#[test]
+fn accept_with_on_condemned_general_request_does_not_establish() {
+  // In `Mode::General` the FIRST inbound request still becomes the tunnel-slot pointer
+  // `request_id`, yet it is registered NON-tunnel (`is_tunnel = false`) — so a
+  // stream-scoped error on it (premature DATA before `accept_with`, in a dropped
+  // `Frames`) records a pending reset for `request_id`. `accept_with` must reconcile that
+  // FIRST and refuse to establish: it must NOT report `Event::Established` / flip to
+  // `Open` for a stream `poll_transmit` will reset. (Pre-fix `accept_with` skipped the
+  // reconcile on the false assumption that `request_id` is never condemned, then saw the
+  // stale entry and established a doomed tunnel.)
+  let mut h = Harness::new();
+  h.server.set_mode(Mode::General);
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  h.server.provide_stream(StreamRole::Request, id);
+  // Observe a valid CONNECT request: the server yields `Frame::Request`, flipping the
+  // entry's `observed` (the gate `accept_with` waits on) and naming `request_id = id`.
+  let req = request_headers_frame(&CONNECT_REQUEST[..]);
+  let mut scratch = std::vec![0u8; 2048];
+  {
+    let mut frames = h
+      .server
+      .handle_stream(id, &req, &mut scratch)
+      .expect("builds iterator");
+    assert!(
+      matches!(frames.next(), Ok(Some(Frame::Request(_)))),
+      "the server observes the CONNECT request"
+    );
+    while frames.next().expect("drain request").is_some() {}
+  }
+  assert!(
+    h.server.request_received(),
+    "the CONNECT request is observed (accept_with's gate is open)"
+  );
+  // A premature DATA frame on the same stream (the tunnel is not established — no
+  // `accept_with` yet), delivered in a `Frames` iterator the driver DROPS without pulling
+  // the DATA: the drop-drain hits the establishment gate and records a stream-scoped reset
+  // for `request_id` (General mode → reset, not connection-fatal).
+  let premature = data_frame(b"early");
+  {
+    let _frames = h
+      .server
+      .handle_stream(id, &premature, &mut scratch)
+      .expect("builds iterator");
+    // Dropped WITHOUT pulling: the drain records the pending reset but does not apply it.
+  }
+  assert!(
+    !h.server.is_failed(),
+    "a premature-DATA reset on a general stream is not connection-fatal"
+  );
+  // `accept_with` must reconcile the pending reset and refuse: WouldBlock (the condemned
+  // entry is gone, so `request_id` reads as not-observed), NEVER Ok.
+  assert_eq!(
+    h.server.accept_with(&RESPONSE[..]),
+    Err(Error::WouldBlock),
+    "accept_with must not establish a condemned tunnel"
+  );
+  // No connection-level establishment happened.
+  assert!(
+    !h.server.is_established(),
+    "the connection must NOT flip to Open for a condemned tunnel"
+  );
+  assert!(
+    !matches!(h.server.poll_event(), Some(Event::Established)),
+    "accept_with must NOT emit Event::Established for a condemned tunnel"
+  );
+  // The deferred reset materialized (the stream is freed) and its RESET_STREAM is emitted.
+  assert!(
+    h.server.stream_is_gone(id),
+    "the condemned request stream is freed by the reconcile"
+  );
+  let kind = h
+    .server
+    .poll_transmit()
+    .expect("the deferred reset materialized")
+    .kind();
+  assert!(
+    matches!(kind, StreamKind::ResetStream { id: rid, code }
+      if rid == id && code == H3Error::MessageError.code()),
+    "the condemned stream's RESET_STREAM(MessageError) is emitted, got {kind:?}"
   );
 }
 
@@ -3374,6 +3839,89 @@ fn accept_with_after_peer_settings_succeeds() {
   assert_eq!(s.poll_event(), Some(Event::Established));
 }
 
+/// A server whose peer SETTINGS are decoded AND whose CONNECT request HEADERS have been
+/// observed, so `accept_with`'s readiness gates are open and the only remaining decision
+/// is the response itself. The request is on stream 0 (`request_id`).
+fn server_ready_to_accept() -> StaticConnection<Server> {
+  let mut s = server_request_registered_no_peer_settings();
+  let mut sc = [0u8; 128];
+  let bytes = peer_control_settings(&[0x08, 0x01]);
+  {
+    let mut frames = s
+      .handle_stream(StreamId::new(3), &bytes, &mut sc)
+      .expect("control bytes ok");
+    assert!(frames.next().expect("no frames").is_none());
+  }
+  deliver_connect_request(&mut s, StreamId::new(0));
+  s
+}
+
+#[test]
+fn accept_with_rejects_non_2xx_status_and_commits_nothing() {
+  // Finding #1: `accept_with` ESTABLISHES the tunnel, so a CONNECT acceptance MUST be a
+  // valid 2xx final response (RFC 9114 §4.4). A missing / malformed / interim (1xx) /
+  // non-2xx final (3xx–5xx) `:status` must be rejected with MessageError BEFORE anything
+  // is committed: no response transmit, no `Established`, the tunnel NOT established, the
+  // connection still live (a local caller bug, retriable with a valid response). Pre-fix
+  // `accept_with` never inspected `:status`, so each of these established a tunnel though
+  // the wire carried no final 2xx response.
+  let cases: &[(&str, &[(&str, &str)])] = &[
+    ("interim 103", &[(":status", "103")]),
+    ("interim 100", &[(":status", "100")]),
+    ("non-2xx final 404", &[(":status", "404")]),
+    ("non-2xx final 503", &[(":status", "503")]),
+    ("malformed 2xx-but-too-long", &[(":status", "2000")]),
+    ("malformed non-digit", &[(":status", "2xx")]),
+    ("no :status", &[("x-foo", "bar")]),
+  ];
+  for (label, resp) in cases {
+    let mut s = server_ready_to_accept();
+    assert_eq!(
+      s.accept_with(*resp),
+      Err(Error::Protocol(H3Error::MessageError)),
+      "accept_with({label}) must be rejected as MessageError"
+    );
+    assert!(
+      s.poll_transmit().is_none(),
+      "accept_with({label}) must commit NO response transmit"
+    );
+    assert!(
+      !s.is_established(),
+      "accept_with({label}) must NOT establish the tunnel"
+    );
+    assert!(
+      !matches!(s.poll_event(), Some(Event::Established)),
+      "accept_with({label}) must NOT emit Event::Established"
+    );
+    assert!(
+      !s.is_terminal(),
+      "a rejected (local caller-bug) accept_with leaves the connection live"
+    );
+    // The readiness gates are still open: a VALID 2xx now succeeds on the same connection.
+    s.accept_with(&RESPONSE[..])
+      .unwrap_or_else(|e| panic!("a valid 2xx after a rejected {label} must succeed: {e:?}"));
+    assert!(
+      s.is_established(),
+      "the retry with a 2xx establishes the tunnel"
+    );
+    assert_eq!(s.poll_event(), Some(Event::Established));
+  }
+}
+
+#[test]
+fn accept_with_accepts_2xx_other_than_200() {
+  // The 2xx check is the whole class, not just 200: a 201 CONNECT acceptance establishes
+  // the tunnel exactly like 200 (the existing tunnel tests use 200, which still works).
+  let mut s = server_ready_to_accept();
+  s.accept_with(&[(":status", "201")][..])
+    .expect("a 201 acceptance establishes the tunnel");
+  assert!(s.is_established(), "201 is a valid CONNECT acceptance");
+  let t = s.poll_transmit().expect("response HEADERS enqueued");
+  assert!(matches!(t.kind(), StreamKind::Existing(_)));
+  assert!(!t.bytes().is_empty());
+  assert_eq!(s.poll_event(), Some(Event::Established));
+}
+
 #[test]
 fn accept_with_second_call_is_noop_ok() {
   // Server parity with the client's exactly-once `request_sent` guard: a single
@@ -4099,6 +4647,198 @@ fn open_with_single_pass_too_large_sends_nothing_and_keeps_request_unsent() {
   assert!(c.poll_transmit().is_none(), "still nothing sent");
 }
 
+// ── send_response classifies finality from the SAME traversal it encodes ──────
+
+/// A non-replayable `Headers` response supplier whose `for_each` yields a
+/// DIFFERENT `:status` on each call: a FINAL `200` on the first traversal, an
+/// INTERIM `103` on every later traversal. A two-pass `send_response` (classify in
+/// one traversal, encode in another) could read `200` for its finality decision
+/// (marking the stream `FinalSent`/established) yet put the `103` interim bytes on
+/// the wire — or the inverse. The single-pass design records the `:status` class
+/// DURING the one encode traversal, so the finality decision and the encoded bytes
+/// can never disagree. (Models the crate's existing adversarial-supplier pattern,
+/// cf. `ShrinkingHeaders`.)
+struct FlipStatusHeaders {
+  calls: core::cell::Cell<u32>,
+}
+
+impl FlipStatusHeaders {
+  const fn new() -> Self {
+    Self {
+      calls: core::cell::Cell::new(0),
+    }
+  }
+}
+
+impl Headers for FlipStatusHeaders {
+  fn for_each(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), Error> {
+    let n = self.calls.get();
+    self.calls.set(n.saturating_add(1));
+    if n == 0 {
+      // First traversal: a FINAL status.
+      f(":status", "200");
+    } else {
+      // Any later traversal: an INTERIM status.
+      f(":status", "103");
+    }
+    Ok(())
+  }
+}
+
+/// Decodes the single `:status` of a server-transmitted HEADERS frame's field
+/// section, asserting the transmit is a HEADERS frame on `id`.
+fn transmitted_status(h: &mut Harness, id: StreamId) -> String {
+  let t = h.server.poll_transmit().expect("a response transmit");
+  assert!(
+    matches!(t.kind(), StreamKind::Existing(sid) if sid == id),
+    "the response transmit targets the request stream"
+  );
+  let bytes = t.bytes();
+  let (hn, hdr) = crate::frame::decode_header(bytes).expect("frame header decodes");
+  assert!(matches!(hdr.kind(), crate::frame::FrameKind::Headers));
+  let fs = bytes.get(hn..).expect("field section follows the header");
+  let mut scratch = std::vec![0u8; 512];
+  let mut lines =
+    crate::qpack::decode_field_section_into(fs, &mut scratch).expect("field section decodes");
+  let first = lines.next().expect("ok").expect("one field");
+  assert_eq!(first.name(), ":status", "the sole field is :status");
+  first.value().to_string()
+}
+
+#[test]
+fn send_response_finality_matches_the_encoded_status_not_a_separate_traversal() {
+  // The request is observed on the server; the server then responds with the
+  // non-replayable `FlipStatusHeaders` and `last = true` (the caller's assertion
+  // that this is the FINAL response, matching the FIRST-traversal `200`).
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, get).expect("open_request");
+  h.pump();
+  assert!(h.server_saw_request, "server observed the request");
+
+  let headers = FlipStatusHeaders::new();
+  h.server
+    .send_response(id, &headers, true)
+    .expect("send_response of the final 200");
+  // Exactly ONE traversal: classify and encode are fused.
+  assert_eq!(
+    headers.calls.get(),
+    1,
+    "the supplier must be traversed exactly once"
+  );
+
+  // The committed send state reflects a FINAL response (the FIRST-traversal class)...
+  let entry = h.server.streams.get(id).expect("server entry");
+  assert!(
+    matches!(entry.send, SendState::FinalSent),
+    "a final :status moves the send half to FinalSent"
+  );
+  assert!(
+    entry.established,
+    "a final response marks the stream established"
+  );
+  // ...and the bytes ACTUALLY on the wire carry that SAME final 200 — never the
+  // interim 103 a second traversal would have produced.
+  assert_eq!(
+    transmitted_status(&mut h, id),
+    "200",
+    "the wire carries the SAME :status the finality decision used"
+  );
+}
+
+#[test]
+fn send_response_last_mismatch_with_flip_supplier_sends_nothing() {
+  // Same non-replayable supplier, but the caller asserts `last = false` (interim).
+  // The FIRST-traversal (and encoded) `:status` is the FINAL `200`, so `last`
+  // contradicts the encoded class: the fill closure returns `MessageError`, the
+  // reserved transmit slot is discarded, and NO state transition happens — nothing
+  // reaches the wire and the stream stays respondable.
+  let mut h = Harness::new();
+  h.exchange_settings();
+  let id = StreamId::new(0);
+  let get: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    (":authority", "x"),
+  ];
+  h.client.open_request(id, get).expect("open_request");
+  h.pump();
+  assert!(h.server_saw_request, "server observed the request");
+
+  let headers = FlipStatusHeaders::new();
+  assert_eq!(
+    h.server.send_response(id, &headers, false),
+    Err(Error::Protocol(H3Error::MessageError)),
+    "last = false contradicts the encoded final :status — rejected"
+  );
+  // Nothing was committed: no transmit, the send half is still Idle, and the
+  // connection is live (a synchronous caller refusal, not a teardown).
+  assert!(
+    h.server.poll_transmit().is_none(),
+    "the contradicted response enqueued no bytes"
+  );
+  let entry = h.server.streams.get(id).expect("server entry");
+  assert!(
+    matches!(entry.send, SendState::Idle),
+    "the refused response left the send half untouched"
+  );
+  assert!(!entry.established, "no establishment on the refused path");
+  assert!(
+    !h.server.is_failed(),
+    "a caller refusal is not connection-fatal"
+  );
+}
+
+#[test]
+fn send_response_with_malformed_status_is_rejected() {
+  // A `:status` that is not exactly three ASCII digits in `100..=599` is
+  // unclassifiable: `send_response` rejects it with `MessageError` and commits
+  // nothing — regardless of `last`. `0200` parses as 200 to a naive integer read,
+  // but the strict three-digit-shape rule rejects the four-char form.
+  for bad in ["0200", "1000", "999", "099", "2xx"] {
+    let mut h = Harness::new();
+    h.exchange_settings();
+    let id = StreamId::new(0);
+    let get: &[(&str, &str)] = &[
+      (":method", "GET"),
+      (":scheme", "https"),
+      (":path", "/"),
+      (":authority", "x"),
+    ];
+    h.client.open_request(id, get).expect("open_request");
+    h.pump();
+    assert!(h.server_saw_request, "server observed the request");
+
+    let resp: &[(&str, &str)] = &[(":status", bad)];
+    assert_eq!(
+      h.server.send_response(id, resp, true),
+      Err(Error::Protocol(H3Error::MessageError)),
+      "malformed :status {bad:?} must be rejected"
+    );
+    assert!(
+      h.server.poll_transmit().is_none(),
+      "a malformed :status enqueues no bytes ({bad:?})"
+    );
+    let entry = h.server.streams.get(id).expect("server entry");
+    assert!(
+      matches!(entry.send, SendState::Idle),
+      "the malformed response left the send half untouched ({bad:?})"
+    );
+    assert!(
+      !h.server.is_failed(),
+      "a caller refusal is not connection-fatal"
+    );
+  }
+}
+
 // ── outbound HEADERS: the encode workspace is sized to the transmit slot (TX_CAP) ─
 
 /// A `Headers` supplier that emits `count` copies of a fixed literal field
@@ -4818,6 +5558,173 @@ fn clean_request_fin_after_headers_is_peer_closed_and_not_a_teardown() {
   );
 }
 
+#[test]
+fn client_interim_then_fin_on_tunnel_is_request_incomplete_conn_error() {
+  // Finding #2 (tunnel): a client receives ONLY an interim 1xx (103), then the peer FINs.
+  // An interim leaves the leading message INCOMPLETE (no final response arrived), so the
+  // FIN is `RequestIncomplete`, not a clean / deferred half-close. On the CONNECT tunnel
+  // this is connection-fatal: ConnError(RequestIncomplete), terminal, NO PeerClosed.
+  // Pre-fix `Stream::fin` returned Ok after any completed HEADERS section, so a
+  // 103-then-FIN read as a clean pre-establishment half-close (only `peer_fin_pending`
+  // set) that no final could ever flush — the silent forever-deferred half-close.
+  let mut c = Connection::<Client>::new();
+  let id = StreamId::new(0);
+  c.provide_stream(StreamRole::Request, id); // is_tunnel = true
+  let interim = request_headers_frame(&[(":status", "103")][..]);
+  let mut sc = std::vec![0u8; 512];
+  {
+    let mut frames = c
+      .handle_stream(id, &interim, &mut sc)
+      .expect("builds iterator");
+    match frames.next() {
+      Ok(Some(Frame::Response {
+        interim: true,
+        mut headers,
+      })) => while headers.next().expect("interim field").is_some() {},
+      other => panic!(
+        "expected the interim Frame::Response, got {:?}",
+        other.is_ok()
+      ),
+    }
+    assert!(frames.next().expect("drain").is_none());
+  }
+  assert!(
+    !c.is_established(),
+    "an interim 1xx does NOT establish the tunnel"
+  );
+  // The peer FINs after only the interim: the leading message never completed.
+  c.handle_stream_fin(id);
+  assert_eq!(
+    c.poll_event(),
+    Some(Event::ConnError(H3Error::RequestIncomplete)),
+    "a FIN after only an interim is RequestIncomplete, connection-fatal on the tunnel"
+  );
+  assert!(
+    !matches!(c.poll_event(), Some(Event::PeerClosed)),
+    "no silent (deferred) PeerClosed for an incomplete message"
+  );
+  assert!(
+    c.is_terminal(),
+    "the incomplete-message FIN makes the tunnel connection terminal"
+  );
+}
+
+#[test]
+fn client_interim_then_fin_on_general_resets_stream() {
+  // Finding #2 (general): the SAME 103-then-FIN on a GENERAL client request stream is a
+  // STREAM error, not connection-fatal — a RESET_STREAM(RequestIncomplete) is emitted, the
+  // stream is freed, and the connection stays live (RFC 9114 §4.1.2). Routed through the
+  // existing `fail_or_reset` tunnel-vs-general split via `handle_stream_fin`'s `Err` arm.
+  let id = StreamId::new(0);
+  let mut h = general_client_after_open(id); // general (non-tunnel) request stream
+  let interim = request_headers_frame(&[(":status", "103")][..]);
+  let mut sc = std::vec![0u8; 512];
+  {
+    let mut frames = h
+      .client
+      .handle_stream(id, &interim, &mut sc)
+      .expect("builds iterator");
+    match frames.next() {
+      Ok(Some(Frame::Response { interim: true, .. })) => {}
+      other => panic!(
+        "expected the interim Frame::Response, got {:?}",
+        other.is_ok()
+      ),
+    }
+    assert!(frames.next().expect("drain").is_none());
+  }
+  h.client.handle_stream_fin(id);
+  assert!(
+    !h.client.is_failed(),
+    "a FIN after only an interim on a general stream is NOT connection-fatal"
+  );
+  assert!(
+    !matches!(h.client.poll_event(), Some(Event::PeerClosed)),
+    "no PeerClosed: this is a stream reset, not a clean half-close"
+  );
+  let kind = h
+    .client
+    .poll_transmit()
+    .expect("a reset transmit materializes")
+    .kind();
+  assert!(
+    matches!(kind, StreamKind::ResetStream { id: rid, code }
+      if rid == id && code == H3Error::RequestIncomplete.code()),
+    "the incomplete message resets the stream with RequestIncomplete, got {kind:?}"
+  );
+  assert!(h.client.stream_is_gone(id), "the reset stream is freed");
+}
+
+#[test]
+fn client_final_then_fin_on_general_is_clean_no_regression() {
+  // No regression: a client receiving the FINAL response (200), then FIN, is a CLEAN
+  // half-close — the final completes the leading message (`complete_leading`), so the FSM
+  // leaves `Phase::Headers` and `fin()` is Ok. No error, no reset, the connection lives.
+  let id = StreamId::new(0);
+  let mut h = general_client_after_open(id);
+  let final_resp = request_headers_frame(&[(":status", "200")][..]);
+  let mut sc = std::vec![0u8; 512];
+  {
+    let mut frames = h
+      .client
+      .handle_stream(id, &final_resp, &mut sc)
+      .expect("builds iterator");
+    match frames.next() {
+      Ok(Some(Frame::Response { interim: false, .. })) => {}
+      other => panic!(
+        "expected the final Frame::Response, got {:?}",
+        other.is_ok()
+      ),
+    }
+    assert!(frames.next().expect("drain").is_none());
+  }
+  h.client.handle_stream_fin(id);
+  assert!(
+    !h.client.is_failed(),
+    "a clean FIN after the final response is not connection-fatal"
+  );
+  // No RESET_STREAM for a clean half-close (a general final response emits no connection
+  // PeerClosed event — that is tunnel-only — but it must NOT reset the stream either).
+  assert!(
+    h.client.poll_transmit().is_none(),
+    "a clean half-close after the final response emits no RESET_STREAM"
+  );
+}
+
+#[test]
+fn server_request_then_fin_no_body_is_clean_no_regression() {
+  // No regression: a server observes the CONNECT request, then the peer FINs BEFORE any
+  // body (and before `accept_with`). The request HEADERS complete the leading message
+  // (`complete_leading` on the request), so the FSM left `Phase::Headers` and `fin()` is
+  // Ok — a clean half-close, NOT `RequestIncomplete`. The tunnel is not yet established, so
+  // the half-close is DEFERRED (`peer_fin_pending`), not an error and not terminal.
+  // `server_ready_to_accept` decodes the peer SETTINGS and the CONNECT request (so the FSM
+  // already left `Phase::Headers` via `complete_leading`) and leaves `accept_with` ready.
+  let mut s = server_ready_to_accept();
+  s.handle_stream_fin(StreamId::new(0));
+  // No error event and not terminal: the request was complete, so the FIN is clean.
+  assert!(
+    !s.is_terminal(),
+    "a clean FIN after the complete request is not a teardown"
+  );
+  assert!(
+    !matches!(
+      s.poll_event(),
+      Some(Event::ConnError(H3Error::RequestIncomplete))
+    ),
+    "a complete request then FIN must NOT be RequestIncomplete"
+  );
+  // The deferred half-close surfaces AFTER establishment: accept the tunnel, then the
+  // Established event precedes the deferred PeerClosed.
+  s.accept_with(&RESPONSE[..]).expect("accept the tunnel");
+  assert_eq!(s.poll_event(), Some(Event::Established));
+  assert_eq!(
+    s.poll_event(),
+    Some(Event::PeerClosed),
+    "the deferred half-close surfaces after Established"
+  );
+}
+
 // ── every connection-fatal inbound H3Error routes through `fail` ───────
 
 /// Drives a client to the `Open` phase (the tunnel established) by: feeding the
@@ -4854,20 +5761,21 @@ fn client_open_at_tunnel_boundary(req_id: StreamId) -> StaticConnection<Client> 
 
 #[test]
 fn lazy_second_headers_routes_through_fail_and_makes_terminal() {
-  // A SECOND HEADERS frame on the request stream is a frame-placement violation
-  // surfaced LAZILY by `Frames::next` (not by `handle_stream` itself). This lazy
-  // error must fail the connection rather than merely propagate to the caller:
-  // otherwise the connection would stay Open and a later `send_data` would be
-  // accepted on a dead tunnel. Routing through the centralized `fail` makes the
-  // connection terminal, enqueues exactly one ConnError(FrameUnexpected), and makes
-  // `send_data` return Closed.
+  // A SECOND HEADERS frame on the established tunnel — a `:status`-bearing section after
+  // the final response — is MALFORMED BODYLESS TRAILERS (a pseudo-header is forbidden in
+  // trailers) surfaced LAZILY by `Frames::next` (not by `handle_stream` itself). This lazy
+  // error must fail the connection rather than merely propagate to the caller: otherwise
+  // the connection would stay Open and a later `send_data` would be accepted on a dead
+  // tunnel. Routing through the centralized `fail` makes the connection terminal, enqueues
+  // exactly one ConnError(MessageError), and makes `send_data` return Closed.
   let req_id = StreamId::new(0);
   let mut c = client_open_at_tunnel_boundary(req_id);
   // The tunnel is Open: a send works right up until the fatal frame.
   c.send_data(b"pre").expect("send_data works while Open");
   drain_transmits(&mut c);
-  // Feed a SECOND HEADERS frame on the request stream (the FSM is in Tunnel, so a
-  // HEADERS is now H3_FRAME_UNEXPECTED). The error surfaces on the first pull.
+  // Feed a SECOND HEADERS frame on the request stream. The leading message completed on
+  // the final response, so this is a trailing section; its `:status` pseudo-header is
+  // forbidden in trailers → H3_MESSAGE_ERROR. The error surfaces on the first pull.
   let second = request_headers_frame(&RESPONSE[..]);
   let mut sc = std::vec![0u8; 512];
   {
@@ -4876,8 +5784,8 @@ fn lazy_second_headers_routes_through_fail_and_makes_terminal() {
       .expect("handle_stream only builds the iterator");
     assert_eq!(
       frames.next().err(),
-      Some(H3Error::FrameUnexpected),
-      "a second HEADERS in Tunnel is the lazy frame-unexpected error"
+      Some(H3Error::MessageError),
+      "a :status-bearing trailing section is the lazy malformed-trailers error"
     );
   }
   // The lazy error routed through `fail` → terminal + one ConnError.
@@ -4892,7 +5800,7 @@ fn lazy_second_headers_routes_through_fail_and_makes_terminal() {
   );
   assert_eq!(
     c.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected)),
+    Some(Event::ConnError(H3Error::MessageError)),
     "the lazy error is surfaced as exactly one terminal ConnError"
   );
   assert_eq!(c.poll_event(), None, "exactly one ConnError is enqueued");
@@ -4952,15 +5860,14 @@ fn lazy_qpack_error_routes_through_fail_and_makes_terminal() {
 
 // ── `Frames::next` is inert once the connection has failed (terminal-priority) ─────
 
-/// A zero-length HEADERS frame (frame type HEADERS, length 0, empty field section).
-/// On an established tunnel the request FSM is in `Tunnel`, so ANY HEADERS frame is a
-/// forbidden second HEADERS → `H3Error::FrameUnexpected` — even an empty one (the FSM
-/// rejects on the frame header's kind, before any field section is consumed).
-fn zero_length_headers_frame() -> Vec<u8> {
-  let mut hdr = [0u8; 16];
-  let hn = crate::frame::encode_header(crate::frame::FrameType::Headers, 0, &mut hdr)
-    .expect("zero-length HEADERS frame header encodes");
-  hdr[..hn].to_vec()
+/// A MALFORMED trailing HEADERS frame: a `:status`-bearing section. On an established
+/// tunnel the leading message is complete (the connection signalled `complete_leading` on
+/// the final response), so a following HEADERS section is the TRAILING section — and a
+/// `:status` pseudo-header is forbidden in trailers, so the validator rejects it with
+/// `H3Error::MessageError`. Used where a test needs the trailing HEADERS to be fatal (an
+/// empty trailers section would now be VALID bodyless trailers).
+fn malformed_trailing_headers_frame() -> Vec<u8> {
+  request_headers_frame(&RESPONSE[..])
 }
 
 #[test]
@@ -4969,8 +5876,8 @@ fn lazy_fatal_then_second_next_yields_no_trailing_data_frames_next_is_fused() {
   // connection — mirroring `drain_for_errors`' `is_failed()` top guard.
   //
   // The exploit: on an established tunnel, ONE `handle_stream` read carrying
-  // `[forbidden zero-length second HEADERS][DATA frame]`. The first `next()` hits
-  // the forbidden HEADERS in `Tunnel` (→ `FrameUnexpected`) and routes through
+  // `[malformed trailing HEADERS][DATA frame]`. The first `next()` hits the malformed
+  // bodyless trailers (a `:status`-bearing section → `MessageError`) and routes through
   // `fail_into` (terminal `ConnError` recorded). Without the fuse the SAME iterator
   // would stay live, so a SECOND `next()` would resume parsing AFTER the bad HEADERS
   // and — because `tunnel_established` is still true — yield the following
@@ -4979,20 +5886,20 @@ fn lazy_fatal_then_second_next_yields_no_trailing_data_frames_next_is_fused() {
   // returns `Ok(None)` and the only observable event is the single terminal ConnError.
   let req_id = StreamId::new(0);
   let mut c = client_open_at_tunnel_boundary(req_id);
-  // ONE read: a forbidden zero-length second HEADERS, then a DATA frame that the
-  // pre-fix iterator would resume into and surface as `Frame::Data`.
-  let mut input = zero_length_headers_frame();
+  // ONE read: a malformed trailing HEADERS, then a DATA frame that the pre-fix iterator
+  // would resume into and surface as `Frame::Data`.
+  let mut input = malformed_trailing_headers_frame();
   input.extend_from_slice(&request_data_frame(b"smuggled"));
   let mut sc = std::vec![0u8; 512];
   {
     let mut frames = c
       .handle_stream(req_id, &input, &mut sc)
       .expect("handle_stream only builds the iterator on an Open connection");
-    // First pull: the forbidden HEADERS is the lazy frame-unexpected error.
+    // First pull: the malformed bodyless trailers is the lazy error.
     assert_eq!(
       frames.next().err(),
-      Some(H3Error::FrameUnexpected),
-      "a second (zero-length) HEADERS in Tunnel is the lazy frame-unexpected error"
+      Some(H3Error::MessageError),
+      "a :status-bearing trailing section is the lazy malformed-trailers error"
     );
     // Second pull: the iterator is now fused (the connection is Failed). It MUST NOT
     // resume parsing into the trailing DATA frame and surface it as `Frame::Data`.
@@ -5022,8 +5929,8 @@ fn lazy_fatal_then_second_next_yields_no_trailing_data_frames_next_is_fused() {
   );
   assert_eq!(
     c.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected)),
-    "exactly the terminal ConnError(FrameUnexpected) — no Frame::Data ahead of it"
+    Some(Event::ConnError(H3Error::MessageError)),
+    "exactly the terminal ConnError(MessageError) — no Frame::Data ahead of it"
   );
   assert_eq!(
     c.poll_event(),
@@ -5035,7 +5942,7 @@ fn lazy_fatal_then_second_next_yields_no_trailing_data_frames_next_is_fused() {
 #[test]
 fn lazy_fatal_then_drop_drain_emits_nothing_new_next_drain_parity() {
   // Drop variant — next/drain parity end-to-end: the SAME
-  // `[zero-length second HEADERS][DATA]` read, but the driver pulls `next()` ONCE
+  // `[malformed trailing HEADERS][DATA]` read, but the driver pulls `next()` ONCE
   // (getting the `Err`) and then DROPS the `Frames`. The drop-drain
   // (`drain_for_errors`) must be a no-op — its own `is_failed()` top guard already
   // short-circuits a connection the yield path just failed — so it yields/emits
@@ -5043,7 +5950,7 @@ fn lazy_fatal_then_drop_drain_emits_nothing_new_next_drain_parity() {
   // confirms the yield-path fuse and the drop-path guard agree.
   let req_id = StreamId::new(0);
   let mut c = client_open_at_tunnel_boundary(req_id);
-  let mut input = zero_length_headers_frame();
+  let mut input = malformed_trailing_headers_frame();
   input.extend_from_slice(&request_data_frame(b"smuggled"));
   let mut sc = std::vec![0u8; 512];
   {
@@ -5052,8 +5959,8 @@ fn lazy_fatal_then_drop_drain_emits_nothing_new_next_drain_parity() {
       .expect("handle_stream only builds the iterator");
     assert_eq!(
       frames.next().err(),
-      Some(H3Error::FrameUnexpected),
-      "the forbidden HEADERS fails the connection on the first pull"
+      Some(H3Error::MessageError),
+      "the malformed trailers fails the connection on the first pull"
     );
     // Drop `frames` here WITHOUT pulling again: the drop-drain runs over the
     // remaining (post-error) input but is guarded by `is_failed()`, so it is a no-op.
@@ -5064,7 +5971,7 @@ fn lazy_fatal_then_drop_drain_emits_nothing_new_next_drain_parity() {
   );
   assert_eq!(
     c.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected)),
+    Some(Event::ConnError(H3Error::MessageError)),
     "the drop-drain added nothing: exactly the single terminal ConnError"
   );
   assert_eq!(
@@ -5079,13 +5986,16 @@ fn lazy_fatal_then_drop_drain_emits_nothing_new_next_drain_parity() {
 #[test]
 fn undrained_request_frames_drop_validates_trailing_forbidden_headers_server() {
   // The OBSERVED-then-dropped path: a peer can coalesce, in ONE `handle_stream`
-  // call, a valid CONNECT request HEADERS frame followed by a FORBIDDEN second
-  // HEADERS frame. A server driver that pulls ONLY the first `Frame::Request` (so
+  // call, a valid CONNECT request HEADERS frame followed by a malformed trailing
+  // HEADERS frame (here a `:status`-bearing section — a pseudo-header forbidden in
+  // trailers). A server driver that pulls ONLY the first `Frame::Request` (so
   // readiness fires from that next()) and then drops the iterator (without pulling
-  // far enough to surface the second HEADERS) must STILL get the trailing frame
-  // validated: drain-on-drop drives the FSM over the unread bytes, hits
-  // H3_FRAME_UNEXPECTED, and routes it through `fail`. The connection becomes
-  // terminal even though `Frames::next` was never pulled to the error.
+  // far enough to surface the second section) must STILL get the trailing frame
+  // validated: drain-on-drop drives the FSM over the unread bytes. The request
+  // completed the leading message (the connection signalled `complete_leading`), so the
+  // second section is BODYLESS trailers; the trailers validator rejects its pseudo-header
+  // with H3_MESSAGE_ERROR, routed through `fail`. The connection becomes terminal even
+  // though `Frames::next` was never pulled to the error.
   // (Distinct from the unobserved-drop case: here the first HEADERS WAS observed
   // via next(), so granting readiness was correct; the trailing-fatal scan is what
   // the drop drain adds.)
@@ -5101,7 +6011,8 @@ fn undrained_request_frames_drop_validates_trailing_forbidden_headers_server() {
       .expect("control bytes ok");
     assert!(frames.next().expect("no frames").is_none());
   }
-  // One `handle_stream` input = [valid CONNECT request HEADERS][forbidden 2nd HEADERS].
+  // One `handle_stream` input = [valid CONNECT request HEADERS][malformed bodyless
+  // trailers: a `:status`-bearing section].
   let mut bytes = request_headers_frame(&CONNECT_REQUEST[..]);
   bytes.extend_from_slice(&request_headers_frame(&RESPONSE[..]));
   let mut rsc = std::vec![0u8; 512];
@@ -5110,7 +6021,7 @@ fn undrained_request_frames_drop_validates_trailing_forbidden_headers_server() {
       .handle_stream(StreamId::new(0), &bytes, &mut rsc)
       .expect("handle_stream only builds the iterator");
     // Pull ONLY the first frame (the CONNECT request), then stop and let `frames`
-    // drop WITHOUT pulling the second HEADERS that follows it in the same input.
+    // drop WITHOUT pulling the second section that follows it in the same input.
     let first = frames
       .next()
       .expect("first frame ok")
@@ -5119,7 +6030,7 @@ fn undrained_request_frames_drop_validates_trailing_forbidden_headers_server() {
       matches!(first, Frame::Request(_)),
       "the first yielded frame is the CONNECT request HEADERS"
     );
-    // `frames` drops here: drain-on-drop validates the trailing forbidden HEADERS.
+    // `frames` drops here: drain-on-drop validates the trailing malformed trailers.
   }
   // The drop-drain failed the connection: it is now terminal, so BOTH send paths
   // report `Closed` (the request was received, so absent the drop-drain validation
@@ -5138,29 +6049,30 @@ fn undrained_request_frames_drop_validates_trailing_forbidden_headers_server() {
     Err(Error::Closed),
     "send_data after the drop-drain failure must be Closed"
   );
-  // Exactly one ConnError(FrameUnexpected) — the second HEADERS — is observable.
+  // Exactly one ConnError(MessageError) — the malformed bodyless trailers — is observable.
   assert_eq!(
     s.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected)),
-    "the trailing second HEADERS surfaces as exactly one terminal ConnError"
+    Some(Event::ConnError(H3Error::MessageError)),
+    "the trailing malformed trailers surfaces as exactly one terminal ConnError"
   );
   assert_eq!(s.poll_event(), None, "exactly one ConnError is enqueued");
 }
 
 #[test]
 fn undrained_request_frames_drop_validates_trailing_forbidden_frame_client() {
-  // Client analog — the OBSERVED-then-dropped path: a response HEADERS frame
-  // followed by a forbidden frame (a second HEADERS) in ONE `handle_stream` input.
-  // The client pulls only the `Frame::Response` (observing it, which establishes the
-  // tunnel from that next()) and drops without reaching the forbidden frame;
-  // drain-on-drop must still fail the connection. (Distinct from the unobserved-drop
-  // case: here the response WAS observed, so establishing was correct; the
-  // trailing-fatal scan then supersedes it.)
+  // Client analog — the OBSERVED-then-dropped path: a final response HEADERS frame
+  // followed by a malformed trailing section (a `:status`-bearing HEADERS) in ONE
+  // `handle_stream` input. The client pulls only the `Frame::Response` (observing it,
+  // which establishes the tunnel from that next() AND signals leading-complete) and drops
+  // without reaching the trailing section; drain-on-drop must still fail the connection.
+  // The second section is BODYLESS trailers, rejected by the validator (pseudo-header in
+  // trailers → MessageError). (Distinct from the unobserved-drop case: here the response
+  // WAS observed, so establishing was correct; the trailing-fatal scan then supersedes it.)
   let req_id = StreamId::new(0);
   let mut c = client_after_peer_settings(&[0x08, 0x01]);
   c.open_with(&CONNECT_REQUEST[..]).expect("open_with");
   c.provide_stream(StreamRole::Request, req_id);
-  // [valid response HEADERS][forbidden 2nd HEADERS] in a single feed.
+  // [valid final response HEADERS][malformed bodyless trailers] in a single feed.
   let mut bytes = request_headers_frame(&RESPONSE[..]);
   bytes.extend_from_slice(&request_headers_frame(&RESPONSE[..]));
   let mut sc = std::vec![0u8; 512];
@@ -5176,13 +6088,13 @@ fn undrained_request_frames_drop_validates_trailing_forbidden_frame_client() {
       matches!(first, Frame::Response { .. }),
       "the first yielded frame is the response HEADERS"
     );
-    // Drop without pulling the trailing forbidden HEADERS.
+    // Drop without pulling the trailing malformed trailers.
   }
   // Pulling the response established the tunnel; the drop-drain then failed it on the
-  // forbidden frame, so `Failed` supersedes `Open` and the send path is `Closed`.
+  // malformed trailers, so `Failed` supersedes `Open` and the send path is `Closed`.
   assert!(
     c.is_terminal(),
-    "the trailing forbidden frame made the connection terminal on drop"
+    "the trailing malformed trailers made the connection terminal on drop"
   );
   assert_eq!(
     c.send_data(b"x"),
@@ -5191,12 +6103,12 @@ fn undrained_request_frames_drop_validates_trailing_forbidden_frame_client() {
   );
   // The fail transition clears the pending queue, so the `Established` queued by the
   // pulled response is DISCARDED — the connection is terminal-priority and
-  // `poll_event` yields EXACTLY the terminal ConnError(FrameUnexpected), then None
+  // `poll_event` yields EXACTLY the terminal ConnError(MessageError), then None
   // (no stale `Established` ahead of it).
   assert_eq!(
     c.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected)),
-    "the trailing second HEADERS surfaces as exactly one terminal ConnError"
+    Some(Event::ConnError(H3Error::MessageError)),
+    "the trailing malformed trailers surfaces as exactly one terminal ConnError"
   );
   assert_eq!(
     c.poll_event(),
@@ -5314,7 +6226,7 @@ fn fail_via_lazy_error_cancels_a_deferred_close_fin() {
   // connection never flushes a deferred graceful FIN regardless of which path
   // produced the failure.
   // Same scenario as `fail_cancels_a_deferred_close_fin` but the fatal condition is
-  // a second HEADERS (a lazy `FrameUnexpected`), not a mid-frame FIN.
+  // a malformed bodyless trailers section (a lazy `MessageError`), not a mid-frame FIN.
   let req_id = StreamId::new(0);
   let mut c = client_open_at_tunnel_boundary(req_id);
   for _ in 0..super::queue::TX_N {
@@ -5327,14 +6239,15 @@ fn fail_via_lazy_error_cancels_a_deferred_close_fin() {
     c.is_close_pending(),
     "the deferred FIN must be pending after close() under a full ring"
   );
-  // A lazy fatal error: a second HEADERS on the request stream (FSM in Tunnel).
+  // A lazy fatal error: a `:status`-bearing trailing section after the final response is
+  // malformed trailers (the leading message completed → it is the trailing section).
   let second = request_headers_frame(&RESPONSE[..]);
   let mut sc = std::vec![0u8; 512];
   {
     let mut frames = c
       .handle_stream(req_id, &second, &mut sc)
       .expect("handle_stream only builds the iterator");
-    assert_eq!(frames.next().err(), Some(H3Error::FrameUnexpected));
+    assert_eq!(frames.next().err(), Some(H3Error::MessageError));
   }
   // The lazy fail path clears close_pending directly (via fail_into's &mut bool
   // parameter), so the primary invariant holds — not just the secondary
@@ -5361,7 +6274,7 @@ fn fail_via_lazy_error_cancels_a_deferred_close_fin() {
   );
   assert_eq!(
     c.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected))
+    Some(Event::ConnError(H3Error::MessageError))
   );
   assert_eq!(c.poll_event(), None, "exactly one ConnError");
 }
@@ -5658,12 +6571,13 @@ fn start_is_noop_in_open_phase() {
 #[test]
 fn drain_on_drop_in_closing_with_forbidden_frame_fails_supersedes_close() {
   // The exploit: open the tunnel, fill the transmit ring so the FIN is deferred,
-  // call close() (phase → Closing, close_pending set), then deliver a forbidden
-  // request-stream frame (a second HEADERS in Tunnel) and drop the returned Frames
-  // WITHOUT pulling from it. The drop-drain validates even while Closing, and the
-  // fatal path clears close_pending directly (via fail_into's &mut bool parameter)
-  // — the primary invariant, not only the belt-and-suspenders phase guard in
-  // try_send_fin — so a failed connection cannot flush a deferred FIN.
+  // call close() (phase → Closing, close_pending set), then deliver a malformed
+  // request-stream frame (a `:status`-bearing trailing section after the final response
+  // → malformed bodyless trailers) and drop the returned Frames WITHOUT pulling from it.
+  // The drop-drain validates even while Closing, and the fatal path clears close_pending
+  // directly (via fail_into's &mut bool parameter) — the primary invariant, not only the
+  // belt-and-suspenders phase guard in try_send_fin — so a failed connection cannot flush
+  // a deferred FIN.
   let req_id = StreamId::new(0);
   let mut c = client_open_at_tunnel_boundary(req_id);
   // Fill the transmit ring so the FIN cannot be enqueued immediately.
@@ -5682,8 +6596,8 @@ fn drain_on_drop_in_closing_with_forbidden_frame_fails_supersedes_close() {
     c.is_close_pending(),
     "is_close_pending() accessor confirms the deferred FIN is armed"
   );
-  // Deliver a forbidden request-stream frame (a second HEADERS in Tunnel) and drop
-  // the Frames WITHOUT pulling — drain-on-drop must still validate.
+  // Deliver a malformed trailing request-stream frame and drop the Frames WITHOUT
+  // pulling — drain-on-drop must still validate.
   let second = request_headers_frame(&RESPONSE[..]);
   let mut sc = std::vec![0u8; 512];
   {
@@ -5695,7 +6609,7 @@ fn drain_on_drop_in_closing_with_forbidden_frame_fails_supersedes_close() {
   // The connection must now be Failed (fatal supersedes Closing).
   assert!(
     c.phase.is_failed(),
-    "a forbidden frame on drop in Closing must make the connection Failed"
+    "a malformed trailing frame on drop in Closing must make the connection Failed"
   );
   // The drop-drain fatal path clears close_pending directly via fail_into, so the
   // primary invariant holds — the deferred FIN is cancelled by the fail transition
@@ -5716,11 +6630,11 @@ fn drain_on_drop_in_closing_with_forbidden_frame_fails_supersedes_close() {
     !saw_fin,
     "a Failed connection must not flush a deferred graceful FIN"
   );
-  // Exactly one ConnError(FrameUnexpected) — the second HEADERS — is observable.
+  // Exactly one ConnError(MessageError) — the malformed trailers — is observable.
   assert_eq!(
     c.poll_event(),
-    Some(Event::ConnError(H3Error::FrameUnexpected)),
-    "the trailing forbidden frame surfaces as exactly one terminal ConnError"
+    Some(Event::ConnError(H3Error::MessageError)),
+    "the trailing malformed frame surfaces as exactly one terminal ConnError"
   );
   assert_eq!(c.poll_event(), None, "exactly one ConnError is enqueued");
 }

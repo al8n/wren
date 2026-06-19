@@ -68,9 +68,9 @@ struct Scan {
 enum StatusClass {
   /// An interim informational status (`100..=199`, RFC 9110 §15.2).
   Interim,
-  /// A final status (`>= 200`).
+  /// A final status (`200..=599`).
   Final,
-  /// A value that is non-numeric or outside the valid status range.
+  /// Not exactly three ASCII digits, or three digits outside `100..=599`.
   Invalid,
 }
 
@@ -85,8 +85,8 @@ enum StatusClass {
 ///   `:path` (`:authority` optional); **CONNECT** = only `:method` + `:authority`
 ///   (no `:scheme`/`:path`); **Extended CONNECT** (`:method`=CONNECT +
 ///   `:protocol`) = `:protocol` + `:scheme`/`:path`/`:authority` (RFC 8441/9220);
-/// - **Response/Interim:** `:status` required; an interim status is `1xx`; a final
-///   status is `>= 200`;
+/// - **Response/Interim:** `:status` required (exactly three ASCII digits in the
+///   `1xx`–`5xx` classes); an interim status is `1xx`; a final status is `2xx`–`5xx`;
 /// - **Field rules (§4.2):** reject `Connection`/`Keep-Alive`/`Proxy-Connection`/
 ///   `Transfer-Encoding`/`Upgrade`; `TE` may only be `trailers`; field names must
 ///   be lowercase;
@@ -161,17 +161,36 @@ fn set_once_value<T>(slot: &mut Option<T>, derived: T, dup: &mut bool) {
 }
 
 /// Classifies a `:status` value as interim (`100..=199`, RFC 9110 §15.2), final
-/// (`>= 200`), or invalid (non-numeric or below 100).
+/// (`200..=599`), or invalid.
+///
+/// A valid HTTP status-code is EXACTLY three ASCII digits in the `1xx`–`5xx`
+/// classes (RFC 9110 §15). This rejects anything else WITHOUT parsing the string
+/// as an integer and WITHOUT arithmetic: a wrong length (`99`, `0200`, `1000`) or
+/// a non-digit byte fails the shape check; once the shape is three digits, the
+/// FIRST digit alone fixes the class — `1` is `100..=199`, `2`–`5` is `200..=599`,
+/// and `0`/`6`–`9` are out of class (`000`–`099` incl. the leading-zero `099`, and
+/// `600`–`999`). The trailing two digits only need to be digits (range-irrelevant
+/// once the leading digit is in class), so no value reconstruction is needed.
 fn classify_status(value: &str) -> StatusClass {
-  match value.parse::<u16>() {
-    Ok(100..=199) => StatusClass::Interim,
-    Ok(200..) => StatusClass::Final,
+  // Exactly three ASCII digits — no more, no fewer, no sign, no non-digit.
+  let [d0, d1, d2] = *value.as_bytes() else {
+    return StatusClass::Invalid;
+  };
+  if !d0.is_ascii_digit() || !d1.is_ascii_digit() || !d2.is_ascii_digit() {
+    return StatusClass::Invalid;
+  }
+  // The leading digit alone determines the class for an in-shape three-digit code.
+  match d0 {
+    b'1' => StatusClass::Interim,
+    b'2'..=b'5' => StatusClass::Final,
+    // `0xx` (`< 100`, incl. leading-zero `099`) and `6xx`–`9xx` (`> 599`).
     _ => StatusClass::Invalid,
   }
 }
 
 /// Whether a `:status` value is interim (`Some(true)`, `100..=199`) or final
-/// (`Some(false)`, `>= 200`); `None` for a non-numeric / out-of-range value.
+/// (`Some(false)`, `200..=599`); `None` for any other form — not exactly three
+/// ASCII digits, or three digits outside `100..=599` (see `classify_status`).
 ///
 /// The outbound-side twin of [`response_is_interim`] (which classifies a DECODED
 /// inbound section): both route through the one `classify_status`, so a SERVER's
@@ -183,6 +202,23 @@ pub fn status_class_is_interim(value: &str) -> Option<bool> {
     StatusClass::Final => Some(false),
     StatusClass::Invalid => None,
   }
+}
+
+/// Whether a `:status` value is a valid `2xx` (`200..=299`) success code: exactly
+/// three ASCII digits whose leading digit is `2`. A `1xx` interim, a `3xx`–`5xx`
+/// final, and any malformed `:status` (wrong length, non-digit, or out of the
+/// `1xx`–`5xx` classes) all return `false`.
+///
+/// The CONNECT-acceptance specialization of [`status_class_is_interim`]: a CONNECT
+/// tunnel is established only by a `2xx` final response (RFC 9110 §15.3 / RFC 9114
+/// §4.4), so `accept_with` enforces this exact class on the response it is about to
+/// commit. Final non-`2xx` responses (e.g. `4xx`) are well-formed but do NOT accept
+/// the tunnel. Shares `classify_status`'s leading-digit shape check, so it parses no
+/// integer and does no arithmetic.
+pub fn status_is_2xx(value: &str) -> bool {
+  // Exactly three ASCII digits, leading digit `2` (`200..=299`).
+  matches!(value.as_bytes(), [b'2', d1, d2]
+    if d1.is_ascii_digit() && d2.is_ascii_digit())
 }
 
 /// Enforces the §4.2 field rules on one regular (non-pseudo) field: a lowercase

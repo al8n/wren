@@ -93,9 +93,11 @@ impl ReqBufAlloc for &mut [u8] {
 /// Which placement a decoded HEADERS section occupies in the RFC 9114 §4.1
 /// request-stream sequence `HEADERS(interim)* HEADERS(final) DATA* HEADERS(trailers)?`.
 ///
-/// The recv FSM classifies by *placement* only: the first HEADERS section(s) are
-/// [`Initial`](Self::Initial) (the connection/validator decide interim-vs-final
-/// by `:status`); a HEADERS section that arrives after any DATA frame is
+/// The recv FSM classifies by *placement* only: the leading HEADERS section(s) are
+/// [`Initial`](Self::Initial) (the connection/validator decide interim-vs-final by
+/// `:status`); a HEADERS section that arrives after the leading message completed — after
+/// any DATA frame, OR after the connection signals leading-complete via the FSM's
+/// `complete_leading` with no DATA in between (bodyless trailers) — is
 /// [`Trailers`](Self::Trailers). The request/response direction is decided by the
 /// connection from its role, not here.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, IsVariant)]
@@ -103,20 +105,36 @@ impl ReqBufAlloc for &mut [u8] {
 pub enum HeadersKind {
   /// A leading HEADERS section (request, final response, or an interim 1xx —
   /// disambiguated by `:status` at a higher layer). Repeats are allowed (interim
-  /// responses) until the first DATA frame.
+  /// responses) until the connection signals the leading message complete (the FSM's
+  /// `complete_leading`) or the first DATA frame.
   Initial,
-  /// A trailing HEADERS section after the body (trailers). At most one; nothing
-  /// may follow it.
+  /// A trailing HEADERS section after the leading message (trailers), whether after the
+  /// body or directly after a bodyless leading message. At most one; nothing may follow
+  /// it.
   Trailers,
 }
 
 /// Phase of the read (recv) side, tracking the RFC 9114 §4.1 sequence.
 enum Phase {
-  /// Awaiting the first HEADERS; repeated leading HEADERS (interim 1xx) keep the
-  /// FSM here until the first DATA frame.
+  /// Awaiting the leading message: repeated leading HEADERS (interim 1xx) keep the
+  /// FSM here. The FSM cannot decode `:status`, so it does NOT itself know when the
+  /// leading message is complete (the server's single request, or the client's FINAL
+  /// non-interim response); the connection signals that via `complete_leading`, which
+  /// moves to [`LeadingDone`](Self::LeadingDone). The first DATA frame seen while still
+  /// here (the connection has not signalled yet — e.g. DATA after only interims) moves
+  /// to [`Body`](Self::Body) directly; the connection's premature-DATA gate rejects DATA
+  /// that arrives before the leading message completed.
   Headers,
-  /// At least one HEADERS section seen and at least one DATA frame seen (or the
-  /// body has begun): DATA frames and an optional trailing HEADERS are allowed.
+  /// The leading message is complete (signalled by the connection via
+  /// `complete_leading`) but no DATA frame has arrived yet. The post-leading, pre-DATA
+  /// state: a DATA frame moves to [`Body`](Self::Body); a HEADERS section here is the
+  /// trailing section (bodyless trailers — trailers that follow the leading message with
+  /// NO intervening DATA, RFC 9114 §4.1-legal) and moves to [`Trailers`](Self::Trailers).
+  /// A frame-boundary FIN here is a clean half-close (a bodyless final response / request
+  /// then FIN).
+  LeadingDone,
+  /// At least one HEADERS section seen and at least one DATA frame seen (the body has
+  /// begun): DATA frames and an optional trailing HEADERS are allowed.
   Body,
   /// A trailing HEADERS (trailers) section was seen: the recv message is complete;
   /// nothing further may arrive on the recv half.
@@ -129,8 +147,9 @@ enum Cur {
   None,
   /// Accumulating a HEADERS field section into the FSM-owned `hdr_acc[0..acc]`.
   /// `trailers` records whether the placement match classified this section as a
-  /// trailing (post-DATA) HEADERS, so the completion arm reports the right
-  /// [`HeadersKind`] and enters the right [`Phase`].
+  /// trailing HEADERS (after the body, or after the leading message completed with no
+  /// DATA — bodyless trailers), so the completion arm reports the right [`HeadersKind`]
+  /// and enters the right [`Phase`].
   Headers {
     remaining: u64,
     acc: usize,
@@ -150,11 +169,20 @@ enum Cur {
 /// leading HEADERS sections (the CONNECT request / response, plus any interim 1xx
 /// responses), then a sequence of DATA frames, then an optional trailing HEADERS
 /// (trailers). Each decoded section is tagged with a [`HeadersKind`] by placement
-/// (leading vs post-DATA); interim-vs-final is decided at a higher layer by
-/// `:status`. The CONNECT tunnel is the specialization: one leading HEADERS, then
-/// DATA. Unknown frame types are skipped (RFC 9114 §9); DATA before any HEADERS, a
-/// frame after trailers, PUSH_PROMISE, or control-stream frames are protocol
-/// violations.
+/// (leading vs trailing); interim-vs-final is decided at a higher layer by `:status`.
+/// The CONNECT tunnel is the specialization: one leading HEADERS, then DATA. Unknown
+/// frame types are skipped (RFC 9114 §9); DATA before any HEADERS, a frame after
+/// trailers, PUSH_PROMISE, or control-stream frames are protocol violations.
+///
+/// The FSM cannot decode `:status`, so it does not by itself know which leading
+/// HEADERS section COMPLETES the leading message (the single request, or the FINAL
+/// non-interim response — not an interim 1xx). The connection signals that via the
+/// crate-internal `complete_leading`, moving the FSM from its leading phase to the
+/// post-leading, pre-DATA `LeadingDone` phase. The next HEADERS section after that
+/// signal is the trailing section EVEN IF no DATA arrived in between (bodyless
+/// trailers — a bodyless final response / request then trailers, which is
+/// RFC 9114-legal). Without the signal a further HEADERS is another leading section
+/// (an interim 1xx repeat).
 ///
 /// A naturally-fragmented HEADERS frame is accumulated into FSM-owned storage
 /// (`hdr_acc`), so the caller's `scratch` is needed only as transient
@@ -165,10 +193,13 @@ enum Cur {
 pub struct Stream<'a, B = DefaultReqBuf<'a>> {
   phase: Phase,
   cur: Cur,
-  /// Whether at least one HEADERS section has completed. A clean FIN before the
-  /// first HEADERS is [`H3Error::RequestIncomplete`]; once any HEADERS completed,
-  /// a frame-boundary FIN is a clean half-close even before any DATA (a body-less
-  /// response, or the CONNECT 2xx with no payload yet).
+  /// Whether at least one HEADERS section has completed. Gates the leading-phase
+  /// premature-DATA transition (a DATA frame is legal only once a leading HEADERS
+  /// section exists, RFC 9114 §4.1) and the connection's "exactly one HEADERS
+  /// exchange" tunnel rule via [`headers_seen`](Self::headers_seen). It does NOT by
+  /// itself decide a clean FIN: an interim 1xx sets this yet leaves the leading
+  /// message incomplete, so [`fin`](Self::fin) keys on the PHASE (the leading message
+  /// completed) instead.
   headers_seen: bool,
   /// Partial frame-header bytes (type varint + length varint, `<= 16`).
   hdr_buf: [u8; MAX_HEADER_LEN],
@@ -288,25 +319,34 @@ impl<'buf, B> Stream<'buf, B> {
 
   /// Signal the QUIC stream FIN.
   ///
-  /// - `Ok(())` — a clean half-close at a frame boundary once at least one HEADERS
-  ///   section has completed (the recv half of the message is well-formed): after
-  ///   the body has begun, after a trailing section, or after a leading HEADERS even
-  ///   before any DATA (a body-less response, or the CONNECT 2xx before any DATA).
-  ///   The peer ended its send side (RFC 9114 §7.1).
-  /// - `Err(`[`H3Error::RequestIncomplete`]`)` — a frame-boundary FIN while still
-  ///   awaiting the first HEADERS: the request / response field section never
-  ///   arrived, so the message is incomplete (RFC 9114 §8.1).
+  /// - `Ok(())` — a clean half-close at a frame boundary once the LEADING MESSAGE has
+  ///   COMPLETED (the recv half of the message is well-formed): after the body has
+  ///   begun, after a trailing section, or after the leading message completed even
+  ///   before any DATA (a body-less final response / request, or the CONNECT 2xx
+  ///   before any DATA). The peer ended its send side (RFC 9114 §7.1).
+  /// - `Err(`[`H3Error::RequestIncomplete`]`)` — a frame-boundary FIN while still in
+  ///   the leading-HEADERS phase, i.e. the leading message never completed: either no
+  ///   HEADERS at all, or ONLY interim 1xx leading sections (the final response /
+  ///   request never arrived). The message is incomplete (RFC 9114 §8.1). Completion
+  ///   is the FSM leaving `Phase::Headers` — which the connection signals via
+  ///   `complete_leading` ONLY on the final response / request, NEVER on an interim —
+  ///   not merely `headers_seen` (an interim 1xx completes a section but NOT the
+  ///   message, so a `103`-then-FIN must NOT read as a clean half-close).
   /// - `Err(`[`H3Error::FrameError`]`)` — a FIN mid-frame (a header or payload was
   ///   cut off), which is malformed framing.
   #[inline]
   pub fn fin(&self) -> Result<(), H3Error> {
     match (self.hdr_len, &self.cur) {
       (0, Cur::None) => match self.phase {
-        // Body / Trailers (or Headers AFTER at least one section) = clean half-close.
-        Phase::Body | Phase::Trailers => Ok(()),
-        // Still in the leading-HEADERS phase: clean once one section completed, but a
-        // FIN before the first HEADERS leaves the message incomplete (RFC 9114 §8.1).
-        Phase::Headers if self.headers_seen => Ok(()),
+        // The leading message completed (the FSM left `Phase::Headers`): a bodyless
+        // final response / request (LeadingDone), the body began (Body), or trailers
+        // arrived (Trailers) — all clean half-closes.
+        Phase::LeadingDone | Phase::Body | Phase::Trailers => Ok(()),
+        // Still in the leading-HEADERS phase: the leading message never completed — no
+        // HEADERS, or only interim 1xx sections (`complete_leading` fires only on the
+        // final response / request, so an interim leaves the FSM here). Either way the
+        // message is incomplete (RFC 9114 §8.1); `headers_seen` (set by an interim too)
+        // is NOT sufficient.
         Phase::Headers => Err(H3Error::RequestIncomplete),
       },
       // Mid-frame: a header or payload was truncated by the FIN (malformed).
@@ -325,6 +365,32 @@ impl<'buf, B> Stream<'buf, B> {
   pub(crate) fn headers_seen(&self) -> bool {
     self.headers_seen
   }
+
+  /// Signal that the leading message is complete: the connection classified the
+  /// just-completed leading HEADERS section as the SERVER's single request or the
+  /// CLIENT's FINAL (non-interim) response — NOT an interim 1xx. The FSM cannot decode
+  /// `:status`, so this is how it learns the leading message is over and the NEXT
+  /// HEADERS section is the trailing section EVEN WITH no intervening DATA (bodyless
+  /// trailers, RFC 9114 §4.1). Moves `Phase::Headers → Phase::LeadingDone` (the
+  /// post-leading, pre-DATA state); from there a DATA frame begins the body and a
+  /// HEADERS section is trailers.
+  ///
+  /// The connection MUST NOT call this for an interim 1xx leading section (several may
+  /// precede the final response): leaving the FSM in `Phase::Headers` keeps a subsequent
+  /// interim / the final classified as another leading section.
+  ///
+  /// Idempotent and frame-boundary-only in practice: the connection signals it right
+  /// after a leading section completes, when `cur` is `Cur::None`. It is a no-op in any
+  /// phase but `Headers` (a DATA frame may already have moved the FSM to `Body`, e.g.
+  /// `[final response][DATA][late signal]` — though the connection signals before the
+  /// DATA is processed; and after `LeadingDone` / `Trailers` there is nothing to do), so
+  /// it can never reopen a trailing or body phase.
+  #[inline]
+  pub(crate) fn complete_leading(&mut self) {
+    if matches!(self.phase, Phase::Headers) {
+      self.phase = Phase::LeadingDone;
+    }
+  }
 }
 
 impl<'a, B> Items<'a, '_, B> {
@@ -333,6 +399,15 @@ impl<'a, B> Items<'a, '_, B> {
   /// offsets independently of any `&mut self` borrow.
   pub(crate) fn input(&self) -> &'a [u8] {
     self.input
+  }
+
+  /// Signal the driven FSM that the leading message is complete (see
+  /// [`Stream::complete_leading`]). The connection calls this through the [`Items`] it
+  /// already holds (the FSM is borrowed by it), after classifying a completed leading
+  /// section as the request / FINAL response, so the next HEADERS section is the trailing
+  /// section even with no intervening DATA. A no-op outside the FSM's leading phase.
+  pub(crate) fn complete_leading(&mut self) {
+    self.fsm.complete_leading();
   }
 }
 
@@ -459,7 +534,10 @@ where
                 *hdr_len = 0;
                 match (&*phase, hdr.kind()) {
                   // A leading HEADERS section: stays in Headers (interim 1xx repeat)
-                  // until the first DATA frame.
+                  // until the connection signals the leading message complete
+                  // (`complete_leading` → LeadingDone) or the first DATA frame begins the
+                  // body. The connection re-tags each completed leading section by
+                  // `:status`, so the FSM keeps reporting `Initial` here.
                   (Phase::Headers, FrameKind::Headers) => {
                     *cur = Cur::Headers {
                       remaining: hdr.length(),
@@ -467,11 +545,23 @@ where
                       trailers: false,
                     };
                   }
-                  // First DATA after a leading HEADERS: the body has begun. (DATA stays
-                  // legal in Body for subsequent frames.) DATA before ANY HEADERS is
-                  // illegal — guarded by `headers_seen`, since a completed leading
-                  // HEADERS keeps the phase in `Headers` until this transition.
+                  // First DATA while still in the leading phase (the connection has not
+                  // signalled the leading message complete — e.g. DATA arriving after only
+                  // interim 1xx responses): the body has begun. DATA before ANY HEADERS is
+                  // illegal — guarded by `headers_seen`, since a completed leading HEADERS
+                  // keeps the phase in `Headers` until this transition. The connection's
+                  // premature-DATA gate separately rejects DATA before the leading message
+                  // completed (it never established), so this only ever yields DATA the
+                  // gate then judges.
                   (Phase::Headers, FrameKind::Data) if *headers_seen => {
+                    *phase = Phase::Body;
+                    *cur = Cur::Data {
+                      remaining: hdr.length(),
+                    };
+                  }
+                  // First DATA after the leading message completed (`complete_leading`):
+                  // the body has begun.
+                  (Phase::LeadingDone, FrameKind::Data) => {
                     *phase = Phase::Body;
                     *cur = Cur::Data {
                       remaining: hdr.length(),
@@ -482,9 +572,14 @@ where
                       remaining: hdr.length(),
                     };
                   }
+                  // A HEADERS section after the leading message completed but before any
+                  // DATA: BODYLESS trailers (RFC 9114 §4.1 — trailers may follow with no
+                  // body). At most one; the LeadingDone→Trailers transition on completion
+                  // guards a second one.
+                  (Phase::LeadingDone, FrameKind::Headers)
                   // A HEADERS section after the body has begun: trailers (at most one;
                   // the Body→Trailers transition on completion guards a second one).
-                  (Phase::Body, FrameKind::Headers) => {
+                  | (Phase::Body, FrameKind::Headers) => {
                     *cur = Cur::Headers {
                       remaining: hdr.length(),
                       acc: 0,
@@ -575,9 +670,11 @@ where
             // and report the completed section's length + placement. The bytes stay in
             // `hdr_acc` until the next HEADERS frame overwrites them (an initial /
             // trailers pair never overlap in time), so the caller's fresh decode reads
-            // them back. A trailing section ends the recv message (Phase::Trailers);
-            // a leading section keeps us in Phase::Headers (a later interim 1xx
-            // repeats), and the first DATA frame is what moves us to Phase::Body.
+            // them back. A trailing section ends the recv message (Phase::Trailers); a
+            // leading section keeps us in Phase::Headers (a later interim 1xx repeats)
+            // until the connection signals the leading message complete
+            // (`complete_leading` → LeadingDone) or the first DATA frame moves us to
+            // Phase::Body.
             *cur = Cur::None;
             *headers_seen = true;
             let kind = if trailers {

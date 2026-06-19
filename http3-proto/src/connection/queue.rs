@@ -338,10 +338,14 @@ const fn empty_tx_meta() -> TxMeta {
 /// enqueue cannot reuse the slot); this only records how many bytes the driver has
 /// already written (`consumed`) so a partial QUIC `writev` can resume from there.
 ///
-/// `consume_seen` distinguishes "the driver re-polled without acking a partial
-/// write" (treated as a full write of the previous transmit — the legacy
+/// `consume_seen` means "a [`consume`](TxRing::consume) happened SINCE THE LAST
+/// `poll`". It distinguishes "the driver re-polled without acking a partial write"
+/// (treated as a full write of the previously yielded segments — the legacy
 /// poll-advances model) from "the driver reported a partial write via
-/// [`consume`](TxRing::consume)" (re-yield the remaining segments).
+/// [`consume`](TxRing::consume)" (re-yield the remaining segments). `poll` clears
+/// it the moment it re-yields the remainder, so the cleared-then-re-polled state is
+/// exactly the "advance" case: a partial write is re-yielded EXACTLY ONCE per
+/// `consume`, never duplicated.
 #[derive(Clone, Copy)]
 struct TxFront {
   consumed: usize,
@@ -427,10 +431,21 @@ where
     }
     let head = self.head;
     let consumed = match self.front {
-      // A transmit is in flight. If the driver reported a partial write that has
-      // not yet drained the slot, re-yield the remainder; otherwise the previous
-      // poll's transmit is done — advance past it and start the next.
-      Some(f) if f.consume_seen && f.consumed < self.front_total(head) => f.consumed,
+      // A transmit is in flight. If the driver reported a partial write since the
+      // last poll that has not yet drained the slot, re-yield the remainder AND
+      // clear `consume_seen` — the partial write has now been re-yielded, so a NEXT
+      // poll without a fresh `consume` means "this remainder was fully written,
+      // advance" (the poll-advances model). Without clearing it, the same remainder
+      // would be re-yielded forever.
+      Some(f) if f.consume_seen && f.consumed < self.front_total(head) => {
+        if let Some(front) = self.front.as_mut() {
+          front.consume_seen = false;
+        }
+        f.consumed
+      }
+      // Either no partial write since the last poll (the previous yield is fully
+      // written) or the partial write has drained the slot — advance past it and
+      // start the next.
       Some(_) => {
         self.advance_head(head, capacity);
         self.front = None;

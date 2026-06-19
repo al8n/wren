@@ -460,6 +460,69 @@ fn response_with_non_numeric_status_is_error() {
   );
 }
 
+#[test]
+fn strict_status_rejects_non_3xx_digit_shapes() {
+  // A valid `:status` is EXACTLY three ASCII digits in `100..=599`. Everything
+  // else is `MessageError`, regardless of the response context (final or interim).
+  // - `999`: three digits but out of class (`> 599`).
+  // - `1000`: four digits — too long, even though it parses as an integer.
+  // - `0200`: a leading-zero four-char form that an integer parse would read as
+  //   `200`; the three-digit shape check rejects it BEFORE any range test.
+  // - `099`: three digits but `< 100` (interim class starts at `100`).
+  // - `2xx`: a non-digit byte in a three-char value.
+  for bad in ["999", "1000", "0200", "099", "2xx"] {
+    assert_eq!(
+      check(MessageKind::Response, &[(":status", bad)]).unwrap_err(),
+      H3Error::MessageError,
+      "final-context `:status` {bad:?} must be rejected"
+    );
+    assert_eq!(
+      check(MessageKind::Interim, &[(":status", bad)]).unwrap_err(),
+      H3Error::MessageError,
+      "interim-context `:status` {bad:?} must be rejected"
+    );
+  }
+}
+
+#[test]
+fn strict_status_accepts_exactly_3_digit_in_class() {
+  // The boundary values of each class: `100`/`103` interim, `200`/`599` final.
+  assert!(
+    check(MessageKind::Interim, &[(":status", "100")]).is_ok(),
+    "100 is the first interim status"
+  );
+  assert!(
+    check(MessageKind::Interim, &[(":status", "103")]).is_ok(),
+    "103 is a valid interim status"
+  );
+  assert!(
+    check(MessageKind::Response, &[(":status", "200")]).is_ok(),
+    "200 is the first final status"
+  );
+  assert!(
+    check(MessageKind::Response, &[(":status", "599")]).is_ok(),
+    "599 is the last in-class final status"
+  );
+}
+
+#[test]
+fn status_is_2xx_accepts_only_3_digit_2xx() {
+  // The CONNECT-acceptance classifier: exactly three ASCII digits, leading `2`.
+  for ok in ["200", "201", "204", "299"] {
+    assert!(status_is_2xx(ok), "{ok} is a 2xx success code");
+  }
+  // Interim, other final classes, and every malformed shape are NOT 2xx.
+  for bad in [
+    "100", "103", // interim
+    "300", "404", "500", "599", // non-2xx final
+    "2", "20", "2000", // wrong length
+    "02x", "2x0", "0200", "099", // non-digit / leading zero
+    "",    // empty
+  ] {
+    assert!(!status_is_2xx(bad), "{bad:?} must not classify as 2xx");
+  }
+}
+
 // ── trailers ──────────────────────────────────────────────────────────────────
 
 #[test]
