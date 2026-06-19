@@ -311,7 +311,15 @@ fn unknown_frame_is_skipped() {
 }
 
 #[test]
-fn clean_fin_after_frame_ok() {
+fn fin_after_leading_headers_without_complete_signal_is_request_incomplete() {
+  // A completed leading HEADERS section alone does NOT make a FIN clean: the FSM stays in
+  // `Phase::Headers` until the connection signals the leading message complete
+  // (`complete_leading`, fired only on the final response / request, never on an interim
+  // 1xx). A FIN here — the shape of `[interim 1xx] FIN`, where no `complete_leading` ran —
+  // is `RequestIncomplete`, NOT a clean half-close. (Pre-fix `fin` returned `Ok` for any
+  // `headers_seen`, so a `103`-then-FIN read as a clean pre-establishment half-close — the
+  // silent forever-deferred half-close of Finding #2. The clean case requires the signal;
+  // see `complete_leading_then_fin_is_clean_half_close`.)
   let mut scratch = [0u8; 512];
   let mut s = RequestStream::new();
   let req = headers_frame(&[(":method", "CONNECT")]);
@@ -319,7 +327,11 @@ fn clean_fin_after_frame_ok() {
     let mut items = s.handle(&req, &mut scratch);
     while items.next().unwrap().is_some() {}
   }
-  assert!(s.fin().is_ok());
+  assert_eq!(
+    s.fin(),
+    Err(H3Error::RequestIncomplete),
+    "a leading HEADERS without complete_leading (only interims seen) is incomplete on FIN"
+  );
 }
 
 #[test]
@@ -540,6 +552,100 @@ fn repeated_initial_headers_before_data_are_allowed() {
     items.next().expect("ok").expect("some"),
     StreamItem::Headers {
       kind: HeadersKind::Initial,
+      ..
+    }
+  ));
+  assert!(items.next().expect("ok").is_none());
+}
+
+// After the connection signals the leading message complete (`complete_leading`), a
+// HEADERS section with NO intervening DATA is the trailing section (bodyless trailers,
+// RFC 9114 §4.1) — tagged `Trailers`, not `Initial`. Without the signal the same two
+// sections are both `Initial` (see `repeated_initial_headers_before_data_are_allowed`),
+// so this pins that the signal is what flips the second to trailers.
+#[test]
+fn complete_leading_makes_next_headers_bodyless_trailers() {
+  let mut s = Stream::new();
+  // First feed: the leading HEADERS section (tagged Initial).
+  {
+    let bytes = [0x01, 0x03, 0x00, 0x00, 0xd1]; // HEADERS (leading)
+    let mut scratch = [0u8; 256];
+    let mut items = s.handle(&bytes, &mut scratch);
+    assert!(matches!(
+      items.next().expect("ok").expect("some"),
+      StreamItem::Headers {
+        kind: HeadersKind::Initial,
+        ..
+      }
+    ));
+    assert!(items.next().expect("ok").is_none());
+  }
+  // The connection signals the leading message complete (request / final response).
+  s.complete_leading();
+  // Second feed: a HEADERS section with NO DATA in between — now BODYLESS trailers.
+  {
+    let bytes = [0x01, 0x03, 0x00, 0x00, 0xd1]; // HEADERS (bodyless trailers)
+    let mut scratch = [0u8; 256];
+    let mut items = s.handle(&bytes, &mut scratch);
+    assert!(matches!(
+      items.next().expect("ok").expect("some"),
+      StreamItem::Headers {
+        kind: HeadersKind::Trailers,
+        ..
+      }
+    ));
+    assert!(items.next().expect("ok").is_none());
+  }
+  // A frame-boundary FIN after bodyless trailers is a clean half-close.
+  assert!(s.fin().is_ok());
+}
+
+// `complete_leading` leaves the FSM in a clean-FIN state even with NO trailers and NO
+// DATA: a bodyless final response / request then FIN is a clean half-close (the message
+// is complete), not `RequestIncomplete`.
+#[test]
+fn complete_leading_then_fin_is_clean_half_close() {
+  let mut s = Stream::new();
+  {
+    let bytes = [0x01, 0x03, 0x00, 0x00, 0xd1]; // HEADERS (leading)
+    let mut scratch = [0u8; 256];
+    let mut items = s.handle(&bytes, &mut scratch);
+    let _ = items.next().expect("ok").expect("some");
+  }
+  s.complete_leading();
+  assert!(
+    s.fin().is_ok(),
+    "a bodyless leading message then FIN is clean"
+  );
+}
+
+// After `complete_leading`, a DATA frame still begins the body (LeadingDone -> Body), and a
+// HEADERS section after that DATA is trailers — the post-leading state funnels into the
+// existing body/trailers path identically.
+#[test]
+fn complete_leading_then_data_then_trailers() {
+  let mut s = Stream::new();
+  {
+    let bytes = [0x01, 0x03, 0x00, 0x00, 0xd1]; // HEADERS (leading)
+    let mut scratch = [0u8; 256];
+    let _ = s
+      .handle(&bytes, &mut scratch)
+      .next()
+      .expect("ok")
+      .expect("some");
+  }
+  s.complete_leading();
+  let bytes = [
+    0x00, 0x02, b'h', b'i', // DATA
+    0x01, 0x03, 0x00, 0x00, 0xd1, // HEADERS after DATA = trailers
+  ];
+  let mut scratch = [0u8; 256];
+  let mut items = s.handle(&bytes, &mut scratch);
+  assert!(matches!(items.next().expect("ok").expect("some"), StreamItem::Data(b) if b == b"hi"));
+  assert!(matches!(
+    items.next().expect("ok").expect("some"),
+    StreamItem::Headers {
+      kind: HeadersKind::Trailers,
       ..
     }
   ));

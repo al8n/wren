@@ -508,21 +508,23 @@ struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
   /// Client-only: arm the establish on the FIRST FINAL (non-interim) response the
   /// moment [`Frames::next`] YIELDS it to the driver (the observation point — NOT
   /// merely when the FSM decodes it, so a dropped-unobserved iterator does not
-  /// establish). Armed only when entered in `Handshaking` (so a response yielded after
-  /// a close / failure does not re-establish, and — since a general connection never
-  /// leaves `Handshaking` — a general stream stays armed until its final response);
+  /// establish). Armed for EVERY client request stream INDEPENDENT of the connection
+  /// phase (per-stream establishment is decoupled from connection-level establishment);
   /// cleared by the consuming `take` after it fires. Always `false` on the server (it
   /// establishes in `accept_with` / `send_response`).
   ///
   /// The establish split rides [`is_tunnel`](Self::is_tunnel): consuming this on the
   /// final response runs the connection-scoped [`Phase::establish_into`] (phase →
-  /// `Open` + [`Event::Established`] + `established`) for the tunnel, or sets the
-  /// per-stream `established` ONLY for a general stream. An interim 1xx response
-  /// establishes NEITHER — it leaves this armed and yields `Frame::Response { interim:
-  /// true, .. }` — so the consume happens in [`Frames::next`]'s yield tail AFTER the
-  /// `:status` interim classification, not in
-  /// [`on_headers_decoded`](Self::on_headers_decoded) (which would fire on a leading
-  /// interim, before `interim` is known).
+  /// `Open` + [`Event::Established`] + `established`) for the tunnel — gated INTERNALLY on
+  /// `Handshaking`, so a response yielded after a close / failure does not re-establish —
+  /// or sets the per-stream `established` ONLY (in ANY phase) for a general stream. The
+  /// per-stream flag is therefore set on every client final response regardless of phase,
+  /// so a general stream opened AFTER a CONNECT tunnel reached `Open` still establishes
+  /// per-stream (gating `Frame::Data`). An interim 1xx response establishes NEITHER — it
+  /// leaves this armed and yields `Frame::Response { interim: true, .. }` — so the consume
+  /// happens in [`Frames::next`]'s yield tail AFTER the `:status` interim classification,
+  /// not in [`on_headers_decoded`](Self::on_headers_decoded) (which would fire on a
+  /// leading interim, before `interim` is known).
   establish_on_response: bool,
   /// Whether the stream this carrier drives is the CONNECT tunnel (copied from the
   /// [`StreamEntry`]'s [`is_tunnel`](StreamEntry::is_tunnel)). Read in
@@ -643,11 +645,12 @@ where
       match advanced {
         None => return Ok(None),
         // A HEADERS section. The FSM classified it by placement ([`HeadersKind`]: an
-        // `Initial` leading section — request / interim / final response — or a post-DATA
-        // `Trailers` section). The role-based placement policy, validation, and `interim`
-        // classification all live in the shared `accept_headers_section` routine the
-        // drop-drain runs too (next/drain parity); break out so it (and the readiness
-        // side effect + the borrowing yield) run once, outside the skip loop.
+        // `Initial` leading section — request / interim / final response — or a `Trailers`
+        // section, after the body OR a bodyless leading message). The role-based placement
+        // policy, validation, and `interim` classification all live in the shared
+        // `accept_headers_section` routine the drop-drain runs too (next/drain parity);
+        // break out so it (and the readiness side effect + the borrowing yield) run once,
+        // outside the skip loop.
         Some(Advanced::Headers { acc_end, kind }) => break (acc_end, kind),
         Some(Advanced::Data { start, end }) => {
           // Tunnel DATA is delivered ONLY once the tunnel reached `Open`
@@ -712,16 +715,20 @@ where
     if let HeadersAccept::Response { interim } = outcome {
       // Establish on the FIRST FINAL response (the observation point). An interim 1xx
       // establishes NOTHING — it leaves the carrier armed so a later final response still
-      // establishes. Armed only when entered in `Handshaking` (see
-      // `establish_on_response`); consumed exactly once via `take`. The split keeps
-      // general vs tunnel streams distinct (events are connection-scoped only,
+      // establishes. Armed for EVERY client request stream (see `establish_on_response`);
+      // consumed exactly once via `take`. The split keeps per-stream establishment SEPARATE
+      // from connection-level establishment (events are connection-scoped only,
       // RFC 9114 §2):
       //
-      // - the TUNNEL establishes connection-wide via `Phase::establish_into` (phase →
-      //   `Open`, one `Event::Established`, `established` set — a no-op outside
-      //   `Handshaking`);
-      // - a GENERAL stream sets ONLY its per-stream `established` (gating `Frame::Data`)
-      //   and emits NO connection `Event::Established` and NO `Phase::Open` transition.
+      // - the CONNECT TUNNEL establishes connection-wide via `Phase::establish_into` (phase
+      //   → `Open`, one `Event::Established`, `established` set), gated INTERNALLY on
+      //   `Handshaking` (a no-op in any other phase). This connection-level transition fires
+      //   ONLY for the tunnel (`is_tunnel`) AND only from `Handshaking`.
+      // - a GENERAL stream sets ONLY its per-stream `established` (gating `Frame::Data`) — in
+      //   ANY connection phase — and emits NO connection `Event::Established` and NO
+      //   `Phase::Open` transition. This is what lets a general stream opened via
+      //   `open_request` AFTER a CONNECT tunnel reached `Open` still establish per-stream;
+      //   without it the next valid response DATA would be (wrongly) premature and reset it.
       //
       // `*rf.tunnel_established` (the entry's `established`) thus becomes true on the
       // final response on BOTH paths, so the second-`Initial`-after-final reject in
@@ -904,6 +911,14 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   ///    `final_response_seen` (client) when that `Initial` is the final response (a
   ///    `Trailers` section re-arms neither). Both are committed BEFORE the semantic
   ///    validate, so placement is identical on both paths even if validation then fails.
+  /// 4. **Leading-complete signal** — when the accepted `Initial` is the SERVER's request
+  ///    or the CLIENT's FINAL (non-interim) response, the recv FSM is signalled via
+  ///    `Items::complete_leading` (NOT for an interim 1xx), so its next HEADERS section is
+  ///    classified as the trailing section even with NO intervening DATA (bodyless
+  ///    trailers, RFC 9114 §4.1). Because the FSM cannot decode `:status`, this connection
+  ///    signal is the only thing that distinguishes "the final response, then trailers"
+  ///    from "another interim leading section". It runs here in the shared routine, so the
+  ///    FSM transitions identically on the live and drop paths (next/drain parity).
   ///
   /// Returns the [`HeadersAccept`] classification so each caller can run its OWN tail
   /// (the live path yields the matching [`Frame`] after re-deciding the same `interim`;
@@ -973,11 +988,29 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
         MessageKind::Response
       };
       self.validate_section(kind, acc_end)?;
+      if !interim {
+        // The leading message is complete on the FINAL (non-interim) response: signal the
+        // recv FSM so the NEXT HEADERS section is classified as the trailing section even
+        // with NO intervening DATA (bodyless trailers, RFC 9114 §4.1). An interim 1xx does
+        // NOT complete the leading message — leaving the FSM in its leading phase keeps a
+        // subsequent interim / the final classified `Initial`. This runs on BOTH the live
+        // (`Frames::next`) and drop-drain paths because it lives in this shared routine
+        // (next/drain parity): the FSM transitions to its post-leading phase identically,
+        // so bodyless trailers are recognised whether or not the driver pulled the
+        // response. (After the final response `final_response_seen` is set, so a later
+        // `Initial` is impossible — every subsequent HEADERS is now trailers, validated
+        // under `MessageKind::Trailers`; a pseudo-header-bearing section is rejected there.)
+        self.items.complete_leading();
+      }
       Ok(HeadersAccept::Response { interim })
     } else {
       // A request: validate under `Request` (pseudo-header presence/ordering, CONNECT
       // / Extended-CONNECT shape, field rules).
       self.validate_section(MessageKind::Request, acc_end)?;
+      // The server's single request IS the whole leading message: signal the recv FSM so
+      // the next HEADERS section is trailers even with no DATA in between (bodyless
+      // trailers). Shared routine ⇒ runs on the live and drop paths identically.
+      self.items.complete_leading();
       Ok(HeadersAccept::Request)
     }
   }
@@ -1139,21 +1172,27 @@ where
         Ok(Some(Advanced::Headers { acc_end, kind })) => {
           // On an accepted (valid) section we keep scanning; on an error the routine
           // already `fail_or_reset`-ed, so stop. Readiness is NOT granted on the drop path
-          // (`on_headers_decoded` runs only from the live yield), so a leading section here
-          // is the UNOBSERVED first/repeat: mark the stream `request_abandoned` so every
-          // later observable path treats it as inert (no `Frame::Data` from a tunnel the
-          // driver never established, no `PeerClosed` on a clean FIN) WITHOUT failing the
-          // connection (a lazy drop is not a protocol violation). A `Trailers` section
-          // never triggers abandonment. KEEP scanning the rest of THIS input — a trailing
-          // forbidden frame routes through `fail_into`, and a coalesced DATA frame hits the
-          // establishment gate in the DATA arm (an unobserved request never established the
-          // tunnel, so that DATA is premature, RFC 9114 §4.4); both SUPERSEDE mere
-          // abandonment.
+          // (`on_headers_decoded` runs only from the live yield), so an unobserved LEADING
+          // message COMPLETION marks the stream `request_abandoned` — every later observable
+          // path then treats it as inert (no `Frame::Data` from a tunnel the driver never
+          // established, no `PeerClosed` on a clean FIN) WITHOUT failing the connection (a
+          // lazy drop is not a protocol violation).
+          //
+          // Only a COMPLETED leading message abandons: an unobserved SERVER `Request` or an
+          // unobserved CLIENT FINAL (non-interim) response. An unobserved INTERIM 1xx is
+          // validated-and-IGNORED — interims are optional and do NOT complete the leading
+          // message, so abandoning on one would make the stream validation-only forever and
+          // SWALLOW a later final response (the stream could never establish). A `Trailers`
+          // section never abandons either. KEEP scanning the rest of THIS input regardless —
+          // a trailing forbidden frame routes through `fail_into`, and a coalesced DATA frame
+          // hits the establishment gate in the DATA arm (an unobserved request never
+          // established the tunnel, so that DATA is premature, RFC 9114 §4.4); both SUPERSEDE
+          // mere abandonment.
           match self.accept_headers_section(kind, acc_end) {
-            Ok(HeadersAccept::Request | HeadersAccept::Response { .. }) => {
+            Ok(HeadersAccept::Request | HeadersAccept::Response { interim: false }) => {
               *self.request_abandoned = true;
             }
-            Ok(HeadersAccept::Trailers) => {}
+            Ok(HeadersAccept::Response { interim: true } | HeadersAccept::Trailers) => {}
             Err(_) => return,
           }
         }
@@ -2842,16 +2881,24 @@ where
     EventBuf: AsMut<[Option<Event>]>,
   {
     let is_client = Ro::IS_CLIENT;
-    // Decide the role-specific first-HEADERS readiness side effects before the
-    // request FSM is borrowed: the client runs the `establish` transition (phase +
-    // event); the server flips the tunnel entry's `observed` (the `Frame::Request`
-    // yield is itself the gate `accept_with` waits on). Each role arms exactly one.
-    // Both fire ONLY when `Frames::next` yields the first HEADERS (the observation
-    // point), never from the drop-drain. Establish is armed only when the phase is
-    // `Handshaking`, so a response yielded after a close / failure does not
-    // (re-)establish — exactly the `establish` precondition, evaluated here because
-    // the transition fires from inside the lending iterator over a disjoint borrow.
-    let establish_on_response = is_client && self.phase.is_handshaking();
+    // Decide the role-specific first-HEADERS readiness side effects before the request FSM
+    // is borrowed: the client arms the establish on its first FINAL response; the server
+    // flips the tunnel entry's `observed` (the `Frame::Request` yield is itself the gate
+    // `accept_with` waits on). Each role arms exactly one. Both fire ONLY when
+    // `Frames::next` yields the first HEADERS (the observation point), never from the
+    // drop-drain.
+    //
+    // The client arms it for EVERY request stream, INDEPENDENT of the connection phase —
+    // per-stream establishment is decoupled from connection-level establishment. The split
+    // in `Frames::next` keeps them apart: the CONNECT TUNNEL'S final response runs the
+    // connection-scoped `Phase::establish_into` (gated INTERNALLY on `Handshaking`, so a
+    // response after a close / failure does not re-establish) AND sets the per-stream flag;
+    // a GENERAL stream's final response sets ONLY its per-stream `established` flag, in ANY
+    // phase. So a general client stream opened via `open_request` AFTER a CONNECT tunnel
+    // moved the connection to `Open` still establishes per-stream (gating `Frame::Data`),
+    // even though the connection is no longer `Handshaking`. (Evaluated here because the
+    // transition fires from inside the lending iterator over a disjoint borrow.)
+    let establish_on_response = is_client;
     let observed = self.streams.get(id).is_some_and(|e| e.observed);
     let needs_request = !is_client && !observed;
     Ok(Frames {
@@ -3802,13 +3849,15 @@ where
   /// case):
   ///
   /// - **Request stream** (routed through [`Stream::fin`]):
-  ///   - a clean end at a frame boundary AFTER the CONNECT HEADERS (the tunnel is
-  ///     established) enqueues [`Event::PeerClosed`] — a graceful half-close that
-  ///     does NOT make the connection terminal. Idempotent: a second clean FIN on
-  ///     the (already half-closed) request stream enqueues no duplicate
-  ///     `PeerClosed` (the peer FINs its send side at most once);
-  ///   - a malformed FIN — at a frame boundary BEFORE the mandatory CONNECT HEADERS
-  ///     ([`H3Error::RequestIncomplete`], RFC 9114 §8.1) or mid-frame
+  ///   - a clean end at a frame boundary once the leading message completed (the
+  ///     CONNECT request / final response, and the tunnel is established) enqueues
+  ///     [`Event::PeerClosed`] — a graceful half-close that does NOT make the
+  ///     connection terminal. Idempotent: a second clean FIN on the (already
+  ///     half-closed) request stream enqueues no duplicate `PeerClosed` (the peer FINs
+  ///     its send side at most once);
+  ///   - a malformed FIN — at a frame boundary while the leading message is still
+  ///     incomplete (no HEADERS, or only interim 1xx leading sections —
+  ///     [`H3Error::RequestIncomplete`], RFC 9114 §8.1) or mid-frame
   ///     ([`H3Error::FrameError`], RFC 9114 §7.1) — is scoped by whether the stream is
   ///     the CONNECT tunnel (the entry's private `is_tunnel` marker): on the tunnel it
   ///     is connection-fatal ([`Event::ConnError`], terminal); on a **general** request
@@ -3880,20 +3929,21 @@ where
         return;
       }
       match fin {
-        // A clean end at a frame boundary AFTER the CONNECT HEADERS (the FSM reached
-        // its tunnel phase): the peer half-closed its send side. A graceful
+        // A clean end at a frame boundary once the LEADING MESSAGE completed (the FSM
+        // left `Phase::Headers`): the peer half-closed its send side. A graceful
         // tunnel-end signal, NOT a connection-fatal error, so the connection is not
         // forced terminal here — a half-closed tunnel may still send locally (the
         // request FSM models only the peer's direction). But `fin() == Ok(())` proves
-        // only that the request FSM reached `Tunnel` (HEADERS decoded), NOT that the
-        // tunnel is established (open for DATA): on the SERVER the phase can still be
-        // `Handshaking` here, with the request HEADERS observed (`request_received`)
-        // but `accept_with` not yet called (it sends the 2xx and establishes). A
-        // tunnel-lifecycle `PeerClosed` must never precede `Established`, so gate on
-        // `tunnel_established` exactly like inbound tunnel DATA:
+        // only that the leading message completed (the CONNECT request / final
+        // response, NOT merely an interim 1xx), NOT that the tunnel is established (open
+        // for DATA): on the SERVER the phase can still be `Handshaking` here, with the
+        // request HEADERS observed (`request_received`) but `accept_with` not yet called
+        // (it sends the 2xx and establishes). A tunnel-lifecycle `PeerClosed` must never
+        // precede `Established`, so gate on `tunnel_established` exactly like inbound
+        // tunnel DATA:
         //
         // - established → surface `PeerClosed` now. Idempotent: `RequestStream::fin()`
-        //   is a pure read that keeps returning `Ok(())` at a tunnel-phase frame
+        //   is a pure read that keeps returning `Ok(())` at a post-leading frame
         //   boundary, so a second clean FIN would re-push `PeerClosed`; the
         //   `peer_closed` flag emits it exactly once (the peer FINs its send side at
         //   most once).
@@ -3920,7 +3970,8 @@ where
             }
           }
         }
-        // A FIN before the mandatory CONNECT HEADERS (`RequestIncomplete`) or mid-frame
+        // A FIN with no completed leading message — before any HEADERS or after ONLY
+        // interim 1xx leading sections (`RequestIncomplete`) — or mid-frame
         // (`FrameError`), scoped by `is_tunnel`: connection-fatal on the tunnel (make it
         // terminal so a later send is rejected, signalled once), a stream-scoped reset
         // on a general stream (RFC 9114 §4.1.2 — free + `RESET_STREAM`, connection live).
@@ -4367,7 +4418,16 @@ where
   /// = one connection), where a general response stream resets per-stream (RFC 9114
   /// §4.1.2).
   ///
-  /// The driver validates `response`'s `:status`; the core stays status-agnostic.
+  /// A CONNECT tunnel is established only by a valid `2xx` final response (RFC 9114
+  /// §4.4), so — unlike the status-agnostic general `send_response` —`accept_with`
+  /// ENFORCES that `response`'s committed `:status` is a `2xx`. The `2xx` check rides
+  /// the SAME single-pass `StatusObserver` encode that `send_response` uses to classify
+  /// finality: a missing, malformed (not three ASCII digits in `100..=599`), interim
+  /// (`1xx`), or non-`2xx` final (`3xx`–`5xx`) `:status` is rejected with
+  /// [`Error::Protocol`]`(`[`H3Error::MessageError`]`)` (a local caller bug) BEFORE the
+  /// response is committed — the transmit slot is discarded, the tunnel is NOT marked
+  /// established, and NO [`Event::Established`] is pushed. To send a non-`2xx` (the
+  /// CONNECT request was refused) use [`send_response`](Connection::send_response).
   ///
   /// The preconditions mirror the client's [`open_with`](Connection::open_with)
   /// (QUIC streams are unordered, so the request stream — and this call — can
@@ -4394,11 +4454,14 @@ where
   ///   `open_with` enforces it for the request. Our own client advertises no
   ///   limit, so this never fires against our peers, but it is enforced against
   ///   real ones.
+  /// - [`Error::Protocol`]`(`[`H3Error::MessageError`]`)` if the committed `:status`
+  ///   is not a valid `2xx` (missing / malformed / interim / non-`2xx` final — see
+  ///   above): a CONNECT acceptance must be a `2xx`. Nothing is committed.
   ///
   /// On success the response HEADERS frame is enqueued, the tunnel is marked
   /// established, and [`Event::Established`] is pushed — only on success, so an
-  /// over-limit or unsendable response commits nothing. The response is sent
-  /// exactly once: a repeat `accept_with` after a successful one is a no-op
+  /// over-limit, unsendable, or non-`2xx` response commits nothing. The response is
+  /// sent exactly once: a repeat `accept_with` after a successful one is a no-op
   /// `Ok(())` (no second HEADERS, no second `Established`), mirroring the client's
   /// exactly-once `request_sent` guard. A single CONNECT phase carries exactly one
   /// response HEADERS, so re-sending it would be a protocol violation.
@@ -4407,26 +4470,46 @@ where
     TxBuf: AsMut<[u8]>,
     EventBuf: AsMut<[Option<Event>]>,
   {
-    // Reconcile audit: `accept_with` (and `guard_accept`) act ONLY on the tunnel slot
-    // (`request_id`), whose entry is `is_tunnel = true`. A carrier records a pending reset
-    // only for a NON-tunnel stream (a tunnel error fails the connection instead), and the
-    // capacity backstop resets a distinct overflow id — so `request_id` is provably never
-    // in `pending_resets`. This path therefore cannot act on a condemned stream; no
-    // reconcile is needed here (unlike the general send guards, which do reconcile).
+    // Reconcile any deferred stream-scoped reset FIRST (as the general send guards do).
+    // `request_id` is NOT provably un-condemned: in `Mode::General` the first inbound
+    // request still becomes `request_id` yet is registered NON-tunnel (`is_tunnel =
+    // false`), so a stream-scoped error on it (e.g. premature DATA in a dropped `Frames`)
+    // records a pending reset for `request_id`. Reconciling frees that condemned entry and
+    // clears `request_id`, so `guard_accept` below then reads it as not-yet-observed and
+    // returns `WouldBlock` — `accept_with` cannot report `Established` for a stream that
+    // `poll_transmit` will reset. (A tunnel-mode `request_id` is `is_tunnel = true`, whose
+    // errors fail the connection instead of recording a reset, so this no-ops there.)
+    self.reconcile_pending_resets();
     let (id, limit) = match self.guard_accept()? {
       SendGuard::AlreadyDone => return Ok(()),
       SendGuard::Proceed(resolved) => resolved,
     };
-    // Encode and size-check the response HEADERS in a SINGLE traversal (see
-    // `open_with`): on a too-large section `write_headers_frame` errors, so the
-    // transmit slot is discarded and `establish()` below is NOT reached — the
-    // tunnel is not marked established and no `Established` event is pushed.
+    // The committed `:status` is the source of truth for whether this is a CONNECT
+    // acceptance, NOT the caller's word: a CONNECT tunnel is established only by a valid
+    // `2xx` final response (RFC 9114 §4.4). The `StatusObserver` records the first
+    // `:status`'s class DURING the single encode pass that produces the bytes — so the
+    // bytes committed and the acceptance decision come from ONE pass, exactly as
+    // `send_response` derives interim-vs-final. A missing / malformed / interim (`1xx`)
+    // / non-`2xx` final (`3xx`–`5xx`) `:status` makes the fill closure return `Err`, so
+    // the transmit slot is discarded BEFORE commit: nothing reaches the wire, and the
+    // `is_tunnel` / `FinalSent` / `establish()` transitions below are NOT reached (no
+    // `Event::Established`).
+    let observer = StatusObserver::new(response);
     self
       .tx
       .enqueue(StreamKind::Existing(id), false, |out| {
-        write_headers_frame(out, response, limit)
+        // Encode + size-check in ONE traversal (see `open_with`): a too-large section
+        // errors here and discards the slot.
+        let frame_len = write_headers_frame(out, &observer, limit)?;
+        // The recorded class now reflects the EXACT encoded section. Reject anything but
+        // a valid `2xx` — discarding this slot.
+        observer.require_2xx()?;
+        Ok(frame_len)
       })
       .map_err(map_tx)?;
+    // The slot is committed (the closure returned `Ok` only after `require_2xx`
+    // succeeded), so this re-read cannot diverge from the committed bytes.
+    observer.require_2xx()?;
     // Confirm the tunnel slot's entry as the CONNECT tunnel: `accept_with` is the
     // tunnel-establishing path, so its entry is `is_tunnel = true` regardless of the
     // connection [`Mode`] that classified it at `provide_stream` time (`Tunnel` ⇒ `true`
@@ -4519,24 +4602,37 @@ where
     // response can be enqueued — see `guard_send_response`. It also rejects a response
     // out of sequence (after the final, or after `finish`).
     let limit = self.guard_send_response(id)?;
-    // Finality is DERIVED from `:status` (the same rule applied to a received response),
-    // NOT taken from `last`; `last` is asserted to match. A misclassified or unclassifiable
-    // response is rejected BEFORE anything is enqueued, so it never reaches the wire.
-    let interim = classify_response_status(headers)?;
-    if last == interim {
-      // `last` contradicts the `:status` class: a final status with `last = false`, or an
-      // interim status with `last = true`. A caller bug — refuse without sending.
-      return Err(Error::Protocol(H3Error::MessageError));
-    }
-    // Size-checked in the single encode pass (see `accept_with` / `open_with`): on a
-    // too-large section `write_headers_frame` errors, the slot is discarded, and the
-    // `established` / `SendState` transition below is NOT reached.
+    // Finality is DERIVED from the `:status` of the field section ACTUALLY ENCODED,
+    // NOT taken from `last` and NOT from a separate traversal: the `StatusObserver`
+    // records the first `:status`'s class DURING the single encode pass that produces
+    // the bytes, so the bytes committed and the finality decision come from one pass.
+    // `last` is asserted to match that recorded class. A misclassified / unclassifiable
+    // response, or a `last` that contradicts the encoded class, makes the fill closure
+    // return `Err` so the transmit slot is discarded BEFORE commit — nothing reaches
+    // the wire and the `established` / `SendState` transition below is NOT reached.
+    let observer = StatusObserver::new(headers);
     self
       .tx
       .enqueue(StreamKind::Existing(id), false, |out| {
-        write_headers_frame(out, headers, limit)
+        // Encode + size-check in ONE traversal (see `accept_with` / `open_with`);
+        // a too-large section errors here and discards the slot.
+        let frame_len = write_headers_frame(out, &observer, limit)?;
+        // The class now reflects the EXACT encoded section. Reject an unclassifiable
+        // `:status` or a `last` that contradicts it — both discard this slot.
+        let interim = observer.finality()?;
+        if last == interim {
+          // `last` contradicts the `:status` class: a final status with `last = false`,
+          // or an interim status with `last = true`. A caller bug — refuse without
+          // sending (returning `Err` from `fill` discards the reserved slot).
+          return Err(Error::Protocol(H3Error::MessageError));
+        }
+        Ok(frame_len)
       })
       .map_err(map_tx)?;
+    // The slot is committed: re-read the class the encode pass recorded to drive the
+    // state transition. It is `Some(Some(_))` (the closure returned `Ok` only after
+    // `finality()` succeeded), so this cannot diverge from the committed bytes.
+    let interim = observer.finality()?;
     // Responding via the GENERAL path marks the entry NON-tunnel (`is_tunnel = false`):
     // committing to a general response is what makes the stream general — a later stream
     // error then resets just this stream rather than failing the connection (RFC 9114
@@ -4692,29 +4788,83 @@ fn write_control_settings(out: &mut [u8], settings: &Settings) -> Result<usize, 
 /// this, so header + field section is guaranteed to fit one transmit slot.
 const HEADERS_HDR_RESERVE: usize = CTRL_HDR_CAP;
 
-/// Classifies an OUTBOUND response by its `:status`: `Ok(true)` interim (`1xx`),
-/// `Ok(false)` final (`2xx`–`5xx`). The send-side twin of the connection's inbound
-/// `classify_response` — both route through [`validate::status_class_is_interim`], so a
-/// SERVER derives interim-vs-final by EXACTLY the rule applied to a CLIENT's received
-/// response (RFC 9114 §4.3.2 / §15.2). A response that cannot be classified — no `:status`,
-/// or a non-numeric / out-of-range one — is [`Error::Protocol`]`(`[`H3Error::MessageError`]`)`
-/// (a malformed response, a local caller bug). A [`Headers`] supplier that aborts the scan
-/// surfaces its own [`Error`].
-fn classify_response_status<H: Headers + ?Sized>(response: &H) -> Result<bool, Error> {
-  // Read the FIRST `:status` via the supplier's `for_each` (the only access `Headers`
-  // gives), classifying it with the inbound rule. `seen` distinguishes "no `:status`" from
-  // "an invalid `:status`"; both are `MessageError`, but keeping them apart documents intent
-  // and lets the first occurrence win (a duplicate is the validator's concern, not this).
-  let mut seen: Option<Option<bool>> = None;
-  response.for_each(&mut |name, value| {
-    if name == ":status" && seen.is_none() {
-      seen = Some(validate::status_class_is_interim(value));
+/// A [`Headers`] adapter that records the FIRST `:status`'s interim/final class
+/// (via [`validate::status_class_is_interim`]) as it forwards the supplier's
+/// `for_each` to the encoder — so the recorded class comes from the EXACT SAME
+/// single traversal that produced the encoded bytes.
+///
+/// This closes the classify-then-encode gap: a non-replayable / interior-mutable
+/// supplier (which the crate already treats as adversarial for outbound HEADERS)
+/// could yield one `:status` to a separate classifying traversal and a different
+/// one to the encoder. By classifying DURING the encode pass, `send_response`
+/// drives its finality decision from the `:status` of the field section it
+/// actually commits, never from a stale earlier reading.
+///
+/// `status` distinguishes "no `:status` seen" (`None`) from "a `:status` seen,
+/// classified" (`Some(Option<bool>)`): `Some(Some(interim))` is a valid
+/// interim/final, `Some(None)` an unclassifiable value. The first `:status` wins
+/// (a duplicate is the validator's concern, not this).
+struct StatusObserver<'a, H: Headers + ?Sized> {
+  inner: &'a H,
+  /// The first `:status`'s interim classification, recorded during the single encode
+  /// pass: outer `None` = no `:status` seen; `Some(None)` = a `:status` that is not a
+  /// valid `1xx`–`5xx`; `Some(Some(interim))` = a valid code's interim flag.
+  status: core::cell::Cell<Option<Option<bool>>>,
+  /// Whether that first `:status` is a valid `2xx`, recorded in the SAME pass so the
+  /// CONNECT-acceptance check (`is_2xx`) and the interim check (`finality`) both come
+  /// from the bytes actually encoded. `false` until a `2xx` `:status` is seen.
+  is_2xx: core::cell::Cell<bool>,
+}
+
+impl<'a, H: Headers + ?Sized> StatusObserver<'a, H> {
+  const fn new(inner: &'a H) -> Self {
+    Self {
+      inner,
+      status: core::cell::Cell::new(None),
+      is_2xx: core::cell::Cell::new(false),
     }
-  })?;
-  match seen {
-    Some(Some(interim)) => Ok(interim),
-    // An out-of-range / non-numeric `:status`, or none at all: unclassifiable.
-    Some(None) | None => Err(Error::Protocol(H3Error::MessageError)),
+  }
+
+  /// The recorded finality of the encoded section: `Ok(true)` interim (`1xx`),
+  /// `Ok(false)` final (`2xx`–`5xx`). A section with no `:status`, or a `:status`
+  /// that is not exactly three ASCII digits in `100..=599`, is unclassifiable and
+  /// rejected as [`Error::Protocol`]`(`[`H3Error::MessageError`]`)` (a malformed
+  /// response — a local caller bug). Read only AFTER the encode pass has run.
+  fn finality(&self) -> Result<bool, Error> {
+    match self.status.get() {
+      Some(Some(interim)) => Ok(interim),
+      Some(None) | None => Err(Error::Protocol(H3Error::MessageError)),
+    }
+  }
+
+  /// Whether the encoded section's first `:status` is a valid `2xx` — the CONNECT
+  /// acceptance check (RFC 9114 §4.4): a tunnel is established only by a `2xx` final
+  /// response. A missing / malformed / interim (`1xx`) / non-`2xx` final (`3xx`–`5xx`)
+  /// `:status` is NOT a CONNECT acceptance and is rejected as
+  /// [`Error::Protocol`]`(`[`H3Error::MessageError`]`)`. Read only AFTER the encode
+  /// pass has run. The recorded `2xx` bit is meaningful only once a `:status` was seen,
+  /// so this also requires the outer `status` to be set (a no-`:status` response leaves
+  /// `is_2xx` at its `false` default and so is rejected here too).
+  fn require_2xx(&self) -> Result<(), Error> {
+    if self.status.get().is_some() && self.is_2xx.get() {
+      Ok(())
+    } else {
+      Err(Error::Protocol(H3Error::MessageError))
+    }
+  }
+}
+
+impl<H: Headers + ?Sized> Headers for StatusObserver<'_, H> {
+  fn for_each(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), Error> {
+    self.inner.for_each(&mut |name, value| {
+      if name == ":status" && self.status.get().is_none() {
+        self
+          .status
+          .set(Some(validate::status_class_is_interim(value)));
+        self.is_2xx.set(validate::status_is_2xx(value));
+      }
+      f(name, value);
+    })
   }
 }
 
