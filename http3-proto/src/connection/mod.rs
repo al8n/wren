@@ -70,6 +70,7 @@ pub use queue::{DefaultEventBuf, DefaultTxBuf};
 
 mod sealed {
   pub trait Sealed {}
+  pub trait SealedMode {}
 }
 
 /// Marker for the connection role (client or server). Sealed: only [`Client`]
@@ -92,6 +93,48 @@ impl Role for Client {
 }
 impl Role for Server {
   const IS_CLIENT: bool = false;
+}
+
+/// Compile-time marker for whether a [`Connection`] is a single CONNECT tunnel
+/// ([`Tunnel`]) or a general HTTP/3 endpoint ([`General`]). Sibling to [`Role`]:
+/// it is a type-state parameter (`Mo`) of [`Connection`], not a runtime value, so
+/// mixing the tunnel and general APIs is a COMPILE error. Sealed: only [`Tunnel`]
+/// and [`General`] implement it.
+///
+/// `IS_TUNNEL` is the single source of truth for the two identity splits a
+/// connection used to guess per stream:
+///
+/// - **error scope** (RFC 9114 §4.1.2): a protocol violation on a [`Tunnel`]
+///   connection is connection-fatal (one tunnel = one connection); on a
+///   [`General`] connection it is a stream-scoped `RESET_STREAM`.
+/// - **establishment**: on a [`Tunnel`] connection the tunnel stream's valid final
+///   response derives the connection-level [`Event::Established`] + `Phase::Open`;
+///   on a [`General`] connection establishment is purely per-stream (it gates
+///   `Frame::Data` and emits no connection event).
+pub trait Mode: sealed::SealedMode {
+  /// True for the CONNECT-tunnel marker ([`Tunnel`]); false for [`General`].
+  const IS_TUNNEL: bool;
+}
+
+/// Connection marker: a single CONNECT tunnel. The default `Mo` of
+/// [`Connection`] (so `Connection<'…, Client>` is the shipped tunnel). A protocol
+/// violation is connection-fatal and the tunnel's final response establishes the
+/// whole connection. See [`Mode`].
+pub struct Tunnel;
+
+/// Connection marker: a general HTTP/3 endpoint (the multi-stream
+/// request/response API). A per-stream protocol violation resets just that stream
+/// (RFC 9114 §4.1.2) and establishment is per-stream (no connection event). See
+/// [`Mode`].
+pub struct General;
+
+impl sealed::SealedMode for Tunnel {}
+impl sealed::SealedMode for General {}
+impl Mode for Tunnel {
+  const IS_TUNNEL: bool = true;
+}
+impl Mode for General {
+  const IS_TUNNEL: bool = false;
 }
 
 /// The uni-stream type byte for the HTTP/3 control stream (RFC 9114 §6.2.1).
@@ -272,7 +315,7 @@ enum SendOp {
 /// Per-stream connection-side state: the inbound recv FSM, the local send half-FSM
 /// (`SendState`), plus the lifecycle markers that used to be singular
 /// [`Connection`] fields (now one set PER stream, held in the [`StreamStore`]). The
-/// CONNECT tunnel uses exactly one entry, keyed by the tunnel's `request_id`.
+/// CONNECT tunnel uses exactly one entry, keyed by the tunnel's `tunnel_id`.
 ///
 /// Its fields are private connection bookkeeping; the type is `pub` only so the
 /// bare-tier caller can name `StreamSlot` when allocating
@@ -321,46 +364,19 @@ pub struct StreamEntry<'req, ReqBuf> {
   /// for the full role-shaped transition table; it is orthogonal to the inbound recv FSM
   /// and to `peer_closed` (the PEER's half-close).
   send: SendState,
-  /// Whether this stream is the CONNECT tunnel (vs a general request/response
-  /// stream). It drives BOTH the establish split (connection-scoped for the tunnel,
-  /// per-stream otherwise) and the error-scope split (a protocol violation /
-  /// `RESET_STREAM` is connection-fatal on the tunnel, stream-scoped otherwise —
-  /// RFC 9114 §4.1.2):
-  ///
-  /// - `true` — the tunnel: the client establishes on the final response via the
-  ///   shared `Handshaking → Open` transition ([`Phase::establish_into`]: phase →
-  ///   `Open`, [`Event::Established`] enqueued, `established` set), and the server via
-  ///   [`accept_with`](Connection::accept_with). A stream error on it fails the WHOLE
-  ///   connection. Set on:
-  ///   - the client tunnel path (`open_with` →
-  ///     [`provide_stream`](Connection::provide_stream)); and
-  ///   - an inbound server request stream registered while the connection is in
-  ///     [`Mode::Tunnel`] (the default) — the server cannot tell tunnel from general
-  ///     before any HEADERS, so the strict-CONNECT default keeps a pre-response protocol
-  ///     violation connection-fatal. In [`Mode::General`] the registration is `false`
-  ///     instead (a general server: a pre-response request error resets per-stream).
-  ///     Either way [`send_response`](Connection::send_response) (the general response
-  ///     path) makes/keeps it `false`; `accept_with` makes/keeps it `true` (the
-  ///     established tunnel). See [`Mode`].
-  /// - `false` — a general stream (opened with
-  ///   [`open_request`](Connection::open_request) on the client, or responded to with
-  ///   [`send_response`](Connection::send_response) on the server): establishment is
-  ///   purely per-stream — the final response sets `established` (gating
-  ///   [`Frame::Data`]) and NOTHING else (no connection [`Event::Established`], no
-  ///   `Phase::Open` transition), because [`Event`]s are connection-scoped and a
-  ///   general request stream is not. A stream error on it resets ONLY that stream.
-  is_tunnel: bool,
 }
 
 impl<'req, ReqBuf> StreamEntry<'req, ReqBuf> {
   /// A fresh entry wrapping the recv FSM `fsm`, with every recv-side lifecycle marker
-  /// clear and the send half-FSM seeded to `send`. `is_tunnel` marks whether this is
-  /// the CONNECT tunnel slot (set only on the tunnel path) — it drives the
-  /// connection-scoped vs per-stream establish split. `send` is the role-shaped start
+  /// clear and the send half-FSM seeded to `send`. `send` is the role-shaped start
   /// state: [`SendState::RequestSent`] for a CLIENT-opened stream (its request HEADERS
   /// are already enqueued, so request body may follow) or [`SendState::Idle`] for an
   /// inbound SERVER request stream (no response sent yet).
-  fn new(fsm: Stream<'req, ReqBuf>, is_tunnel: bool, send: SendState) -> Self {
+  ///
+  /// The CONNECT-tunnel-vs-general identity is NOT stored per entry: it derives from
+  /// the connection's [`Mode`] marker (`Mo::IS_TUNNEL`), the single source of truth for
+  /// the error-scope and establish splits.
+  fn new(fsm: Stream<'req, ReqBuf>, send: SendState) -> Self {
     Self {
       fsm,
       observed: false,
@@ -370,7 +386,6 @@ impl<'req, ReqBuf> StreamEntry<'req, ReqBuf> {
       peer_fin_pending: false,
       abandoned: false,
       send,
-      is_tunnel,
     }
   }
 }
@@ -526,11 +541,13 @@ struct RequestFrames<'a, 'req, 'event, ReqBuf, EventBuf> {
   /// not in [`on_headers_decoded`](Self::on_headers_decoded) (which would fire on a
   /// leading interim, before `interim` is known).
   establish_on_response: bool,
-  /// Whether the stream this carrier drives is the CONNECT tunnel (copied from the
-  /// [`StreamEntry`]'s [`is_tunnel`](StreamEntry::is_tunnel)). Read in
+  /// Whether the connection this carrier drives is a CONNECT tunnel (a copy of the
+  /// connection marker's `Mo::IS_TUNNEL` const — NOT a per-entry guess). Read in
   /// [`Frames::next`]'s client final-response yield tail to pick the establish:
   /// connection-scoped ([`Phase::establish_into`]) for the tunnel, per-stream
-  /// (`established` only) for a general stream.
+  /// (`established` only) for a general connection; and in
+  /// [`fail_or_reset`](Self::fail_or_reset) to pick the error scope (connection-fatal
+  /// for the tunnel, a stream-scoped reset for general).
   is_tunnel: bool,
   /// Server-only: a disjoint borrow of `request_received`, flipped to `true`
   /// exactly when [`Frames::next`] YIELDS the first request HEADERS to the driver
@@ -1594,7 +1611,7 @@ enum FramePart {
 /// [`begin_close`](Connection::begin_close), [`fail`](Connection::fail)), and
 /// every public operation's preconditions are derived from it (see the
 /// phase × operation table on [`Connection`]). The orthogonal data/role markers
-/// (`settings_peer`, `request_sent`, `request_received`, `request_id`, the stream
+/// (`settings_peer`, `request_sent`, `request_received`, `tunnel_id`, the stream
 /// bookkeeping) are NOT phases — they record *what has been exchanged*, and are
 /// read alongside the phase by the guards.
 #[derive(Clone, Copy, Eq, PartialEq, derive_more::IsVariant)]
@@ -1613,52 +1630,6 @@ enum Phase {
   Closing,
   /// A fatal connection-level error; terminal.
   Failed,
-}
-
-/// How inbound request-stream errors are SCOPED for the whole connection
-/// (RFC 9114 §4.1.2 per-stream error vs a connection-level error).
-///
-/// The mode is connection-level, set on the SERVER before [`start`](Connection::start)
-/// / [`provide_stream`](Connection::provide_stream), and it governs how a newly
-/// registered inbound request stream is classified (its private `is_tunnel` error
-/// scope): a request error before the server has committed to a response is connection-fatal
-/// in [`Tunnel`](Self::Tunnel) mode and stream-scoped in [`General`](Self::General)
-/// mode. It does not affect the CLIENT (which always knows whether it opened a
-/// CONNECT tunnel via [`open_with`](Connection::open_with) or a general request via
-/// [`open_request`](Connection::open_request)) nor an already-established server
-/// CONNECT tunnel (an [`accept_with`](Connection::accept_with) stream stays a tunnel).
-///
-/// The default is [`Tunnel`](Self::Tunnel) for backward compatibility with the
-/// shipped CONNECT-tunnel behavior; a general HTTP/3 server should select
-/// [`General`](Self::General) via [`set_mode`](Connection::set_mode).
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, IsVariant, derive_more::Display)]
-#[display("{}", self.as_str())]
-#[non_exhaustive]
-pub enum Mode {
-  /// One tunnel = one connection: an error on an inbound request stream is
-  /// CONNECTION-fatal. This is the strict CONNECT-tunnel scoping — a protocol
-  /// violation on the (single) tunnel stream fails the whole connection rather
-  /// than resetting just that stream. The default, preserving the behavior of a
-  /// connection dedicated to one CONNECT tunnel.
-  #[default]
-  Tunnel,
-  /// A general HTTP/3 server: an error on an inbound request stream is
-  /// STREAM-scoped — it resets just that stream (RFC 9114 §4.1.2,
-  /// `RESET_STREAM`) and the connection survives, so other concurrent request
-  /// streams are unaffected. Select this on a general server (it governs the
-  /// pre-response window before [`send_response`](Connection::send_response)).
-  General,
-}
-
-impl Mode {
-  /// A stable, lower-case name for the mode (logging / diagnostics).
-  #[inline(always)]
-  pub const fn as_str(&self) -> &'static str {
-    match self {
-      Self::Tunnel => "tunnel",
-      Self::General => "general",
-    }
-  }
 }
 
 impl Phase {
@@ -1782,7 +1753,7 @@ enum SendGuard<T> {
 /// was queued, exactly once), `request_received` (server: the request HEADERS were
 /// OBSERVED — yielded to the driver via [`Frames::next`], not merely decoded),
 /// `tunnel_established` (the tunnel reached `Open` — gates yielding [`Frame::Data`],
-/// and stays `true` across a later `Closing`), `request_id` / `roles` / `uni` /
+/// and stays `true` across a later `Closing`), `tunnel_id` / `roles` / `uni` /
 /// `close_pending`.
 ///
 /// ## Transitions (the only places the phase changes)
@@ -1954,6 +1925,7 @@ pub struct Connection<
   'event,
   'uni,
   Ro,
+  Mo = Tunnel,
   ReqBuf = DefaultReqBuf<'req>,
   CtrlBuf = DefaultCtrlBuf<'ctrl>,
   TxBuf = DefaultTxBuf<'tx>,
@@ -1963,14 +1935,17 @@ pub struct Connection<
 > {
   settings_local: Settings,
   settings_peer: Option<Settings>,
-  /// Per-stream state ([`StreamEntry`]) keyed by [`StreamId`]. The CONNECT tunnel
-  /// uses exactly one entry, named by `request_id`; the singular `request` FSM and
-  /// per-tunnel markers moved onto that entry. See [`StreamStore`].
+  /// Per-stream state ([`StreamEntry`]) keyed by [`StreamId`]. A CONNECT tunnel
+  /// ([`Tunnel`]) uses exactly one entry, pointed at by `tunnel_id`; the singular
+  /// `request` FSM and per-tunnel markers moved onto that entry. See [`StreamStore`].
   streams: St,
-  /// The single CONNECT-tunnel stream slot's id (the one entry in `streams`). Kept
-  /// as the tunnel-specialization pointer so [`send_data`](Self::send_data) /
-  /// [`close`](Self::close) / [`accept_with`](Self::accept_with) find their stream.
-  request_id: Option<StreamId>,
+  /// The CONNECT-tunnel stream slot's id, set ONLY on a [`Tunnel`] connection (the
+  /// tunnel path: [`open_with`](Self::open_with) → [`provide_stream`](Self::provide_stream),
+  /// [`accept_with`](Self::accept_with)). It is the tunnel-specialization pointer so
+  /// [`send_data`](Self::send_data) / [`close`](Self::close) / `accept_with` find their
+  /// one stream, and gates the connection-scoped establish. A [`General`] connection
+  /// leaves this `None` (the general API is id-explicit — no tunnel pointer).
+  tunnel_id: Option<StreamId>,
   /// The caller-provided (or default) HEADERS accumulator buffer, held until the
   /// FIRST request stream is registered. The CONNECT tunnel preallocates exactly
   /// one recv FSM, so its buffer is seeded here at construction and moved into the
@@ -2049,7 +2024,7 @@ pub struct Connection<
   ///   recorded here (RFC 9114 §4.1 — `H3_REQUEST_REJECTED` lets the peer safely retry).
   ///
   /// Recording is DEDUPED by stream id (FIRST code wins — exactly-once per RFC 9114
-  /// §4.1.2). The slot bookkeeping (free the entry, clear `request_id`) and DATA purge a
+  /// §4.1.2). The slot bookkeeping (free the entry, clear `tunnel_id`) and DATA purge a
   /// recorded reset still needs run in [`reconcile_pending_resets`](Self::reconcile_pending_resets),
   /// at the head of every `&mut self` entry that can observe the effect
   /// ([`handle_stream`](Self::handle_stream) / [`poll_transmit`](Self::poll_transmit) /
@@ -2062,15 +2037,8 @@ pub struct Connection<
   /// distinct `Connection` field so the carrier's borrow of it stays disjoint from
   /// `phase` / `events` / `close_pending` / `conn_error`.
   pending_resets: PendingResets,
-  /// How inbound request-stream errors are scoped for this connection (see [`Mode`]).
-  /// Read by the SERVER's [`provide_request_stream`](Self::provide_request_stream) to
-  /// classify a newly registered request stream's
-  /// [`is_tunnel`](StreamEntry::is_tunnel) marker, so it must be set (via
-  /// [`set_mode`](Self::set_mode)) before the first inbound request stream is provided.
-  /// Defaults to [`Mode::Tunnel`] (strict CONNECT-tunnel scoping); the CLIENT paths and
-  /// `accept_with` ignore it (they know their stream's scope directly).
-  mode: Mode,
   _ro: PhantomData<fn() -> Ro>,
+  _mo: PhantomData<fn() -> Mo>,
   _storage: PhantomData<(
     &'req mut (),
     &'ctrl mut (),
@@ -2086,13 +2054,14 @@ pub struct Connection<
 /// accumulator, control-stream payload buffer, transmit-ring byte storage,
 /// event slots, and inbound-uni tracking slots. Each storage class has its own
 /// lifetime parameter so the buffers do not have to come from the same owner.
-pub type BorrowedConnection<'req, 'ctrl, 'tx, 'event, 'uni, Ro> = Connection<
+pub type BorrowedConnection<'req, 'ctrl, 'tx, 'event, 'uni, Ro, Mo = Tunnel> = Connection<
   'req,
   'ctrl,
   'tx,
   'event,
   'uni,
   Ro,
+  Mo,
   &'req mut [u8],
   &'ctrl mut [u8],
   &'tx mut [u8],
@@ -2101,7 +2070,7 @@ pub type BorrowedConnection<'req, 'ctrl, 'tx, 'event, 'uni, Ro> = Connection<
 >;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-impl<Ro: Role> Connection<'static, 'static, 'static, 'static, 'static, Ro> {
+impl<Ro: Role, Mo: Mode> Connection<'static, 'static, 'static, 'static, 'static, Ro, Mo> {
   /// A fresh connection in the role `Ro`, with our local settings selected and
   /// all queues empty. Nothing is sent until [`start`](Self::start) (both roles);
   /// the client then sends its CONNECT request with
@@ -2122,7 +2091,7 @@ impl<Ro: Role> Connection<'static, 'static, 'static, 'static, 'static, Ro> {
   }
 }
 
-impl<'req, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
+impl<'req, Ro, Mo, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
   Connection<
     'req,
     '_,
@@ -2130,6 +2099,7 @@ impl<'req, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
     '_,
     '_,
     Ro,
+    Mo,
     ReqBuf,
     CtrlBuf,
     TxBuf,
@@ -2139,6 +2109,7 @@ impl<'req, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf>
   >
 where
   Ro: Role,
+  Mo: Mode,
 {
   /// A fresh connection backed by caller-provided storage buffers (heap tiers).
   ///
@@ -2214,7 +2185,7 @@ where
       settings_local,
       settings_peer: None,
       streams,
-      request_id: None,
+      tunnel_id: None,
       req_seed: Some(request_headers),
       roles: [None; ROLE_COUNT],
       ctrl: ControlState::with_buffer(control_payload),
@@ -2226,17 +2197,18 @@ where
       close_pending: false,
       conn_error: None,
       pending_resets: PendingResets::new(),
-      mode: Mode::Tunnel,
       _ro: PhantomData,
+      _mo: PhantomData,
       _storage: PhantomData,
     }
   }
 }
 
-impl<Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
-  Connection<'_, '_, '_, '_, '_, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+impl<Ro, Mo, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'_, '_, '_, '_, '_, Ro, Mo, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
 where
   Ro: Role,
+  Mo: Mode,
 {
   /// The peer's settings, once its control-stream SETTINGS frame has been
   /// received and validated (`None` until then).
@@ -2269,30 +2241,6 @@ where
     self.phase.is_open()
   }
 
-  /// This connection's request-error scoping [`Mode`] (default [`Mode::Tunnel`]).
-  #[inline(always)]
-  pub const fn mode(&self) -> Mode {
-    self.mode
-  }
-
-  /// Selects how inbound request-stream errors are scoped (see [`Mode`]), returning
-  /// `&mut Self` so it chains with other configuration.
-  ///
-  /// This must be set BEFORE [`start`](Self::start) /
-  /// [`provide_stream`](Self::provide_stream): it governs how the SERVER registers a
-  /// newly inbound request stream (it derives the new entry's private `is_tunnel` error
-  /// scope from the mode), so changing it after a request stream is already registered
-  /// does not reclassify that stream. The default is
-  /// [`Mode::Tunnel`] (strict CONNECT-tunnel scoping); a general HTTP/3 server should
-  /// call `set_mode(`[`Mode::General`]`)`. The CLIENT paths and
-  /// [`accept_with`](Self::accept_with) ignore the mode (they know their stream's
-  /// scope directly).
-  #[inline(always)]
-  pub const fn set_mode(&mut self, mode: Mode) -> &mut Self {
-    self.mode = mode;
-    self
-  }
-
   /// Whether the connection is winding down or terminal (phase `Closing` or
   /// `Failed`): a local [`close`](Self::close), a clean peer reset, or a fatal
   /// error have all made it so. The send paths are terminal (`Err(Closed)`) here.
@@ -2321,10 +2269,11 @@ where
   }
 }
 
-impl<'req, 'event, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
-  Connection<'req, '_, '_, 'event, '_, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+impl<'req, 'event, Ro, Mo, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'req, '_, '_, 'event, '_, Ro, Mo, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
 where
   Ro: Role,
+  Mo: Mode,
   St: StreamStore<StreamEntry<'req, ReqBuf>>,
 {
   // ── Centralized transitions: the ONLY places `self.phase` changes ────────────
@@ -2374,10 +2323,17 @@ where
   where
     EventBuf: AsMut<[Option<Event>]>,
   {
+    // Connection-level establishment is the CONNECT tunnel's: only a `Tunnel`
+    // connection derives `Event::Established` + `Phase::Open` here. A `General`
+    // connection establishes per-stream (the carrier sets the entry's `established`),
+    // so this is a no-op for it.
+    if !Mo::IS_TUNNEL {
+      return;
+    }
     // The tunnel's per-stream `established` / `peer_*` markers live on its
-    // `StreamEntry` now; look it up by the tunnel-slot pointer (`request_id`) and
+    // `StreamEntry` now; look it up by the tunnel-slot pointer (`tunnel_id`) and
     // borrow `phase` / `events` separately (disjoint fields from `self.streams`).
-    let Some(id) = self.request_id else {
+    let Some(id) = self.tunnel_id else {
       // No tunnel stream yet: still run the phase-only establish so a degenerate
       // order behaves as before (no per-stream marker to flip).
       Phase::establish_into(&mut self.phase, &mut self.events, &mut false);
@@ -2403,7 +2359,7 @@ where
   #[cfg(all(test, any(feature = "std", feature = "alloc")))]
   pub(crate) fn request_received(&self) -> bool {
     self
-      .request_id
+      .tunnel_id
       .and_then(|id| self.streams.get(id))
       .is_some_and(|e| e.observed)
   }
@@ -2493,8 +2449,9 @@ where
   /// SAME request `id` re-binds in place (idempotent). At store capacity the insert
   /// is dropped and the overflow stream reset with [`H3Error::RequestRejected`] (a
   /// `RESET_STREAM` transmit) — NOT connection-fatal: the peer learns the request was
-  /// rejected while the connection stays live. The FIRST request id also records
-  /// `request_id`, the CONNECT tunnel-slot pointer the tunnel send paths use.
+  /// rejected while the connection stays live. On a [`Tunnel`] connection the FIRST
+  /// request id also records `tunnel_id`, the CONNECT tunnel-slot pointer the tunnel
+  /// send paths use; a [`General`] connection records no tunnel pointer.
   ///
   /// Binding a *critical* (control / QPACK) role stays write-once: each maps to
   /// exactly one stream id for the connection's lifetime. Re-providing the SAME
@@ -2505,9 +2462,9 @@ where
   /// UNCHANGED. (`provide_stream` keeps its `()` signature; the failure is signalled
   /// terminally via the phase and the event.)
   ///
-  /// A [`close`](Self::close) before the request stream is bound leaves
-  /// `request_id` unbound, so the later FIRST `provide_stream(Request, id)` still
-  /// records it — the deferred close FIN then has its target id. By contrast, a
+  /// On a [`Tunnel`] connection a [`close`](Self::close) before the request stream is
+  /// bound leaves `tunnel_id` unbound, so the later FIRST `provide_stream(Request, id)`
+  /// still records it — the deferred close FIN then has its target id. By contrast, a
   /// `Failed` connection is terminal, so `provide_stream` is a no-op there: it does
   /// not bind a new id (nothing usable could come of it after the terminal
   /// `ConnError`).
@@ -2534,37 +2491,18 @@ where
     // first lets a same-id re-provide register a clean fresh stream instead.
     self.reconcile_pending_resets();
     if role.is_request() {
-      // Classify the new request entry's `is_tunnel` (its error scope: RFC 9114
-      // §4.1.2 per-stream vs a connection error) by SIDE and connection [`Mode`]:
-      //
-      // - The CLIENT reaches `provide_stream(Request, …)` only via the CONNECT tunnel
-      //   path (`open_with` → `OpenRequest` → the driver registers the minted id here),
-      //   so a client stream provided this way IS the tunnel. The general client opens
-      //   streams through `open_request` instead, which registers them
-      //   `is_tunnel = false` directly. So the client always passes `true` here, and
-      //   `self.mode` (a server-side knob, default `Tunnel`) leaves that unchanged.
-      // - The SERVER cannot tell tunnel from general from the id alone (it is bound
-      //   before any HEADERS), so it uses the connection-level [`Mode`]:
-      //   [`Mode::Tunnel`] (the default) ⇒ `is_tunnel = true`, so a protocol violation
-      //   before it commits to a response is connection-fatal (strict CONNECT-tunnel
-      //   scoping: one tunnel = one connection); [`Mode::General`] ⇒ `is_tunnel = false`,
-      //   so a pre-response malformed request resets just that stream and the connection
-      //   survives. Either way the general server response path
-      //   [`send_response`](Self::send_response) keeps the entry `is_tunnel = false`,
-      //   and [`accept_with`](Self::accept_with) keeps it `true` (the established tunnel).
-      //
-      // This is the connection-level tunnel-mode that resolves the former Phase-0
-      // limitation (a general server's PRE-response window mis-scoped the error): a
-      // `General`-mode connection now resets a pre-response request error per-stream
-      // instead of failing the whole connection. The default stays `Tunnel`, so every
-      // CONNECT-tunnel test keeps the connection-fatal behavior unchanged; a general
-      // HTTP/3 server opts in via [`set_mode`](Self::set_mode)`(`[`Mode::General`]`)`.
+      // The error scope and establish split derive from the connection's `Mode` marker
+      // (`Mo::IS_TUNNEL`), the single source of truth — not a per-entry guess. On a
+      // `Tunnel` connection the FIRST request id records the `tunnel_id` pointer (so a
+      // protocol violation on it is connection-fatal and its final response establishes
+      // the whole connection); a `General` connection records no tunnel pointer (every
+      // request stream is per-stream scoped). See [`provide_request_stream`].
       //
       // The driver provides an INBOUND stream; the core enqueues no HEADERS of its own
       // here (the server responds later via `accept_with` / `send_response`), so a
       // capacity rejection (the overflow stream already reset inside) needs no further
       // action — discard the outcome.
-      let _ = self.provide_request_stream(id, self.mode.is_tunnel());
+      let _ = self.provide_request_stream(id);
       return;
     }
     // Critical (control / QPACK) streams stay write-once-singular in `roles`.
@@ -2584,11 +2522,11 @@ where
 
   /// Registers an inbound request stream `id`: inserts a fresh [`StreamEntry`] into
   /// the [`StreamStore`] (seeding the FIRST entry's recv-FSM buffer from the
-  /// construction-time `req_seed`, additional entries from `ReqBuf::default()`), and
-  /// records the CONNECT tunnel-slot pointer `request_id` the first time. A
-  /// re-provided id re-binds in place; an at-capacity insert is dropped and the overflow
-  /// stream reset with [`H3Error::RequestRejected`] via
-  /// [`enqueue_stream_reset`](Self::enqueue_stream_reset) (not connection-fatal). See
+  /// construction-time `req_seed`, additional entries from `ReqBuf::default()`), and —
+  /// on a [`Tunnel`] connection only — records the CONNECT tunnel-slot pointer
+  /// `tunnel_id` the first time. A re-provided id re-binds in place; an at-capacity
+  /// insert is dropped and the overflow stream reset with [`H3Error::RequestRejected`]
+  /// via [`enqueue_stream_reset`](Self::enqueue_stream_reset) (not connection-fatal). See
   /// [`provide_stream`](Self::provide_stream).
   ///
   /// Returns the [`RequestRegister`] outcome so a caller that also enqueues request
@@ -2596,17 +2534,13 @@ where
   /// registration from a capacity rejection: it MUST NOT enqueue HEADERS on a rejected
   /// (untracked) id (the stream was reset, not opened).
   ///
-  /// `is_tunnel` marks the new entry's
-  /// [`StreamEntry::is_tunnel`](StreamEntry::is_tunnel): `true` on the CONNECT tunnel
-  /// path (the client tunnel, or a server inbound stream while in [`Mode::Tunnel`] —
-  /// the client's establish split then picks connection-scoped establishment, and a
-  /// protocol error is connection-fatal), `false` for a general client `open_request`
-  /// stream or a server inbound stream in [`Mode::General`] (per-stream establishment,
-  /// a stream-scoped error reset — RFC 9114 §4.1.2). The caller derives it from the
-  /// side and connection [`Mode`] (see [`provide_stream`](Self::provide_stream)). A
-  /// re-provide does not change an existing entry's marker.
+  /// The tunnel-vs-general identity is NOT stored per entry — the error scope and
+  /// establish split derive from the connection's [`Mode`] marker (`Mo::IS_TUNNEL`). The
+  /// `tunnel_id` pointer is recorded ONLY on a [`Tunnel`] connection (the first request
+  /// id is the one tunnel); a [`General`] connection records no tunnel pointer (the
+  /// general API is id-explicit, every stream per-stream scoped — RFC 9114 §4.1.2).
   #[allow(private_bounds)]
-  fn provide_request_stream(&mut self, id: StreamId, is_tunnel: bool) -> RequestRegister
+  fn provide_request_stream(&mut self, id: StreamId) -> RequestRegister
   where
     ReqBuf: ReqBufAlloc,
     TxBuf: AsMut<[u8]>,
@@ -2634,7 +2568,7 @@ where
     } else {
       SendState::Idle
     };
-    let entry = StreamEntry::new(Stream::with_buffer(buf), is_tunnel, send);
+    let entry = StreamEntry::new(Stream::with_buffer(buf), send);
     if self.streams.insert(id, entry).is_err() {
       // At store capacity: drop the overflow stream and reset it with
       // `H3_REQUEST_REJECTED` so the peer learns the request was not accepted (and may
@@ -2648,9 +2582,10 @@ where
       self.enqueue_stream_reset(id, H3Error::RequestRejected.code());
       return RequestRegister::Rejected;
     }
-    // The first registered request id names the single CONNECT tunnel slot.
-    if self.request_id.is_none() {
-      self.request_id = Some(id);
+    // On a `Tunnel` connection the first registered request id names the single CONNECT
+    // tunnel slot. A `General` connection records no tunnel pointer (per-stream scoped).
+    if Mo::IS_TUNNEL && self.tunnel_id.is_none() {
+      self.tunnel_id = Some(id);
     }
     RequestRegister::Inserted
   }
@@ -2672,7 +2607,7 @@ where
   ///
   /// A no-op if `id` is not a tracked request stream or the connection is already
   /// `Failed` (a reset is moot then, and a stale `RESET_STREAM` must not follow the
-  /// terminal `ConnError`). If `id` was the tunnel-slot pointer (`request_id`) it is
+  /// terminal `ConnError`). If `id` was the tunnel-slot pointer (`tunnel_id`) it is
   /// cleared.
   ///
   /// EXACTLY-ONCE (RFC 9114 §4.1.2 — at most one `RESET_STREAM` per stream): a
@@ -2701,8 +2636,8 @@ where
       return;
     }
     if self.streams.remove(id).is_some() {
-      if self.request_id == Some(id) {
-        self.request_id = None;
+      if self.tunnel_id == Some(id) {
+        self.tunnel_id = None;
       }
       self.enqueue_stream_reset(id, code);
     }
@@ -2721,7 +2656,7 @@ where
   /// stream was never inserted, yet must still be reset on the wire (RFC 9114 §4.1 —
   /// `H3_REQUEST_REJECTED` lets the peer retry); its purge is a harmless no-op (an
   /// uninserted id queued no DATA). Callers do their own slot bookkeeping first (free the
-  /// entry, clear `request_id`). A no-op when already `Failed` (a reset is moot — a stale
+  /// entry, clear `tunnel_id`). A no-op when already `Failed` (a reset is moot — a stale
   /// `RESET_STREAM` must not follow the terminal `ConnError`). Recording is deduped by id
   /// (FIRST code wins); a full channel is pathological (`RESET_CAP` distinct undrained
   /// resets), so the connection fails closed ([`H3Error::ExcessiveLoad`]) rather than
@@ -2744,7 +2679,7 @@ where
 
   /// Reconciles the dedicated reset channel against `streams` / the transmit ring,
   /// idempotently, WITHOUT emitting (or removing) any abort. For every recorded reset it
-  /// frees the [`StreamStore`] slot (clearing the tunnel-slot pointer `request_id` if it
+  /// frees the [`StreamStore`] slot (clearing the tunnel-slot pointer `tunnel_id` if it
   /// matched) and purges the stream's already-queued DATA/FIN from the ring. The recorded
   /// aborts stay in the channel; [`poll_transmit`](Self::poll_transmit) emits them.
   ///
@@ -2769,8 +2704,8 @@ where
       // guards, and clear the tunnel-slot pointer if this was it. The carrier could not
       // do this in place; the capacity backstop already did (its stream was never
       // inserted), so this no-ops there.
-      if self.streams.remove(id).is_some() && self.request_id == Some(id) {
-        self.request_id = None;
+      if self.streams.remove(id).is_some() && self.tunnel_id == Some(id) {
+        self.tunnel_id = None;
       }
       // Drop the stream's queued DATA/FIN so `poll` never yields stale same-stream bytes
       // ahead of (or after) the abort. Decoupled from emission — purging here does not
@@ -2779,21 +2714,22 @@ where
     }
   }
 
-  /// Routes an eager request-stream error by SCOPE — the `&mut self` twin of the
-  /// lending carrier's [`RequestFrames::fail_or_reset`], shared by the request-stream
-  /// FIN branches of [`handle_stream_fin`](Self::handle_stream_fin):
+  /// Routes an eager request-stream error by SCOPE (derived from the connection's
+  /// [`Mode`] marker `Mo::IS_TUNNEL`) — the `&mut self` twin of the lending carrier's
+  /// [`RequestFrames::fail_or_reset`], shared by the request-stream FIN branches of
+  /// [`handle_stream_fin`](Self::handle_stream_fin):
   ///
-  /// - the CONNECT **tunnel** (`is_tunnel`): connection-fatal via [`fail`](Self::fail)
+  /// - a CONNECT **tunnel** connection: connection-fatal via [`fail`](Self::fail)
   ///   (one tunnel = one connection);
-  /// - a **general** request stream: a stream-scoped [`reset_stream`](Self::reset_stream)
+  /// - a **general** connection: a stream-scoped [`reset_stream`](Self::reset_stream)
   ///   with the error's [`code`](H3Error::code) (free the slot + enqueue `RESET_STREAM`,
   ///   RFC 9114 §4.1.2), leaving the connection live.
-  fn fail_or_reset_stream(&mut self, id: StreamId, is_tunnel: bool, error: H3Error)
+  fn fail_or_reset_stream(&mut self, id: StreamId, error: H3Error)
   where
     EventBuf: AsMut<[Option<Event>]>,
     TxBuf: AsMut<[u8]>,
   {
-    if is_tunnel {
+    if Mo::IS_TUNNEL {
       self.fail(error);
     } else {
       self.reset_stream(id, error.code());
@@ -2958,10 +2894,11 @@ where
     // carrier (an immutable read that ends before the `&mut entry.fsm` split below), so
     // the second-HEADERS guard works across `handle_stream` calls too.
     let first_headers_seen = entry.fsm.headers_seen();
-    // Copy the tunnel marker out before the FSM borrow splits the entry: the client's
-    // establish split in `Frames::next` reads it to pick connection-scoped (tunnel) vs
-    // per-stream (general) establishment.
-    let is_tunnel = entry.is_tunnel;
+    // The tunnel-vs-general identity is the connection marker's const (`Mo::IS_TUNNEL`),
+    // not a per-entry field: the client's establish split in `Frames::next` reads it to
+    // pick connection-scoped (tunnel) vs per-stream (general) establishment, and
+    // `fail_or_reset` reads it to pick the error scope.
+    let is_tunnel = Mo::IS_TUNNEL;
     let request_abandoned = &mut entry.abandoned;
     let tunnel_established = &mut entry.established;
     let final_response_seen = &mut entry.final_response_seen;
@@ -3330,7 +3267,7 @@ where
     // (mutating connection state) and yield no frames; their eager errors carry no
     // escaping borrow, so route them through `fail` and return empty/`Err` here. A
     // request stream is keyed in `streams`, so store membership — not a single
-    // `request_id` — selects the request path (the multi-stream router).
+    // `tunnel_id` — selects the request path (the multi-stream router).
     if self.streams.get(id).is_none() {
       return match self.handle_non_request(id, bytes) {
         Ok(()) => Ok(Frames::empty()),
@@ -3423,18 +3360,25 @@ where
       StreamRole::Request => Err(H3Error::FrameUnexpected),
     }
   }
+}
 
+impl<'req, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'req, '_, '_, '_, '_, Ro, Tunnel, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+where
+  Ro: Role,
+  St: StreamStore<StreamEntry<'req, ReqBuf>>,
+{
   /// Sends a chunk of tunnel payload as an HTTP/3 DATA frame on the CONNECT tunnel's
-  /// request stream — the CONNECT **specialization** of the general
-  /// [`send_data_on`](Self::send_data_on): a thin wrapper that forwards to
-  /// `send_data_on(request_id, …)`, so the DATA frame travels the exact same per-id
-  /// path as a general request/response body. The specialization is only the
-  /// signature and the implicit id: it keeps the tunnel's `send_data(&[u8])` arity
-  /// (copying the borrowed slice into a [`DataBuf`](crate::backend::DataBuf) on the
-  /// heap tiers, since the caller hands no owned buffer) and targets the single
-  /// tunnel-slot pointer (`request_id`) instead of an explicit id. As with every
-  /// tunnel method, a framing/transport error here is CONNECTION-fatal (one tunnel =
-  /// one connection), where a general stream resets per-stream.
+  /// request stream — the [`Tunnel`]-marker analogue of the general
+  /// [`send_data_on`](Connection::send_data_on): it shares the same per-id DATA enqueue
+  /// (`enqueue_data_on`), so the DATA frame travels the exact same per-id path as a
+  /// general request/response body. The difference is only the signature and the implicit
+  /// id: it keeps the tunnel's `send_data(&[u8])` arity (copying the borrowed slice into a
+  /// [`DataBuf`](crate::backend::DataBuf) on the heap tiers, since the caller hands no
+  /// owned buffer) and targets the single tunnel-slot pointer (`tunnel_id`) instead of an
+  /// explicit id. As a [`Tunnel`] method, a framing/transport error here is
+  /// CONNECTION-fatal (one tunnel = one connection), where a general stream resets
+  /// per-stream.
   ///
   /// Returns:
   /// - [`Err`]`(`[`Error::Closed`]`)` before the tunnel is established or after
@@ -3457,21 +3401,57 @@ where
     if !self.phase.is_open() {
       return Err(Error::Closed);
     }
-    let id = self.request_id.ok_or(Error::Closed)?;
-    // The tunnel keeps its `send_data(&[u8])` arity. On heap tiers the general
-    // entry point takes an owned `DataBuf`, so the borrowed slice is copied into
-    // one here (the caller did not hand us a buffer to hold zero-copy); on bare it
+    let id = self.tunnel_id.ok_or(Error::Closed)?;
+    // The tunnel keeps its `send_data(&[u8])` arity over the shared DATA enqueue. On heap
+    // tiers the shared helper takes an owned `DataBuf`, so the borrowed slice is copied
+    // into one here (the caller did not hand us a buffer to hold zero-copy); on bare it
     // forwards the slice to the copy-into-ring path.
     #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
     {
-      self.send_data_on(id, crate::backend::copy_from_slice(payload))
+      self.enqueue_data_on(id, crate::backend::copy_from_slice(payload))
     }
     #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
     {
-      self.send_data_on(id, payload)
+      self.enqueue_data_on(id, payload)
     }
   }
 
+  /// Closes the tunnel: moves to phase `Closing` (from any non-terminal phase) and
+  /// enqueues an empty FIN transmit on the request stream.
+  ///
+  /// Unlike the other tunnel methods this has no general per-id counterpart in
+  /// Phase 0: it is connection-level (the tunnel-slot pointer `tunnel_id` IS the
+  /// connection's one stream), so it half-closes the connection rather than a single
+  /// general stream. A per-id graceful half-close for general streams is future work.
+  ///
+  /// If the transmit ring is momentarily full (or the request stream has not been
+  /// opened yet), the FIN cannot be enqueued now; it is marked pending and
+  /// [`poll_transmit`](Self::poll_transmit) retries it once the ring drains, so a
+  /// close under backpressure is never silently dropped. The FIN is emitted
+  /// exactly once: a second `close` while one is already pending is a no-op, and
+  /// once enqueued `close_pending` is cleared. A `close` on an already-terminal
+  /// connection (`Closing`/`Failed`) is a no-op.
+  pub fn close(&mut self)
+  where
+    TxBuf: AsMut<[u8]>,
+  {
+    // Enter `Closing` (a no-op if already terminal), and on the FIRST transition
+    // arm the deferred FIN — the local half-close sends an empty FIN on the request
+    // stream (deferred via `close_pending` if the ring is full / the stream is not
+    // yet bound). Arming only on a real transition keeps the FIN exactly-once.
+    if self.begin_close() {
+      self.close_pending = true;
+      self.try_send_fin();
+    }
+  }
+}
+
+impl<'req, Ro, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'req, '_, '_, '_, '_, Ro, General, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+where
+  Ro: Role,
+  St: StreamStore<StreamEntry<'req, ReqBuf>>,
+{
   /// Sends a chunk of DATA-frame payload (request/response body, or tunnel bytes) on
   /// the request stream `id` — the GENERAL per-stream DATA entry point.
   ///
@@ -3501,16 +3481,8 @@ where
     TxBuf: AsMut<[u8]>,
     B: Into<crate::backend::DataBuf>,
   {
-    use core::ops::Deref;
     self.guard_send_on(id, SendOp::Body)?;
-    let body = body.into();
-    let body_len = body.deref().len();
-    self
-      .tx
-      .enqueue_data(StreamKind::Existing(id), false, body, |out| {
-        write_data_header(out, body_len)
-      })
-      .map_err(map_tx)
+    self.enqueue_data_on(id, body.into())
   }
 
   /// Sends a chunk of DATA-frame payload on the request stream `id` — the GENERAL
@@ -3534,23 +3506,7 @@ where
     TxBuf: AsMut<[u8]>,
   {
     self.guard_send_on(id, SendOp::Body)?;
-    self
-      .tx
-      .enqueue(StreamKind::Existing(id), false, |out| {
-        write_data_frame(out, payload)
-      })
-      .map_err(map_tx)
-  }
-
-  /// Reports that the driver wrote `n` bytes of the transmit last returned by
-  /// [`poll_transmit`](Self::poll_transmit) — a partial QUIC `writev`. The next
-  /// `poll_transmit` re-yields that transmit's remaining segments (re-sliced past
-  /// the `n` already-written bytes); the transmit is only dropped once every byte
-  /// is written. A `poll_transmit` with no intervening `consume_transmit`
-  /// acknowledges the previous transmit as fully written (the "driver re-polls"
-  /// model). Calling this with no transmit in flight is a no-op.
-  pub fn consume_transmit(&mut self, n: usize) {
-    self.tx.consume(n);
+    self.enqueue_data_on(id, payload)
   }
 
   /// Sends a trailing HEADERS section (trailers) on the request stream `id`, in
@@ -3634,6 +3590,55 @@ where
     }
     Ok(())
   }
+}
+
+impl<'req, Ro, Mo, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'req, '_, '_, '_, '_, Ro, Mo, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+where
+  Ro: Role,
+  Mo: Mode,
+  St: StreamStore<StreamEntry<'req, ReqBuf>>,
+{
+  /// Reports that the driver wrote `n` bytes of the transmit last returned by
+  /// [`poll_transmit`](Self::poll_transmit) — a partial QUIC `writev`. The next
+  /// `poll_transmit` re-yields that transmit's remaining segments (re-sliced past
+  /// the `n` already-written bytes); the transmit is only dropped once every byte
+  /// is written. A `poll_transmit` with no intervening `consume_transmit`
+  /// acknowledges the previous transmit as fully written (the "driver re-polls"
+  /// model). Calling this with no transmit in flight is a no-op.
+  pub fn consume_transmit(&mut self, n: usize) {
+    self.tx.consume(n);
+  }
+
+  /// Attempts to enqueue the pending empty FIN transmit on the request stream.
+  /// A no-op unless a close is pending and the request stream exists; on a
+  /// successful enqueue it clears `close_pending` so the FIN is sent exactly once.
+  /// Leaves `close_pending` set if the ring is full (retried from
+  /// [`poll_transmit`](Self::poll_transmit)).
+  ///
+  /// The graceful FIN is emitted ONLY in `Phase::Closing`: a `Failed` connection
+  /// does not flush a clean close FIN. `fail` already clears `close_pending` (the
+  /// primary guard), so this phase check is belt-and-suspenders against a deferred
+  /// FIN surviving a later failure.
+  fn try_send_fin(&mut self)
+  where
+    TxBuf: AsMut<[u8]>,
+  {
+    if !self.close_pending || !self.phase.is_closing() {
+      return;
+    }
+    let Some(id) = self.tunnel_id else {
+      return; // No request stream yet; retry once it is provided.
+    };
+    // An empty FIN: zero bytes, fin = true. The fill closure writes nothing.
+    if self
+      .tx
+      .enqueue(StreamKind::Existing(id), true, |_out| Ok::<usize, ()>(0))
+      .is_ok()
+    {
+      self.close_pending = false;
+    }
+  }
 
   /// Shared precondition for the general per-stream send paths
   /// ([`send_data_on`](Self::send_data_on) / [`send_trailers`](Self::send_trailers) /
@@ -3688,63 +3693,44 @@ where
     Ok(())
   }
 
-  /// Closes the tunnel: moves to phase `Closing` (from any non-terminal phase) and
-  /// enqueues an empty FIN transmit on the request stream.
-  ///
-  /// Unlike the other tunnel methods this has no general per-id counterpart in
-  /// Phase 0: it is connection-level (the tunnel-slot pointer `request_id` IS the
-  /// connection's one stream), so it half-closes the connection rather than a single
-  /// general stream. A per-id graceful half-close for general streams is future work.
-  ///
-  /// If the transmit ring is momentarily full (or the request stream has not been
-  /// opened yet), the FIN cannot be enqueued now; it is marked pending and
-  /// [`poll_transmit`](Self::poll_transmit) retries it once the ring drains, so a
-  /// close under backpressure is never silently dropped. The FIN is emitted
-  /// exactly once: a second `close` while one is already pending is a no-op, and
-  /// once enqueued `close_pending` is cleared. A `close` on an already-terminal
-  /// connection (`Closing`/`Failed`) is a no-op.
-  pub fn close(&mut self)
+  /// Enqueues a DATA frame for `body` on the request stream `id`, the shared body of the
+  /// tunnel [`send_data`](Self::send_data) (heap tiers) and the general
+  /// [`send_data_on`](Self::send_data_on). Holds `body` zero-copy as the DATA frame's body
+  /// segment (a refcounted clone, not a memcpy into the ring), so only the small frame
+  /// header is bounded by the per-slot capacity. The caller has already run its own
+  /// precondition (the tunnel `is_open` gate, or the general [`guard_send_on`](Self::guard_send_on)).
+  #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+  fn enqueue_data_on(&mut self, id: StreamId, body: crate::backend::DataBuf) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
   {
-    // Enter `Closing` (a no-op if already terminal), and on the FIRST transition
-    // arm the deferred FIN — the local half-close sends an empty FIN on the request
-    // stream (deferred via `close_pending` if the ring is full / the stream is not
-    // yet bound). Arming only on a real transition keeps the FIN exactly-once.
-    if self.begin_close() {
-      self.close_pending = true;
-      self.try_send_fin();
-    }
+    use core::ops::Deref;
+    let body_len = body.deref().len();
+    self
+      .tx
+      .enqueue_data(StreamKind::Existing(id), false, body, |out| {
+        write_data_header(out, body_len)
+      })
+      .map_err(map_tx)
   }
 
-  /// Attempts to enqueue the pending empty FIN transmit on the request stream.
-  /// A no-op unless a close is pending and the request stream exists; on a
-  /// successful enqueue it clears `close_pending` so the FIN is sent exactly once.
-  /// Leaves `close_pending` set if the ring is full (retried from
-  /// [`poll_transmit`](Self::poll_transmit)).
-  ///
-  /// The graceful FIN is emitted ONLY in `Phase::Closing`: a `Failed` connection
-  /// does not flush a clean close FIN. `fail` already clears `close_pending` (the
-  /// primary guard), so this phase check is belt-and-suspenders against a deferred
-  /// FIN surviving a later failure.
-  fn try_send_fin(&mut self)
+  /// Enqueues a DATA frame for `payload` on the request stream `id` (bare `no_std` tier),
+  /// the shared body of the tunnel [`send_data`](Self::send_data) and the general
+  /// [`send_data_on`](Self::send_data_on). With no refcounted buffer type, `payload` is
+  /// copied into the transmit storage as a single framed DATA segment (the v1 no-alloc
+  /// bound: the framed payload must fit one transmit slot). The caller has already run its
+  /// own precondition (the tunnel `is_open` gate, or [`guard_send_on`](Self::guard_send_on)).
+  #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
+  fn enqueue_data_on(&mut self, id: StreamId, payload: &[u8]) -> Result<(), Error>
   where
     TxBuf: AsMut<[u8]>,
   {
-    if !self.close_pending || !self.phase.is_closing() {
-      return;
-    }
-    let Some(id) = self.request_id else {
-      return; // No request stream yet; retry once it is provided.
-    };
-    // An empty FIN: zero bytes, fin = true. The fill closure writes nothing.
-    if self
+    self
       .tx
-      .enqueue(StreamKind::Existing(id), true, |_out| Ok::<usize, ()>(0))
-      .is_ok()
-    {
-      self.close_pending = false;
-    }
+      .enqueue(StreamKind::Existing(id), false, |out| {
+        write_data_frame(out, payload)
+      })
+      .map_err(map_tx)
   }
 
   /// Signal a QUIC `RESET_STREAM` for `id` with application error `code`. A no-op
@@ -3755,9 +3741,9 @@ where
   /// same `resolve_non_request_close` body) — with each `id` matching at most one
   /// case:
   ///
-  /// - **Request stream**, scoped by whether it is the CONNECT tunnel (the entry's
-  ///   private `is_tunnel` marker):
-  ///   - a **general** (non-tunnel) request stream is stream-scoped: free its store
+  /// - **Request stream**, scoped by whether the connection is a CONNECT tunnel (the
+  ///   `Mode` marker `Mo::IS_TUNNEL`):
+  ///   - a **general** connection's request stream is stream-scoped: free its store
   ///     slot and leave the connection (and every OTHER stream) live — NO
   ///     [`Event::Reset`], NO phase change. A `RESET_STREAM` carries no frame bytes,
   ///     and we do not echo a reset back (the peer already aborted its side).
@@ -3804,7 +3790,7 @@ where
     // on the wire). A stream reset does not fail the connection, so this runs live.
     self.reconcile_pending_resets();
     if let Some(entry) = self.streams.get(id) {
-      let is_tunnel = entry.is_tunnel;
+      let is_tunnel = Mo::IS_TUNNEL;
       let abandoned = entry.abandoned;
       if !is_tunnel {
         // A GENERAL request stream the peer reset is stream-scoped: free its slot and
@@ -3814,8 +3800,8 @@ where
         // the tunnel-slot pointer it is cleared. (The tunnel branch below keeps the
         // connection-scoped teardown.)
         self.streams.remove(id);
-        if self.request_id == Some(id) {
-          self.request_id = None;
+        if self.tunnel_id == Some(id) {
+          self.tunnel_id = None;
         }
         return;
       }
@@ -3858,10 +3844,10 @@ where
   ///   - a malformed FIN — at a frame boundary while the leading message is still
   ///     incomplete (no HEADERS, or only interim 1xx leading sections —
   ///     [`H3Error::RequestIncomplete`], RFC 9114 §8.1) or mid-frame
-  ///     ([`H3Error::FrameError`], RFC 9114 §7.1) — is scoped by whether the stream is
-  ///     the CONNECT tunnel (the entry's private `is_tunnel` marker): on the tunnel it
-  ///     is connection-fatal ([`Event::ConnError`], terminal); on a **general** request
-  ///     stream it is a stream-scoped reset (free the slot + a `RESET_STREAM` transmit,
+  ///     ([`H3Error::FrameError`], RFC 9114 §7.1) — is scoped by whether the connection is
+  ///     a CONNECT tunnel (the `Mode` marker `Mo::IS_TUNNEL`): on a tunnel it is
+  ///     connection-fatal ([`Event::ConnError`], terminal); on a **general** connection
+  ///     it is a stream-scoped reset (free the slot + a `RESET_STREAM` transmit,
   ///     RFC 9114 §4.1.2) that leaves the connection live.
   /// - **An outbound critical stream** (control or QPACK encoder/decoder we
   ///   opened, tracked in `roles`): closing it is
@@ -3908,7 +3894,6 @@ where
       // of `self`).
       let fin = entry.fsm.fin();
       let abandoned = entry.abandoned;
-      let is_tunnel = entry.is_tunnel;
       // An abandoned request stream: a prior `handle_stream` decoded its first HEADERS
       // on the drop-drain without the driver observing it, advancing the FSM into its
       // tunnel phase. It is permanently inert to the DRIVER (the tunnel was never
@@ -3924,7 +3909,7 @@ where
       // the `Failed` (above) and `peer_closed` guards.
       if abandoned {
         if let Err(e) = fin {
-          self.fail_or_reset_stream(id, is_tunnel, e);
+          self.fail_or_reset_stream(id, e);
         }
         return;
       }
@@ -3972,10 +3957,10 @@ where
         }
         // A FIN with no completed leading message — before any HEADERS or after ONLY
         // interim 1xx leading sections (`RequestIncomplete`) — or mid-frame
-        // (`FrameError`), scoped by `is_tunnel`: connection-fatal on the tunnel (make it
-        // terminal so a later send is rejected, signalled once), a stream-scoped reset
-        // on a general stream (RFC 9114 §4.1.2 — free + `RESET_STREAM`, connection live).
-        Err(e) => self.fail_or_reset_stream(id, is_tunnel, e),
+        // (`FrameError`), scoped by `Mo::IS_TUNNEL`: connection-fatal on the tunnel (make
+        // it terminal so a later send is rejected, signalled once), a stream-scoped reset
+        // on a general connection (RFC 9114 §4.1.2 — free + `RESET_STREAM`, connection live).
+        Err(e) => self.fail_or_reset_stream(id, e),
       }
       return;
     }
@@ -4166,20 +4151,20 @@ where
 }
 
 impl<'req, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
-  Connection<'req, '_, '_, '_, '_, Client, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'req, '_, '_, '_, '_, Client, Tunnel, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
 where
   St: StreamStore<StreamEntry<'req, ReqBuf>>,
 {
   /// Sends the CONNECT request HEADERS — call this AFTER the peer's SETTINGS have
   /// been received (i.e. [`peer_settings`](Connection::peer_settings) is `Some`).
   ///
-  /// This is the CONNECT **specialization** of the general
+  /// This is the [`Tunnel`]-marker analogue of the general [`General`]-marker
   /// [`open_request`](Connection::open_request): it opens a request stream with the
   /// same `write_headers_frame` encode+size-check, adding exactly one extra
   /// precondition — the Extended-CONNECT opt-in (`SETTINGS_ENABLE_CONNECT_PROTOCOL`,
   /// checked in `guard_open` where `open_request`'s `guard_open_request` does not) —
-  /// and registering the resulting stream `is_tunnel = true`. That marker makes the
-  /// tunnel connection-scoped: it establishes the whole connection
+  /// and recording the resulting stream as the `tunnel_id`. The connection's [`Tunnel`]
+  /// marker makes it connection-scoped: it establishes the whole connection
   /// ([`Event::Established`], `Phase::Open`) and a stream error on it is
   /// CONNECTION-fatal (one tunnel = one connection), where a general `open_request`
   /// stream establishes per-stream and resets per-stream (RFC 9114 §4.1.2). It also
@@ -4236,6 +4221,42 @@ where
     Ok(())
   }
 
+  /// The single source of truth for `open_with`'s preconditions. Returns the
+  /// resolved field-size limit to proceed, [`SendGuard::AlreadyDone`] for the
+  /// idempotent already-sent case, or the appropriate `Err`. The phase decides
+  /// the terminal / not-started cases; the data markers decide readiness.
+  fn guard_open(&self) -> Result<SendGuard<Option<u64>>, Error> {
+    match self.phase {
+      // Terminal: a prior `close()` / reset / fatal error. Checked before the
+      // readiness gate so a closed-and-not-yet-ready connection reports `Closed`,
+      // not `WouldBlock`. Mirrors `accept_with`.
+      Phase::Closing | Phase::Failed => Err(Error::Closed),
+      // Setup (control + SETTINGS) must precede the CONNECT request: a request
+      // ahead of `start` would put the CONNECT HEADERS on the wire before our
+      // SETTINGS (RFC 8441 / RFC 9114 ordering). In practice the peer's SETTINGS
+      // cannot arrive before our own `start`, so this only fires on misuse.
+      Phase::Created => Err(Error::Closed),
+      // The request is sent exactly once; a repeat is a no-op (only reachable in a
+      // non-terminal post-setup phase, so it never resends after a teardown).
+      Phase::Handshaking | Phase::Open if self.request_sent => Ok(SendGuard::AlreadyDone),
+      Phase::Handshaking | Phase::Open => {
+        // The peer's SETTINGS gate the request: the RFC 8441 opt-in and the peer's
+        // MAX_FIELD_SECTION_SIZE are both checked synchronously here at send time.
+        let settings = self.settings_peer.ok_or(Error::WouldBlock)?;
+        if !settings.enable_connect_protocol() {
+          return Err(Error::ExtendedConnectUnsupported);
+        }
+        Ok(SendGuard::Proceed(settings.max_field_section_size()))
+      }
+    }
+  }
+}
+
+impl<'req, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'req, '_, '_, '_, '_, Client, General, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+where
+  St: StreamStore<StreamEntry<'req, ReqBuf>>,
+{
   /// Opens a new request stream on the driver-minted QUIC bidi id `id`, registering
   /// its [`StreamEntry`] slot and enqueuing the request HEADERS as an `Existing(id)`
   /// transmit so the bytes flush on `id` via
@@ -4313,16 +4334,16 @@ where
     // call freshly inserts is rolled back below.
     let preexisting = self.streams.get(id).is_some();
     // Register the per-stream slot (recv FSM + lifecycle markers) keyed by the
-    // driver-minted `id`, mirroring an inbound `provide_stream(Request, id)`, but marked
-    // NON-tunnel: a general request establishes per-stream (final response → the entry's
-    // `established`), never connection-wide (no `Event::Established`, no `Phase::Open`).
-    // The first registered id still names the `request_id` tunnel-slot pointer (the
-    // CONNECT specialization's "one stream"); later ids are independent concurrent
-    // streams. An at-capacity STORE rejects the overflow stream (already reset with
-    // `H3_REQUEST_REJECTED` inside): the id is NOT tracked, so we must NOT enqueue HEADERS
-    // on it (the driver was told the request was rejected, not opened). Return the
-    // rejection error rather than both resetting and writing on the same untracked id.
-    if self.provide_request_stream(id, false) == RequestRegister::Rejected {
+    // driver-minted `id`, mirroring an inbound `provide_stream(Request, id)`. This is a
+    // `General` connection (the marker is the single source of truth), so a request
+    // establishes per-stream (final response → the entry's `established`), never
+    // connection-wide (no `Event::Established`, no `Phase::Open`), and records no
+    // `tunnel_id` pointer — every id is an independent concurrent stream. An at-capacity
+    // STORE rejects the overflow stream (already reset with `H3_REQUEST_REJECTED` inside):
+    // the id is NOT tracked, so we must NOT enqueue HEADERS on it (the driver was told the
+    // request was rejected, not opened). Return the rejection error rather than both
+    // resetting and writing on the same untracked id.
+    if self.provide_request_stream(id) == RequestRegister::Rejected {
       return Err(Error::Protocol(H3Error::RequestRejected));
     }
     // Enqueue the request HEADERS on `id` (size-checked in the single encode pass, as in
@@ -4338,8 +4359,8 @@ where
     }) {
       if !preexisting {
         self.streams.remove(id);
-        if self.request_id == Some(id) {
-          self.request_id = None;
+        if self.tunnel_id == Some(id) {
+          self.tunnel_id = None;
         }
       }
       return Err(map_tx(e));
@@ -4365,40 +4386,10 @@ where
       }
     }
   }
-
-  /// The single source of truth for `open_with`'s preconditions. Returns the
-  /// resolved field-size limit to proceed, [`SendGuard::AlreadyDone`] for the
-  /// idempotent already-sent case, or the appropriate `Err`. The phase decides
-  /// the terminal / not-started cases; the data markers decide readiness.
-  fn guard_open(&self) -> Result<SendGuard<Option<u64>>, Error> {
-    match self.phase {
-      // Terminal: a prior `close()` / reset / fatal error. Checked before the
-      // readiness gate so a closed-and-not-yet-ready connection reports `Closed`,
-      // not `WouldBlock`. Mirrors `accept_with`.
-      Phase::Closing | Phase::Failed => Err(Error::Closed),
-      // Setup (control + SETTINGS) must precede the CONNECT request: a request
-      // ahead of `start` would put the CONNECT HEADERS on the wire before our
-      // SETTINGS (RFC 8441 / RFC 9114 ordering). In practice the peer's SETTINGS
-      // cannot arrive before our own `start`, so this only fires on misuse.
-      Phase::Created => Err(Error::Closed),
-      // The request is sent exactly once; a repeat is a no-op (only reachable in a
-      // non-terminal post-setup phase, so it never resends after a teardown).
-      Phase::Handshaking | Phase::Open if self.request_sent => Ok(SendGuard::AlreadyDone),
-      Phase::Handshaking | Phase::Open => {
-        // The peer's SETTINGS gate the request: the RFC 8441 opt-in and the peer's
-        // MAX_FIELD_SECTION_SIZE are both checked synchronously here at send time.
-        let settings = self.settings_peer.ok_or(Error::WouldBlock)?;
-        if !settings.enable_connect_protocol() {
-          return Err(Error::ExtendedConnectUnsupported);
-        }
-        Ok(SendGuard::Proceed(settings.max_field_section_size()))
-      }
-    }
-  }
 }
 
 impl<'req, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
-  Connection<'req, '_, '_, '_, '_, Server, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'req, '_, '_, '_, '_, Server, Tunnel, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
 where
   St: StreamStore<StreamEntry<'req, ReqBuf>>,
 {
@@ -4406,17 +4397,15 @@ where
   /// (already-registered) request stream, marking the tunnel established, and
   /// enqueuing [`Event::Established`].
   ///
-  /// This is the CONNECT **specialization** of the general
+  /// This is the [`Tunnel`]-marker analogue of the general [`General`]-marker
   /// [`send_response`](Connection::send_response): it is `send_response(id, response,
   /// last = true)` (the same `write_headers_frame` encode+size-check + final-response
-  /// enqueue) PLUS the tunnel establish path — keep the entry `is_tunnel = true`, run
-  /// the connection-scoped `establish` (phase → `Open`, push [`Event::Established`],
-  /// flush any deferred `peer_fin_pending` as [`Event::PeerClosed`]). `send_response`
-  /// instead flips the entry to
-  /// `is_tunnel = false` and pushes NO connection event. The error scope rides that
-  /// marker: a stream error on the established tunnel is CONNECTION-fatal (one tunnel
-  /// = one connection), where a general response stream resets per-stream (RFC 9114
-  /// §4.1.2).
+  /// enqueue) PLUS the tunnel establish path — run the connection-scoped `establish`
+  /// (phase → `Open`, push [`Event::Established`], flush any deferred `peer_fin_pending`
+  /// as [`Event::PeerClosed`]). `send_response` pushes NO connection event. The error
+  /// scope rides the connection's [`Mode`] marker: a stream error on a [`Tunnel`]
+  /// connection is CONNECTION-fatal (one tunnel = one connection), where a [`General`]
+  /// connection's response stream resets per-stream (RFC 9114 §4.1.2).
   ///
   /// A CONNECT tunnel is established only by a valid `2xx` final response (RFC 9114
   /// §4.4), so — unlike the status-agnostic general `send_response` —`accept_with`
@@ -4471,14 +4460,9 @@ where
     EventBuf: AsMut<[Option<Event>]>,
   {
     // Reconcile any deferred stream-scoped reset FIRST (as the general send guards do).
-    // `request_id` is NOT provably un-condemned: in `Mode::General` the first inbound
-    // request still becomes `request_id` yet is registered NON-tunnel (`is_tunnel =
-    // false`), so a stream-scoped error on it (e.g. premature DATA in a dropped `Frames`)
-    // records a pending reset for `request_id`. Reconciling frees that condemned entry and
-    // clears `request_id`, so `guard_accept` below then reads it as not-yet-observed and
-    // returns `WouldBlock` — `accept_with` cannot report `Established` for a stream that
-    // `poll_transmit` will reset. (A tunnel-mode `request_id` is `is_tunnel = true`, whose
-    // errors fail the connection instead of recording a reset, so this no-ops there.)
+    // On a `Tunnel` connection an error on the tunnel stream is connection-fatal (it never
+    // records a per-stream reset), so this is a defensive no-op for the tunnel slot, kept
+    // for uniformity with the other `&mut self` entries.
     self.reconcile_pending_resets();
     let (id, limit) = match self.guard_accept()? {
       SendGuard::AlreadyDone => return Ok(()),
@@ -4492,7 +4476,7 @@ where
     // `send_response` derives interim-vs-final. A missing / malformed / interim (`1xx`)
     // / non-`2xx` final (`3xx`–`5xx`) `:status` makes the fill closure return `Err`, so
     // the transmit slot is discarded BEFORE commit: nothing reaches the wire, and the
-    // `is_tunnel` / `FinalSent` / `establish()` transitions below are NOT reached (no
+    // `FinalSent` / `establish()` transitions below are NOT reached (no
     // `Event::Established`).
     let observer = StatusObserver::new(response);
     self
@@ -4510,19 +4494,12 @@ where
     // The slot is committed (the closure returned `Ok` only after `require_2xx`
     // succeeded), so this re-read cannot diverge from the committed bytes.
     observer.require_2xx()?;
-    // Confirm the tunnel slot's entry as the CONNECT tunnel: `accept_with` is the
-    // tunnel-establishing path, so its entry is `is_tunnel = true` regardless of the
-    // connection [`Mode`] that classified it at `provide_stream` time (`Tunnel` ⇒ `true`
-    // already; `General` ⇒ `false`, re-asserted to `true` here — accepting a CONNECT
-    // makes this stream the tunnel). The marker keeps the entry's establishment
-    // connection-scoped (matching the `Event::Established` this enqueues) and feeds the
-    // per-stream-vs-connection reset split (a tunnel error is connection-fatal). The
-    // general `send_response` path instead clears it.
+    // `accept_with` runs only on a `Tunnel` connection, so the tunnel-vs-general identity
+    // is already settled by the `Mo` marker — there is no per-entry flag to flip. The
+    // CONNECT 2xx IS this stream's FINAL response: move the send half to `FinalSent` so
+    // tunnel DATA / FIN may now flow (`send_data` / `finish`). Without this the tunnel's
+    // own body would be rejected as premature by `guard_send_on`.
     if let Some(entry) = self.streams.get_mut(id) {
-      entry.is_tunnel = true;
-      // The CONNECT 2xx IS this stream's FINAL response: move the send half to `FinalSent`
-      // so tunnel DATA / FIN may now flow (`send_data` / `finish`). Without this the
-      // tunnel's own body would be rejected as premature by `guard_send_on`.
       entry.send = SendState::FinalSent;
     }
     // The single `Handshaking → Open` transition: flips the phase and enqueues
@@ -4531,6 +4508,61 @@ where
     Ok(())
   }
 
+  /// The single source of truth for `accept_with`'s preconditions. Returns the
+  /// resolved `(request stream id, field-size limit)` to proceed,
+  /// [`SendGuard::AlreadyDone`] for the idempotent already-responded case, or the
+  /// appropriate `Err`. Mirrors `guard_open`: the phase decides the terminal /
+  /// not-started / already-done cases; the data markers decide readiness.
+  fn guard_accept(&self) -> Result<SendGuard<(StreamId, Option<u64>)>, Error> {
+    match self.phase {
+      // The response is sent exactly once: an established server responded already,
+      // so a repeat is a no-op `Ok` (no second HEADERS, no second `Established`).
+      Phase::Open => Ok(SendGuard::AlreadyDone),
+      // Terminal: a prior `close()` / reset / fatal error takes precedence over the
+      // readiness gates, so a closing server reports `Closed`, not `WouldBlock`.
+      Phase::Closing | Phase::Failed => Err(Error::Closed),
+      // Setup (control + SETTINGS) must precede the response: a response ahead of
+      // `start` would precede our own SETTINGS on the wire (RFC 8441 / RFC 9114).
+      Phase::Created => Err(Error::Closed),
+      Phase::Handshaking => {
+        // The request HEADERS must be decoded before the server responds. The
+        // request stream id is registered (via `provide_stream`) the moment the
+        // QUIC stream opens — before any HEADERS — so registration alone is not
+        // enough; block until `handle_stream` has yielded `Frame::Request` (which
+        // sets the tunnel entry's `observed`). Enforces "accept after the request
+        // arrives". A missing tunnel slot / entry reads as not-yet-observed.
+        let id = self.tunnel_id.ok_or(Error::WouldBlock)?;
+        let Some(entry) = self.streams.get(id) else {
+          return Err(Error::WouldBlock);
+        };
+        if !entry.observed {
+          return Err(Error::WouldBlock);
+        }
+        // The CONNECT 2xx is a FINAL leading section: legal only from `Idle`. A non-`Idle`
+        // send-state means a final response was already sent on this stream by the general
+        // `send_response`, or trailers / a FIN already followed it — a second leading section
+        // (here the CONNECT 2xx) is out of sequence. The all-`Open` idempotent repeat is
+        // handled above; this catches the mixed general-then-tunnel misuse on the same
+        // stream while still in `Handshaking`.
+        if entry.send != SendState::Idle {
+          return Err(Error::Protocol(H3Error::FrameUnexpected));
+        }
+        // The peer's SETTINGS gate the response, exactly as in `open_with`: its
+        // MAX_FIELD_SECTION_SIZE is checked synchronously at send time. Until it
+        // arrives, an unlimited limit could send an over-limit response and commit
+        // the tunnel — so block and retry instead.
+        let settings = self.settings_peer.ok_or(Error::WouldBlock)?;
+        Ok(SendGuard::Proceed((id, settings.max_field_section_size())))
+      }
+    }
+  }
+}
+
+impl<'req, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+  Connection<'req, '_, '_, '_, '_, Server, General, ReqBuf, CtrlBuf, TxBuf, EventBuf, UniBuf, St>
+where
+  St: StreamStore<StreamEntry<'req, ReqBuf>>,
+{
   /// Sends a response HEADERS frame on the request stream `id`, the GENERAL
   /// (non-CONNECT) server response entry point.
   ///
@@ -4633,26 +4665,21 @@ where
     // state transition. It is `Some(Some(_))` (the closure returned `Ok` only after
     // `finality()` succeeded), so this cannot diverge from the committed bytes.
     let interim = observer.finality()?;
-    // Responding via the GENERAL path marks the entry NON-tunnel (`is_tunnel = false`):
-    // committing to a general response is what makes the stream general — a later stream
-    // error then resets just this stream rather than failing the connection (RFC 9114
-    // §4.1.2). This is also what made the entry general in `Mode::Tunnel` (the default,
-    // where `provide_stream` registered it `true`); in `Mode::General` it was already
-    // `false`, so this is a no-op re-assert. `accept_with` is the tunnel path and keeps it
-    // `true`. The FINAL response also marks the entry established (gating `Frame::Data`)
-    // but pushes NO connection `Event` — general streams are not connection-scoped (see
-    // the doc above); an interim response leaves it unestablished. A missing entry was
-    // already rejected by the guard.
-    if let Some(entry) = self.streams.get_mut(id) {
-      entry.is_tunnel = false;
-      if !interim {
-        entry.established = true;
-        // The FINAL response leading section is now SENT: move the send half to `FinalSent`
-        // so response body / trailers / FIN may follow (`send_data_on` / `send_trailers` /
-        // `finish`). An interim response leaves it `Idle` — a body before the FINAL response
-        // would be premature DATA (RFC 9114 §4.1).
-        entry.send = SendState::FinalSent;
-      }
+    // `send_response` runs only on a `General` connection (the marker is the single source
+    // of truth for the stream-scoped error scope — RFC 9114 §4.1.2), so there is no
+    // per-entry flag to flip. The FINAL response marks the entry established (gating
+    // `Frame::Data`) but pushes NO connection `Event` — general streams are not
+    // connection-scoped (see the doc above); an interim response leaves it unestablished.
+    // A missing entry was already rejected by the guard.
+    if let Some(entry) = self.streams.get_mut(id)
+      && !interim
+    {
+      entry.established = true;
+      // The FINAL response leading section is now SENT: move the send half to `FinalSent`
+      // so response body / trailers / FIN may follow (`send_data_on` / `send_trailers` /
+      // `finish`). An interim response leaves it `Idle` — a body before the FINAL response
+      // would be premature DATA (RFC 9114 §4.1).
+      entry.send = SendState::FinalSent;
     }
     Ok(())
   }
@@ -4707,56 +4734,6 @@ where
         // The peer's SETTINGS gate the response for its `MAX_FIELD_SECTION_SIZE`.
         let settings = self.settings_peer.ok_or(Error::WouldBlock)?;
         Ok(settings.max_field_section_size())
-      }
-    }
-  }
-
-  /// The single source of truth for `accept_with`'s preconditions. Returns the
-  /// resolved `(request stream id, field-size limit)` to proceed,
-  /// [`SendGuard::AlreadyDone`] for the idempotent already-responded case, or the
-  /// appropriate `Err`. Mirrors [`guard_open`](Self::guard_open): the phase decides
-  /// the terminal / not-started / already-done cases; the data markers decide
-  /// readiness.
-  fn guard_accept(&self) -> Result<SendGuard<(StreamId, Option<u64>)>, Error> {
-    match self.phase {
-      // The response is sent exactly once: an established server responded already,
-      // so a repeat is a no-op `Ok` (no second HEADERS, no second `Established`).
-      Phase::Open => Ok(SendGuard::AlreadyDone),
-      // Terminal: a prior `close()` / reset / fatal error takes precedence over the
-      // readiness gates, so a closing server reports `Closed`, not `WouldBlock`.
-      Phase::Closing | Phase::Failed => Err(Error::Closed),
-      // Setup (control + SETTINGS) must precede the response: a response ahead of
-      // `start` would precede our own SETTINGS on the wire (RFC 8441 / RFC 9114).
-      Phase::Created => Err(Error::Closed),
-      Phase::Handshaking => {
-        // The request HEADERS must be decoded before the server responds. The
-        // request stream id is registered (via `provide_stream`) the moment the
-        // QUIC stream opens — before any HEADERS — so registration alone is not
-        // enough; block until `handle_stream` has yielded `Frame::Request` (which
-        // sets the tunnel entry's `observed`). Enforces "accept after the request
-        // arrives". A missing tunnel slot / entry reads as not-yet-observed.
-        let id = self.request_id.ok_or(Error::WouldBlock)?;
-        let Some(entry) = self.streams.get(id) else {
-          return Err(Error::WouldBlock);
-        };
-        if !entry.observed {
-          return Err(Error::WouldBlock);
-        }
-        // The CONNECT 2xx is a FINAL leading section: legal only from `Idle`. A non-`Idle`
-        // send-state means a final response was already sent on this stream by the general
-        // `send_response`, or trailers / a FIN already followed it — a second leading section
-        // (here the CONNECT 2xx) is out of sequence. The all-`Open` idempotent repeat is
-        // handled above; this catches the mixed general-then-tunnel misuse on the same
-        // stream while still in `Handshaking`.
-        if entry.send != SendState::Idle {
-          return Err(Error::Protocol(H3Error::FrameUnexpected));
-        }
-        // The peer's SETTINGS gate the response, exactly as in `open_with`: its
-        // MAX_FIELD_SECTION_SIZE is checked synchronously at send time. Until it
-        // arrives, an unlimited limit could send an over-limit response and commit
-        // the tunnel — so block and retry instead.
-        let settings = self.settings_peer.ok_or(Error::WouldBlock)?;
-        Ok(SendGuard::Proceed((id, settings.max_field_section_size())))
       }
     }
   }

@@ -94,8 +94,8 @@ pub mod connection;
 pub use connection::StreamSlot;
 pub use connection::{
   BorrowedConnection, Client, Connection, DefaultCtrlBuf, DefaultEventBuf, DefaultReqBuf,
-  DefaultStreamStore, DefaultTxBuf, DefaultUniBuf, Frame, Frames, Mode, Role, Server, StreamEntry,
-  UniSlot,
+  DefaultStreamStore, DefaultTxBuf, DefaultUniBuf, Frame, Frames, General, Mode, Role, Server,
+  StreamEntry, Tunnel, UniSlot,
 };
 
 /// Internal hot-path accessors for the `no-panic` link-time test

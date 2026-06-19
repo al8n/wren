@@ -9,9 +9,10 @@ use crate::{
   stream::HDR_CAP,
 };
 
-type StaticConnection<Ro> = Connection<'static, 'static, 'static, 'static, 'static, Ro>;
-type StaticBorrowedConnection<Ro> =
-  BorrowedConnection<'static, 'static, 'static, 'static, 'static, Ro>;
+type StaticConnection<Ro, Mo = Tunnel> =
+  Connection<'static, 'static, 'static, 'static, 'static, Ro, Mo>;
+type StaticBorrowedConnection<Ro, Mo = Tunnel> =
+  BorrowedConnection<'static, 'static, 'static, 'static, 'static, Ro, Mo>;
 
 /// The CONNECT request a WebSocket client sends (RFC 9220 Extended CONNECT).
 const CONNECT_REQUEST: [(&str, &str); 5] = [
@@ -170,9 +171,9 @@ struct Captured {
 /// Pairs a client and server connection over a single shared stream-id space
 /// (the same [`StreamId`] identifies a stream on both ends), routing transmits
 /// between them and recording the observable outcomes.
-struct Harness {
-  client: StaticConnection<Client>,
-  server: StaticConnection<Server>,
+struct Harness<Mo: Mode = Tunnel> {
+  client: StaticConnection<Client, Mo>,
+  server: StaticConnection<Server, Mo>,
   next_id: u64,
   client_established: bool,
   server_established: bool,
@@ -211,7 +212,7 @@ enum Side {
   Server,
 }
 
-impl Harness {
+impl<Mo: Mode> Harness<Mo> {
   fn new() -> Self {
     Self {
       client: Connection::new(),
@@ -425,6 +426,48 @@ impl Harness {
     self.drain_events();
   }
 
+  /// `start()`s both roles and pumps until BOTH have decoded the peer's SETTINGS, so
+  /// either direction can send HEADERS. Unlike [`run_until_established`] this opens no
+  /// stream — the general tests drive `open_request` / `send_response` themselves.
+  fn exchange_settings(&mut self) {
+    self.client.start().expect("client start");
+    self.server.start().expect("server start");
+    for _ in 0..16 {
+      self.pump();
+      if self.client.peer_settings().is_some() && self.server.peer_settings().is_some() {
+        return;
+      }
+    }
+    panic!("peer SETTINGS never exchanged");
+  }
+
+  /// Pumps both directions with full client-response capture enabled, recording every
+  /// `Frame::Response` the client observes into `client_responses` as
+  /// `(interim, headers)`.
+  fn pump_collect_client_responses(&mut self) {
+    self.collect_client_responses = true;
+    self.pump();
+    self.collect_client_responses = false;
+  }
+
+  /// The bytes the server received on request stream `id` (general DATA body).
+  fn server_rx_for(&self, id: StreamId) -> &[u8] {
+    self
+      .server_rx_by_id
+      .get(&id.get())
+      .map_or(&[][..], Vec::as_slice)
+  }
+
+  /// The bytes the client received on request stream `id` (general DATA body).
+  fn client_rx_for(&self, id: StreamId) -> &[u8] {
+    self
+      .client_rx_by_id
+      .get(&id.get())
+      .map_or(&[][..], Vec::as_slice)
+  }
+}
+
+impl Harness<Tunnel> {
   /// Drives the full new client flow to Established on both sides:
   ///
   /// 1. `start()` both roles (control + QPACK setup).
@@ -473,22 +516,9 @@ impl Harness {
       self.client_established, self.server_established, self.server_saw_request, self.client_opened
     );
   }
+}
 
-  /// `start()`s both roles and pumps until BOTH have decoded the peer's SETTINGS, so
-  /// either direction can send HEADERS. Unlike [`run_until_established`] this opens no
-  /// stream — the general tests drive `open_request` / `send_response` themselves.
-  fn exchange_settings(&mut self) {
-    self.client.start().expect("client start");
-    self.server.start().expect("server start");
-    for _ in 0..16 {
-      self.pump();
-      if self.client.peer_settings().is_some() && self.server.peer_settings().is_some() {
-        return;
-      }
-    }
-    panic!("peer SETTINGS never exchanged");
-  }
-
+impl Harness<General> {
   /// Brings up a GENERAL (non-CONNECT) request/response exchange to its final response
   /// on `id`: exchange SETTINGS, `open_request` a GET on `id`, then `send_response` a
   /// final 200. After this both the request and the final response have been observed,
@@ -511,31 +541,6 @@ impl Harness {
     self.pump();
     id
   }
-
-  /// Pumps both directions with full client-response capture enabled, recording every
-  /// `Frame::Response` the client observes into `client_responses` as
-  /// `(interim, headers)`.
-  fn pump_collect_client_responses(&mut self) {
-    self.collect_client_responses = true;
-    self.pump();
-    self.collect_client_responses = false;
-  }
-
-  /// The bytes the server received on request stream `id` (general DATA body).
-  fn server_rx_for(&self, id: StreamId) -> &[u8] {
-    self
-      .server_rx_by_id
-      .get(&id.get())
-      .map_or(&[][..], Vec::as_slice)
-  }
-
-  /// The bytes the client received on request stream `id` (general DATA body).
-  fn client_rx_for(&self, id: StreamId) -> &[u8] {
-    self
-      .client_rx_by_id
-      .get(&id.get())
-      .map_or(&[][..], Vec::as_slice)
-  }
 }
 
 #[test]
@@ -552,30 +557,32 @@ fn client_server_connect_then_tunnel() {
 
 #[test]
 fn connect_tunnel_is_specialization_of_general_stream() {
-  // A full CONNECT establish leaves exactly one stream in the store, flagged as
-  // the tunnel; tunnel send_data routes through the general per-id DATA path.
+  // A full CONNECT establish leaves exactly one stream in the store, named by the
+  // tunnel-slot pointer; tunnel send_data routes through the general per-id DATA path.
   let mut h = Harness::new();
   h.run_until_established();
   let id = h.request_id.expect("request id");
   // Exactly one stream on each side, and it is the one named by the tunnel-slot
-  // pointer (`request_id`): the CONNECT tunnel IS the general per-id stream, not a
+  // pointer (`tunnel_id`): the CONNECT tunnel IS the general per-id stream, not a
   // separate channel.
   assert_eq!(h.client.streams.len(), 1, "tunnel is the one client stream");
   assert_eq!(h.server.streams.len(), 1, "tunnel is the one server stream");
-  // Both sides flag that single stream `is_tunnel` (the client via `open_with`, the
-  // server via `accept_with`): the specialization marker that scopes its errors
-  // connection-fatal and drove the connection-wide `Event::Established`.
-  assert!(
-    h.client.streams.get(id).expect("client entry").is_tunnel,
-    "client tunnel stream is flagged is_tunnel"
+  // Both sides point `tunnel_id` at that single stream (the client via `open_with`, the
+  // server via `accept_with`): on the `Tunnel` marker it is the tunnel-slot pointer that
+  // scopes errors connection-fatal and drove the connection-wide `Event::Established`.
+  assert_eq!(
+    h.client.tunnel_id,
+    Some(id),
+    "client tunnel_id names the tunnel stream"
   );
-  assert!(
-    h.server.streams.get(id).expect("server entry").is_tunnel,
-    "server tunnel stream is flagged is_tunnel"
+  assert_eq!(
+    h.server.tunnel_id,
+    Some(id),
+    "server tunnel_id names the tunnel stream"
   );
-  // Tunnel send_data works and the byte reaches the server: it is a thin wrapper
-  // over the general `send_data_on(request_id, ..)`, so the DATA frame travels the
-  // SAME per-id path the general body tests exercise.
+  // Tunnel send_data works and the byte reaches the server: it shares the general per-id
+  // DATA enqueue (`enqueue_data_on`), so the DATA frame travels the SAME per-id path the
+  // general body tests exercise.
   h.client.send_data(b"tunneled").expect("tunnel send_data");
   h.pump();
   assert_eq!(h.server_rx, b"tunneled");
@@ -875,25 +882,18 @@ fn incomplete_message_fin_before_headers_is_error() {
   ));
 }
 
-// The `Mode::General` contrast to the tunnel-default test above: a GENERAL HTTP/3
+// The `General`-marker contrast to the tunnel-default test above: a GENERAL HTTP/3
 // server that receives a MALFORMED request (FIN before any HEADERS) BEFORE it has
 // responded scopes the error PER-STREAM (RFC 9114 §4.1.2) rather than failing the
-// whole connection — the connection-level tunnel-mode fix for the former Phase-0
-// pre-response ambiguity. The offending stream is reset (`RESET_STREAM`) and freed,
-// the connection survives (no `Event::ConnError`, `!is_failed()`), and a SECOND
-// concurrent general request stream stays fully usable end to end. In the default
-// `Mode::Tunnel` the same FIN-before-HEADERS is connection-fatal
+// whole connection — the type-state `General` connection's per-stream error scope. The
+// offending stream is reset (`RESET_STREAM`) and freed, the connection survives (no
+// `Event::ConnError`, `!is_failed()`), and a SECOND concurrent general request stream
+// stays fully usable end to end. On the default `Tunnel` marker the same
+// FIN-before-HEADERS is connection-fatal
 // (`incomplete_message_fin_before_headers_is_error`, above).
 #[test]
 fn general_mode_malformed_request_before_response_resets_alone() {
-  let mut h = Harness::new();
-  // Select general scoping on the server BEFORE start (`exchange_settings` calls it):
-  // the mode governs how inbound request streams are registered.
-  h.server.set_mode(Mode::General);
-  assert!(
-    h.server.mode().is_general(),
-    "the server is in general mode"
-  );
+  let mut h = Harness::<General>::new();
   h.exchange_settings();
   let id_a = StreamId::new(0);
   let id_b = StreamId::new(4);
@@ -997,59 +997,6 @@ fn general_client_final_response_establishes_per_stream_without_connection_event
   h.pump();
   assert_eq!(h.server_rx, b"req-body");
   assert_eq!(h.client_rx, b"resp-body");
-}
-
-#[test]
-fn post_tunnel_general_client_stream_establishes_per_stream_in_open() {
-  // Regression: a GENERAL client stream opened via `open_request` AFTER a CONNECT tunnel
-  // moved the connection to `Open` must STILL establish per-stream on its final response
-  // (gating `Frame::Data`), even though the connection phase is no longer `Handshaking`.
-  // Pre-fix `establish_on_response` was armed only while `Handshaking`, so the per-stream
-  // `established` flag was never set on a post-tunnel general stream and its first valid
-  // response DATA was (wrongly) treated as premature and reset the stream.
-  let mut h = Harness::new();
-  // Establish the CONNECT tunnel: the client flips to `Open` with `Event::Established`.
-  h.run_until_established();
-  assert!(
-    h.client_established,
-    "the tunnel emitted Event::Established"
-  );
-  assert!(h.client.is_established(), "the connection is Open");
-  // Open a GENERAL request on a NEW id while the connection is already `Open`.
-  let gid = StreamId::new(8);
-  let get: &[(&str, &str)] = &[
-    (":method", "GET"),
-    (":scheme", "https"),
-    (":path", "/"),
-    (":authority", "x"),
-  ];
-  h.client
-    .open_request(gid, get)
-    .expect("open_request in Open");
-  drain_transmits(&mut h.client);
-  // Deliver the general stream's FINAL response coalesced with a DATA frame directly to
-  // the client. The final response must establish the PER-STREAM entry (in `Open`), so the
-  // coalesced DATA surfaces as `Frame::Data`; if the per-stream flag were not set, this
-  // DATA would be premature (RFC 9114 §4.4) and reset the stream / surface nothing.
-  let mut tail = request_headers_frame(&[(":status", "200")][..]);
-  tail.extend_from_slice(&request_data_frame(b"post-tunnel"));
-  h.deliver(Side::Client, gid, &tail);
-  assert!(
-    !h.client.is_failed(),
-    "the post-tunnel general response establishes the stream; its DATA is not premature"
-  );
-  assert_eq!(
-    h.client_rx_for(gid),
-    b"post-tunnel",
-    "DATA flows on the per-stream-established general stream opened in Open"
-  );
-  // No SECOND connection-level establishment: a general stream emits no Event::Established
-  // and does not re-transition the phase (events are connection-scoped only).
-  assert_eq!(
-    h.client.poll_event(),
-    None,
-    "a general client final response must emit no further connection event"
-  );
 }
 
 // Two concurrent request streams (distinct driver-minted ids) exchange interleaved
@@ -1238,7 +1185,7 @@ fn malformed_response_on_general_client_stream_resets_alone() {
 /// bytes, returning the harness positioned to pull/drop the resulting `Frames`. The DATA
 /// is consumed first (the stream is established), so `trailing` parses as a `Trailers`
 /// section — the NON-first section the FSM defers.
-fn general_client_with_trailing(id: StreamId, trailing: &[u8]) -> (Harness, Vec<u8>) {
+fn general_client_with_trailing(id: StreamId, trailing: &[u8]) -> (Harness<General>, Vec<u8>) {
   let mut h = Harness::new();
   h.establish_general_get(id);
   let mut bytes = data_frame(b"body");
@@ -1464,7 +1411,7 @@ fn drop_semantic_malformed_trailers_on_tunnel_is_conn_error_like_next() {
 /// A harness whose CLIENT has SETTINGS exchanged and a general GET opened on `id`, with
 /// the outbound request HEADERS transmit DRAINED — so the transmit ring is empty and a
 /// subsequent `poll_transmit` returns only what the test causes (e.g. a RESET_STREAM).
-fn general_client_after_open(id: StreamId) -> Harness {
+fn general_client_after_open(id: StreamId) -> Harness<General> {
   let mut h = Harness::new();
   h.exchange_settings();
   let get: &[(&str, &str)] = &[
@@ -2061,9 +2008,8 @@ fn drop_malformed_first_headers_on_general_stream_resets_like_next() {
 /// request CONDEMNED (a `pending_reset` recorded by the live `Frames::next`), WITHOUT yet
 /// running any `&mut self` entry that would materialize it. Returns the harness with the
 /// pending reset still latched, so a subsequent send guard is what must reject it.
-fn general_server_with_condemned_request(id: StreamId) -> Harness {
-  let mut h = Harness::new();
-  h.server.set_mode(Mode::General);
+fn general_server_with_condemned_request(id: StreamId) -> Harness<General> {
+  let mut h = Harness::<General>::new();
   h.exchange_settings();
   h.server.provide_stream(StreamRole::Request, id);
   // A request HEADERS section that DECODES but is SEMANTICALLY malformed (no `:method`),
@@ -2164,89 +2110,6 @@ fn send_data_on_condemned_general_stream_is_rejected() {
   );
 }
 
-#[test]
-fn accept_with_on_condemned_general_request_does_not_establish() {
-  // In `Mode::General` the FIRST inbound request still becomes the tunnel-slot pointer
-  // `request_id`, yet it is registered NON-tunnel (`is_tunnel = false`) — so a
-  // stream-scoped error on it (premature DATA before `accept_with`, in a dropped
-  // `Frames`) records a pending reset for `request_id`. `accept_with` must reconcile that
-  // FIRST and refuse to establish: it must NOT report `Event::Established` / flip to
-  // `Open` for a stream `poll_transmit` will reset. (Pre-fix `accept_with` skipped the
-  // reconcile on the false assumption that `request_id` is never condemned, then saw the
-  // stale entry and established a doomed tunnel.)
-  let mut h = Harness::new();
-  h.server.set_mode(Mode::General);
-  h.exchange_settings();
-  let id = StreamId::new(0);
-  h.server.provide_stream(StreamRole::Request, id);
-  // Observe a valid CONNECT request: the server yields `Frame::Request`, flipping the
-  // entry's `observed` (the gate `accept_with` waits on) and naming `request_id = id`.
-  let req = request_headers_frame(&CONNECT_REQUEST[..]);
-  let mut scratch = std::vec![0u8; 2048];
-  {
-    let mut frames = h
-      .server
-      .handle_stream(id, &req, &mut scratch)
-      .expect("builds iterator");
-    assert!(
-      matches!(frames.next(), Ok(Some(Frame::Request(_)))),
-      "the server observes the CONNECT request"
-    );
-    while frames.next().expect("drain request").is_some() {}
-  }
-  assert!(
-    h.server.request_received(),
-    "the CONNECT request is observed (accept_with's gate is open)"
-  );
-  // A premature DATA frame on the same stream (the tunnel is not established — no
-  // `accept_with` yet), delivered in a `Frames` iterator the driver DROPS without pulling
-  // the DATA: the drop-drain hits the establishment gate and records a stream-scoped reset
-  // for `request_id` (General mode → reset, not connection-fatal).
-  let premature = data_frame(b"early");
-  {
-    let _frames = h
-      .server
-      .handle_stream(id, &premature, &mut scratch)
-      .expect("builds iterator");
-    // Dropped WITHOUT pulling: the drain records the pending reset but does not apply it.
-  }
-  assert!(
-    !h.server.is_failed(),
-    "a premature-DATA reset on a general stream is not connection-fatal"
-  );
-  // `accept_with` must reconcile the pending reset and refuse: WouldBlock (the condemned
-  // entry is gone, so `request_id` reads as not-observed), NEVER Ok.
-  assert_eq!(
-    h.server.accept_with(&RESPONSE[..]),
-    Err(Error::WouldBlock),
-    "accept_with must not establish a condemned tunnel"
-  );
-  // No connection-level establishment happened.
-  assert!(
-    !h.server.is_established(),
-    "the connection must NOT flip to Open for a condemned tunnel"
-  );
-  assert!(
-    !matches!(h.server.poll_event(), Some(Event::Established)),
-    "accept_with must NOT emit Event::Established for a condemned tunnel"
-  );
-  // The deferred reset materialized (the stream is freed) and its RESET_STREAM is emitted.
-  assert!(
-    h.server.stream_is_gone(id),
-    "the condemned request stream is freed by the reconcile"
-  );
-  let kind = h
-    .server
-    .poll_transmit()
-    .expect("the deferred reset materialized")
-    .kind();
-  assert!(
-    matches!(kind, StreamKind::ResetStream { id: rid, code }
-      if rid == id && code == H3Error::MessageError.code()),
-    "the condemned stream's RESET_STREAM(MessageError) is emitted, got {kind:?}"
-  );
-}
-
 // Round 3, findings #1 + #2: the reset-emission path is ONE never-drop, ordered mechanism.
 // #1 — a general-stream FIN error (`reset_stream` via `fail_or_reset_stream`) under a FULL
 // transmit ring must NOT drop the `RESET_STREAM`: it is recorded in the bounded retry queue
@@ -2261,8 +2124,7 @@ fn general_fin_error_reset_not_lost_under_full_tx_ring() {
   // stream resets it, but when the transmit ring is FULL the wire `RESET_STREAM` cannot be
   // enqueued directly — it must survive in the pending-reset retry queue and materialize
   // later, never be dropped.
-  let mut h = Harness::new();
-  h.server.set_mode(Mode::General);
+  let mut h = Harness::<General>::new();
   h.exchange_settings();
   // Stream A: registered HEADERS-less — the malformed stream we will FIN.
   let id_a = StreamId::new(0);
@@ -2553,7 +2415,7 @@ fn poll_transmit_does_not_strand_reset_returning_none_first() {
 
 /// Brings up a second GENERAL request/response stream on `id` to its final response, on a
 /// harness whose first general stream is already established. Returns `id`.
-fn add_general_get(h: &mut Harness, id: StreamId) -> StreamId {
+fn add_general_get(h: &mut Harness<General>, id: StreamId) -> StreamId {
   let get: &[(&str, &str)] = &[
     (":method", "GET"),
     (":scheme", "https"),
@@ -2571,8 +2433,7 @@ fn add_general_get(h: &mut Harness, id: StreamId) -> StreamId {
 
 #[test]
 fn reset_not_stranded_behind_held_front_transmit() {
-  let mut h = Harness::new();
-  h.server.set_mode(Mode::General);
+  let mut h = Harness::<General>::new();
   // Two established general streams: A (the held-front stream) and B (the reset target).
   let id_a = h.establish_general_get(StreamId::new(0));
   let id_b = add_general_get(&mut h, StreamId::new(4));
@@ -2637,7 +2498,7 @@ fn reset_not_stranded_behind_held_front_transmit() {
 
 /// Drains every queued server transmit, returning the codes of all RESET_STREAM transmits
 /// for `id` (in order) and asserting the loop terminates.
-fn collect_resets_for(h: &mut Harness, id: StreamId) -> Vec<u64> {
+fn collect_resets_for(h: &mut Harness<General>, id: StreamId) -> Vec<u64> {
   let mut codes = Vec::new();
   let mut polls = 0usize;
   while let Some(t) = h.server.poll_transmit() {
@@ -3447,7 +3308,7 @@ fn peer_control_settings(settings_payload: &[u8]) -> Vec<u8> {
 }
 
 /// Drains and discards a connection's queued transmits, returning their count.
-fn drain_transmits<Ro: Role>(c: &mut StaticConnection<Ro>) -> usize {
+fn drain_transmits<Ro: Role, Mo: Mode>(c: &mut StaticConnection<Ro, Mo>) -> usize {
   let mut n = 0usize;
   while c.poll_transmit().is_some() {
     n += 1;
@@ -4687,7 +4548,7 @@ impl Headers for FlipStatusHeaders {
 
 /// Decodes the single `:status` of a server-transmitted HEADERS frame's field
 /// section, asserting the transmit is a HEADERS frame on `id`.
-fn transmitted_status(h: &mut Harness, id: StreamId) -> String {
+fn transmitted_status(h: &mut Harness<General>, id: StreamId) -> String {
   let t = h.server.poll_transmit().expect("a response transmit");
   assert!(
     matches!(t.kind(), StreamKind::Existing(sid) if sid == id),
@@ -5332,7 +5193,7 @@ fn provide_stream_second_request_id_coexists_and_keeps_the_tunnel_slot() {
   let id2 = StreamId::new(8);
   c.provide_stream(StreamRole::Request, id1);
   assert_eq!(
-    c.request_id,
+    c.tunnel_id,
     Some(id1),
     "first binding records the tunnel slot"
   );
@@ -5344,7 +5205,7 @@ fn provide_stream_second_request_id_coexists_and_keeps_the_tunnel_slot() {
     "a second request id coexists rather than failing the connection"
   );
   assert_eq!(
-    c.request_id,
+    c.tunnel_id,
     Some(id1),
     "the tunnel-slot pointer keeps naming the first id"
   );
@@ -5359,7 +5220,7 @@ fn provide_stream_second_request_id_coexists_and_keeps_the_tunnel_slot() {
     None,
     "re-providing the same (Request, id1) is a no-op"
   );
-  assert_eq!(c.request_id, Some(id1));
+  assert_eq!(c.tunnel_id, Some(id1));
 }
 
 #[test]
@@ -5393,11 +5254,11 @@ fn close_before_provide_request_still_binds_first_id() {
   drain_transmits(&mut c);
   c.close(); // request stream not yet bound; FIN is held pending
   assert!(c.is_terminal());
-  assert_eq!(c.request_id, None, "close does not bind the request id");
+  assert_eq!(c.tunnel_id, None, "close does not bind the request id");
   let req_id = StreamId::new(12);
   c.provide_stream(StreamRole::Request, req_id);
   assert_eq!(
-    c.request_id,
+    c.tunnel_id,
     Some(req_id),
     "the first request binding after close still records the id"
   );
@@ -7781,7 +7642,7 @@ fn fully_drained_first_headers_path_is_unchanged() {
 /// `PeerClosed` events directly, so a subsequent fatal path cannot enqueue its
 /// `ConnError` into the queue — proving the terminal error survives via the
 /// dedicated `conn_error` slot. Returns the number pushed (the full capacity).
-fn saturate_event_queue<Ro: Role>(c: &mut StaticConnection<Ro>) -> usize {
+fn saturate_event_queue<Ro: Role, Mo: Mode>(c: &mut StaticConnection<Ro, Mo>) -> usize {
   let mut n = 0usize;
   // `push` returns Err(item) once full; stop there.
   while c.events.push(Event::PeerClosed).is_ok() {
@@ -7802,7 +7663,7 @@ fn saturate_event_queue<Ro: Role>(c: &mut StaticConnection<Ro>) -> usize {
 /// Drains `poll_event`, returning the count of terminal `ConnError`s seen and the
 /// first such error. Asserts exactly one `ConnError` is delivered (the terminal
 /// code), regardless of how many benign events preceded it in the queue.
-fn drain_until_single_conn_error<Ro: Role>(c: &mut StaticConnection<Ro>) -> H3Error {
+fn drain_until_single_conn_error<Ro: Role, Mo: Mode>(c: &mut StaticConnection<Ro, Mo>) -> H3Error {
   let mut conn_errors = std::vec::Vec::new();
   while let Some(ev) = c.poll_event() {
     if let Event::ConnError(e) = ev {
@@ -8246,10 +8107,7 @@ fn provide_stream_after_fail_is_a_noop() {
   // Now the driver provides the request stream LATE. On a Failed connection this is
   // a no-op: no id bound, no FSM created.
   c.provide_stream(StreamRole::Request, StreamId::new(0));
-  assert_eq!(
-    c.request_id, None,
-    "a Failed connection binds no request id"
-  );
+  assert_eq!(c.tunnel_id, None, "a Failed connection binds no request id");
   // The connection stays Failed and only the original terminal error is delivered.
   assert!(c.phase.is_failed());
   assert_eq!(
