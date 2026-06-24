@@ -48,7 +48,7 @@ portable-atomic-util = { workspace = true, optional = true }
 [dev-dependencies]
 proptest = "1"
 no-panic = "0.1"
-phf = { version = "0.13.1", default-features = false, features = ["macros"] }
+phf = { version = "0.14.0", default-features = false, features = ["macros"] }
 criterion = "0.7"
 
 [[bench]]
