@@ -41,7 +41,7 @@ thiserror.workspace = true
 derive_more.workspace = true
 bytes = { workspace = true, optional = true }
 slab = { version = "0.4", default-features = false, optional = true }
-hashbrown = { version = "0.16", default-features = false, optional = true }
+hashbrown = { version = "0.17", default-features = false, optional = true }
 portable-atomic = { workspace = true, optional = true }
 portable-atomic-util = { workspace = true, optional = true }
 
