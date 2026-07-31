@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.3
         with:
           tool: cargo-hack
       - run: cargo hack build -p websocket-proto --each-feature
@@ -185,7 +185,7 @@ jobs:
             .
             websocket-proto/fuzz
             http3-proto/fuzz
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.3
         with:
           tool: cargo-fuzz
       - name: Fuzz all targets — websocket-proto (bounded smoke)
