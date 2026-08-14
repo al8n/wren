@@ -1,0 +1,913 @@
+//! RFC 9110 §5.6 field grammar over raw byte values.
+//!
+//! Field NAMES are tokens (§5.6.2 `tchar`); field VALUES are byte strings whose
+//! content is `field-vchar` / SP / HTAB with the surrounding OWS stripped
+//! (§5.5) — never `str`, because `obs-text` (0x80-0xFF) is legal field content
+//! and need not be UTF-8. Everything here is a pure predicate over borrowed
+//! bytes: no allocation, no panics, no state.
+//!
+//! The request-target validators (`is_valid_path_and_query`, `is_valid_query`,
+//! `is_valid_authority`) work on `&str` instead: a target is validated ASCII by
+//! the time it reaches them, and they enforce the RFC 3986 grammar that
+//! RFC 9112 §3.2 builds request-target forms out of.
+
+/// RFC 9110 §5.6.2 `tchar`: a byte that may appear in a token (field names,
+/// methods, transfer codings, `Connection` / `Upgrade` list elements).
+#[inline]
+pub const fn is_token_byte(b: u8) -> bool {
+  matches!(b,
+    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+    | b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+}
+
+/// Whether every byte of `s` is a token byte (and `s` is non-empty).
+///
+/// RFC 9110 §5.6.2 defines `token = 1*tchar`, so the empty string is not a
+/// token — an empty field name or an empty coding name is a grammar violation,
+/// not a degenerate-but-legal value.
+#[inline]
+pub fn is_token(s: &[u8]) -> bool {
+  !s.is_empty() && s.iter().all(|&b| is_token_byte(b))
+}
+
+/// RFC 9110 §5.5 `field-vchar`: `VCHAR` (0x21-0x7E) or `obs-text` (0x80-0xFF).
+///
+/// Excludes SP and HTAB, which are legal *between* field-vchars but may not
+/// start or end a value — see [`validate_field_value`] and [`trim_ows`].
+#[inline]
+pub const fn is_field_vchar(b: u8) -> bool {
+  matches!(b, 0x21..=0x7E | 0x80..=0xFF)
+}
+
+/// Validates a raw field value: every byte is `field-vchar`, SP, or HTAB
+/// (RFC 9110 §5.5). CTLs — NUL, VT, FF, and in particular a bare CR or LF, which
+/// would smuggle a line break into the field section — are rejected.
+///
+/// The input must already be OWS-trimmed ([`trim_ows`]): SP/HTAB are accepted
+/// anywhere here, so leading or trailing whitespace passes rather than being
+/// diagnosed. Returns the offset of the first offending byte on error.
+#[inline]
+pub fn validate_field_value(v: &[u8]) -> Result<(), usize> {
+  for (i, &b) in v.iter().enumerate() {
+    if !is_field_vchar(b) && b != b' ' && b != b'\t' {
+      return Err(i);
+    }
+  }
+  Ok(())
+}
+
+/// Trims OWS (SP/HTAB, RFC 9110 §5.6.3) from both ends, returning the subslice.
+///
+/// OWS around a field value is not part of the value (§5.5), so trimming is
+/// mandatory before the value is compared, parsed, or handed to the caller.
+#[inline]
+pub fn trim_ows(v: &[u8]) -> &[u8] {
+  let mut out = v;
+  while let Some((&b, rest)) = out.split_first() {
+    if b != b' ' && b != b'\t' {
+      break;
+    }
+    out = rest;
+  }
+  while let Some((&b, rest)) = out.split_last() {
+    if b != b' ' && b != b'\t' {
+      break;
+    }
+    out = rest;
+  }
+  out
+}
+
+/// Splits a comma-separated list value into its non-empty, OWS-trimmed
+/// elements. RFC 9110 §5.6.1.2: "a recipient MUST parse and ignore a
+/// reasonable number of empty list elements" — EVERY list consumer routes
+/// through here, so the empty-element rule lives in exactly one place instead
+/// of being rediscovered per open-coded `split(b',')`.
+#[inline]
+pub fn list_elements(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+  value
+    .split(|&b| b == b',')
+    .map(trim_ows)
+    .filter(|item| !item.is_empty())
+}
+
+/// Whether a comma-separated token list contains `token`
+/// (ASCII case-insensitive, OWS-tolerant) — e.g. `Connection: keep-alive, Upgrade`.
+#[inline]
+pub fn token_list_contains(value: &[u8], token: &str) -> bool {
+  list_elements(value).any(|item| eq_ignore_ascii(item, token))
+}
+
+/// ASCII case-insensitive equality between a raw byte string and a known token.
+///
+/// Field names and the tokens defined by the specification are ASCII, so this
+/// is the comparison RFC 9110 §5.6.2 and §5.1 call for; bytes outside ASCII
+/// compare exactly, which is what a non-token value should do.
+#[inline]
+pub fn eq_ignore_ascii(a: &[u8], b: &str) -> bool {
+  a.eq_ignore_ascii_case(b.as_bytes())
+}
+
+/// RFC 3986 `pchar` byte (plus `/`): what may appear literally in a URI
+/// path segment. Everything else — including `#`, which is a fragment
+/// delimiter and never part of a request-target — must arrive `%XX`-escaped.
+const fn is_path_byte(b: u8) -> bool {
+  matches!(b,
+    // unreserved
+    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+    // sub-delims
+    | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+    // pchar extras + segment separator
+    | b':' | b'@' | b'/')
+}
+
+/// Validates an origin-form request-target's path-and-query string
+/// (RFC 9112 §3.2.1) against the RFC 3986 grammar: a leading `/`, `pchar`/`/`
+/// bytes in the path, `pchar`/`/`/`?` bytes after the first `?`, and `%` only
+/// as `%XX` percent-escapes. A fragment is not part of a request-target, so a
+/// raw `#` is rejected in both parts.
+pub fn is_valid_path_and_query(s: &str) -> bool {
+  s.starts_with('/') && valid_pq_bytes(s.bytes(), false)
+}
+
+/// Validates bare query bytes (everything after the `?`) under the same
+/// grammar — for the absolute-form `http://host?q` shape, whose path-and-query
+/// `/?q` is assembled positionally rather than borrowed.
+pub fn is_valid_query(s: &str) -> bool {
+  valid_pq_bytes(s.bytes(), true)
+}
+
+/// RFC 3986 §3.2.2 `reg-name` byte: unreserved / sub-delims (pct-escapes
+/// handled by the caller). URI delimiters (`/ ? # @ :`) are NOT host bytes.
+const fn is_reg_name_byte(b: u8) -> bool {
+  matches!(b,
+    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+    | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=')
+}
+
+/// Validates a `Host:` value / authority-form target against the RFC 3986
+/// §3.2.2 authority grammar (no userinfo, per RFC 9110 §7.2): a `reg-name` or a
+/// bracketed IP-literal, then an optional `":" *DIGIT` port. An authority is
+/// not a URL — `/`, `?`, `#`, `@`, whitespace, and controls are all out.
+///
+/// Non-empty-strict: an empty string is rejected here. RFC 9112 §3.2 does allow
+/// an EMPTY `Host` field value for a target that carries no authority, and that
+/// allowance is applied by the message-validation layer, which short-circuits
+/// an empty value as legal before calling this.
+pub fn is_valid_authority(s: &str) -> bool {
+  let port = match s.strip_prefix('[') {
+    // IP-literal: a real IPv6address or IPvFuture (RFC 3986 §3.2.2) — a
+    // byte filter is not enough (`[127.0.0.1]` and `[::::]` are not
+    // addresses; `[v1.a]` is).
+    Some(rest) => {
+      let Some((lit, after)) = rest.split_once(']') else {
+        return false;
+      };
+      if !is_valid_ipv6(lit) && !is_valid_ipvfuture(lit) {
+        return false;
+      }
+      if after.is_empty() {
+        return true;
+      }
+      let Some(port) = after.strip_prefix(':') else {
+        return false;
+      };
+      port
+    }
+    // reg-name [":" port] — a reg-name carries no `:`, so the LAST colon
+    // starts the port and any earlier colon fails the byte check below.
+    None => {
+      let (host, port) = match s.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => (s, ""),
+      };
+      if host.is_empty() {
+        return false;
+      }
+      let mut pending_hex: u8 = 0;
+      for b in host.bytes() {
+        if pending_hex > 0 {
+          if !b.is_ascii_hexdigit() {
+            return false;
+          }
+          pending_hex = pending_hex.saturating_sub(1);
+          continue;
+        }
+        match b {
+          b'%' => pending_hex = 2,
+          _ if is_reg_name_byte(b) => {}
+          _ => return false,
+        }
+      }
+      if pending_hex > 0 {
+        return false;
+      }
+      port
+    }
+  };
+  // `port = *DIGIT` — empty is grammatically legal ("example.com:").
+  port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// RFC 3986 `IPv6address`: up to 8 16-bit hex groups, at most one `::`
+/// compression (standing for one or more zero groups), optionally an
+/// IPv4 dotted-quad as the last two groups.
+fn is_valid_ipv6(s: &str) -> bool {
+  let (head, tail, compressed) = match s.split_once("::") {
+    Some((head, tail)) => {
+      if tail.contains("::") {
+        return false; // a second `::`
+      }
+      (head, tail, true)
+    }
+    None => (s, "", false),
+  };
+  // Counts the h16 groups in one side; a trailing dotted-quad counts as 2.
+  let count_groups = |part: &str, v4_may_end: bool| -> Option<usize> {
+    if part.is_empty() {
+      return Some(0);
+    }
+    let mut n = 0usize;
+    let mut groups = part.split(':').peekable();
+    while let Some(group) = groups.next() {
+      let last = groups.peek().is_none();
+      if group.is_empty() {
+        return None; // `:` at an edge, or `:::`
+      }
+      if last && v4_may_end && group.contains('.') {
+        if !is_valid_ipv4(group) {
+          return None;
+        }
+        n = n.saturating_add(2);
+      } else {
+        if group.len() > 4 || !group.bytes().all(|b| b.is_ascii_hexdigit()) {
+          return None;
+        }
+        n = n.saturating_add(1);
+      }
+    }
+    Some(n)
+  };
+  // Without compression the dotted-quad (if any) ends the whole address —
+  // i.e. it sits at the end of `head`; with compression it ends `tail`.
+  let Some(head_groups) = count_groups(head, !compressed) else {
+    return false;
+  };
+  let Some(tail_groups) = count_groups(tail, true) else {
+    return false;
+  };
+  let total = head_groups.saturating_add(tail_groups);
+  if compressed {
+    total <= 7 // `::` expands to at least one more group
+  } else {
+    total == 8
+  }
+}
+
+/// RFC 3986 `dec-octet` ×4: 0–255, no leading zeros.
+fn is_valid_ipv4(s: &str) -> bool {
+  let mut octets = 0usize;
+  for octet in s.split('.') {
+    octets = octets.saturating_add(1);
+    if octet.is_empty()
+      || octet.len() > 3
+      || !octet.bytes().all(|b| b.is_ascii_digit())
+      || (octet.len() > 1 && octet.starts_with('0'))
+    {
+      return false;
+    }
+    match octet.parse::<u16>() {
+      Ok(v) if v <= 255 => {}
+      _ => return false,
+    }
+  }
+  octets == 4
+}
+
+/// RFC 3986 `IPvFuture`: `v` 1*HEXDIG `.` 1*(unreserved / sub-delims / ":")
+/// (ABNF literals are case-insensitive, so `V` matches too).
+fn is_valid_ipvfuture(s: &str) -> bool {
+  let Some(rest) = s.strip_prefix(['v', 'V']) else {
+    return false;
+  };
+  let Some((version, tail)) = rest.split_once('.') else {
+    return false;
+  };
+  !version.is_empty()
+    && version.bytes().all(|b| b.is_ascii_hexdigit())
+    && !tail.is_empty()
+    && tail.bytes().all(|b| is_reg_name_byte(b) || b == b':')
+}
+
+fn valid_pq_bytes(bytes: impl Iterator<Item = u8>, mut in_query: bool) -> bool {
+  let mut pending_hex: u8 = 0;
+  for b in bytes {
+    if pending_hex > 0 {
+      if !b.is_ascii_hexdigit() {
+        return false;
+      }
+      pending_hex = pending_hex.saturating_sub(1);
+      continue;
+    }
+    match b {
+      b'%' => pending_hex = 2,
+      b'?' if !in_query => in_query = true,
+      b'?' => {} // additional `?` is legal query data (RFC 3986 §3.4)
+      _ if is_path_byte(b) => {}
+      _ => return false,
+    }
+  }
+  pending_hex == 0
+}
+
+/// Skips RFC 9110 §5.6.3 `OWS` (and `BWS`, which §5.6.3 defines as the same
+/// bytes) from `at`, returning where the next element begins.
+pub(crate) fn skip_ows(value: &[u8], at: usize) -> usize {
+  let mut at = at;
+  while matches!(value.get(at), Some(b' ' | b'\t')) {
+    at = at.saturating_add(1);
+  }
+  at
+}
+
+/// The end of the RFC 9110 §5.6.2 `token` starting at `at`, or `None` when there
+/// is not one — `token = 1*tchar`, so an empty run is not a token.
+pub(crate) fn token_end(value: &[u8], at: usize) -> Option<usize> {
+  let mut end = at;
+  while value.get(end).copied().is_some_and(is_token_byte) {
+    end = end.saturating_add(1);
+  }
+  (end > at).then_some(end)
+}
+
+/// Where a RFC 9110 §5.6.4 `quoted-string` scan got to.
+///
+/// [`Open`](Self::Open) exists because a field's value may arrive as several
+/// field lines: RFC 9110 §5.2 makes them ONE value joined by commas, and a comma
+/// inside a quoted-string is DATA — so a string opened on one line legitimately
+/// continues into the next, with the join's comma as one of its characters. A
+/// scanner that restarted at each physical line would call that value
+/// unterminated and derive the wrong facts from it.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum QuotedScan {
+  /// The string closed; the offset is just past its DQUOTE.
+  Closed(usize),
+  /// The input ended with the string still open.
+  Open {
+    /// The last byte was a backslash whose escaped byte has not arrived, so the
+    /// NEXT byte is data whatever it is — including a DQUOTE, which must not be
+    /// read as the close.
+    escape: bool,
+  },
+  /// A byte §5.6.4's grammar forbids inside a quoted-string.
+  Invalid,
+}
+
+/// RFC 9110 §5.2's separator, as a value: the field lines of one field are
+/// "concatenated in order, with each field line value separated by a comma".
+///
+/// One comma and nothing else. §5.3 lets a recipient add OWS "for consistency"
+/// when it REWRITES a section, but the combined VALUE §5.2 defines has none, and
+/// a parser that invented one would put a space inside a quoted string that
+/// spans the join.
+const JOIN: &[u8] = b",";
+
+/// Resumes a §5.6.4 quoted-string left open by the previous field line, at the
+/// first byte of the NEXT one.
+///
+/// The separator is fed THROUGH the open string first, and that is the whole
+/// point of the function: inside a quoted-string §5.2's comma is `qdtext` — or,
+/// when the previous line ended on a backslash, it is the character that
+/// `quoted-pair` escapes. Resuming at the next line's first byte with the
+/// pending escape still set hands that escape to the wrong character, so
+/// `p="a\` + `", chunked` (a legal value: the backslash escapes the join comma
+/// and the quote then closes) was read as unterminated, and `p="a\` +
+/// `\", chunked` (unterminated: the backslash escapes the quote) was read as a
+/// closed string with a final `chunked` behind it. Either way the two ends
+/// disagree about where the message stops.
+///
+/// Written as a scan of the actual separator rather than as the constant it
+/// works out to, so the reasoning is not something a later reader has to
+/// reconstruct — and so it stays correct if `JOIN` ever changes.
+pub(crate) fn scan_quoted_after_join(value: &[u8], escape: bool) -> QuotedScan {
+  match scan_quoted(JOIN, 0, escape) {
+    // The only reachable arm: one comma is data inside a quoted-string whether
+    // or not an escape was pending, so the string is still open at the start of
+    // the next line — with no escape left over, because the comma consumed it.
+    QuotedScan::Open { escape } => scan_quoted(value, 0, escape),
+    // Unreachable for a lone comma, and answered rather than asserted away.
+    settled => settled,
+  }
+}
+
+/// Scans the INTERIOR of a §5.6.4 quoted-string from `at`, given whether the
+/// previous byte was an unconsumed backslash.
+///
+/// ```text
+/// quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+/// qdtext        = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+/// quoted-pair   = "\" ( HTAB / SP / VCHAR / obs-text )
+/// ```
+///
+/// `qdtext` deliberately excludes DQUOTE and the backslash, which is why each is
+/// reached only through its own arm: `"a\"b"` is ONE string containing a quote,
+/// and a reader that stopped at the second DQUOTE would resume parsing inside
+/// quoted data.
+pub(crate) fn scan_quoted(value: &[u8], at: usize, escape: bool) -> QuotedScan {
+  let mut at = at;
+  let mut escape = escape;
+  loop {
+    let Some(&byte) = value.get(at) else {
+      return QuotedScan::Open { escape };
+    };
+    at = at.saturating_add(1);
+    if escape {
+      // `quoted-pair`: this byte is data whatever it is.
+      if !(byte == b'\t' || byte == b' ' || is_field_vchar(byte)) {
+        return QuotedScan::Invalid;
+      }
+      escape = false;
+      continue;
+    }
+    match byte {
+      b'"' => return QuotedScan::Closed(at),
+      b'\\' => escape = true,
+      b if b == b'\t' || b == b' ' || is_field_vchar(b) => {}
+      _ => return QuotedScan::Invalid,
+    }
+  }
+}
+
+/// The end of the §5.6.4 `quoted-string` whose opening DQUOTE is at `at`, or
+/// `None` when it is unterminated within this input or carries a forbidden byte.
+///
+/// The single-value convenience over [`scan_quoted`], for the callers that have
+/// the whole value in hand.
+pub(crate) fn quoted_string_end(value: &[u8], at: usize) -> Option<usize> {
+  if value.get(at) != Some(&b'"') {
+    return None;
+  }
+  match scan_quoted(value, at.saturating_add(1), false) {
+    QuotedScan::Closed(end) => Some(end),
+    QuotedScan::Open { .. } | QuotedScan::Invalid => None,
+  }
+}
+
+/// The end of one top-level element of a `#`-list starting at `at`, respecting
+/// quoted-strings.
+///
+/// The whole reason this is not `split(b',')`: RFC 9110 §5.6.1's list construct
+/// separates elements with commas, but a comma INSIDE a §5.6.4 quoted-string is
+/// data. A splitter that cuts there turns one element into two, and for a
+/// parameterised list that can invent a coding the sender never named — which is
+/// two recipients disagreeing about where the message ends (RFC 9112 §11.1).
+///
+/// `None` when a quoted-string in the element is unterminated or malformed, which
+/// makes the whole field unusable rather than silently truncated.
+pub(crate) fn list_element_end(value: &[u8], at: usize) -> Option<usize> {
+  let mut at = at;
+  loop {
+    match value.get(at) {
+      None | Some(b',') => return Some(at),
+      Some(b'"') => at = quoted_string_end(value, at)?,
+      Some(_) => at = at.saturating_add(1),
+    }
+  }
+}
+
+/// What one field-line value is, as a list, to a SENDER.
+///
+/// Three answers rather than two, because "no empty element" is a fact ABOUT a
+/// list and a value whose §5.6.4 quoted-string never closes is not one — there
+/// is no element boundary in it to call empty or full. Folding the two together
+/// reported an unterminated quote as §5.6.1.1's empty element, which named a
+/// rule the caller had not broken.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListShape {
+  /// `1#element` with every element present.
+  Sendable,
+  /// A leading comma, a trailing one, two in a row, or an empty value: RFC 9110
+  /// §5.6.1.1's "a sender MUST NOT generate empty list elements".
+  EmptyElement,
+  /// Not a list at all — a quoted-string opens and never closes, so the value
+  /// ends inside one and its commas were never separators.
+  Unparseable,
+}
+
+/// The SHAPE of a list a sender proposes to generate.
+///
+/// RFC 9110 §5.6.1.1: "in any production that uses the list construct, a sender
+/// MUST NOT generate empty list elements", i.e. `1#element => element *( OWS ","
+/// OWS element )`. So no leading comma, no trailing comma, no two in a row, and
+/// not an empty value.
+///
+/// The counterpart to [`list_elements`], which DROPS empty elements because
+/// §5.6.1.2 makes a recipient ignore them. Recipient tolerance is not a licence
+/// to emit: this core reads `,chunked` and writes it never. Quote-aware, so a
+/// comma inside a §5.6.4 quoted-string is data here too.
+///
+/// This checks the list's SHAPE. What each element must BE is the field's own
+/// grammar, checked beside it.
+pub(crate) fn sender_list_shape(value: &[u8]) -> ListShape {
+  let mut at = 0usize;
+  loop {
+    let Some(end) = list_element_end(value, at) else {
+      return ListShape::Unparseable;
+    };
+    if trim_ows(value.get(at..end).unwrap_or_default()).is_empty() {
+      return ListShape::EmptyElement;
+    }
+    if value.get(end).is_none() {
+      return ListShape::Sendable;
+    }
+    at = end.saturating_add(1);
+  }
+}
+
+/// SENDER side: every non-empty member of this value is a bare RFC 9110 §5.6.2
+/// `token`, and the value names at least one.
+///
+/// RFC 9110 §7.6.1's `connection-option = token` admits no argument, no
+/// parameter and no quoted-string, so anything else means the value is not a
+/// `Connection` header — and this core will not write one whose meaning a
+/// recipient cannot read.
+pub(crate) fn is_sender_token_list(value: &[u8]) -> bool {
+  let mut at = 0usize;
+  let mut named = false;
+  loop {
+    at = skip_ows(value, at);
+    if !matches!(value.get(at), None | Some(b',')) {
+      let Some(end) = token_end(value, at) else {
+        return false;
+      };
+      named = true;
+      at = skip_ows(value, end);
+      if !matches!(value.get(at), None | Some(b',')) {
+        return false;
+      }
+    }
+    if value.get(at).is_none() {
+      return named;
+    }
+    at = at.saturating_add(1);
+  }
+}
+
+/// RFC 9110 §10.1.1's `Expect`, parsed as ONE value across every field line of
+/// the section.
+///
+/// ```text
+/// Expect      = #expectation
+/// expectation = token [ "=" ( token / quoted-string ) parameters ]
+/// parameters  = *( OWS ";" OWS [ parameter ] )        ; §5.6.6
+/// parameter   = parameter-name "=" parameter-value
+/// ```
+///
+/// Note WHERE the brackets are: `parameters` sits INSIDE the optional group, so
+/// a member carrying a parameter without an argument (`ext;flag`) is not an
+/// `expectation` at all. Note also what is absent: `parameter` has no BWS around
+/// its `=`, unlike §7's `transfer-parameter`, so `ext = value` is not one
+/// either. Both were accepted by the per-line sender check this replaces.
+///
+/// ONE parser for BOTH directions, with the two roles taking different facts out
+/// of the same parse — the shape this crate settled on for every field it
+/// interprets. A recipient reads §5.6.1.2's tolerance of empty elements and
+/// §10.1.1's 417 for a member it cannot parse; a sender reads §5.6.1.1's
+/// prohibition and is refused outright. Neither re-walks the value with rules of
+/// its own, and neither can disagree with the other about what the value SAYS.
+///
+/// Every fact is PROVISIONAL until the whole combined value has been pushed:
+/// `100-continue` is derived by [`expects_continue`](Self::expects_continue),
+/// which asks [`parsed`](Self::parsed) first. Committing the fact the moment one
+/// member parsed is what let `Expect: 100-continue, @` — a value that fails the
+/// field's grammar — still deliver the ask.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct Expectations {
+  /// A `quoted-string` still open when the last field line ended, carrying the
+  /// escape state §5.2's join comma will be fed through.
+  open: Option<bool>,
+  /// PROVISIONAL: some member parsed WHOLE as the bare `100-continue`.
+  bare: bool,
+  /// PROVISIONAL: some member parsed and was not that.
+  other: bool,
+  /// Some member did not parse, so nothing may be derived from the value.
+  malformed: bool,
+  /// Some element of the COMBINED list was empty — §5.6.1.1's prohibition for a
+  /// sender, §5.6.1.2's "parse and ignore" for a recipient.
+  saw_empty: bool,
+  /// The parse is positioned where an element must appear: at the start, and
+  /// after every comma. True at the end of the value means a trailing empty
+  /// element.
+  expecting: bool,
+  /// Some field line was pushed, so the field is PRESENT. Distinguishes "the
+  /// caller stated `Expect:` with nothing in it" from "the caller stated no
+  /// `Expect` at all", which are the same accumulator otherwise.
+  present: bool,
+  /// Some member parsed. §5.6.1.1's `1#element` needs one.
+  any: bool,
+}
+
+/// Where parsing one member's `parameters` got to.
+enum Params {
+  /// Ended at this offset.
+  Ended(usize),
+  /// A quoted parameter value is open and continues on the next field line.
+  Suspended,
+  /// The member does not parse.
+  Malformed,
+}
+
+impl Default for Expectations {
+  /// The `Default` a `KeyFields` derives, which is [`new`](Self::new) rather
+  /// than a field-wise zero: `expecting` starts TRUE, and a derived default
+  /// would start the parse in the middle of a list it has not seen.
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Expectations {
+  pub(crate) const fn new() -> Self {
+    Self {
+      open: None,
+      bare: false,
+      other: false,
+      malformed: false,
+      saw_empty: false,
+      // `#element` starts where an element may appear, so an entirely empty
+      // value ends there too — which is exactly the empty element §5.6.1.1
+      // forbids a sender to generate.
+      expecting: true,
+      present: false,
+      any: false,
+    }
+  }
+
+  /// Whether the whole combined value parsed.
+  ///
+  /// A string still open when the LAST line ended is not parsed either: §5.2 has
+  /// no further line to continue it with.
+  pub(crate) const fn parsed(&self) -> bool {
+    !self.malformed && self.open.is_none()
+  }
+
+  /// RFC 9110 §10.1.1's one defined expectation, derived only from a value that
+  /// parsed whole.
+  pub(crate) const fn expects_continue(&self) -> bool {
+    self.parsed() && self.bare
+  }
+
+  /// Whether the value states an expectation this core does not implement —
+  /// §10.1.1's 417.
+  ///
+  /// A value that did not parse counts as one: §10.1.1 makes an unrecognised
+  /// expectation a 417 rather than a framing fault, so a recipient answers
+  /// rather than failing the connection.
+  pub(crate) const fn has_other(&self) -> bool {
+    !self.parsed() || self.other
+  }
+
+  /// SENDER side: the field is present and some element of it is empty
+  /// (§5.6.1.1), counting a value that names nothing at all.
+  pub(crate) const fn empty_element(&self) -> bool {
+    // `parsed` first: an element BOUNDARY is a fact about a value that parsed,
+    // and a value ending inside an open `quoted-string` has none to call empty.
+    // Reporting one as §5.6.1.1's empty element named a rule the caller had not
+    // broken — the same confusion `ListShape::Unparseable` exists to prevent.
+    self.present && self.parsed() && (self.saw_empty || self.expecting)
+  }
+
+  /// SENDER side: the field is present and did not parse.
+  pub(crate) const fn grammar_fault(&self) -> bool {
+    self.present && !self.parsed()
+  }
+
+  /// Folds one `Expect` field line into the value.
+  pub(crate) fn push(&mut self, value: &[u8]) {
+    if self.malformed {
+      // Nothing further may be derived from a value that did not parse.
+      return;
+    }
+    let joined = self.present;
+    self.present = true;
+    let mut at = 0usize;
+    match self.open.take() {
+      Some(escape) => match scan_quoted_after_join(value, escape) {
+        QuotedScan::Open { escape } => {
+          self.open = Some(escape);
+          return;
+        }
+        QuotedScan::Invalid => {
+          self.malformed = true;
+          return;
+        }
+        QuotedScan::Closed(end) => match self.parameters(value, end) {
+          Params::Ended(next) => match self.end_member(value, next) {
+            Some(next) => at = next,
+            None => return,
+          },
+          Params::Suspended => return,
+          Params::Malformed => {
+            self.malformed = true;
+            return;
+          }
+        },
+      },
+      // Not inside a string: §5.2's comma is the SEPARATOR, so it opens a new
+      // element — and if one was already expected, the element between the two
+      // commas is empty.
+      None if joined => {
+        self.saw_empty |= self.expecting;
+        self.expecting = true;
+      }
+      None => {}
+    }
+
+    loop {
+      at = skip_ows(value, at);
+      match value.get(at) {
+        // The end of this field line. Whether an element is still expected is
+        // answered by the NEXT line's join, or by `empty_element` if there is
+        // no next line.
+        None => return,
+        Some(b',') => {
+          self.saw_empty |= self.expecting;
+          self.expecting = true;
+          at = at.saturating_add(1);
+          continue;
+        }
+        Some(_) => {}
+      }
+      let Some(name_end) = token_end(value, at) else {
+        self.malformed = true;
+        return;
+      };
+      let bare = eq_ignore_ascii(value.get(at..name_end).unwrap_or_default(), "100-continue");
+      at = name_end;
+      // `[ "=" ( token / quoted-string ) parameters ]`. The `=` is IMMEDIATE:
+      // §10.1.1's production has neither OWS nor BWS around it, and a member
+      // carrying a parameter and no argument is not an `expectation`.
+      if value.get(at) == Some(&b'=') {
+        // Whatever the argument turns out to be, this member is not the bare
+        // token §10.1.1 defines.
+        self.other = true;
+        let argument = at.saturating_add(1);
+        match self.argument(value, argument) {
+          Params::Ended(next) => at = next,
+          Params::Suspended => {
+            self.expecting = false;
+            return;
+          }
+          Params::Malformed => {
+            self.malformed = true;
+            return;
+          }
+        }
+        match self.parameters(value, at) {
+          Params::Ended(next) => at = next,
+          Params::Suspended => {
+            self.expecting = false;
+            return;
+          }
+          Params::Malformed => {
+            self.malformed = true;
+            return;
+          }
+        }
+      } else if bare {
+        self.bare = true;
+      } else {
+        self.other = true;
+      }
+      match self.end_member(value, at) {
+        Some(next) => at = next,
+        None => return,
+      }
+    }
+  }
+
+  /// One `( token / quoted-string )`, which is both an argument and a
+  /// `parameter-value`.
+  fn argument(&mut self, value: &[u8], at: usize) -> Params {
+    if value.get(at) != Some(&b'"') {
+      return match token_end(value, at) {
+        Some(end) => Params::Ended(end),
+        None => Params::Malformed,
+      };
+    }
+    match scan_quoted(value, at.saturating_add(1), false) {
+      QuotedScan::Closed(end) => Params::Ended(end),
+      QuotedScan::Open { escape } => {
+        self.open = Some(escape);
+        Params::Suspended
+      }
+      QuotedScan::Invalid => Params::Malformed,
+    }
+  }
+
+  /// `parameters = *( OWS ";" OWS [ parameter ] )`.
+  fn parameters(&mut self, value: &[u8], at: usize) -> Params {
+    let mut at = at;
+    loop {
+      let semicolon = skip_ows(value, at);
+      if value.get(semicolon) != Some(&b';') {
+        return Params::Ended(at);
+      }
+      at = skip_ows(value, semicolon.saturating_add(1));
+      let Some(name_end) = token_end(value, at) else {
+        // `[ parameter ]`: §5.6.6 admits an empty one.
+        at = semicolon.saturating_add(1);
+        continue;
+      };
+      // `parameter = parameter-name "=" parameter-value`: the `=` is required
+      // and immediate.
+      if value.get(name_end) != Some(&b'=') {
+        return Params::Malformed;
+      }
+      match self.argument(value, name_end.saturating_add(1)) {
+        Params::Ended(end) => at = end,
+        suspended_or_bad => return suspended_or_bad,
+      }
+    }
+  }
+
+  /// The tail every member shares: `#rule` puts OWS and a comma — or the end of
+  /// the value — after one, and nothing else.
+  fn end_member(&mut self, value: &[u8], at: usize) -> Option<usize> {
+    let at = skip_ows(value, at);
+    if !matches!(value.get(at), None | Some(b',')) {
+      self.malformed = true;
+      return None;
+    }
+    self.any = true;
+    self.expecting = false;
+    Some(at)
+  }
+}
+
+/// RFC 9110 §7.8 `Upgrade = #protocol`, asked as a SENDER: this one field-line
+/// value names at least one protocol and every element of it is well formed.
+///
+/// Per LINE, and strict about empty elements, because that is what §5.6.1.1
+/// requires of a sender: "in any production that uses the list construct, a
+/// sender MUST NOT generate empty list elements". A caller handing this core an
+/// `Upgrade:` with nothing in it is asking it to put an empty element on the
+/// wire, and this refuses.
+///
+/// The RECIPIENT side is [`lists_a_protocol`], and it is deliberately more
+/// tolerant. The two are not an inconsistency: §5.6.1.1 and §5.6.1.2 are
+/// adjacent sections stating opposite MUSTs for the two roles, and this core
+/// implements both.
+pub(crate) fn is_protocol_list(value: &[u8]) -> bool {
+  let mut named = false;
+  for element in list_elements(value) {
+    if !is_protocol(element) {
+      return false;
+    }
+    named = true;
+  }
+  named
+}
+
+/// The same production asked as a RECIPIENT, over the COMBINED value of every
+/// `Upgrade` field line the message carried.
+///
+/// RFC 9110 §5.2 makes repeated field lines one comma-separated list, so the
+/// question can only be answered once, over all of them — a per-line reading
+/// splits one list into several and asks each to satisfy the whole grammar. For
+/// `Upgrade:` followed by `Upgrade: websocket` the combined value is
+/// `, websocket`, which §5.6.1.2's own examples make VALID: it shows
+/// `"foo , ,bar,charlie"` as a legal `1#element` and only `""`, `","` and
+/// `",   ,"` as invalid, "since at least one non-empty element is required".
+///
+/// So the cardinality is global. Empty elements never contribute to it —
+/// "a recipient MUST parse and ignore a reasonable number of empty list
+/// elements", which [`list_elements`] does by dropping them — while a
+/// NON-empty element that is not a `protocol` still fails the list.
+pub(crate) fn lists_a_protocol<'a>(values: impl Iterator<Item = &'a [u8]>) -> bool {
+  let mut named = false;
+  for value in values {
+    for element in list_elements(value) {
+      if !is_protocol(element) {
+        return false;
+      }
+      named = true;
+    }
+  }
+  named
+}
+
+/// RFC 9110 §7.8 `protocol = protocol-name ["/" protocol-version]`, both of them
+/// `token`s (§5.6.2).
+fn is_protocol(element: &[u8]) -> bool {
+  match element.iter().position(|&b| b == b'/') {
+    Some(at) => match (element.get(..at), element.get(at.saturating_add(1)..)) {
+      (Some(name), Some(version)) => is_token(name) && is_token(version),
+      _ => false,
+    },
+    None => is_token(element),
+  }
+}
+
+#[cfg(test)]
+mod tests;
