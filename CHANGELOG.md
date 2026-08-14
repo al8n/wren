@@ -1,5 +1,94 @@
 # UNRELEASED
 
+## `http1-proto` — cycle 5 (Sans-I/O HTTP/1.1 core)
+
+A hand-rolled Sans-I/O HTTP/1.1 message and connection core — no_std +
+no-alloc capable, with no buffer, clock, or allocator of its own. PR1 of the
+cycle: the standalone crate. PR2 re-bases `websocket-proto`'s h1 handshake onto
+it.
+
+### What it is
+
+- **Scope**: RFC 9110 / RFC 9112 as a complete message and connection layer —
+  grammar, both start lines, a resumable bounded head scanner, the §6.3 body
+  framing decision list, counted / chunked / read-to-close bodies, validated
+  encoders, and a connection state machine for both roles. Not a router, a URI
+  resolver, a cache, or a content codec: it reports what the message says and
+  refuses what the RFCs make unframable.
+
+### Codec leaves (panic-free)
+
+- **Grammar** (RFC 9110 §5.6): `token` / `field-value` over raw bytes
+  (`field-vchar = VCHAR / obs-text`, interior SP/HTAB, OWS-trimmed, CTLs
+  rejected), the RFC 3986 target validators, and the §5.6.1 list splitter.
+- **Start lines** (RFC 9112 §3, §4): all four §3.2 request-target forms with
+  method pairing; single-SP separators only; case-sensitive `HTTP-version`,
+  higher 1.x minor processed as 1.1 (RFC 9110 §6.2), other majors → 505.
+- **Head scanner** (RFC 9112 §2.1, §5): **resumable** — it carries a watermark
+  rather than restarting, so a head arriving one byte at a time is O(N) not
+  O(N²). `MAX_HEAD_BYTES = 16384`, `MAX_HEADERS = 64`, and at most 4 leading
+  empty lines server-side; an over-long request-line is 414, an over-large
+  field section 431.
+- **Lazy head view**: fields walked out of the borrowed block on demand — no
+  table, no copies — with case-insensitive lookup and repeated-line iteration.
+- **Chunked** (RFC 9112 §7.1): overflow-guarded `1*HEXDIG` size, no whitespace
+  after it, `1*("0")` last-chunk, grammar-checked `chunk-ext` under a 256-byte
+  per-line cap, trailer section surfaced separately and never merged.
+- **Encoders**: heads and chunk framing written into a caller slice with exact
+  sizing, no partial writes, and refusal of anything a parser would reject.
+
+### Connection state machine
+
+- `Connection<Client | Server, General | Tunnel>`: the mode is a **compile-time
+  type-state**, not a runtime flag — a General connection cannot be asked to
+  switch protocols, and a Tunnel connection cannot be asked to stream
+  exchanges.
+- **General**: `handle(input) -> Items` lends borrowed
+  `Item::{Head, BodyChunk, Trailer, ExchangeComplete, ExpectContinue}` naming
+  their `ExchangeId`; the core holds no buffer, so `Items::consumed()` is the
+  driver's cursor into its own append-only accumulation. Keep-alive re-arm,
+  pipelining tolerance (RFC 9112 §9.3.2), 1xx interim, `Expect: 100-continue`,
+  HTTP/1.0 fallback, close-delimited responses, §9.6 draining.
+- **Readiness split**: `wants_read()` / `is_awaiting_send()` — the two disjoint
+  answers to why the items ran out, which `Ok(None)` alone cannot give.
+- **Send side**: `open_request`, `send_response`, `send_interim`, `send_body`,
+  `finish_body`, and the single RFC-mandated `send_error_response` owed after a
+  violation (injects `close`, refuses a contradicting caller field). RFC 9112
+  §3.2's `Host` is enforced outbound as well as inbound: every request path
+  (CONNECT included) refuses a section that states none, and writes nothing.
+- **Tunnel**: one switch — RFC 9110 §7.8 `Upgrade` or §9.3.6 `CONNECT`, at
+  either end — reporting the **leftover** that belongs to the new protocol, and
+  enforcing a 100 before a 101 when both were asked for.
+- **Errors**: a byte offset on every violation and a `SuggestedStatus`
+  (400 / 414 / 431 / 501 / 505) wherever a server would answer.
+
+### Tiers
+
+| Cargo features | Heap | Target |
+|---|---|---|
+| `default` (`std`) | yes | any std platform |
+| `alloc` | yes | WASM, embedded with allocator |
+| `no-atomic` | yes (no atomic CAS) | `thumbv6m-none-eabi` |
+| _(none)_ | **no** | `thumbv6m-none-eabi`, `thumbv7em-none-eabihf` |
+
+### Tooling
+
+- **no-panic link test** (`tests/no_panic.rs`): shims over `find_head_end`,
+  `parse_status_line` and `parse_chunk_size`, plus four release smokes.
+  Requires `--release` **and fat LTO** — the shims call across the crate
+  boundary, so the default thin-local LTO false-positives on all of them; CI
+  sets `CARGO_PROFILE_RELEASE_LTO=fat` on that step.
+- **httparse differential oracle** (`tests/differential.rs`): never more
+  permissive than `httparse`; every divergence adjudicated in-file and the
+  allowlists checked for stale entries.
+- **Request-smuggling corpus** (`tests/smuggling.rs`): each named vector, accept
+  and reject side.
+- **Split-robustness property** (`tests/split_robustness.rs`): where the
+  transport cut the stream cannot change what the connection says about it, over
+  one shot / byte-at-a-time / every single cut / proptest multi-cut vectors.
+- **254 tests** at `--all-features`, green on every tier and under
+  `cargo hack test --each-feature`.
+
 ## `http3-proto` — cycle 4 (Sans-I/O HTTP/3 tunnel core)
 
 A novel hand-rolled Sans-I/O HTTP/3 Extended-CONNECT tunnel core for Rust —

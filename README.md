@@ -28,6 +28,8 @@ The crates split protocol logic from I/O, mirroring the `quinn` layering:
 | Crate | Role |
 |-------|------|
 | [`websocket-proto`](websocket-proto) | Sans-I/O protocol state machines (`no_std`-capable, panic-free) |
+| [`http1-proto`](http1-proto) | Sans-I/O HTTP/1.1 connection state machine — RFC 9110 / 9112 (`no_std`-capable, panic-free) |
+| [`http3-proto`](http3-proto) | Sans-I/O HTTP/3 Extended-CONNECT tunnel core — RFC 9114 / 9204 / 9220 (`no_std`-capable, panic-free) |
 | `wren` *(planned)* | batteries-included facade (core + default driver) |
 | [`wren-reactor`](wren-reactor) | runtime-agnostic async h1 driver (`tokio` & `smol`) — split-transport full duplex, `tls`/`deflate` |
 | [`wren-compio`](wren-compio) | `compio` (thread-per-core) async h1 driver — client + server, `tls`/`deflate` |
