@@ -61,6 +61,11 @@ jobs:
       - run: cargo clippy -p websocket-proto --no-default-features --features alloc -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features deflate -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features no-atomic -- -D warnings
+      - run: cargo clippy -p http1-proto --no-default-features -- -D warnings
+      - run: cargo clippy -p http1-proto --no-default-features --features alloc -- -D warnings
+      # http1-proto carries websocket-proto's `no-atomic` tier (http3-proto has
+      # no such feature), so the lint wall is checked on it too.
+      - run: cargo clippy -p http1-proto --no-default-features --features no-atomic -- -D warnings
       - run: cargo clippy -p http3-proto --no-default-features -- -D warnings
       - run: cargo clippy -p http3-proto --no-default-features --features alloc -- -D warnings
 
@@ -86,6 +91,8 @@ jobs:
           tool: cargo-hack
       - run: cargo hack build -p websocket-proto --each-feature
       - run: cargo hack test -p websocket-proto --each-feature
+      - run: cargo hack build -p http1-proto --each-feature
+      - run: cargo hack test -p http1-proto --each-feature
       - run: cargo hack build -p http3-proto --each-feature
       - run: cargo hack test -p http3-proto --each-feature
       - run: cargo hack test -p wren-trace --each-feature
@@ -109,6 +116,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p websocket-proto --all-features
+      - run: cargo test -p http1-proto --all-features
       - run: cargo test -p http3-proto --all-features
       - run: cargo test -p wren-trace --all-features
       - run: cargo test -p wren-compio --all-features
@@ -137,6 +145,24 @@ jobs:
       # combo — deflate's `alloc` dependency drags the atomic-CAS backends in,
       # defeating the tier. lib.rs raises a compile_error!; pin that it fires.
       - run: "! cargo check -p websocket-proto --no-default-features --features no-atomic,deflate 2>/dev/null"
+      # http1-proto bare tier: no std, no alloc — the start-line codecs, the head
+      # scanner, the body/chunked decoders and the Connection state machine must
+      # compile without an allocator. The `const _: () = assert!(…)` size bounds
+      # on `Connection` and `HeadView` are unconditional, so these checks are
+      # also where they are evaluated for a 32-bit `usize`.
+      - run: cargo check -p http1-proto --no-default-features --target thumbv7em-none-eabihf
+      - run: cargo check -p http1-proto --no-default-features --target thumbv6m-none-eabi
+      - run: cargo check -p http1-proto --no-default-features --features alloc --target thumbv7em-none-eabihf
+      - run: cargo check -p http1-proto --no-default-features --features alloc --target wasm32-unknown-unknown
+      # The `no-atomic` tier, checked on the core that motivates it — mirroring
+      # websocket-proto above. http3-proto has no such feature, so nothing here
+      # corresponds to it.
+      - run: cargo check -p http1-proto --no-default-features --features no-atomic --target thumbv6m-none-eabi
+      # Run the bare tier on the host (x86_64), the same reason as http3-proto's
+      # `--test tiers` below: a cross-compiled target cannot execute tests in CI
+      # without QEMU. http1-proto has no separate tier smoke — its whole suite is
+      # tier-agnostic and runs at `--no-default-features`, so that IS the smoke.
+      - run: cargo test -p http1-proto --no-default-features
       # http3-proto bare tier: no std, no alloc — varint/frame/QPACK codecs and
       # the Connection state machine must compile without any allocator.
       - run: cargo check -p http3-proto --no-default-features --target thumbv7em-none-eabihf
@@ -169,11 +195,28 @@ jobs:
           # syscalls miri's isolation rejects. Disabling isolation permits
           # them; UB detection is unaffected.
           MIRIFLAGS: -Zmiri-disable-isolation
+      - run: cargo miri test -p http1-proto --all-features
+        env:
+          PROPTEST_CASES: 8
+          MIRIFLAGS: -Zmiri-disable-isolation
       - run: cargo miri test -p http3-proto --all-features
         env:
           PROPTEST_CASES: 8
           MIRIFLAGS: -Zmiri-disable-isolation
 
+  # http1-proto is deliberately absent from this job: it ships no `fuzz/`
+  # directory, so there is no `cargo fuzz list` to iterate and adding an empty
+  # workspace would only cost a cargo-fuzz build.
+  #
+  # What stands in its place is a set of BOUNDED, hand-written suites rather than
+  # a coverage-guided search, and the difference is worth stating plainly: the
+  # `httparse` differential oracle (`tests/differential.rs`) compares two parsers
+  # over a fixed corpus, `tests/smuggling.rs` and `tests/smuggling_outbound.rs`
+  # pin named vectors in each direction, and `tests/split_robustness.rs` is a
+  # proptest property over a fixed corpus with generated CUT POINTS — the inputs
+  # are the corpus's, not the fuzzer's. None of them explores unknown input the
+  # way a fuzz target does. Add the cache path and a run block here when the
+  # crate gains fuzz targets.
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:
@@ -225,3 +268,59 @@ jobs:
         run: |
           cargo test -p websocket-proto --release --features test-no-panic --test no_panic
           cargo test -p http3-proto --release --features test-no-panic --test no_panic
+      # http1-proto needs FAT LTO on top of `--release`, and the requirement is
+      # not cosmetic: its shims call leaves across the crate boundary, so under
+      # the default thin-local LTO the panic paths of `core` are still separate
+      # codegen units at link time and `no-panic` reports a panic in EVERY shim.
+      # Without this env the job would red on a correct crate; a copy of the two
+      # lines above is a known-broken shape. It is set per-step rather than on
+      # the job so the two crates above keep the profile they were verified
+      # under. LTO is not settable per-package in a workspace `Cargo.toml`,
+      # which is why this lives here rather than in checked-in config.
+      - name: no-panic link-time verification — http1-proto (release + fat LTO)
+        env:
+          CARGO_PROFILE_RELEASE_LTO: fat
+        run: cargo test -p http1-proto --release --features test-no-panic --test no_panic
+      # MUST-FAIL, and it is what makes the step above mean anything. `no-panic`
+      # proves a shim panic-free by failing the LINK, so a shim that was never
+      # instantiated over opaque input passes with an EMPTY proof and nothing in
+      # a green run says so — LLVM constant-folds a call made with literals, the
+      # body is never compiled for unknown input, and the symbol whose presence
+      # would fail the link is never emitted. (Measured: a shim whose body is a
+      # guaranteed out-of-bounds index linked clean and reported "ok" until every
+      # argument was wrapped in `core::hint::black_box`.)
+      #
+      # `test-no-panic-lie` adds exactly one such shim, with a reachable panic
+      # and its argument fed through `black_box` like every real one, and the
+      # build has to FAIL. A green run here reports that the link proof has gone
+      # vacuous — a dropped `black_box`, a profile without fat LTO, a `no-panic`
+      # release that stopped emitting the symbol — not that anything is fine.
+      #
+      # The failure is checked for its REASON, not merely for its exit code. "It
+      # did not build" is satisfied by a typo, a renamed feature, a dependency
+      # that stopped resolving, or any unrelated breakage in the crate — all of
+      # which would turn this step green while proving nothing, which is the same
+      # vacuity one layer up. So the output is captured and matched against
+      # `no-panic`'s own link-error marker naming the shim.
+      #
+      # Two shell notes, both load-bearing. `set -e` does NOT fire on a command
+      # whose status is inverted with `!` (POSIX: the errexit exemption list), so
+      # the negation needs its own `||` guard or a lie-check that BUILT would sail
+      # past. And stderr is redirected into the log rather than to /dev/null,
+      # because the marker is on it.
+      - name: no-panic lie-check — the link proof must not be vacuous (MUST FAIL)
+        env:
+          CARGO_PROFILE_RELEASE_LTO: fat
+        run: |
+          log="$(mktemp)"
+          ! cargo test -p http1-proto --release --features test-no-panic-lie \
+            --test no_panic >"$log" 2>&1 || {
+            echo "::error::the lie-check BUILT — the no-panic link proof is vacuous"
+            exit 1
+          }
+          grep -q 'ERROR\[no-panic\]: detected panic in function `shim_lie`' "$log" || {
+            echo "::error::the lie-check failed to build, but not with no-panic's link error"
+            cat "$log"
+            exit 1
+          }
+          echo "lie-check refused to link, for the right reason"

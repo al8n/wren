@@ -42,7 +42,7 @@ jobs:
           set -euo pipefail
           tokeit
           mv tokeit.json loc-wren.json
-          for c in websocket-proto wren-trace wren-compio wren-reactor; do
+          for c in websocket-proto http1-proto http3-proto wren-trace wren-compio wren-reactor; do
             ( cd "$c" && tokeit )
             mv "$c/tokeit.json" "loc-$c.json"
           done
@@ -59,9 +59,13 @@ jobs:
             const fs = require('fs');
             const gistId = '327b2a8aef9003246e45c6e47fe63937';
             // Gist file name -> LoC json. `wren` is the workspace total; the
-            // rest are per-crate. These names match the LoC badge URLs in the
-            // crate READMEs (…/raw/<name>).
-            const crates = ['websocket-proto', 'wren-trace', 'wren-compio', 'wren-reactor'];
+            // rest are per-crate. A name here is the `…/raw/<name>` a LoC badge
+            // would point at — `websocket-proto` and the workspace total are the
+            // two that have one today, and the other entries are published so a
+            // README that adds one has a file to point at. Must stay in step
+            // with the shell loop above: a name here with no `loc-<name>.json`
+            // beside it fails the whole PATCH.
+            const crates = ['websocket-proto', 'http1-proto', 'http3-proto', 'wren-trace', 'wren-compio', 'wren-reactor'];
             const files = {
               wren: { content: fs.readFileSync('loc-wren.json', 'utf8') },
             };
