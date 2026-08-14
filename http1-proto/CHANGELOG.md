@@ -1,0 +1,174 @@
+# Changelog
+
+## 0.1.0 (unreleased)
+
+First release: a Sans-I/O HTTP/1.1 message and connection core (RFC 9110 /
+RFC 9112), `no_std` + no-alloc capable, with no buffer, clock, or allocator of
+its own.
+
+### Codec leaves
+
+- **Grammar** (`grammar`): RFC 9110 §5.6 `token` and `field-value` over raw
+  bytes — `field-vchar = VCHAR / obs-text` with interior SP/HTAB, OWS-trimmed,
+  CTLs rejected — plus the RFC 3986 request-target validators and the §5.6.1
+  list-element splitter.
+- **Start lines** (`head::request_line`, `head::status_line`): RFC 9112 §3
+  `request-line` with all four §3.2 target forms (origin / absolute / authority /
+  asterisk) and §4 `status-line`. Single-SP separators only; the lenient
+  whitespace-boundary parse is a named smuggling vector and is not taken.
+  `HTTP-version` is case-sensitive (RFC 9112 §2.3), a higher 1.x minor is
+  processed as 1.1 (RFC 9110 §6.2), and any other major is `505` rather than
+  malformed.
+- **Head scanner** (`head::scan`): a **resumable** bounded scan — it carries a
+  watermark instead of restarting, so a head arriving one byte at a time costs
+  O(N) rather than O(N²). Caps: `MAX_HEAD_BYTES = 16384`, `MAX_HEADERS = 64`,
+  `MAX_LEADING_EMPTY_LINES = 4`. A cap breach distinguishes an over-long
+  request-line (`414`) from an over-large field section (`431`). The empty-line
+  cap binds BOTH roles: a server's leading empty lines (RFC 9112 §2.2) are never
+  consumed, so one scan of the growing region sees them all; an idle client's
+  discarded ones (§9.2) ARE consumed, so the connection carries a cumulative
+  tally instead — cleared by `open_request`, since the allowance is per idle
+  period.
+- **Lazy head view** (`head::view`): `HeadView` walks field lines out of the
+  borrowed block on demand — no table, no copies — with case-insensitive
+  lookup, repeated-line iteration, and the field count the scan recorded.
+- **Encoders** (`head::encode`, `body::encode`): validated request/status heads
+  and chunk framing written into a caller-supplied slice, with exact sizing,
+  no partial writes on a short buffer, and refusal of any field a parser would
+  reject (CRLF injection is impossible by construction).
+
+### Semantics
+
+- **`validate`**: the RFC 9112 §3.2 `Host` rule (exactly one, valid
+  `uri-host[:port]`, required on 1.1 requests, an empty value accepted),
+  `Content-Length` and `Transfer-Encoding` validation, method/target pairing,
+  and the connection directives a head carries.
+- **RFC 9112 §6.3 body framing** implemented branch-for-branch **in its stated
+  order**: bodiless statuses and HEAD responses and CONNECT 2xx resolve before
+  any CL/TE inspection; then chunked, then `Content-Length`, then
+  read-to-close for a response, then zero-length for a request.
+- Every framing ambiguity is a hard error rather than a guess: TE beside CL,
+  differing `Content-Length` values, `chunked` non-final in a request. An
+  identical comma-repeated `Content-Length` is processed as that single value
+  (the exception §6.3 item 5 carves out).
+- The **sender** rules bind at every status, item 1's bodiless responses
+  included: §6.2's "a sender MUST NOT send a Content-Length header field in any
+  message that contains a Transfer-Encoding header field" is unconditional, and
+  §8.6's `1*DIGIT` is what a length has to be. Item 1 tells a RECIPIENT to
+  ignore those fields; it is not a licence for this end to write a pair of them
+  or an unreadable one. A single well-formed `Content-Length` on a HEAD response
+  or a 304 stays legal — that is item 1's own case.
+- §3.2's `Host` is enforced **in both directions**. Every outbound request path
+  — `open_request`, and Tunnel's `open_upgrade` / `open_connect`, CONNECT
+  included, since §3.2.3's authority-form target is an addressing rule and not
+  an exemption — refuses a field section that states no `Host`, and writes
+  nothing. Presence is the whole check: an empty value is the field §3.2
+  requires when the target authority is undefined, and naming the right
+  authority stays the caller's.
+
+### Bodies
+
+- **`body`**: counted, read-to-close, and none, plus a strict **chunked**
+  decoder (RFC 9112 §7.1) — `1*HEXDIG` chunk-size with an overflow guard, no
+  whitespace after the size, `1*("0")` last-chunk, grammar-checked `chunk-ext`
+  under a 256-byte per-line cap, and a trailer section surfaced as its own items
+  and never merged into the header section.
+
+### Connection
+
+- **Compile-time type-state**: `Connection<Client | Server, General | Tunnel>`.
+  The mode is a type parameter, not a runtime flag, so asking a General
+  connection to switch protocols (or a Tunnel connection to stream exchanges)
+  does not compile.
+- **General mode**: `handle(input) -> Items` yields borrowed
+  `Item::{Head, BodyChunk, Trailer, ExchangeComplete, ExpectContinue}`, each
+  naming its `ExchangeId`; `Items::consumed()` is the driver's cursor. Keep-alive
+  re-arm, inbound pipelining tolerance (RFC 9112 §9.3.2 holds the next request
+  unconsumed until the response is written), 1xx interim responses,
+  `Expect: 100-continue`, HTTP/1.0 fallback, close-delimited responses, and
+  RFC 9112 §9.6 draining.
+- **Readiness split**: `wants_read()` and `is_awaiting_send()` are disjoint
+  answers to "why did the items run out?" — `Ok(None)` alone cannot say whether
+  to read the socket or to write to it.
+- **Send side**: `open_request`, `send_response`, `send_interim`, `send_body`,
+  `finish_body`, and `send_error_response` — the single RFC-mandated
+  400-then-close answer owed after a violation, which injects the `close`
+  connection option, refuses a caller `Connection` field that would contradict
+  it, and refuses the whole 1xx and 2xx classes: a phase whose meaning is "a
+  rejection is owed" has no success to state (Tunnel's `reject` applies the same
+  rule while a rejection is owed). A 3xx is legal — a redirect refuses the
+  request as it was put.
+- `finish_body` refuses four field names in a trailer section —
+  `Content-Length`, `Transfer-Encoding`, `Host`, `Trailer` — per RFC 9110
+  §6.5.1's sender MUST NOT. A narrow list on purpose: which other definitions
+  permit a trailer is a registry question for the layer that knows the message.
+- An inbound **close-delimited** response (§6.3 item 8) signals the end of
+  keep-alive at its HEAD, not at the EOF: §9.3 makes a connection carrying a
+  message with no self-defined length non-persistent, so `Event::CloseSignaled`
+  reaches the driver before it plans a second request.
+- **Tunnel mode**: one protocol switch, RFC 9110 §7.8 `Upgrade` or §9.3.6
+  `CONNECT`, at either end. Every outcome that CONSUMED a head reports the
+  **leftover** — the suffix of the offer belonging to the new protocol, or to the
+  head that follows an interim — and carries the start line this core parsed;
+  `Refused` is terminal and reports none. A 100 is enforced before a 101 when
+  both were asked for. A handshake head may carry `Content-Length: 0`: it
+  announces no octets (RFC 9110 §8.6), so both directions of this crate write and
+  classify it.
+- **Public enums**: `Item`, `StartLine`, `Event`, `ClientTunnelOutcome` and
+  `ServerTunnelRequest` are `#[non_exhaustive]` — they are what this core chooses
+  to surface, and that can grow. `Target`, `BodyPlan` and `BodyFraming` are NOT:
+  the RFCs close those sets, so a consumer may match them exhaustively.
+- **Errors**: every protocol violation carries a byte offset
+  (`MalformedDetail { at, what }`) and, where a server would answer, a
+  `SuggestedStatus` (400 / 414 / 431 / 501 / 505).
+
+### Tiers
+
+| Cargo features | Heap | Target |
+|---|---|---|
+| `default` (`std`) | yes | any std platform |
+| `alloc` | yes (no `std`) | WASM, embedded with allocator |
+| `no-atomic` | yes (no `std`, no atomic CAS) | `thumbv6m-none-eabi` |
+| _(none)_ | **no** | `thumbv6m-none-eabi`, `thumbv7em-none-eabihf` |
+
+`Connection<Role, Mode>` is const-asserted at ≤ 256 bytes and `HeadView` at
+≤ 128, unconditionally — so the bound is checked on every target, including the
+32-bit `usize` ones.
+
+### Tooling
+
+- **no-panic link test** (`tests/no_panic.rs`): `#[no_panic]` shims prove
+  `find_head_end`, `parse_status_line` and `parse_chunk_size` compile to
+  panic-free code at link time, plus four release smokes over the deeper paths.
+  Requires `--release` **and fat LTO** (`CARGO_PROFILE_RELEASE_LTO=fat`) — the
+  shims call across the crate boundary, so without it every one false-positives.
+  Every argument goes through `core::hint::black_box`: a shim called with
+  compile-time constants is folded away before the guard can act, and proves
+  nothing. The internal `test-no-panic-lie` feature adds a shim with a reachable
+  panic whose build CI asserts must FAIL, which is what keeps that honest.
+- **httparse differential oracle** (`tests/differential.rs`): we are never more
+  permissive than `httparse`; every stricter refusal and every looser acceptance
+  is adjudicated in-file with its RFC citation, and the allowlists are checked
+  for stale entries. A second, independent comparison over the same corpus checks
+  where each parser says a head ENDS — `Status::Complete(n)` against
+  `Items::consumed` — since two recipients that accept the same head but cut it
+  in different places have already disagreed about where the body begins.
+- **Request-smuggling corpus**, both directions. `tests/smuggling.rs` drives
+  each named inbound vector end to end with both its accept and its reject side,
+  pinning the EXACT refusal — the `H1Error` variant and its payload — rather than
+  the error class. `tests/smuggling_outbound.rs` is the mirror: for every send
+  entry point, the head/plan combinations that must be refused, each asserting
+  the exact refusal and that the call left the buffer and the connection
+  untouched. RFC 9112 §11.1/§11.2 are about two recipients disagreeing, and
+  nothing in that says the disagreement has to be the peer's fault.
+- **Split-robustness property** (`tests/split_robustness.rs`): where the
+  transport cut the stream cannot change what the connection says about it —
+  one shot, byte-at-a-time, every single cut, and proptest multi-cut vectors,
+  over a corpus covering every inbound shape, each entry carrying an absolute
+  golden pin as well as the equality (an entry mis-read identically in every feed
+  shape satisfies an equality). Includes the linearity probe that pins the head
+  scan as resuming rather than restarting — asserted on CI too, at a looser
+  margin, since a lost watermark makes the two halves EQUAL and no margin above
+  1 tolerates that.
+- **288 tests** at `--all-features` (254 on the bare `no_std` tier), green on
+  every tier and on `cargo hack test --each-feature`.
