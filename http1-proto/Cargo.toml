@@ -1,0 +1,58 @@
+[package]
+name = "http1-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+license = "MIT OR Apache-2.0"
+description = "Sans-I/O HTTP/1.1 connection state machine (RFC 9110/9112; no_std, no_alloc capable, panic-free)."
+repository = "https://github.com/al8n/websockit"
+readme = "README.md"
+keywords = ["http", "http1", "no-std", "sans-io", "websocket"]
+categories = ["network-programming", "no-std", "embedded", "web-programming"]
+
+[features]
+default = ["std"]
+std = ["thiserror/default"]
+# Heap-tier markers. PR1's outbound path is encode-into-caller-slice on every
+# tier, so no heap storage backend exists yet — these features carry the tier
+# SEMANTICS (and websocket-proto will forward them 1:1 in PR2) but currently
+# enable no deps. When a transmit queue / owned body backend lands, `bytes`
+# (alloc/std) and `portable-atomic-util` (no-atomic) attach HERE.
+alloc = []
+# `no-atomic`: the heap tier for cores WITHOUT native atomic CAS (Cortex-M0+ /
+# thumbv6m / RP2040). It STANDS IN for `alloc` on such a core rather than
+# accompanying it — that is the tier it names, not a constraint anything
+# enforces. Nothing here is mutually exclusive: `--all-features` enables all
+# three and must keep building (CI runs it), and while these features pull no
+# deps there is nothing for a combination to contradict. Whether the combination
+# becomes a `compile_error!` is a decision for the change that attaches the
+# backends above, not a claim to make ahead of it.
+no-atomic = []
+# Internal: exposes leaf hot paths for `tests/no_panic.rs`. Implies `std`.
+test-no-panic = ["std"]
+# Internal, and MUST-FAIL by design: adds one `#[no_panic]` shim to
+# `tests/no_panic.rs` whose body contains a reachable panic, so building that
+# test in RELEASE has to fail to LINK. It is the permanent check that the link
+# proof is not vacuous — a shim whose call the optimizer folded away, or a build
+# without fat LTO, would let every real shim "pass" with an empty proof, and
+# nothing in a green run would say so. CI asserts the failure; see the `no-panic`
+# job in `.github/workflows/ci.yml`. In debug the guard is off (the test's own
+# `cfg_attr`), so `cargo hack --each-feature` and miri build and run this like
+# any other test.
+test-no-panic-lie = ["test-no-panic"]
+
+[dependencies]
+thiserror.workspace = true
+derive_more.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+no-panic = "0.1"
+httparse = { version = "1", default-features = false, features = ["std"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

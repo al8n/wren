@@ -1,0 +1,86 @@
+//! Leaf-path forwarders for the `no-panic` link-time test (`tests/no_panic.rs`).
+//!
+//! Gated behind `test-no-panic`, doc-hidden, and exempt from semver: these
+//! `pub` forwarders expose the crate's leaf entry points so the test can wrap
+//! them in `#[no_panic]` shims — `find_head_end`, `parse_status_line` and
+//! `parse_chunk_size` — or run them as plain smoke tests, which is what
+//! `parse_request_line`, `encode_request_head` and `scan_head` get. The test
+//! file records why each of those three cannot be link-checked; the reasons are
+//! properties of `no-panic` and of the call trees, not of the code's
+//! panic-freedom.
+//!
+//! A `pub use` of a `pub(crate)` item is illegal (E0364/E0365), so these are
+//! thin forwarders rather than re-exports. Being `#[inline]` keeps the
+//! forwarder itself out of the way; what actually carries the leaf bodies
+//! across the crate boundary is the fat LTO the test's documented invocation
+//! turns on, since a shim is only provable over code the optimizer can inline
+//! into it.
+//!
+//! Names here are plain code spans rather than intra-doc links on purpose. This
+//! doc block is merged with the outer doc on the `lib.rs` declaration and
+//! resolved in the crate root's scope, and every target below is `pub(crate)`,
+//! which `rustdoc::private_intra_doc_links` refuses under `-D warnings`.
+
+use crate::{Error, H1Error, HeadView, RequestLine, StatusLine, Target};
+
+/// Forwards to `crate::head::find_head_end` — the incremental head-terminator
+/// scan.
+#[inline]
+pub fn find_head_end(input: &[u8], from: usize) -> Result<Option<usize>, H1Error> {
+  crate::head::find_head_end(input, from)
+}
+
+/// Forwards to `crate::head::parse_request_line` — the RFC 9112 §3
+/// request-line codec.
+#[inline]
+pub fn parse_request_line(line: &[u8]) -> Result<RequestLine<'_>, H1Error> {
+  crate::head::parse_request_line(line)
+}
+
+/// Forwards to `crate::head::parse_status_line` — the RFC 9112 §4 status-line
+/// codec.
+#[inline]
+pub fn parse_status_line(line: &[u8]) -> Result<StatusLine<'_>, H1Error> {
+  crate::head::parse_status_line(line)
+}
+
+/// Forwards to `crate::body::chunked::parse_chunk_size` — the RFC 9112 §7.1
+/// `chunk-size = 1*HEXDIG` reader, the leaf of the chunk-size line path.
+///
+/// The line is already delimited here: delimiting is `delimit_line`'s job and
+/// the stage that combines the two (`read_size_line`) is a decoder method with
+/// state to advance, so the leaf is what a shim can be wrapped around.
+#[inline]
+pub fn parse_chunk_size(line: &[u8]) -> Result<(u64, usize), H1Error> {
+  crate::body::chunked::parse_chunk_size(line)
+}
+
+/// Forwards to `crate::head::encode::encode_request_head`, monomorphized over
+/// the `[(&str, &[u8])]` field supplier.
+///
+/// The encoder is generic over `Headers`, and a forwarder cannot be: the
+/// instantiation the test exercises is pinned here — the slice impl, which is
+/// the one every caller in the crate's own tests uses.
+///
+/// The expected field-section digest is taken from the supplier itself, as it is
+/// in the crate's own encoder tests; in production it travels from the send
+/// side's framing reduction, which is what makes it a cross-walk check.
+#[inline]
+pub fn encode_request_head(
+  method: &str,
+  target: &Target<'_>,
+  headers: &[(&str, &[u8])],
+  out: &mut [u8],
+) -> Result<usize, Error> {
+  let expect = crate::head::encode::field_digest(headers)?;
+  crate::head::encode::encode_request_head(method, target, headers, expect, out)
+}
+
+/// Forwards to `crate::head::scan_head` — the bounded one-pass field-section
+/// scan.
+///
+/// Smoke only, never link-checked: see the module doc.
+#[inline]
+pub fn scan_head(head: &[u8]) -> Result<HeadView<'_>, H1Error> {
+  crate::head::scan_head(head)
+}
