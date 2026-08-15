@@ -38,37 +38,34 @@ pub(crate) fn encode(input: &[u8], out: &mut [u8]) -> Option<usize> {
   let needed = encoded_len(input.len())?;
   let out = out.get_mut(..needed)?;
 
-  let mut groups = input.chunks_exact(3);
+  let (groups, remainder) = input.as_chunks::<3>();
   // `needed` is exactly `ceil(len/3) * 4`, so `dsts` yields one full 4-byte
   // block per input group PLUS one trailing block for a non-empty remainder
-  // (taken via `dsts.next()` below — `into_remainder()` would be empty).
-  let mut dsts = out.chunks_exact_mut(4);
-  for (group, dst) in (&mut groups).zip(&mut dsts) {
-    let &[a, b, c] = group else { return None };
-    let [d0, d1, d2, d3] = dst else { return None };
+  // (taken via `dsts.next()` below — the `as_chunks_mut` remainder is empty).
+  let (dst_groups, _) = out.as_chunks_mut::<4>();
+  let mut dsts = dst_groups.iter_mut();
+  for (group, dst) in groups.iter().zip(&mut dsts) {
+    let &[a, b, c] = group;
+    let [d0, d1, d2, d3] = dst;
     *d0 = sextet(a >> 2)?;
     *d1 = sextet((a << 4) | (b >> 4))?;
     *d2 = sextet((b << 2) | (c >> 6))?;
     *d3 = sextet(c)?;
   }
 
-  // `chunks_exact(3).remainder()` is 0..=2 bytes; the compiler cannot see
+  // `as_chunks::<3>()`'s remainder is 0..=2 bytes; the compiler cannot see
   // that bound, so the wildcard arm is required (and unreachable).
-  match groups.remainder() {
+  match remainder {
     [] => {}
     &[a] => {
-      let [d0, d1, d2, d3] = dsts.next()? else {
-        return None;
-      };
+      let [d0, d1, d2, d3] = dsts.next()?;
       *d0 = sextet(a >> 2)?;
       *d1 = sextet(a << 4)?;
       *d2 = PAD;
       *d3 = PAD;
     }
     &[a, b] => {
-      let [d0, d1, d2, d3] = dsts.next()? else {
-        return None;
-      };
+      let [d0, d1, d2, d3] = dsts.next()?;
       *d0 = sextet(a >> 2)?;
       *d1 = sextet((a << 4) | (b >> 4))?;
       *d2 = sextet(b << 2)?;

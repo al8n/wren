@@ -1921,7 +1921,7 @@ mod tests {
       // direction resets per message, so the peer compresses each message with
       // a fresh context and the decoder must reset to match.
       let params = match accept_deflate_offer(
-        ["permessage-deflate; client_no_context_takeover"].into_iter(),
+        [b"permessage-deflate; client_no_context_takeover".as_slice()],
         &ServerDeflateConfig::new(),
       ) {
         Some((params, _)) => params,

@@ -11,16 +11,18 @@
 //! available on every storage tier.
 
 use crate::{
-  handshake::parser::is_token,
+  handshake::fields::{ConnectRequestFields, ConnectResponseFields},
   negotiation::{Negotiated, NegotiationError},
 };
 use derive_more::{Display, IsVariant, TryUnwrap};
+use http1_proto::grammar::{
+  eq_ignore_ascii, is_token, is_valid_authority, is_valid_path_and_query,
+};
 
-/// Upper bound on a rendered `Sec-WebSocket-Extensions` value — the same bound
-/// the deflate offer/response renderers are sized against. Both views hold one
-/// inline buffer of this size.
+/// Both header views hold one inline buffer of this size for the rendered
+/// `Sec-WebSocket-Extensions` value.
 #[cfg(feature = "deflate")]
-const EXT_BUF_LEN: usize = 160;
+use crate::negotiation::MAX_EXTENSION_VALUE_BYTES;
 
 /// The `:scheme` pseudo-header value.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Display, IsVariant)]
@@ -79,6 +81,12 @@ pub enum ConnectRequestError {
   #[error("malformed sec-websocket-protocol offer list")]
   MalformedSubprotocols,
 
+  /// A `sec-websocket-extensions` value did not conform to RFC 6455 §9.1's
+  /// ABNF. §9.1's MUST is about the negotiation, not about the transport that
+  /// carries it, so this gate enforces it exactly as the h1 server does.
+  #[error("malformed sec-websocket-extensions value")]
+  MalformedExtensions,
+
   /// The request carried an h1-only upgrade field (`Connection`, `Upgrade`,
   /// `Sec-WebSocket-Key`, …) that RFC 8441 §5 / RFC 9113 §8.2.2 forbid on
   /// this transport.
@@ -97,6 +105,25 @@ pub enum ConnectRequestError {
   /// `sec-websocket-version` present but not 13.
   #[error("unsupported sec-websocket-version (only 13)")]
   UnsupportedVersion,
+
+  /// `origin` appeared more than once, which is ambiguous and is therefore
+  /// refused rather than resolved — the h1 server's rule, on the transport RFC
+  /// 8441 §5 carries the same field onto.
+  ///
+  /// §5: "The Origin \[RFC6454\], Sec-WebSocket-Version, Sec-WebSocket-Protocol,
+  /// and Sec-WebSocket-Extensions header fields are used in the CONNECT request
+  /// and response-header fields as defined in \[RFC6455\]." RFC 6454 §7 gives it
+  /// one `origin-list-or-null` — SP-separated, not a comma list — so RFC 9110
+  /// §5.3's "a sender MUST NOT generate multiple field lines with the same name
+  /// … unless that field's definition allows … a comma-separated list" forbids
+  /// repeating it.
+  ///
+  /// Refused rather than resolved for the reason the h1 gate gives: the FIRST
+  /// of two contradicting values authorizes against a value the peer also
+  /// denied, and `None` reads to `if let Some(origin) = view.origin()` as a
+  /// client that sent no origin at all, which skips the policy entirely.
+  #[error("origin must appear at most once")]
+  DuplicateOrigin,
 
   /// Negotiation storage/grammar failure.
   #[error("{0}")]
@@ -127,6 +154,11 @@ pub enum ConnectResponseError {
   /// RFC 9113 §8.2.2 forbid on this transport.
   #[error("h1-only header forbidden on an extended CONNECT response")]
   ForbiddenHeader,
+
+  /// A `sec-websocket-extensions` value did not conform to RFC 6455 §9.1's
+  /// ABNF — the client half of the same MUST the request gate enforces.
+  #[error("malformed sec-websocket-extensions value")]
+  MalformedExtensions,
 
   /// Negotiation storage/grammar failure.
   #[error("{0}")]
@@ -185,19 +217,27 @@ impl<'a> ConnectRequest<'a> {
   pub fn headers(&self) -> Result<ConnectRequestHeaders<'a>, ConnectRequestError> {
     // Same bar as the h1 client's Host: an `:authority` is an RFC 3986
     // authority, not a free string.
-    if !crate::handshake::parser::is_valid_authority(self.authority) {
+    if !is_valid_authority(self.authority) {
       return Err(ConnectRequestError::InvalidField("authority"));
     }
     // Shared RFC 3986 path-and-query grammar — also rejects a raw `#`
     // (RFC 6455 §3: a resource name carries no fragment; escape as %23).
-    if !crate::handshake::parser::is_valid_path_and_query(self.path) {
+    if !is_valid_path_and_query(self.path) {
       return Err(ConnectRequestError::InvalidField("path"));
+    }
+    // The same bound the gate reads back: without it this builder emits a list
+    // `validate_connect_request` refuses, which is the emit/accept asymmetry
+    // this crate screens for field by field.
+    if self.subprotocols.len() > crate::negotiation::MAX_SUBPROTOCOL_OFFERS {
+      return Err(ConnectRequestError::InvalidField(
+        "more subprotocol offers than this crate reads from a peer",
+      ));
     }
     // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique — and
     // must fit [`Negotiated`]'s inline storage, or a conforming peer
     // SELECTING the offer would fail our own retention (self-interop).
     for (i, proto) in self.subprotocols.iter().enumerate() {
-      if !is_token(proto) {
+      if !is_token(proto.as_bytes()) {
         return Err(ConnectRequestError::InvalidField("subprotocol"));
       }
       if proto.len() > crate::negotiation::MAX_SUBPROTOCOL_LEN {
@@ -219,7 +259,7 @@ impl<'a> ConnectRequest<'a> {
       None => None,
       Some(offer) => {
         offer.validate()?;
-        let mut buf = [0u8; EXT_BUF_LEN];
+        let mut buf = [0u8; MAX_EXTENSION_VALUE_BYTES];
         let n = offer
           .write(&mut buf)
           .map_err(|_| ConnectRequestError::InvalidField("deflate offer too long"))?;
@@ -250,7 +290,7 @@ pub struct ConnectRequestHeaders<'a> {
   /// The rendered `sec-websocket-extensions` value and its length, present
   /// only when a deflate offer was made.
   #[cfg(feature = "deflate")]
-  extensions: Option<([u8; EXT_BUF_LEN], usize)>,
+  extensions: Option<([u8; MAX_EXTENSION_VALUE_BYTES], usize)>,
 }
 
 impl ConnectRequestHeaders<'_> {
@@ -353,88 +393,102 @@ impl<'a> Iterator for ConnectRequestHeadersIter<'a> {
 /// caller's header list.
 #[derive(Debug, Copy, Clone)]
 pub struct ConnectRequestView<'a> {
-  headers: &'a [(&'a str, &'a str)],
+  fields: ConnectRequestFields<'a>,
 }
 
 impl<'a> ConnectRequestView<'a> {
-  fn get(&self, name: &str) -> Option<&'a str> {
-    self
-      .headers
-      .iter()
-      .find_map(|(n, v)| n.eq_ignore_ascii_case(name).then_some(*v))
-  }
-
   /// The `:path` pseudo-header, when the stack passed it through.
   pub fn path(&self) -> Option<&'a str> {
-    self.get(":path")
+    self.fields.path().single().ok().flatten()
   }
 
   /// The `:authority` pseudo-header, when present.
   pub fn authority(&self) -> Option<&'a str> {
-    self.get(":authority")
+    self.fields.authority().single().ok().flatten()
+  }
+
+  /// The `origin` header, when present — RFC 8441 §5 carries RFC 6455's
+  /// `Origin` onto this transport unchanged, so this is the same field, with the
+  /// same semantics, that the h1 server hands its own view.
+  ///
+  /// §5, verbatim: "The Origin \[RFC6454\], Sec-WebSocket-Version,
+  /// Sec-WebSocket-Protocol, and Sec-WebSocket-Extensions header fields are used
+  /// in the CONNECT request and response-header fields as defined in
+  /// \[RFC6455\]." So RFC 6455 §4.2.2's origin policy — "The server MAY use this
+  /// information as part of a determination of whether to accept the incoming
+  /// connection" — is the application's here exactly as it is there.
+  ///
+  /// Unambiguous by construction: a request carrying more than one `origin`
+  /// never reaches a view, because [`validate_connect_request`] refuses it as
+  /// [`DuplicateOrigin`](ConnectRequestError::DuplicateOrigin). So `Some` is THE
+  /// value the client sent and `None` is a client that sent none — never "the
+  /// first of several" and never "too many to say". An `origin` with an empty
+  /// value is `Some("")`: a field the peer sent, not one it omitted.
+  pub fn origin(&self) -> Option<&'a str> {
+    // The repeated arm is unreachable behind the gate; answered rather than
+    // unwrapped, like the other post-gate impossibilities here.
+    self.fields.origin().single().ok().flatten()
   }
 
   /// Any header by name (ASCII case-insensitive).
+  ///
+  /// # The FIRST occurrence only
+  ///
+  /// An escape hatch for fields this crate does not manage, and it cannot know
+  /// their cardinality: it reports the first entry and says nothing about a
+  /// second. **Do not make a security decision on it for a field whose value is
+  /// not a list** — a peer that sent two `cookie`s or two `x-forwarded-for`s
+  /// gets authorized against one value while another contradicts it, which is
+  /// the header-confusion shape. A caller that must decide what more than one
+  /// means counts the occurrences in the list it handed
+  /// [`validate_connect_request`] — it still owns that slice.
+  ///
+  /// The fields RFC 6455 and RFC 8441 themselves define are NOT reached this
+  /// way: they are resolved by the named accessors, which refuse the ambiguity
+  /// rather than hiding it. `origin` is the one an application would otherwise
+  /// have asked for here, and this hatch answers it through
+  /// [`origin`](Self::origin) rather than as a first line.
   pub fn header(&self, name: &str) -> Option<&'a str> {
-    self.get(name)
+    self.fields.other(name)
   }
 
-  /// Subprotocol offers across repeated headers and comma lists. Every
-  /// element was token-validated and deduplicated during
-  /// [`validate_connect_request`].
+  /// Subprotocol offers across repeated headers and comma lists. Every element
+  /// was token-validated, deduplicated, and held to RFC 6455 §11.3.4's
+  /// `1#token` during [`validate_connect_request`], so there is at least one
+  /// whenever the field was present.
+  ///
+  /// The same walk the gate ran — the `crate::negotiation` list reader that
+  /// [`crate::negotiation::subprotocol_list_conforms`] is driven from — over
+  /// the field's complete value, so what passed the gate is exactly what
+  /// arrives here.
   pub fn subprotocols(&self) -> impl Iterator<Item = &'a str> + '_ {
+    crate::negotiation::subprotocol_list(self.offer_bytes())
+      // Unreachable: the value is a `str`, and the splitter cuts only on the
+      // ASCII bytes `,`, SP and HTAB, which never occur inside a multi-byte
+      // UTF-8 sequence — so every element is a substring on char boundaries.
+      .filter_map(|offer| core::str::from_utf8(offer).ok())
+  }
+
+  /// The offer field's complete value as bytes, which is what the grammar layer
+  /// reads (RFC 9110 §5.5 admits `obs-text`, so bytes are the honest shape even
+  /// where the transport handed us `str`).
+  fn offer_bytes(self) -> impl Iterator<Item = &'a [u8]> + Clone {
     self
-      .headers
-      .iter()
-      .filter(|(n, _)| n.eq_ignore_ascii_case("sec-websocket-protocol"))
-      .flat_map(|(_, v)| crate::handshake::parser::list_elements(v))
+      .fields
+      .subprotocol_offers()
+      .into_iter()
+      .map(str::as_bytes)
   }
 
   /// Raw `sec-websocket-extensions` values for
-  /// [`crate::negotiation::accept_deflate_offer`].
+  /// [`crate::negotiation::accept_deflate_offer`] — every occurrence, in
+  /// arrival order, because RFC 6455 §9.1 lets the field be "split or combined
+  /// across multiple lines".
   #[cfg(feature = "deflate")]
   #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
   pub fn extensions(&self) -> impl Iterator<Item = &'a str> + '_ {
-    self
-      .headers
-      .iter()
-      .filter(|(n, _)| n.eq_ignore_ascii_case("sec-websocket-extensions"))
-      .map(|(_, v)| *v)
+    self.fields.extension_offers().into_iter()
   }
-}
-
-/// RFC 8441 §5: the h1 upgrade machinery has no place on this transport —
-/// Sec-WebSocket-Key/Accept are not used, and HTTP/2 (RFC 9113 §8.2.2) /
-/// HTTP/3 treat connection-specific fields as malformed outright (incl.
-/// `HTTP2-Settings`, an h1-upgrade artifact). The ONE exception: `TE` may
-/// appear in REQUESTS carrying exactly `trailers` — any other value, or any
-/// `TE` in a response, is malformed. Both validators (request gate AND
-/// response check) reject the class rather than trusting the adapter to
-/// have filtered.
-fn has_forbidden_h1_field(headers: &[(&str, &str)], te_trailers_ok: bool) -> bool {
-  const FORBIDDEN: &[&str] = &[
-    "connection",
-    "upgrade",
-    "keep-alive",
-    "proxy-connection",
-    "transfer-encoding",
-    "http2-settings",
-    "sec-websocket-key",
-    "sec-websocket-accept",
-  ];
-  headers.iter().any(|(name, value)| {
-    if FORBIDDEN.iter().any(|f| name.eq_ignore_ascii_case(f)) {
-      return true;
-    }
-    if name.eq_ignore_ascii_case("te") {
-      // RFC 9113 §8.2.2: "MUST NOT contain any value other than 'trailers'".
-      return !(te_trailers_ok
-        && value
-          .trim_matches([' ', '\t'])
-          .eq_ignore_ascii_case("trailers"));
-    }
-    false
-  })
 }
 
 /// Server-side validation of an extended-CONNECT header list. STRICT: this is
@@ -446,14 +500,13 @@ fn has_forbidden_h1_field(headers: &[(&str, &str)], te_trailers_ok: bool) -> boo
 pub fn validate_connect_request<'a>(
   headers: &'a [(&'a str, &'a str)],
 ) -> Result<ConnectRequestView<'a>, ConnectRequestError> {
-  let view = ConnectRequestView { headers };
-  let count = |name: &str| {
-    headers
-      .iter()
-      .filter(|(n, _)| n.eq_ignore_ascii_case(name))
-      .count()
+  // The gate reads through the SAME accessors the returned view hands the
+  // application, so nothing it validated can be re-derived differently later.
+  let view = ConnectRequestView {
+    fields: ConnectRequestFields::new(headers),
   };
-  if count(":method") != 1 || view.get(":method") != Some("CONNECT") {
+  let fields = &view.fields;
+  if fields.method().single() != Ok(Some("CONNECT")) {
     return Err(ConnectRequestError::NotConnect);
   }
   // Case-INSENSITIVE deliberately: `:protocol` carries an HTTP upgrade
@@ -461,10 +514,10 @@ pub fn validate_connect_request<'a>(
   // case-insensitive comparison when matching each protocol-name to
   // supported protocols" — exact matching would reject a conforming peer.
   // (Contrast subprotocols, whose §11.5 registry is case-sensitive.)
-  let protocol_ok = count(":protocol") == 1
-    && view
-      .get(":protocol")
-      .is_some_and(|p| p.eq_ignore_ascii_case("websocket"));
+  let protocol_ok = fields
+    .protocol()
+    .single()
+    .is_ok_and(|p| p.is_some_and(|p| eq_ignore_ascii(p.as_bytes(), "websocket")));
   if !protocol_ok {
     return Err(ConnectRequestError::NotWebSocket);
   }
@@ -472,56 +525,67 @@ pub fn validate_connect_request<'a>(
   // a CONNECT with no scheme/path/authority has nothing to bootstrap a
   // WebSocket onto, and a gate that passed it would push routing and origin
   // policy onto optional-`None` checks in application code.
-  let scheme_ok = count(":scheme") == 1
-    && view
-      .get(":scheme")
-      .is_some_and(|s| s == "http" || s == "https");
+  let scheme_ok = fields
+    .scheme()
+    .single()
+    .is_ok_and(|s| s.is_some_and(|s| s == "http" || s == "https"));
   if !scheme_ok {
     return Err(ConnectRequestError::NotHttpScheme);
   }
   // Origin-form under the shared RFC 3986 path-and-query grammar (also
   // rejects a raw `#`: RFC 6455 §3 forbids fragments in resource names).
-  let path_ok = count(":path") == 1
-    && view
-      .get(":path")
-      .is_some_and(crate::handshake::parser::is_valid_path_and_query);
+  let path_ok = fields
+    .path()
+    .single()
+    .is_ok_and(|p| p.is_some_and(is_valid_path_and_query));
   if !path_ok {
     return Err(ConnectRequestError::InvalidPath);
   }
-  let authority_ok = count(":authority") == 1
-    && view
-      .get(":authority")
-      .is_some_and(crate::handshake::parser::is_valid_authority);
+  let authority_ok = fields
+    .authority()
+    .single()
+    .is_ok_and(|a| a.is_some_and(is_valid_authority));
   if !authority_ok {
     return Err(ConnectRequestError::InvalidAuthority);
   }
   // Singleton, like the pseudo-headers above: an ambiguous repeated version
   // (which another layer might combine or read differently) must not pass
   // the gate — h1's duplicate-singleton rejection, mirrored.
-  match count("sec-websocket-version") {
-    0 => return Err(ConnectRequestError::MissingVersion),
-    1 => {}
-    _ => return Err(ConnectRequestError::DuplicateVersion),
-  }
-  match view.get("sec-websocket-version") {
-    None => return Err(ConnectRequestError::MissingVersion),
-    Some(v) if v != crate::constants::WEBSOCKET_VERSION => {
+  match fields.websocket_version().single() {
+    Err(_) => return Err(ConnectRequestError::DuplicateVersion),
+    Ok(None) => return Err(ConnectRequestError::MissingVersion),
+    Ok(Some(v)) if v != crate::constants::WEBSOCKET_VERSION => {
       return Err(ConnectRequestError::UnsupportedVersion);
     }
-    Some(_) => {}
+    Ok(Some(_)) => {}
   }
-  if has_forbidden_h1_field(headers, true) {
+  // RFC 8441 §5 carries RFC 6455's optional `Origin` onto this transport with
+  // RFC 6455's own semantics, RFC 6454 §7 defines it as ONE
+  // `origin-list-or-null`, and RFC 9110 §5.3 therefore forbids repeating it.
+  // The h1 server's rule, and refused for the h1 server's reason: this crate
+  // hands the application a `ConnectRequestView` as the thing it authorizes
+  // through, so an ambiguous answer here is one the CRATE produced. Reject-only,
+  // so the caller still answers with a status of its choosing.
+  if fields.origin().single().is_err() {
+    return Err(ConnectRequestError::DuplicateOrigin);
+  }
+  if fields.has_forbidden_h1_field() {
     return Err(ConnectRequestError::ForbiddenHeader);
   }
-  // Mirror of the h1 server's offer-list rule: non-token or repeated
-  // elements fail the gate; empty elements are ignored (RFC 9110 §5.6.1.2).
-  let offers = || view.subprotocols();
-  let mut seen = 0usize;
-  for offer in offers() {
-    if !is_token(offer) || offers().take(seen).any(|prev| prev == offer) {
-      return Err(ConnectRequestError::MalformedSubprotocols);
-    }
-    seen = seen.saturating_add(1);
+  // Not a mirror of the h1 server's offer-list rule — the SAME rule, from the
+  // grammar layer that knows RFC 6455 §11.3.4's `1#token`: non-token or
+  // repeated elements fail, empty elements are ignored (RFC 2616 §2.1), and a
+  // field that is present while naming nothing satisfies no `1#`.
+  if !crate::negotiation::subprotocol_list_conforms(view.offer_bytes()) {
+    return Err(ConnectRequestError::MalformedSubprotocols);
+  }
+  // RFC 6455 §9.1's MUST, in the h1 server gate's own place in the order: a
+  // value that does not conform fails the connection, whatever this build
+  // supports and whatever the server would have granted.
+  if !crate::negotiation::extension_list_conforms(
+    fields.extension_offers().into_iter().map(str::as_bytes),
+  ) {
+    return Err(ConnectRequestError::MalformedExtensions);
   }
   Ok(view)
 }
@@ -597,7 +661,10 @@ impl<'a> ConnectAccept<'a> {
     // be emitted for one whose offers cannot legalize it.
     #[cfg(feature = "deflate")]
     if let Some(response) = &self.deflate
-      && !crate::negotiation::response_matches_offer(request.extensions(), response)
+      && !crate::negotiation::response_matches_offer(
+        request.extensions().map(str::as_bytes),
+        response,
+      )
     {
       return Err(ConnectAcceptError::ExtensionNotOffered);
     }
@@ -608,7 +675,7 @@ impl<'a> ConnectAccept<'a> {
     let extensions = match &self.deflate {
       None => None,
       Some(response) => {
-        let mut buf = [0u8; EXT_BUF_LEN];
+        let mut buf = [0u8; MAX_EXTENSION_VALUE_BYTES];
         let n = response
           .write(&mut buf)
           .map_err(|_| ConnectAcceptError::ResponseTooLong)?;
@@ -657,7 +724,7 @@ pub enum ConnectAcceptError {
 pub struct ConnectAcceptHeaders<'a> {
   subprotocol: Option<&'a str>,
   #[cfg(feature = "deflate")]
-  extensions: Option<([u8; EXT_BUF_LEN], usize)>,
+  extensions: Option<([u8; MAX_EXTENSION_VALUE_BYTES], usize)>,
 }
 
 impl ConnectAcceptHeaders<'_> {
@@ -727,34 +794,33 @@ pub fn validate_connect_response(
   headers: &[(&str, &str)],
   request: &ConnectRequest<'_>,
 ) -> Result<Negotiated, ConnectResponseError> {
-  let count = |name: &str| {
-    headers
-      .iter()
-      .filter(|(n, _)| n.eq_ignore_ascii_case(name))
-      .count()
-  };
-  let get = |name: &str| {
-    headers
-      .iter()
-      .find_map(|(n, v)| n.eq_ignore_ascii_case(name).then_some(*v))
-  };
+  // One accessor per field, exactly as on the h1 response path — the two
+  // transports read the same values by the same rules.
+  let fields = ConnectResponseFields::new(headers);
 
   // Symmetric with the request gate: h1-only and connection-specific
   // fields are just as forbidden on the response (RFC 8441 §5 /
   // RFC 9113 §8.2.2).
-  if has_forbidden_h1_field(headers, false) {
+  if fields.has_forbidden_h1_field() {
     return Err(ConnectResponseError::ForbiddenHeader);
   }
 
-  if count("sec-websocket-protocol") > 1 {
-    return Err(ConnectResponseError::DuplicateHeader);
+  // RFC 6455 §9.1's MUST on the CLIENT side of the same negotiation, asked
+  // before the value is interpreted (and whatever this build offered).
+  let granted_bytes = || fields.granted_extensions().into_iter().map(str::as_bytes);
+  if !crate::negotiation::extension_list_conforms(granted_bytes()) {
+    return Err(ConnectResponseError::MalformedExtensions);
   }
+
+  // §4.2.2 item 4 makes the response ONE selection, so a second field line is
+  // a second answer rather than a continuation of the first.
   #[cfg_attr(not(feature = "deflate"), allow(unused_mut))]
-  let mut negotiated = match get("sec-websocket-protocol") {
-    None => Negotiated::none(),
-    Some(chosen) => {
+  let mut negotiated = match fields.selected_subprotocol().single() {
+    Err(_) => return Err(ConnectResponseError::DuplicateHeader),
+    Ok(None) => Negotiated::none(),
+    Ok(Some(chosen)) => {
       let offered = request.subprotocols.contains(&chosen);
-      if !offered || !is_token(chosen) {
+      if !offered || !is_token(chosen.as_bytes()) {
         return Err(ConnectResponseError::SubprotocolNotOffered);
       }
       Negotiated::with_subprotocol(chosen)?
@@ -763,19 +829,23 @@ pub fn validate_connect_response(
 
   #[cfg(feature = "deflate")]
   {
-    match (request.deflate.as_ref(), count("sec-websocket-extensions")) {
-      (_, 0) => {}
-      (None, _) => return Err(ConnectResponseError::ExtensionNotOffered),
-      (Some(_), n) if n > 1 => return Err(ConnectResponseError::DuplicateHeader),
-      (Some(offer), _) => {
-        let value = get("sec-websocket-extensions").unwrap_or("");
-        let params = crate::negotiation::parse_deflate_response(value, offer)?;
+    match (
+      request.deflate.as_ref(),
+      fields.granted_extensions().present(),
+    ) {
+      (_, false) => {}
+      (None, true) => return Err(ConnectResponseError::ExtensionNotOffered),
+      // Every line, not the first: §9.1 lets the field be split across them,
+      // and "exactly one granted extension" is `parse_deflate_response`'s rule
+      // over the joined value — see the h1 client for the whole argument.
+      (Some(offer), true) => {
+        let params = crate::negotiation::parse_deflate_response(granted_bytes(), offer)?;
         negotiated = negotiated.with_deflate(Some(params));
       }
     }
   }
   #[cfg(not(feature = "deflate"))]
-  if count("sec-websocket-extensions") != 0 {
+  if fields.granted_extensions().present() {
     return Err(ConnectResponseError::ExtensionNotOffered);
   }
 
@@ -823,6 +893,360 @@ mod tests {
 
     // No Key/Accept over h2/h3 (RFC 8441 §5).
     assert_eq!(find(headers.iter(), "sec-websocket-key"), None);
+  }
+
+  /// A minimal conforming extended-CONNECT request with `field` spelled as
+  /// `lines` — one header entry each, in the given order.
+  fn request_with<'a>(field: &'a str, lines: &'a [&'a str]) -> Vec<(&'a str, &'a str)> {
+    let mut headers: Vec<(&str, &str)> = vec![
+      (":method", "CONNECT"),
+      (":protocol", "websocket"),
+      (":scheme", "https"),
+      (":path", "/chat"),
+      (":authority", "server.example.com"),
+      ("sec-websocket-version", "13"),
+    ];
+    headers.extend(lines.iter().map(|line| (field, *line)));
+    headers
+  }
+
+  /// The whole outcome of gating such a request: the verdict, and every value
+  /// the crate then derives from its fields.
+  fn request_verdict(field: &str, lines: &[&str]) -> String {
+    let headers = request_with(field, lines);
+    match validate_connect_request(&headers) {
+      Err(error) => format!("error: {error:?}"),
+      Ok(view) => {
+        let offers: Vec<&str> = view.subprotocols().collect();
+        #[cfg(feature = "deflate")]
+        let extensions = format!(
+          "{:?}",
+          crate::negotiation::accept_deflate_offer(
+            view.extensions().map(str::as_bytes),
+            &crate::negotiation::ServerDeflateConfig::new(),
+          )
+        );
+        #[cfg(not(feature = "deflate"))]
+        let extensions = String::from("(no deflate tier)");
+        format!("ok: offers={offers:?} extensions={extensions}")
+      }
+    }
+  }
+
+  /// The same for the client half: a response whose `field` is spelled as
+  /// `lines`, answered against a request that offered permessage-deflate.
+  fn response_verdict(field: &str, lines: &[&str]) -> String {
+    #[cfg(feature = "deflate")]
+    let request = ConnectRequest::new(Scheme::Https, "h", "/chat")
+      .with_deflate(crate::negotiation::DeflateOffer::new());
+    #[cfg(not(feature = "deflate"))]
+    let request = ConnectRequest::new(Scheme::Https, "h", "/chat");
+    let headers: Vec<(&str, &str)> = lines.iter().map(|line| (field, *line)).collect();
+    match validate_connect_response(&headers, &request) {
+      Err(error) => format!("error: {error:?}"),
+      Ok(negotiated) => {
+        #[cfg(feature = "deflate")]
+        let deflate = format!("{:?}", negotiated.deflate());
+        #[cfg(not(feature = "deflate"))]
+        let deflate = String::from("(no deflate tier)");
+        format!(
+          "ok: subprotocol={:?} deflate={deflate}",
+          negotiated.subprotocol()
+        )
+      }
+    }
+  }
+
+  /// One logical value however it is spelled, on the extended-CONNECT
+  /// transports, both roles. Identical property and identical fixtures to the h1
+  /// tests: the two transports read the same fields by the same rules, so a
+  /// spelling that is one value on h1 is one value here.
+  #[test]
+  fn equivalent_spellings_of_a_connect_field_reach_one_verdict() {
+    use crate::handshake::spellings;
+
+    // ── request role ────────────────────────────────────────────────────
+    let one = spellings::agree("one offer", &spellings::one("chat"), |lines| {
+      request_verdict("sec-websocket-protocol", lines)
+    });
+    assert!(one.contains(r#"offers=["chat"]"#), "{one}");
+    let two = spellings::agree(
+      "two offers",
+      &spellings::two("chat", "superchat"),
+      |lines| request_verdict("sec-websocket-protocol", lines),
+    );
+    assert!(two.contains(r#"offers=["chat", "superchat"]"#), "{two}");
+    let nothing = spellings::agree("no offer named", &spellings::nothing(), |lines| {
+      request_verdict("sec-websocket-protocol", lines)
+    });
+    assert_eq!(nothing, "error: MalformedSubprotocols");
+    let absent = request_verdict("sec-websocket-protocol", &[]);
+    assert!(absent.contains("offers=[]"), "{absent}");
+    assert_ne!(absent, nothing);
+
+    let one = spellings::agree(
+      "one extension",
+      &spellings::one("permessage-deflate"),
+      |lines| request_verdict("sec-websocket-extensions", lines),
+    );
+    assert!(one.starts_with("ok:"), "{one}");
+    let nothing = spellings::agree("no extension named", &spellings::nothing(), |lines| {
+      request_verdict("sec-websocket-extensions", lines)
+    });
+    assert_eq!(nothing, "error: MalformedExtensions");
+
+    // ── response role ───────────────────────────────────────────────────
+    let one = spellings::agree(
+      "one grant",
+      &spellings::one("permessage-deflate"),
+      |lines| response_verdict("sec-websocket-extensions", lines),
+    );
+    #[cfg(feature = "deflate")]
+    assert!(
+      one.starts_with("ok: subprotocol=None deflate=Some"),
+      "{one}"
+    );
+    #[cfg(not(feature = "deflate"))]
+    assert_eq!(one, "error: ExtensionNotOffered");
+
+    let two = spellings::agree(
+      "two grants",
+      &spellings::two("permessage-deflate", "x-private"),
+      |lines| response_verdict("sec-websocket-extensions", lines),
+    );
+    #[cfg(feature = "deflate")]
+    assert_eq!(two, "error: Negotiation(ExtensionMismatch)");
+    #[cfg(not(feature = "deflate"))]
+    assert_eq!(two, "error: ExtensionNotOffered");
+
+    let nothing = spellings::agree("no grant named", &spellings::nothing(), |lines| {
+      response_verdict("sec-websocket-extensions", lines)
+    });
+    assert_eq!(nothing, "error: MalformedExtensions");
+    let absent = response_verdict("sec-websocket-extensions", &[]);
+    assert!(absent.starts_with("ok: subprotocol=None"), "{absent}");
+    assert_ne!(absent, nothing);
+  }
+
+  /// The h1 and extended-CONNECT gates answer the SAME question the same way:
+  /// the two paths are one rule with two transports under it, not two rules
+  /// that happen to agree today.
+  #[test]
+  fn the_two_transports_agree_on_the_offer_list_rule() {
+    use crate::handshake::{
+      h1::{ServerHandshake, ServerProgress},
+      spellings,
+    };
+
+    /// The h1 spelling of the same request, offers included.
+    fn h1_offers(lines: &[&str]) -> Result<Vec<String>, ()> {
+      let mut raw = String::from(
+        "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n",
+      );
+      for line in lines {
+        raw.push_str(&format!("Sec-WebSocket-Protocol: {line}\r\n"));
+      }
+      raw.push_str("\r\n");
+      let mut hs = ServerHandshake::new();
+      match hs.handle(raw.as_bytes()) {
+        Ok(ServerProgress::Upgrade(pending)) => Ok(
+          pending
+            .request()
+            .subprotocols()
+            .map(String::from)
+            .collect::<Vec<_>>(),
+        ),
+        _ => Err(()),
+      }
+    }
+
+    fn connect_offers(lines: &[&str]) -> Result<Vec<String>, ()> {
+      let headers = request_with("sec-websocket-protocol", lines);
+      match validate_connect_request(&headers) {
+        Ok(view) => Ok(view.subprotocols().map(String::from).collect::<Vec<_>>()),
+        Err(_) => Err(()),
+      }
+    }
+
+    let groups = [
+      spellings::one("chat"),
+      spellings::two("chat", "superchat"),
+      spellings::nothing(),
+      vec![vec![]],
+      // Non-token and repeated elements: the other two rules of the same gate.
+      vec![vec![String::from("has space")], vec![String::from("a, a")]],
+    ];
+    for group in groups.iter().flatten() {
+      let borrowed: Vec<&str> = group.iter().map(String::as_str).collect();
+      assert_eq!(
+        h1_offers(&borrowed),
+        connect_offers(&borrowed),
+        "the two transports disagree about {group:?}"
+      );
+    }
+  }
+
+  /// A repeated `origin` is REFUSED on this transport too, and for the same
+  /// reason as on h1.
+  ///
+  /// The argument that used to leave it alone — "RFC 8441 does not carry
+  /// `Origin` into the extended-CONNECT handshake" — is contradicted by §5's own
+  /// words: "The Origin \[RFC6454\], Sec-WebSocket-Version, Sec-WebSocket-Protocol,
+  /// and Sec-WebSocket-Extensions header fields are used in the CONNECT request
+  /// and response-header fields as defined in \[RFC6455\]." RFC 6454 §7 makes it
+  /// one `origin-list-or-null` and RFC 9110 §5.3 forbids repeating it.
+  ///
+  /// The second half of that argument — that an h2/h3 caller owns the slice and
+  /// can count occurrences itself — does not survive either: the thing the
+  /// application authorizes through is the [`ConnectRequestView`] this crate
+  /// hands it, so an ambiguous answer is the CRATE's to have produced.
+  #[test]
+  fn a_repeated_origin_is_refused_on_extended_connect() {
+    let with_origins = |lines: &[&'static str]| -> Vec<(&'static str, &'static str)> {
+      let mut headers: Vec<(&str, &str)> = vec![
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        (":scheme", "https"),
+        (":path", "/chat"),
+        (":authority", "server.example.com"),
+        ("sec-websocket-version", "13"),
+      ];
+      headers.extend(lines.iter().map(|line| ("origin", *line)));
+      headers
+    };
+
+    let two = with_origins(&["https://example.com", "https://evil.example"]);
+    assert!(matches!(
+      validate_connect_request(&two).unwrap_err(),
+      ConnectRequestError::DuplicateOrigin
+    ));
+    // Case does not launder it: RFC 9110 §5.1 matches field names ASCII
+    // case-insensitively, and RFC 8441 §5's note about lowercase encoding is
+    // about what a sender writes, not about what a reader may miss.
+    let mixed: Vec<(&str, &str)> = with_origins(&["https://example.com"])
+      .into_iter()
+      .chain([("Origin", "https://evil.example")])
+      .collect();
+    assert!(matches!(
+      validate_connect_request(&mixed).unwrap_err(),
+      ConnectRequestError::DuplicateOrigin
+    ));
+
+    // Behind the gate the view's answer is unambiguous by construction, and the
+    // escape hatch answers THROUGH it rather than reporting a first entry.
+    let one = with_origins(&["https://example.com"]);
+    let view = validate_connect_request(&one).unwrap();
+    assert_eq!(view.origin(), Some("https://example.com"));
+    assert_eq!(view.header("origin"), view.origin());
+    assert_eq!(view.header("ORIGIN"), view.origin());
+
+    let empty = with_origins(&[""]);
+    let view = validate_connect_request(&empty).unwrap();
+    assert_eq!(
+      view.origin(),
+      Some(""),
+      "`origin:` with no value is a field the peer sent, not one it omitted"
+    );
+    assert_eq!(view.header("origin"), Some(""));
+
+    let none = with_origins(&[]);
+    let view = validate_connect_request(&none).unwrap();
+    assert_eq!(view.origin(), None);
+    assert_eq!(view.header("origin"), None);
+  }
+
+  /// The two transports answer the ORIGIN question the same way, over the same
+  /// fixtures: one rule with two transports under it.
+  #[test]
+  fn the_two_transports_agree_on_the_origin_rule() {
+    use crate::handshake::h1::{ServerHandshake, ServerProgress};
+
+    /// `Ok(the origin, as the view answers it)` or `Err(())` when the gate
+    /// refused the request.
+    fn h1_origin(lines: &[&str]) -> Result<Option<String>, ()> {
+      let mut raw = String::from(
+        "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n",
+      );
+      for line in lines {
+        raw.push_str(&format!("Origin: {line}\r\n"));
+      }
+      raw.push_str("\r\n");
+      let mut hs = ServerHandshake::new();
+      match hs.handle(raw.as_bytes()) {
+        Ok(ServerProgress::Upgrade(pending)) => Ok(
+          pending
+            .request()
+            .origin()
+            .map(|o| String::from_utf8_lossy(o).into_owned()),
+        ),
+        _ => Err(()),
+      }
+    }
+
+    fn connect_origin(lines: &[&str]) -> Result<Option<String>, ()> {
+      let mut headers: Vec<(&str, &str)> = vec![
+        (":method", "CONNECT"),
+        (":protocol", "websocket"),
+        (":scheme", "https"),
+        (":path", "/chat"),
+        (":authority", "server.example.com"),
+        ("sec-websocket-version", "13"),
+      ];
+      headers.extend(lines.iter().map(|line| ("origin", *line)));
+      match validate_connect_request(&headers) {
+        Ok(view) => Ok(view.origin().map(String::from)),
+        Err(_) => Err(()),
+      }
+    }
+
+    for spelling in [
+      &[] as &[&str],
+      &[""],
+      &["https://example.com"],
+      &["null"],
+      &["https://example.com", "https://evil.example"],
+      &["https://example.com", "https://example.com"],
+    ] {
+      assert_eq!(
+        h1_origin(spelling),
+        connect_origin(spelling),
+        "the two transports disagree about {spelling:?}"
+      );
+    }
+  }
+
+  /// The offer-count bound is the SAME number on the way out as on the way in:
+  /// a list this builder writes is one this crate's own gate reads back.
+  #[test]
+  fn the_offer_count_bound_is_the_same_in_both_directions() {
+    use crate::negotiation::MAX_SUBPROTOCOL_OFFERS;
+
+    let names: Vec<String> = (0..=MAX_SUBPROTOCOL_OFFERS)
+      .map(|i| format!("p{i}"))
+      .collect();
+    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    let at_cap = borrowed.get(..MAX_SUBPROTOCOL_OFFERS).unwrap();
+    let request = ConnectRequest::new(Scheme::Https, "h", "/chat").with_subprotocols(at_cap);
+    let headers = request.headers().expect("the cap itself is writable");
+    // Emitted AND read back: the builder writes the pseudo-headers itself, so
+    // its own list is the whole request.
+    let pairs: Vec<(&str, &str)> = headers.iter().collect();
+    let view = validate_connect_request(&pairs).expect("what we emit, we read");
+    assert_eq!(view.subprotocols().count(), MAX_SUBPROTOCOL_OFFERS);
+
+    // One past it is refused at the BUILDER, not left for the peer to fail on.
+    assert!(matches!(
+      ConnectRequest::new(Scheme::Https, "h", "/chat")
+        .with_subprotocols(&borrowed)
+        .headers()
+        .unwrap_err(),
+      ConnectRequestError::InvalidField(_)
+    ));
   }
 
   #[test]
@@ -1143,6 +1567,110 @@ mod tests {
     ));
   }
 
+  /// RFC 6455 §9.1's MUST is a rule about the NEGOTIATION, not about the
+  /// transport that carries it: "if a value is received by either the client or
+  /// the server during negotiation that does not conform to the ABNF below, the
+  /// recipient of such malformed data MUST immediately _Fail the WebSocket
+  /// Connection_." Both extended-CONNECT gates enforce it, on every tier, so
+  /// the h2/h3 path cannot admit bytes the h1 path refuses.
+  #[test]
+  fn connect_gates_enforce_the_extension_grammar() {
+    let base: &[(&str, &str)] = &[
+      (":method", "CONNECT"),
+      (":protocol", "websocket"),
+      (":scheme", "https"),
+      (":path", "/chat"),
+      (":authority", "h"),
+      ("sec-websocket-version", "13"),
+    ];
+    let with_extensions = |value: &'static str| -> Vec<(&'static str, &'static str)> {
+      base
+        .iter()
+        .copied()
+        .chain([("sec-websocket-extensions", value)])
+        .collect()
+    };
+    let req = ConnectRequest::new(Scheme::Https, "h", "/");
+
+    for bad in [
+      "permessage-deflate; x=\"open",
+      "x@y",
+      "permessage-deflate; x=\"a b\"",
+      "",
+      // `extension = extension-token *( ";" extension-param )` — a semicolon
+      // with no parameter behind it, which RFC 9110 §5.6.6's `[ parameter ]`
+      // would have allowed.
+      "permessage-deflate;",
+      "permessage-deflate;;client_max_window_bits",
+    ] {
+      let headers = with_extensions(bad);
+      assert!(
+        matches!(
+          validate_connect_request(&headers).unwrap_err(),
+          ConnectRequestError::MalformedExtensions
+        ),
+        "request gate accepted {bad:?}"
+      );
+      let response: &[(&str, &str)] = &[("sec-websocket-extensions", bad)];
+      assert!(
+        matches!(
+          validate_connect_response(response, &req).unwrap_err(),
+          ConnectResponseError::MalformedExtensions
+        ),
+        "response gate accepted {bad:?}"
+      );
+    }
+
+    // The response gate carries the rule on its own, not merely by standing in
+    // front of §4.1 step 6: with an offer present `permessage-deflate;` would
+    // otherwise reach `parse_deflate_response`, and the gate is what names the
+    // fault as a grammar fault rather than a mismatch.
+    #[cfg(feature = "deflate")]
+    {
+      let offered = ConnectRequest::new(Scheme::Https, "h", "/")
+        .with_deflate(crate::negotiation::DeflateOffer::new());
+      let response: &[(&str, &str)] = &[("sec-websocket-extensions", "permessage-deflate;")];
+      assert!(matches!(
+        validate_connect_response(response, &offered).unwrap_err(),
+        ConnectResponseError::MalformedExtensions
+      ));
+    }
+
+    // RFC 6455 §9.1 states its ABNF "including the 'implied *LWS rule'", so a
+    // conforming server may put whitespace around the `;` and the `=`. RFC 7692
+    // §8.1 makes an extension response the client will not accept FAIL the
+    // connection, so reading the field here with a grammar stricter than the
+    // gate's would refuse a handshake §9.1 admits. Both sides of the CONNECT
+    // negotiation read §9.1's one grammar, so the value is GRANTED.
+    #[cfg(feature = "deflate")]
+    {
+      let offered = ConnectRequest::new(Scheme::Https, "h", "/").with_deflate(
+        crate::negotiation::DeflateOffer::new()
+          .with_server_max_window_bits(Some(12))
+          .with_client_max_window_bits(Some(11)),
+      );
+      let lws = "permessage-deflate ;  server_max_window_bits = 12 ; \
+                 client_max_window_bits = \"11\"";
+      assert!(validate_connect_request(&with_extensions(lws)).is_ok());
+      let response: &[(&str, &str)] = &[("sec-websocket-extensions", lws)];
+      let negotiated = validate_connect_response(response, &offered).unwrap();
+      let params = negotiated.deflate().unwrap();
+      assert_eq!(params.server_max_window_bits(), 12);
+      assert_eq!(params.client_max_window_bits(), 11);
+    }
+
+    // Well formed but unsupported is not a grammar fault: the request gate
+    // passes it (the server then simply declines), and the response gate
+    // reaches §4.1 step 6's "granted an extension we never offered".
+    let headers = with_extensions("x-private; a; b=c");
+    assert!(validate_connect_request(&headers).is_ok());
+    let response: &[(&str, &str)] = &[("sec-websocket-extensions", "x-private; a; b=c")];
+    assert!(matches!(
+      validate_connect_response(response, &req).unwrap_err(),
+      ConnectResponseError::ExtensionNotOffered
+    ));
+  }
+
   #[test]
   fn server_validates_a_connect_request() {
     let headers: &[(&str, &str)] = &[
@@ -1441,8 +1969,11 @@ mod tests {
     // Server side: validate, accept, respond.
     let reqh: Vec<(&str, &str)> = headers.iter().collect();
     let view = validate_connect_request(&reqh).unwrap();
-    let (params, response) =
-      accept_deflate_offer(view.extensions(), &ServerDeflateConfig::new()).unwrap();
+    let (params, response) = accept_deflate_offer(
+      view.extensions().map(str::as_bytes),
+      &ServerDeflateConfig::new(),
+    )
+    .unwrap();
     let accept = ConnectAccept::new().with_deflate(Some(response));
     let (response_headers, server_negotiated) = accept.headers_for(&view).unwrap();
     assert_eq!(server_negotiated.deflate(), Some(params));

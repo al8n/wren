@@ -3,7 +3,7 @@
 //! One [`Connection`] serves any reliable byte stream — an HTTP/1.1-upgraded
 //! TCP socket, an HTTP/2 stream (RFC 8441), or an HTTP/3 stream (RFC 9220) —
 //! because those transports change only the opening handshake. Construct it
-//! from the handshake's [`Negotiated`](crate::negotiation::Negotiated) plus a
+//! from the handshake's [`Negotiated`] plus a
 //! [`ConnectionConfig`] and a [`role::Role`](crate::connection::role::Role) value.
 //!
 //! Receive: feed transport bytes to [`Connection::handle`]; the returned

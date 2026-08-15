@@ -45,7 +45,10 @@ use std::{
 use websocket_proto::{
   Message, MessageAssembler, Negotiated,
   connection::{Connection, ConnectionConfig, Event, role::Server},
-  handshake::h1::{Accept, ServerHandshake, ServerProgress},
+  handshake::{
+    ExtraHeaders,
+    h1::{Accept, ServerHandshake, ServerProgress},
+  },
   negotiation::{ServerDeflateConfig, accept_deflate_offer},
 };
 
@@ -99,7 +102,7 @@ fn serve(mut stream: TcpStream) -> std::io::Result<()> {
 /// `leftover` is any frame-stream bytes that arrived glued to the request, or
 /// `None` if the handshake could not complete.
 fn handshake(stream: &mut TcpStream) -> std::io::Result<Option<(Negotiated, Vec<u8>)>> {
-  let server = ServerHandshake::new();
+  let mut server = ServerHandshake::new();
   let mut buf = Vec::new();
   let mut chunk = [0u8; 4096];
 
@@ -110,30 +113,39 @@ fn handshake(stream: &mut TcpStream) -> std::io::Result<Option<(Negotiated, Vec<
     }
     buf.extend_from_slice(&chunk[..n]);
 
-    // Re-parse the whole accumulated buffer (the handshake is stateless).
+    // Offer the whole accumulated buffer; `NeedMore` consumes nothing.
     let mut out = vec![0u8; 1024];
     match server.handle(&buf) {
       Ok(ServerProgress::NeedMore) => continue,
-      Ok(ServerProgress::Request(view)) => {
-        // Grant permessage-deflate when the client offers it.
-        let granted = accept_deflate_offer(view.extensions(), &ServerDeflateConfig::new());
-        let accept = Accept::new().with_deflate(granted.map(|(_, resp)| resp));
+      Ok(ServerProgress::Upgrade(mut pending)) => {
+        // Everything the answer depends on is decided WHILE the pending upgrade
+        // lives: it borrows the handshake, so what it settles stays inside the
+        // handshake that settled it and cannot cross to another.
+        let leftover = {
+          // Grant permessage-deflate when the client offers it.
+          let granted =
+            accept_deflate_offer(pending.request().extensions(), &ServerDeflateConfig::new());
+          let accept = Accept::new().with_deflate(granted.map(|(_, resp)| resp));
+          pending
+            .validate_accept(&accept)
+            .expect("our own grant answers this request");
+          // Bytes past the request head are the start of the frame stream.
+          pending.leftover().to_vec()
+        };
+        // No extra response headers: the suite wants the bare 101.
         let (written, negotiated) = server
-          .encode_response(&view, &accept, &mut out)
+          .encode_response(&ExtraHeaders::new(), &mut out)
           .expect("encode 101 response");
-        let consumed = view.consumed();
         stream.write_all(&out[..written])?;
-        // Bytes past the request head are the start of the frame stream.
-        let leftover = buf.split_off(consumed);
         return Ok(Some((negotiated, leftover)));
       }
       Err(e) => {
         eprintln!("handshake rejected: {e}");
         return Ok(None);
       }
-      // `ServerProgress` is non-exhaustive; treat any future variant as
-      // "need more input".
-      Ok(_) => continue,
+      // `ServerProgress` is non-exhaustive, and `Closed` says the peer went
+      // away without asking for anything: either way there is no handshake.
+      Ok(_) => return Ok(None),
     }
   }
 }

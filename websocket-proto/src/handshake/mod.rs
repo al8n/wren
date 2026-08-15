@@ -1,11 +1,13 @@
 //! Opening handshakes (RFC 6455 §4).
 //!
-//! Over HTTP/1.1 this crate owns the bytes: [`h1::ClientHandshake`] emits the
-//! upgrade request and validates the response; [`h1::ServerHandshake`] parses
-//! and validates the request and emits the response or a rejection. Both are
-//! **stateless re-parsers**: feed the whole accumulated buffer each time
-//! (heads are capped at 8 KiB), and on completion the `consumed` offset says
-//! where the frame stream begins.
+//! Over HTTP/1.1 this crate adds the WebSocket rules to one `http1-proto`
+//! tunnel connection: [`h1::ClientHandshake`] emits the upgrade request and
+//! validates the response; [`h1::ServerHandshake`] classifies the request and
+//! emits the response or a rejection. Both are **stateful** — one instance
+//! serves one handshake and each call ADVANCES it — so feed the whole
+//! accumulated buffer from its unconsumed start, and every outcome that
+//! consumed a head says where the bytes behind it begin. `http1-proto`'s head
+//! cap applies (16 KiB).
 //!
 //! Over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) the HTTP stack owns the
 //! bytes; the `connect` module (plan 3b) expresses the same negotiation as
@@ -14,13 +16,19 @@
 //! [`h1::ClientHandshake`]: crate::handshake::h1::ClientHandshake
 //! [`h1::ServerHandshake`]: crate::handshake::h1::ServerHandshake
 
-pub(crate) mod parser;
-
-pub use parser::{HeadError, MalformedDetail};
-
 mod extra;
 
 pub use extra::{ExtraHeaders, ExtraHeadersBuilder};
+
+/// The crate's one answer to "what is the logical value of this field" — every
+/// handshake field read on either transport goes through it.
+mod fields;
+
+/// Test fixture shared by both transports and both roles: the ways one logical
+/// field value can be spelled on the wire, and the assertion that they all get
+/// the same verdict.
+#[cfg(all(test, feature = "std"))]
+mod spellings;
 
 pub mod h1;
 
@@ -46,7 +54,9 @@ pub mod h3 {
   pub use super::connect::*;
 }
 
-use crate::{constants, error::BufferTooSmallDetail};
+use crate::constants;
+#[cfg(feature = "deflate")]
+use crate::error::BufferTooSmallDetail;
 use sha1::{Digest, Sha1};
 
 /// Derives the `Sec-WebSocket-Accept` value for a `Sec-WebSocket-Key`
@@ -65,12 +75,16 @@ pub(crate) fn accept_value(key: &[u8]) -> [u8; constants::SEC_WEBSOCKET_ACCEPT_L
   }
 }
 
-/// Bounded forward-only writer used by the handshake encoders.
+/// Bounded forward-only writer, used to render the RFC 7692 extension values
+/// the negotiation module writes. The handshake heads themselves are written by
+/// `http1-proto`'s encoder, which measures its own output.
+#[cfg(feature = "deflate")]
 pub(crate) struct WriteCursor<'a> {
   buf: &'a mut [u8],
   written: usize,
 }
 
+#[cfg(feature = "deflate")]
 impl<'a> WriteCursor<'a> {
   pub(crate) fn new(buf: &'a mut [u8]) -> Self {
     Self { buf, written: 0 }
@@ -110,6 +124,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "deflate")]
   #[test]
   fn write_cursor_tracks_and_rejects() {
     let mut buf = [0u8; 8];

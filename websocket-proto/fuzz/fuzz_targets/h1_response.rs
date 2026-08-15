@@ -23,8 +23,16 @@ impl rand_core::TryRng for ZeroRng {
 
 fuzz_target!(|data: &[u8]| {
   let options = ClientOptions::new("example.com", "/").with_subprotocols(&["chat"]);
-  let hs = ClientHandshake::new(options, &mut ZeroRng).expect("static options are valid");
-  if let Ok(ClientProgress::Complete(done)) = hs.handle(data) {
-    assert!(done.consumed() <= data.len());
+  let mut hs = ClientHandshake::new(options, &mut ZeroRng).expect("static options are valid");
+  // The connection reads a response only for a handshake it opened.
+  let mut request = [0u8; 512];
+  hs.encode_request(&mut request)
+    .expect("static options encode");
+  // Every outcome that consumed a head says how far it reached, and that can
+  // never be past what was offered.
+  match hs.handle(data) {
+    Ok(ClientProgress::Complete(done)) => assert!(done.consumed() <= data.len()),
+    Ok(ClientProgress::Interim { consumed, .. }) => assert!(consumed <= data.len()),
+    _ => {}
   }
 });

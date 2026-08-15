@@ -3,7 +3,7 @@ members = ["websocket-proto", "wren-trace", "wren-compio", "wren-reactor", "http
 resolver = "3"
 
 [workspace.dependencies]
-websocket-proto = { version = "0.1", path = "websocket-proto", default-features = false }
+websocket-proto = { version = "0.2", path = "websocket-proto", default-features = false }
 http1-proto = { version = "0.1", path = "http1-proto", default-features = false }
 http3-proto = { version = "0.1", path = "http3-proto", default-features = false }
 wren-trace = { version = "0.1", path = "wren-trace" }

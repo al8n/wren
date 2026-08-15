@@ -1,6 +1,6 @@
 //! Extra (caller-supplied) handshake headers, shared by both roles.
 
-use crate::handshake::parser::is_token;
+use http1_proto::grammar::is_token;
 
 /// A borrowed list of additional handshake headers (`(name, value)` pairs):
 /// request headers for the client (auth, origin, cookies) and response headers
@@ -9,6 +9,15 @@ use crate::handshake::parser::is_token;
 /// Header names must be RFC 9110 tokens and values must not contain CR or LF;
 /// these checks run at encode time (the client additionally rejects names that
 /// collide with the headers it manages itself).
+///
+/// **A name may repeat unless this crate resolves it as a singleton.** RFC 9110
+/// §5.3 lets a sender repeat any field whose definition has a comma-list
+/// alternative — `Cache-Control`, `Via`, `WWW-Authenticate`, and an open set
+/// besides — so the screen names the other side instead: the fields whose
+/// cardinality this crate itself decides. Of those, `Origin` is the only one a
+/// caller may write at all (the rest are refused outright as managed headers),
+/// and RFC 6454 §7.1 gives it one SP-separated `origin-list`, so it may be sent
+/// once and not twice.
 ///
 /// Construct via the `From` conversions — the option builders take
 /// `impl Into<ExtraHeaders>`, so call sites pass a slice (or array) directly,
@@ -118,24 +127,60 @@ impl<'s, 'a> ExtraHeaders<'s, 'a> {
     self.entries.is_empty()
   }
 
-  /// Validates the checks both roles share: each name is a token and each
-  /// value fits the RFC 9110 §5.5 field-value grammar (HTAB / SP / VCHAR /
-  /// obs-text — no C0 control except HTAB, no DEL). Returns the offending
-  /// reason on the first failure.
+  /// Validates the checks both roles share: each name is a token, each value
+  /// fits the RFC 9110 §5.5 field-value grammar (HTAB / SP / VCHAR / obs-text —
+  /// no C0 control except HTAB, no DEL), and no [`SINGLETON`] name is repeated.
+  /// Returns the offending reason on the first failure.
   ///
   /// This mirrors the inbound parser's screening exactly: a value the crate
   /// refuses to PARSE must not be one it will EMIT, or a conforming peer or
   /// intermediary may reject — or worse, reinterpret — the handshake.
+  ///
+  /// # Which repeats are refused, and why only those
+  ///
+  /// The defect this closes is specific: the client could put two `Origin`
+  /// entries in its extras, and this crate's own server refuses that request as
+  /// a duplicated singleton (RFC 6454 §7.1's `origin-list` is SP-separated, so
+  /// the field has no comma-list spelling). A crate whose client emits what its
+  /// own server rejects has the emitters and the validators drifting apart,
+  /// which is the class this module's screening exists to close.
+  ///
+  /// Preserving *emit ⊆ accept* takes refusing exactly what the receiving side
+  /// refuses — which is [`SINGLETON`], the names whose cardinality this crate
+  /// decides — and nothing beyond it. RFC 9110 §5.3's own text is why the screen
+  /// cannot be run the other way round: a sender may repeat a name "unless that
+  /// field's definition allows multiple field line values to be recombined as a
+  /// comma-separated list", so the permitted set is every list-valued field, an
+  /// open set that includes `Cache-Control`, `Via`, and whatever is registered
+  /// next. Refusing by default and allowlisting would break those conforming
+  /// layouts, and a field this crate neither writes nor reads is the caller's to
+  /// spell — this screen exists to stop the crate contradicting ITSELF, not to
+  /// audit the caller's compliance with a field it does not own.
   pub(crate) fn validate(&self) -> Result<(), &'static str> {
     if self.overflowed {
       return Err("extra headers exceeded the builder capacity");
     }
-    for (name, value) in self.entries {
-      if !is_token(name) {
+    for (i, (name, value)) in self.entries.iter().enumerate() {
+      if !is_token(name.as_bytes()) {
         return Err("extra header name is not a token");
       }
       if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F) {
         return Err("extra header value contains control bytes");
+      }
+      // Compared against the entries BEFORE this one, so the reported offender
+      // is the repeat rather than the first occurrence. The scan runs only for a
+      // singleton name, and is quadratic in the caller's OWN list — outbound
+      // configuration it built and pays for — unlike an inbound list, which a
+      // peer chooses.
+      let singleton = SINGLETON.iter().any(|s| name.eq_ignore_ascii_case(s));
+      let repeated = || {
+        self
+          .entries
+          .get(..i)
+          .is_some_and(|prev| prev.iter().any(|(p, _)| p.eq_ignore_ascii_case(name)))
+      };
+      if singleton && repeated() {
+        return Err("extra header repeats a field name");
       }
     }
     Ok(())
@@ -145,7 +190,7 @@ impl<'s, 'a> ExtraHeaders<'s, 'a> {
   /// (minus `exempt`, ASCII case-insensitive). A colliding extra would put
   /// bytes on the wire that contradict the machine's own negotiation state —
   /// e.g. an extra `Sec-WebSocket-Extensions` granting deflate the returned
-  /// [`Negotiated`](crate::negotiation::Negotiated) knows nothing about.
+  /// [`Negotiated`] knows nothing about.
   pub(crate) fn validate_no_managed_collision(&self, exempt: &[&str]) -> Result<(), &'static str> {
     for (name, _) in self.entries {
       let managed = MANAGED.iter().any(|m| name.eq_ignore_ascii_case(m));
@@ -160,17 +205,15 @@ impl<'s, 'a> ExtraHeaders<'s, 'a> {
 
 /// Headers the handshake machines manage themselves; caller extras must not
 /// collide (the wire would contradict the negotiation state). Shared by both
-/// roles.
-pub(crate) const MANAGED: &[&str] = &[
-  "host",
-  "upgrade",
-  "connection",
-  "sec-websocket-key",
-  "sec-websocket-version",
-  "sec-websocket-protocol",
-  "sec-websocket-extensions",
-  "sec-websocket-accept",
-];
+/// roles, and named ONCE — beside the accessors that read the same fields, so
+/// this list and the reading side cannot come to disagree about which names the
+/// handshake owns.
+pub(crate) use super::fields::MANAGED;
+
+/// The field names a caller's extras may not repeat, named ONCE beside the
+/// accessors that resolve them — same reason as [`MANAGED`]: the rule the
+/// emitter screens against and the rule the gates enforce must be one rule.
+pub(crate) use super::fields::SINGLETON;
 
 /// An incremental, allocation-free builder for [`ExtraHeaders`]: a bounded
 /// inline list of `(name, value)` pairs.
