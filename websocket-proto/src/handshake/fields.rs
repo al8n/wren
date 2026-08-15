@@ -31,8 +31,8 @@
 //!   lines a name may have.
 //! - **[`crate::negotiation`]**: the field's own cardinality — `1#extension`
 //!   (RFC 6455 §9.1), `1#token` (§11.3.4), "a response grants exactly one
-//!   extension" (RFC 7692 §8.1). Those are grammar, and they are asked over the
-//!   complete value this module hands them.
+//!   extension" (RFC 6455 §4.1 step 5). Those are grammar, and they are asked
+//!   over the complete value this module hands them.
 //! - **The gate and the readers**: what the resolved value MEANS. Nothing else.
 //!
 //! A regression test at the bottom of this file fails if any handshake module
@@ -364,7 +364,7 @@ impl<'a> RequestFields<'a> {
   }
 }
 
-/// Every field the h1 CLIENT reads out of a 101 (RFC 6455 §4.1 steps 3-6).
+/// Every field the h1 CLIENT reads out of a 101 (RFC 6455 §4.1 steps 2-6).
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct ResponseFields<'a> {
   head: HeadView<'a>,
@@ -395,8 +395,8 @@ impl<'a> ResponseFields<'a> {
 
   /// `Sec-WebSocket-Extensions` in the RESPONSE role — still RFC 6455 §9.1's
   /// `1#extension`, still splittable across lines. How many extensions a
-  /// RESPONSE may grant is RFC 7692 §8.1's question, asked over the whole value
-  /// by `crate::negotiation::parse_deflate_response`.
+  /// RESPONSE may grant is RFC 6455 §4.1 step 5's question, asked over the
+  /// whole value by `crate::negotiation::parse_deflate_response`.
   pub(crate) fn granted_extensions(self) -> FieldValue<impl Iterator<Item = &'a [u8]> + Clone> {
     h1(self.head, EXTENSIONS)
   }

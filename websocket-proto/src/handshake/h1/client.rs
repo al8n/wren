@@ -201,7 +201,7 @@ pub enum ClientHandshakeError {
   SubprotocolNotOffered,
 
   /// The server granted an extension the client never offered (RFC 6455
-  /// §4.1 step 6 — fail the connection).
+  /// §4.1 step 5 — fail the connection).
   #[error("server granted an unoffered extension")]
   ExtensionNotOffered,
 
@@ -548,9 +548,9 @@ impl<'a> ClientHandshake<'a> {
       extensions,
       extras: self.options.extra_headers,
     };
-    // RFC 9112 §3.2.1's origin-form, which §4.2.1.1 of RFC 6455 makes the shape
-    // of a websocket resource name; `ClientOptions::new` held `path` to that
-    // grammar before this connection existed.
+    // RFC 9112 §3.2.1's origin-form, which §4.2.1 item 1 of RFC 6455 makes the
+    // shape of a websocket resource name; `ClientOptions::new` held `path` to
+    // that grammar before this connection existed.
     let target = Target::Origin {
       path_and_query: self.options.path,
     };
@@ -614,7 +614,7 @@ impl<'a> ClientHandshake<'a> {
     // behind it cannot disagree about occurrences or presence.
     let fields = ResponseFields::new(head);
 
-    // §4.1 step 3: an `Upgrade` field "equal to 'websocket'". http1-proto
+    // §4.1 step 2: an `Upgrade` field "equal to 'websocket'". http1-proto
     // proved BOTH halves of RFC 9110 §7.8 are present and that the field names
     // some protocol; WHICH protocol was offered is known only here, so §7.8
     // delegates the match upward. RFC 9110 §5.3: repeated field lines are one
@@ -639,9 +639,10 @@ impl<'a> ClientHandshake<'a> {
       return Err(ClientHandshakeError::AcceptMismatch);
     }
 
-    // §4.1 step 5: at most one, and one this client offered. §11.5 makes the
-    // identifiers case-SENSITIVE, and the whole value must be a single token —
-    // a server that answered with a LIST selected nothing that was offered.
+    // §4.1 step 6: at most one, and one this client offered. RFC 6455 grants the
+    // identifiers NO case-insensitive comparison, and the whole value must be a
+    // single token — a server that answered with a LIST selected nothing that
+    // was offered.
     // Unlike the REQUEST role's `1#token`, §4.2.2 item 4 makes the response one
     // selection, so a second field line is a second answer rather than a
     // continuation of the first.
@@ -670,7 +671,7 @@ impl<'a> ClientHandshake<'a> {
       return Err(ClientHandshakeError::MalformedExtensions);
     }
 
-    // §4.1 step 6: an extension the client did not offer fails the connection.
+    // §4.1 step 5: an extension the client did not offer fails the connection.
     #[cfg(not(feature = "deflate"))]
     if fields.granted_extensions().present() {
       return Err(ClientHandshakeError::ExtensionNotOffered);
@@ -902,7 +903,8 @@ mod tests {
       ClientHandshakeError::InvalidOptions(_)
     ));
     // RFC 6455 §4.1 item 10: offered subprotocols MUST all be unique
-    // (case-sensitively — "CHAT" is a different identifier per §11.5).
+    // (exactly — RFC 6455 grants no folding, so "CHAT" is a different
+    // identifier).
     let dup = ClientOptions::new("h", "/").with_subprotocols(&["chat", "chat"]);
     assert!(matches!(
       ClientHandshake::new(dup, &mut CountingRng(0)).unwrap_err(),
@@ -1140,7 +1142,7 @@ mod tests {
       ClientHandshakeError::MalformedExtensions
     ));
 
-    // Well formed but unoffered is the OTHER answer (§4.1 step 6), which the
+    // Well formed but unoffered is the OTHER answer (§4.1 step 5), which the
     // gate must not swallow.
     let resp = response_for(&hs, "Sec-WebSocket-Extensions: x-private; a=b\r\n");
     assert!(matches!(
@@ -1454,9 +1456,9 @@ mod tests {
 
   #[test]
   fn subprotocol_selection_is_case_sensitive() {
-    // RFC 6455 §11.5: identifiers are case-sensitive. The client offered
-    // "chat"/"superchat"; a server selecting "CHAT" selected something we
-    // never offered.
+    // RFC 6455 grants identifiers no case-insensitive comparison. The client
+    // offered "chat"/"superchat"; a server selecting "CHAT" selected something
+    // we never offered.
     let mut hs = opened();
     let resp = response_for(&hs, "Sec-WebSocket-Protocol: CHAT\r\n");
     assert!(matches!(
@@ -1784,7 +1786,7 @@ mod tests {
 
   /// RFC 6455 §9.1 states its ABNF "including the 'implied *LWS rule'", so a
   /// conforming server may write `permessage-deflate ; server_max_window_bits =
-  /// 12`. RFC 7692 §8.1 makes an extension response the client will not accept
+  /// 12`. RFC 7692 §7 makes an extension response the client will not accept
   /// FAIL the connection, so reading the granted value with a grammar stricter
   /// than the §9.1 gate's does not merely decline the extension — it refuses a
   /// handshake the RFC admits. Regression for exactly that: the gate accepted
