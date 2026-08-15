@@ -35,6 +35,18 @@ pub enum ConnectError {
     /// The HTTP status the server answered with.
     status: u16,
   },
+
+  /// The server sent more interim (1xx) responses than this driver reads before
+  /// the final one.
+  ///
+  /// RFC 9110 §15.2 puts no limit on how many may precede the answer, so the
+  /// limit is this driver's: without one, a peer that streams 1xx heads keeps
+  /// the connect attempt running forever with nothing to report.
+  #[error("server sent more than {limit} interim responses before answering")]
+  TooManyInterimResponses {
+    /// How many interim responses were read before the attempt was abandoned.
+    limit: usize,
+  },
 }
 
 /// Errors accepting a server connection.
