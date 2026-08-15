@@ -626,6 +626,14 @@ impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
   /// A connection with nothing in flight, ready for its first exchange.
   ///
   /// Exchange ids start at 1, so a zero is never an id this core minted.
+  ///
+  /// Bounded like [`HashMap::with_hasher`](std::collections::HashMap::with_hasher),
+  /// and for the same reason: a constructor decides what a meaningful value of
+  /// the type IS, and this crate's type-state argument is that a mode is a real
+  /// capability set rather than an arbitrary parameter. It is also the bound that
+  /// makes every OTHER impl's widening free rather than a trade — `Connection`'s
+  /// fields are all private, so a `Connection<SomeForeign, SomeOther>` cannot be
+  /// built by any route except this one, and this one still refuses it.
   #[inline]
   pub const fn new() -> Self {
     Self {
@@ -647,7 +655,9 @@ impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
       shape: PhantomData,
     }
   }
+}
 
+impl<Ro, Mo> Connection<Ro, Mo> {
   /// Takes the next queued connection-scoped notice, or `None`.
   ///
   /// Mode-generic, unlike everything else about the receive side: an [`Event`] is
@@ -663,6 +673,9 @@ impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
   /// tracking, while the connection-scoped one is about everything. A driver that
   /// acted on the close before hearing which exchange died would have to work out
   /// the second from the first, which is what the abort exists to spare it.
+  ///
+  /// `Role`- and `Mode`-free: it reads only `aborted` and `event`, neither of
+  /// which either type-state answers a question about.
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event> {
     if let Some(exchange) = self.aborted.take() {
@@ -891,7 +904,13 @@ impl<Ro: Role> Connection<Ro, General> {
       },
     }
   }
+}
 
+// `Ro` is free rather than `Role`-bounded below: none of `is_awaiting_send`,
+// `close` or `settle` reads `Role::IS_CLIENT` or anything else the trait
+// offers — they turn on `lifecycle`, `recv` and `send` alone, which every
+// `Connection<Ro, General>` carries whatever `Ro` is filled with.
+impl<Ro> Connection<Ro, General> {
   /// Whether progress is blocked on the LOCAL send side.
   ///
   /// The write half of the readiness split, and the one a driver must not
