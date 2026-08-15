@@ -1,3 +1,4 @@
+mod handshake_diff;
 mod qpack_data;
 
 use std::{
@@ -48,6 +49,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       }
       qpack_codegen(check)?;
     }
+    "handshake-diff" => {
+      let Some(base) = args.next() else {
+        return Err("handshake-diff needs a base revision".into());
+      };
+      let head = args.next();
+      if args.next().is_some() {
+        return Err("too many handshake-diff arguments".into());
+      }
+      handshake_diff::run(&base, head.as_deref())?;
+    }
     "-h" | "--help" | "help" => print_help(),
     other => return Err(format!("unknown command: {other}").into()),
   }
@@ -61,6 +72,13 @@ fn print_help() {
 Usage:
   cargo run -p xtask -- qpack-codegen
   cargo run -p xtask -- qpack-codegen --check
+  cargo run -p xtask -- handshake-diff <base-rev> [head-rev]
+
+`handshake-diff` runs `handshake-corpus` against two revisions of
+`websocket-proto` and reports the verdicts that moved, grouped by
+(role, field, reason), plus whether equivalent spellings of one field value
+still reach one verdict. `head-rev` defaults to the working tree. It works in
+$TMPDIR and leaves the repository untouched.
 "
   );
 }
