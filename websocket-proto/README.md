@@ -67,10 +67,130 @@ The bare `no_std`, no-`alloc` tier compiles with `--no-default-features`.
 
 ## Quick start
 
+### Server: the opening handshake
+
+RFC 6455 §4.2's accept is **two-phase**, because the request is borrowed from
+the driver's buffer while the answer outlives it. Everything §4.2.2 binds to
+the request — the subprotocol echoed must be one that was offered, an extension
+may be granted only if this request's offers legalize it — is checked by
+[`PendingUpgrade::validate_accept`] while the [`RequestView`] is alive, and
+settled INSIDE the handshake. [`ServerHandshake::encode_response`] writes the
+101 from that stored answer alone, so an answer nobody checked against the
+request is not expressible — and neither is one belonging to a different
+handshake: the pending upgrade holds its handshake by mutable borrow and
+`validate_accept` takes no request argument, so there is nothing to cross.
+
+The HTTP is [`http1-proto`]'s: head grammar and caps, RFC 9112 §3.2's `Host`
+and request-target rules, RFC 9110 §7.8's upgrade offer and the 101 that
+answers it, and the leftover handoff. What lives here is what RFC 6455 adds on
+top — the key/accept SHA-1, the version check, and negotiation.
+
+```rust
+use websocket_proto::{
+  connection::{Connection, ConnectionConfig, Event, role::Server},
+  handshake::{
+    ExtraHeaders,
+    h1::{Accept, ServerHandshake, ServerProgress},
+  },
+  negotiation::select_subprotocol,
+};
+
+fn main() {
+  // The driver's accumulated buffer: RFC 6455 §4.1's request and — glued into
+  // the same read — the first frame the client sent behind it (masked, as §5.3
+  // requires of a client; this one uses an all-zero key so it reads plainly).
+  let inbound: &[u8] = b"GET /chat HTTP/1.1\r\nHost: example.com\r\n\
+    Upgrade: websocket\r\nConnection: Upgrade\r\n\
+    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+    Sec-WebSocket-Protocol: superchat, chat\r\n\
+    Sec-WebSocket-Version: 13\r\n\r\n\x81\x83\x00\x00\x00\x00abc";
+
+  let mut server = ServerHandshake::new();
+  // `NeedMore` consumes nothing — offer the same bytes again with more behind
+  // them; `Closed` is a peer that went away without asking for anything.
+  let ServerProgress::Upgrade(mut pending) =
+    server.handle(inbound).expect("a conforming §4.1 request")
+  else {
+    panic!("the whole head is in this buffer")
+  };
+
+  // PHASE 1, while the request is still readable. The pending upgrade carries
+  // the request AND the handshake that classified it, so the answer below can
+  // only be bound to this exchange.
+  let view = pending.request();
+  assert_eq!(view.path(), "/chat");
+  // The EFFECTIVE authority: an absolute-form target carries its own, which
+  // RFC 9112 §3.2.2 makes an origin server prefer over the `Host` field — so
+  // routing and origin policy read this, never the raw field.
+  assert_eq!(view.host(), "example.com");
+  let chosen = select_subprotocol(view.subprotocols(), &["chat"]);
+  pending
+    .validate_accept(&Accept::new().with_subprotocol(chosen))
+    .expect("`chat` is one of the offers");
+  // Whatever followed the head is frame-stream data. Copied out because the
+  // connection unmasks payloads in place.
+  let mut frames = pending.leftover().to_vec();
+
+  // PHASE 2. The answer outlives the head it was checked against, and the
+  // `Sec-WebSocket-Accept` is derived from the key THIS handshake classified —
+  // here, RFC 6455 §1.3's own example pair.
+  let mut out = [0u8; 256];
+  let (n, negotiated) = server
+    .encode_response(&ExtraHeaders::new(), &mut out)
+    .expect("the buffer fits the 101");
+  assert_eq!(
+    &out[..n],
+    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+      Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+      Sec-WebSocket-Protocol: chat\r\n\r\n"
+  );
+  // ... write out[..n] to the socket ...
+
+  // The handshake is spent. What it negotiated configures the frame machine,
+  // and the leftover is that machine's first input — never the handshake's.
+  let mut conn = Connection::new(
+    &negotiated,
+    ConnectionConfig::new(),
+    Server::new(),
+    Tick(0),
+  );
+  let mut events = conn.handle(Tick(0), &mut frames).expect("not terminal");
+  assert!(matches!(events.next(), Some(Event::MessageStart(_))));
+  assert!(matches!(events.next(), Some(Event::TextChunk(text)) if text.body() == "abc"));
+}
+
+/// The monotonic clock deadlines are scheduled against — microseconds from any
+/// source. `std::time::Instant` already implements it under the `std` feature;
+/// a bare-metal driver wraps its hardware timer exactly like this.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Tick(u64);
+
+impl websocket_proto::time::Instant for Tick {
+  fn checked_add_duration(self, dur: core::time::Duration) -> Option<Self> {
+    u64::try_from(dur.as_micros())
+      .ok()
+      .and_then(|micros| self.0.checked_add(micros))
+      .map(Self)
+  }
+
+  fn checked_duration_since(self, earlier: Self) -> Option<core::time::Duration> {
+    self
+      .0
+      .checked_sub(earlier.0)
+      .map(core::time::Duration::from_micros)
+  }
+}
+```
+
+A rejection takes the same shape without the decision:
+`ServerHandshake::encode_rejection(&Rejection::unsupported_version(), out)`
+writes RFC 6455 §4.2.2's `426` answer (with `Sec-WebSocket-Version: 13`) and
+ends the handshake.
+
 ### Server: accept and echo
 
-After the HTTP/1.1 upgrade completes, build a [`Connection`] from the
-[`Negotiated`] result and run a `handle` → assemble → echo → drain loop. A
+With the handshake done, build a [`Connection`] from the [`Negotiated`] result
+and run a `handle` → assemble → echo → drain loop. A
 [`MessageAssembler`] folds the lending events into owned [`Message`]s
 (`alloc`); the allocator-free [`SliceAssembler`] folds them into a
 caller-provided buffer and yields a borrowed [`MessageRef`] on every tier
@@ -123,37 +243,93 @@ fn echo_step(
 
 ### Client: connect
 
-The client mirror: draw a nonce from an RNG, write the upgrade request, feed
-the accumulating response to [`ClientHandshake::handle`], then build the
-[`Connection`] with the [`Client`] role.
+The mirror: draw the nonce from an RNG, write the request, then feed the
+accumulating response buffer to [`ClientHandshake::handle`] until it answers.
+Every outcome that consumed a head reports how far it reached — RFC 9110 §15.2
+lets any number of 1xx responses precede the real answer, and a driver that
+does not advance past one re-reads it forever.
 
-```rust,ignore
-use std::time::Instant;
-use websocket_proto::{
-    connection::{Connection, ConnectionConfig, role::Client},
-    handshake::h1::{ClientHandshake, ClientOptions, ClientProgress},
-};
+```rust
+use websocket_proto::handshake::h1::{ClientHandshake, ClientOptions, ClientProgress};
 
-fn connect<R: rand_core::Rng>(mut rng: R, response: &[u8], request_out: &mut [u8]) {
-    let options = ClientOptions::new("example.com", "/chat");
-    let handshake = ClientHandshake::new(options, &mut rng).expect("valid options");
+fn main() {
+  let options = ClientOptions::new("example.com", "/chat").with_subprotocols(&["chat"]);
+  let mut client = ClientHandshake::new(options, &mut SampleNonce).expect("valid options");
 
-    // 1. Send the upgrade request.
-    let n = handshake.encode_request(request_out).expect("buffer fits");
-    // ... write request_out[..n]; read the response into `response` ...
-    let _ = n;
+  // 1. Write the request into the caller's buffer.
+  let mut request = [0u8; 256];
+  let n = client.encode_request(&mut request).expect("the buffer fits");
+  assert_eq!(
+    &request[..n],
+    b"GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\
+      Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+      Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat\r\n\r\n"
+  );
+  // ... write request[..n], then append what the socket returns to a buffer ...
 
-    // 2. Feed the accumulated response until the handshake completes.
-    if let ClientProgress::Complete(done) = handshake.handle(response).expect("valid") {
-        let negotiated = done.into_negotiated();
-        let _conn: Connection<Instant, _> = Connection::new(
-            &negotiated,
-            ConnectionConfig::new(),
-            Client::new(rng),
-            Instant::now(),
-        );
-        // ... drive the same handle → encode → poll_transmit loop as the server ...
+  // 2. Read the answer back. This one read carried an interim response, the
+  //    switch, and the server's first frame behind it.
+  let response: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n\
+    HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+    Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+    Sec-WebSocket-Protocol: chat\r\n\r\n\x81\x03abc";
+
+  let mut offset = 0;
+  let negotiated = loop {
+    match client.handle(&response[offset..]).expect("a conforming answer") {
+      // Consumes nothing: read more and offer the whole buffer again.
+      ClientProgress::NeedMore => panic!("the whole answer is in this buffer"),
+      // RFC 9110 §15.2: informational, and explicitly not the answer.
+      ClientProgress::Interim { status, consumed } => {
+        assert_eq!(status, 100);
+        offset += consumed;
+      }
+      // Not an error — RFC 9110 §7.8: "Upgrade cannot be used to insist on a
+      // protocol change". `consumed` delimits the refusing head, so the caller
+      // can read `WWW-Authenticate` or `Location` out of it and act.
+      ClientProgress::Refused { status, .. } => panic!("the server answered {status}"),
+      ClientProgress::Complete(complete) => {
+        offset += complete.consumed();
+        break complete.into_negotiated();
+      }
+      // `ClientProgress` is `#[non_exhaustive]`: an outcome this build does not
+      // know is not the switch, and filing it under "not yet" is the re-read
+      // loop again. Fail rather than guess.
+      other => panic!("unknown outcome: {other:?}"),
     }
+  };
+
+  assert_eq!(negotiated.subprotocol(), Some("chat"));
+  // Everything at and beyond the offset belongs to the frame stream. The
+  // connection is built from `negotiated` exactly as the server's is, with
+  // `role::Client::new(rng)` — which draws a fresh mask key per frame.
+  assert_eq!(&response[offset..], b"\x81\x03abc");
+}
+
+/// RFC 6455 §4.1 draws the 16-byte nonce randomly, so a real client hands
+/// `ClientHandshake::new` a CSPRNG (`rand`'s, behind this crate's `rand`
+/// feature). This one replays the nonce §1.2's example handshake uses, so the
+/// key above is the one the RFC prints and the accept below is §1.3's answer
+/// to it.
+struct SampleNonce;
+
+impl rand_core::TryRng for SampleNonce {
+  type Error = core::convert::Infallible;
+
+  fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+    Ok(0)
+  }
+
+  fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+    Ok(0)
+  }
+
+  fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+    for (slot, byte) in dest.iter_mut().zip(b"the sample nonce".iter().cycle()) {
+      *slot = *byte;
+    }
+    Ok(())
+  }
 }
 ```
 
@@ -169,6 +345,7 @@ facade are separate crates, mirroring the `quinn` layering:
 | Crate | Role |
 |-------|------|
 | `websocket-proto` | Sans-I/O protocol state machines (this crate) |
+| [`http1-proto`] | Sans-I/O HTTP/1.1 core; the h1 opening handshake runs on its Tunnel API |
 | `wren` *(planned)* | batteries-included facade (core + default driver) |
 | `wren-reactor` *(planned)* | runtime-agnostic async h1 driver (`tokio` & `smol`) |
 | `wren-compio` *(planned)* | `compio` (thread-per-core) async h1 driver |
@@ -214,6 +391,10 @@ Copyright (c) 2026 Al Liu.
 [`MessageRef`]: https://docs.rs/websocket-proto/latest/websocket_proto/message/enum.MessageRef.html
 [`Negotiated`]: https://docs.rs/websocket-proto/latest/websocket_proto/negotiation/struct.Negotiated.html
 [`ClientHandshake::handle`]: https://docs.rs/websocket-proto/latest/websocket_proto/handshake/h1/struct.ClientHandshake.html#method.handle
+[`RequestView`]: https://docs.rs/websocket-proto/latest/websocket_proto/handshake/h1/struct.RequestView.html
+[`PendingUpgrade::validate_accept`]: https://docs.rs/websocket-proto/latest/websocket_proto/handshake/h1/struct.PendingUpgrade.html#method.validate_accept
+[`ServerHandshake::encode_response`]: https://docs.rs/websocket-proto/latest/websocket_proto/handshake/h1/struct.ServerHandshake.html#method.encode_response
+[`http1-proto`]: https://docs.rs/http1-proto
 [`Client`]: https://docs.rs/websocket-proto/latest/websocket_proto/connection/role/struct.Client.html
 [`no-panic`]: https://docs.rs/no-panic
 [`examples/autobahn-server.rs`]: https://github.com/al8n/wren/blob/main/websocket-proto/examples/autobahn-server.rs

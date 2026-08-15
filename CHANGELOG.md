@@ -20,7 +20,15 @@ it.
 
 - **Grammar** (RFC 9110 §5.6): `token` / `field-value` over raw bytes
   (`field-vchar = VCHAR / obs-text`, interior SP/HTAB, OWS-trimmed, CTLs
-  rejected), the RFC 3986 target validators, and the §5.6.1 list splitter.
+  rejected), the RFC 3986 target validators, the §5.6.1 list splitter, and
+  `parameterised_list` — the §5.6.6 `#`-list walk that crosses a §5.2 field-line
+  join without materialising it. That walk has **no consumer in this workspace**:
+  it was added for `websocket-proto`'s `Sec-WebSocket-Extensions`, which turned
+  out to need RFC 6455 §9.1's own grammar instead (see that crate's *Fixed*
+  below). It stays because it is the right reading of the fields §5.6.6 actually
+  governs — `Accept`, `Content-Type`, `Forwarded`, a `Transfer-Encoding` with
+  parameters — which is what an HTTP core is for, and because it is the one place
+  the join-crossing rule is implemented.
 - **Start lines** (RFC 9112 §3, §4): all four §3.2 request-target forms with
   method pairing; single-SP separators only; case-sensitive `HTTP-version`,
   higher 1.x minor processed as 1.1 (RFC 9110 §6.2), other majors → 505.
@@ -86,8 +94,378 @@ it.
 - **Split-robustness property** (`tests/split_robustness.rs`): where the
   transport cut the stream cannot change what the connection says about it, over
   one shot / byte-at-a-time / every single cut / proptest multi-cut vectors.
-- **254 tests** at `--all-features`, green on every tier and under
-  `cargo hack test --each-feature`.
+- Green on every tier and under `cargo hack test --each-feature`; the suite is
+  enumerated in `http1-proto/CHANGELOG.md`. No total is quoted here: the figure
+  this line used to carry (254) was 133 short of the measured suite, because a
+  count is invalidated by every commit that adds a test and nothing checks it.
+
+## `websocket-proto` 0.2.0 — cycle 5 (h1 handshake re-based onto `http1-proto`)
+
+PR2 of the cycle. websocket-proto's private HTTP/1.1 layer is deleted and both
+h1 handshakes are rebuilt on `http1-proto`'s Tunnel API, so the split between
+the two crates is the split between the two specifications: `http1-proto` owns
+HTTP — head grammar and caps, RFC 9112 §3.2's `Host` and request-target rules,
+RFC 9110 §7.8's upgrade offer and the 101 that answers it, and the leftover
+handoff — and this crate keeps only what RFC 6455 adds on top: the
+`Sec-WebSocket-Key`/`-Accept` SHA-1, the version check, subprotocol and
+extension negotiation, and the §4.2.1.1 resource-name policy. `RequestView`'s
+inline 64-entry header table (~2 KB) is replaced by the borrowed `HeadView`.
+
+### Breaking
+
+- **The handshakes are stateful, one instance per handshake.** Every method that
+  drives the connection — `handle`, `encode_request`, `encode_response`,
+  `encode_rejection` — takes `&mut self` and ADVANCES it, so `handle` is no
+  longer replayable and a driver that used to re-parse the head must carry the
+  handshake instead. `ServerHandshake` is no longer `Copy`/`Clone`/`Default` and
+  `ClientHandshake` is no longer `Clone` (`http1_proto::Connection` is not
+  `Clone`).
+- **Answering a request splits in two, and the answer never leaves the
+  handshake.** The head's borrow ends before the driver decides, so RFC 6455
+  §4.2.2's request-bound checks — the chosen subprotocol was offered, the
+  deflate grant is one this request legalizes — run in the new
+  `PendingUpgrade::validate_accept(&accept)` while the view is alive. It returns
+  `Result<(), ServerHandshakeError>` and stores what it settled INSIDE the
+  handshake; `ServerHandshake::encode_response(&extras, out)` takes no answer
+  argument and returns `(usize, Negotiated)`, writing the subprotocol and the
+  extension grant out of that stored answer. A handshake that validated nothing
+  answers with the new `ServerHandshakeError::AnswerNotValidated`, so there is no
+  unvalidated path to a 101.
+- **`AcceptDecision` is gone, and so is the request argument.** Both halves of
+  the pairing used to be values a caller held: an owned decision between the two
+  calls, and the classified `RequestView` handed to `validate_accept`. Both were
+  policed by COMPARING the request's `Sec-WebSocket-Key`, which is data the PEER
+  chooses — a client may send one key on two concurrent requests (§4.1 asks for a
+  randomly selected value, which binds a conforming client and not a hostile
+  one), and the comparison then passes: A's subprotocol and A's extension grant
+  written into the 101 answering B, whose client offered neither, with every call
+  returning `Ok`. Deleting the pairable objects deletes the pairing rather than
+  policing it. The answer lives in the handshake that validated it, and
+  `ServerHandshake::handle` now yields a `PendingUpgrade` that holds its
+  handshake by mutable borrow next to the view — `validate_accept` is a method on
+  it and takes no request. No function in the crate accepts a `RequestView`, so
+  answering one exchange out of another's offers does not compile
+  (`PendingUpgrade`'s `compile_fail` proofs), and one handshake cannot hold two
+  pending upgrades at once. `ServerHandshakeError::MismatchedRequest` is gone
+  with the comparison it named.
+- **Extra response headers move off `Accept` and onto `encode_response`.**
+  `Accept::with_extra_headers` is gone; `Accept` now carries only the
+  request-bound half of an answer (the subprotocol and the grant). Nothing
+  about an extra header depends on the request — the checks are token names,
+  field-value bytes, and no collision with a managed field — so they are
+  supplied and validated where the answer is written. Pass
+  `&ExtraHeaders::new()` when there are none. This is what keeps the decision
+  free of borrows; the rejection path is unchanged
+  (`Rejection::with_extra_headers` stays).
+- `handshake::h1` now re-exports `InvalidOptionsDetail`. It was a `pub` type
+  reachable only through an error variant, so no downstream crate could name it
+  and rustdoc had nothing to link.
+- `ServerProgress::Request(view)` is now `Upgrade(PendingUpgrade)`, whose
+  `request()` hands out a `Copy` of the view and whose `leftover()` is whatever
+  the client pipelined behind the head. `ServerProgress` carries the handshake's
+  borrow as a second lifetime, `ServerProgress<'h, 'a>`. The new
+  `ServerProgress::Closed` is "the peer closed WITHOUT sending a request";
+  closing part-way through one stays an error.
+- `RequestView::{origin, header}` return `&[u8]` rather than `&str` — RFC 9110
+  §5.5 admits `obs-text` in a field value, so bytes are what the head layer can
+  honestly hand over — and `extensions` yields the raw `Sec-WebSocket-Extensions`
+  field lines rather than parsed `&str` entries, and is no longer `deflate`-gated.
+  `consumed()` is gone (the offset is `PendingUpgrade::leftover`);
+  `method()`, `target()` and `head()` are new. `method`, `target`, `path`,
+  `query`, `host` and `subprotocols` stay `&str`: each is validated ASCII by
+  construction.
+- `ClientHandshakeError::UnexpectedStatus(u16)` is gone, and a refusal is not an
+  error at all: `ClientProgress` gains `Refused { status, consumed }`. A server
+  that will not switch is the peer ANSWERING, and RFC 6455 §4.1 sends the caller
+  to "HTTP procedures" for it — "the client might perform authentication if it
+  receives a 401 status code; the server might redirect the client using a 3xx
+  status code" — which read `WWW-Authenticate` and `Location`. A status code
+  alone cannot even locate those fields, so the outcome carries the offset its
+  head ended at and the caller hands `data[..consumed]` to whatever HTTP client
+  it already has.
+- `ClientProgress` also gains `Interim { status, consumed }` (see *Fixed*).
+- The `Head(HeadError)` variant on both error enums is now
+  `Http(http1_proto::Error)`, and `handshake::{HeadError, MalformedDetail}` are
+  no longer re-exported — name `http1_proto`'s directly.
+  `ServerHandshakeError::NotHttp11` is gone with them: an HTTP/1.0 upgrade
+  request is still refused (RFC 9110 §7.8's `Upgrade` is not honoured below
+  1.1), but the verdict is `http1-proto`'s and arrives as `Http(_)`.
+- `derive_more::TryUnwrap` is gone from `ServerProgress` and `ClientProgress`;
+  match instead. The derive cannot generate one for a struct variant, and on
+  `ClientProgress` it was actively dangerous: `try_unwrap_complete()` routes
+  `Interim` into the "not yet" arm, so a driver using it re-reads the same head
+  forever. `IsVariant` stays on both, and both error enums keep `TryUnwrap`.
+- `negotiation::{accept_deflate_offer, parse_deflate_response}` take `&[u8]`
+  values rather than `&str`: RFC 6455 §9.1 lets an extension parameter value be
+  a quoted-string and RFC 9110 §5.5 admits `obs-text`, so `&str` at this seam
+  was either lossy or fallible at the wrong layer. Subprotocols are tokens
+  (§4.2.1.8) and stay `&str`.
+- `negotiation::select_subprotocol` returns the matching element of `supported`
+  rather than of the client's offers, so the selection outlives the request
+  head. Its lifetime follows the ENTRIES rather than the slice holding them, so
+  a caller that collects its supported names into a temporary keeps a selection
+  that outlives the collection. Selection ORDER is unchanged — the offers are
+  walked in client preference order.
+- The head cap is `http1-proto`'s 16 KiB rather than this crate's 8 KiB.
+
+### Added
+
+- `ServerHandshake::handle_eof` and `ClientHandshake::handle_eof`: the
+  transport's read side ended. Idempotent, and they decide nothing on their own
+  — the next `handle` resolves the offer that ran out.
+- `h1::MAX_SUBPROTOCOL_OFFER_BYTES` (512): how much the client's offers may
+  measure once comma-joined into the one `Sec-WebSocket-Protocol` field value.
+  Seven offers at `negotiation::MAX_SUBPROTOCOL_LEN`, twenty-five at the lengths
+  RFC 6455 §11.5's registered names run to, a hundred and seventy-one at the
+  one-byte floor. See *Fixed*.
+- `negotiation::MAX_SUBPROTOCOL_OFFERS` (64) and
+  `negotiation::MAX_SUBPROTOCOL_LIST_BYTES` (16384): how many offers, and how
+  many bytes of them, either server will READ — and, mirrored at both emitters,
+  how many either client will write. The first cannot be lower than the sixty
+  `sixty_subprotocol_offers_round_trip_through_our_own_server` pins and is
+  `http1_proto::MAX_HEADERS`; the second is `http1_proto::MAX_HEAD_BYTES`, so on
+  h1 it refuses nothing the head cap did not already. See *Fixed*.
+- `connect::ConnectRequestView::origin` and
+  `connect::ConnectRequestError::DuplicateOrigin`. See *Fixed*.
+- `negotiation::MAX_EXTENSION_VALUE_BYTES` (160): how large a buffer holds any
+  `Sec-WebSocket-Extensions` value this crate RENDERS, which is what
+  `DeflateOffer::write` and `DeflateResponse::write` want to be called with —
+  128 bytes at the widest, pinned by
+  `the_widest_rendered_extension_value_fits`. It was four separate numbers (both
+  h1 scratches, both extended-CONNECT views' inline buffers, and the re-render
+  behind the server-side grant check), three named apart and the fourth an
+  anonymous literal; naming it once is why there is no fifth to drift. It does
+  NOT bound a value a PEER sends — that one is bounded by the transport's own
+  head cap and read in place.
+
+### Documented
+
+- **The head limits an extra header is read under are the RECEIVING peer's**,
+  and they are now stated where a caller sets one:
+  `h1::ClientOptions::with_extra_headers`,
+  `h1::ServerHandshake::encode_response` and `h1::Rejection::with_extra_headers`
+  each name `http1_proto::MAX_HEADERS` (64 field lines) and
+  `http1_proto::MAX_HEAD_BYTES` (16 KiB), and how many lines the managed
+  handshake fields already spend. Neither emitter bounds its own head, and that
+  is deliberate — a large head violates nothing, and refusing to write one a
+  lenient peer would accept is a rule no RFC has — but sixty extra request
+  headers is sixty-five field lines against a sixty-four-line cap, and a caller
+  met that as an error from the far end with nothing in the documentation to
+  explain it.
+
+### Fixed
+
+- **Interim 1xx responses are parsed instead of failing the handshake.** The old
+  client mapped a `100 Continue` prefix to `UnexpectedStatus(100)`, which RFC
+  9110 §15.2.1 forbids: "a client MUST be able to parse one or more 1xx
+  responses received prior to a final response". `ClientProgress::Interim`
+  reports which one arrived AND how far the buffer advanced past it — a driver
+  told only that an interim arrived cannot advance, so it re-offers the same
+  head and reads it forever.
+- **An extension offer can no longer be fabricated out of a quoted string.**
+  `Sec-WebSocket-Extensions` is walked with a quoted-string-aware parser that
+  splits only on the commas and semicolons OUTSIDE a quoted-string. The previous
+  `str::split` splitter cut inside quoted strings and read their CONTENT as list
+  members, so a peer that never offered permessage-deflate could have it
+  negotiated — and then be sent RSV1-compressed frames it never agreed to.
+  Demonstrated against the old code with
+  `x-note; v="a,permessage-deflate;client_max_window_bits=8,b"`, and pinned by
+  `an_offer_cannot_be_fabricated_from_inside_a_quoted_string`.
+- **A malformed `Sec-WebSocket-Extensions` field fails the handshake.** RFC 6455
+  §9.1: "If a value is received by either the client or the server during
+  negotiation that does not conform to the ABNF below, the recipient of such
+  malformed data MUST immediately _Fail the WebSocket Connection_." Both h1
+  handshakes and both extended-CONNECT gates used to read the field only to
+  negotiate with, so an unreadable offer yielded no grant and a 101 all the
+  same — the freedom §9.1 gives a recipient to DECLINE an extension is about one
+  it does not want, not about data it cannot read. The new
+  `negotiation::extension_list_conforms` is the gate, and it runs on every
+  handshake carrying the field, on both sides, whatever extensions the build
+  supports: `ServerHandshakeError::MalformedExtensions`,
+  `ClientHandshakeError::MalformedExtensions`,
+  `ConnectRequestError::MalformedExtensions`,
+  `ConnectResponseError::MalformedExtensions`. The server's refusal is
+  reject-only, so §4.2.1's "HTTP response with an appropriate error code" still
+  goes out. Two consequences of the ABNF: a quoted value whose unescaped form is
+  not a `token` is malformed, and so is a value that spans an RFC 9110 §5.2
+  field-line join — the join's comma lands inside it and a comma is not a
+  `tchar`. And a semicolon with nothing behind it — `permessage-deflate;`,
+  `permessage-deflate;;client_max_window_bits` — is malformed too: what `[ … ]`
+  makes optional in `extension-param = token [ "=" (token | quoted-string) ]` is
+  the value, not the parameter, RFC 2616 §2.1's implied *LWS rule puts whitespace
+  between productions rather than removing one, and the null elements §2.1's
+  `#rule` does permit are list elements rather than parameters. Pinned from both
+  ends by `a_malformed_extension_list_fails_the_handshake`.
+- **`Sec-WebSocket-Extensions` has ONE parser, and it is RFC 6455 §9.1's.** The
+  gate above and the negotiation behind it briefly read two grammars — the gate
+  §9.1's, the readers `http1_proto::grammar::parameterised_list`'s RFC 9110
+  §5.6.6 — on the argument that a divergence could only decline an extension,
+  never grant one. That is true of the OFFER path and false of the RESPONSE
+  path: RFC 7692 §8.1 makes an extension response the client will not accept
+  FAIL the connection, so "declined" there means "handshake refused". §9.1 states
+  its ABNF "including the 'implied *LWS rule'", so a conforming server may write
+  `permessage-deflate ; server_max_window_bits = 11` — the gate passed it and
+  `parse_deflate_response` then rejected it, on the h1 client and on the
+  extended-CONNECT client alike. The gate's §9.1 walk now YIELDS the members and
+  parameters it was already traversing, and `extension_list_conforms`,
+  `accept_deflate_offer`, `parse_deflate_response` and the server-side grant bind
+  all consume it; websocket-proto no longer uses `parameterised_list` at all (see
+  the http1-proto note above for why the walker stays). The walk is line-local,
+  which for this grammar is the same question as the joined value: a member spans
+  §5.2's join only inside a quoted-string, and such a string is malformed either
+  way. Pinned by
+  `a_response_written_with_implied_lws_completes_the_handshake` (h1) and by
+  `connect_gates_enforce_the_extension_grammar` (extended CONNECT).
+- **RFC 9110 §7.8's ordering MUST is honoured.** When the upgrade request
+  carried `Expect: 100-continue`, `encode_response` writes the `100 (Continue)`
+  ahead of the 101 into the same buffer; a short buffer leaves the obligation
+  outstanding rather than discharging it against bytes the caller must not send
+  (`a_hundred_continue_precedes_the_switch`,
+  `a_short_buffer_does_not_lose_the_hundred_continue`).
+- **An extended CONNECT refuses an ambiguous `Origin`, and the client cannot
+  write one.** RFC 8441 §5 carries `Origin` onto the h2/h3 transports in as many
+  words — "The Origin [RFC6454], Sec-WebSocket-Version, Sec-WebSocket-Protocol,
+  and Sec-WebSocket-Extensions header fields are used in the CONNECT request and
+  response-header fields as defined in [RFC6455]" — and RFC 6454 §7 gives it one
+  SP-separated `origin-list-or-null`, so RFC 9110 §5.3 forbids repeating it. The
+  gate now refuses a repeat as `DuplicateOrigin` (reject-only, so the caller
+  still answers), `ConnectRequestView::origin` resolves it, and `origin` is out
+  of the first-occurrence escape hatch on BOTH transports: `header("origin")`
+  routes back through the accessor, so the two cannot answer differently even
+  below a gate. The outbound half is the same defect from the other side — the h1
+  client could put two `Origin` extras in a request its own server then refused —
+  and `ExtraHeaders::validate` now refuses a repeated extra header for the names
+  this crate itself resolves as singletons: `Origin`, plus `Host`,
+  `Sec-WebSocket-Key` and `Sec-WebSocket-Accept`, which the managed-collision
+  check already refuses outright. Every other name may still repeat, because RFC
+  9110 §5.3's exception covers every field "definition \[that\] allows multiple
+  field line values to be recombined as a comma-separated list" — an open set
+  that includes `Cache-Control` and `Via`, so refusing by default would break
+  conforming layouts. `Sec-WebSocket-Version` is deliberately absent for the same
+  reason: the only extras that may carry it are a rejection's, and RFC 6455
+  §11.3.5 makes it one that "MAY appear multiple times in an HTTP response"
+  (`a_repeated_origin_is_refused_on_extended_connect`,
+  `the_two_transports_agree_on_the_origin_rule`,
+  `the_escape_hatch_does_not_answer_a_resolved_field`,
+  `an_extra_header_may_not_repeat_a_singleton_field_name`,
+  `a_rejection_may_advertise_several_versions_but_not_two_origins`,
+  `what_the_client_emits_our_own_server_accepts`).
+- **The offer-uniqueness scan is no longer quadratic in a peer's input.** The
+  offers "MUST all be unique" (RFC 6455 §4.1 item 10) and this crate allocates
+  nothing, so uniqueness is proved by re-walking the value once per offer —
+  Θ(offers × bytes) over input an unauthenticated peer chooses. A 16 KiB head of
+  one-byte offers cost **22.8 ms and was ACCEPTED**; extended CONNECT passed the
+  same function a header slice with no length of its own at all. Both halves are
+  now bounded inside the one function both gates call, and mirrored at both
+  emitters so nothing this crate writes is something it refuses to read. The
+  worst input either server now accepts costs **371 µs**, and the 16 KiB dense
+  head is refused in 13.8 µs. RFC 9110 §5.6.1.2 asks for the bound in as many
+  words — a recipient parses empty list elements "but not so much that they could
+  be used as a denial-of-service mechanism" — and §5.4 makes the refusal a 4xx,
+  which is what a reject-only handshake writes (`the_offer_list_is_bounded`,
+  `the_offer_count_is_bounded_by_what_our_own_server_reads`,
+  `the_offer_count_bound_is_the_same_in_both_directions`,
+  `the_offer_count_bound_is_symmetric_on_both_transports`).
+- **The client's subprotocol offers are one field line again.** The re-base
+  emitted one `Sec-WebSocket-Protocol` field LINE per offer, so sixty one-byte
+  offers made a sixty-five-line head — and `http1-proto`'s own server, the one
+  behind `ServerHandshake` and behind both drivers, refuses a head past
+  `MAX_HEADERS = 64`. Configurations that round-tripped before the re-base failed
+  after it, on every path. RFC 6455 §4.1 item 10 spells the offer as "one or more
+  comma-separated subprotocol", and that is what goes out: `ClientHandshake::new`
+  joins the offers ONCE, in the pass that already validated them, into an inline
+  buffer the `Headers` walk only reads — which is what keeps the section
+  walk-stable without a line per offer. The accidental field-count cliff at the
+  peer becomes the documented byte limit `h1::MAX_SUBPROTOCOL_OFFER_BYTES` (512),
+  and a longer list is refused by `ClientHandshake::new` with the limit named
+  (`subprotocol_offers_travel_as_one_bounded_field_line`,
+  `sixty_subprotocol_offers_round_trip_through_our_own_server`, and one test per
+  driver).
+
+### Changed
+
+- An HTTP/1.0 status line is accepted rather than refused outright, and a higher
+  1.x minor is processed as 1.1 (RFC 9110 §6.2).
+- Up to four leading empty lines before a request are tolerated (RFC 9112 §2.2).
+- A `Sec-WebSocket-Extensions` member the walk cannot resolve ENDS the walk —
+  past a value §9.1's grammar does not admit, nothing behind it is what the peer
+  wrote — where the old splitter skipped that element and kept looking. An offer
+  behind a malformed member is therefore not granted
+  (`an_offer_behind_an_unresolvable_member_is_not_granted`). This fails closed:
+  declining an extension is always available to a server (RFC 7692 §7.1.1), so
+  the handshake still completes, just without compression.
+
+### Tooling
+
+- **Handshake differential harness** (`handshake-corpus`, driven by
+  `cargo run -p xtask -- handshake-diff <base> [head]`): 1967 cases over the five
+  handshake surfaces — the h1 server and client, the extended-CONNECT gate on
+  both sides, and the two EMITTERS read back by this crate's own gate — each
+  reporting the verdict a build reaches for it. `xtask` builds the corpus (one
+  file, always the working tree's, public API only) against two revisions of
+  `websocket-proto` and diffs the records, so a verdict that moved is the
+  revision range's doing and nothing else's. It reports them grouped by
+  `(role, field, reason)`.
+- 165 of the cases' groups are **equivalence groups**: one logical field value
+  written several ways (RFC 9110 §5.2/§5.3, RFC 6455 §9.1's "MAY be split or
+  combined across multiple lines", RFC 2616 §2.1's null elements), which must all
+  reach one verdict. A group that disagrees is a reader making a distinction the
+  grammar does not — the defect found three times in this cycle, always between a
+  gate and a reader that resolved one field separately — and one on the head side
+  fails the command. The claim is withheld exactly where the ROLES make the
+  distinction: the response `Sec-WebSocket-Protocol` is §4.2.2's single
+  selection, and `Origin` is RFC 6454 §7's SP-separated `origin-list-or-null`,
+  so neither has a split spelling.
+- Measured over this branch: `3b13c5d..HEAD` moves 204 verdicts and takes the
+  equivalence violations from 8 to 0; `90d1d1e..HEAD` — the last two commits —
+  moves 117 and holds them at 0. Earlier revisions are out of reach: the corpus
+  is written against the public API, and `ServerProgress::Upgrade` was a struct
+  variant before `3b13c5d`.
+
+## `wren-compio` + `wren-reactor` — cycle 5 (re-based handshake drivers)
+
+Both drivers follow `websocket-proto` 0.2.0's two-phase accept: the pending
+accept carries an advanced `ServerHandshake`, which holds the validated answer
+itself, so the application's accept-or-reject choice happens between
+classification and the answer, and either answer is written through the
+connection that read the request — with nothing beside it that could be paired
+with a different one.
+
+### Fixed
+
+- **A handshake the server stops processing is answered, not dropped.** RFC 6455
+  §4.2.1: "the server MUST stop processing the client's handshake and return an
+  HTTP response with an appropriate error code (such as 400 Bad Request)".
+  `accept`/`accept_pending` used to propagate the fault and drop the transport
+  with nothing on the wire, leaving the client unable to tell a rejected
+  handshake from a dead server. A version the server does not speak now gets RFC
+  6455 §4.2.2's 426 carrying `Sec-WebSocket-Version: 13`; anything else gets 400,
+  or the code `http1_proto::Error::suggested_status` names for an HTTP-level
+  fault. Best-effort by construction: the error returned is always the one that
+  failed the handshake, never one from writing the refusal — the caller needs to
+  know why the handshake failed, not that the apology could not be delivered. A
+  `validate_accept` failure is deliberately NOT answered this way: the answer was
+  built from this request's own offers, so a fault there is the server refusing
+  its own answer rather than the client's handshake being invalid.
+- **Interim responses no longer grow the client's buffer without bound.** The
+  client loop advanced a cursor past each consumed 1xx head and never dropped
+  what it had passed, while later reads kept appending — and RFC 9110 §15.2 puts
+  no limit on how many interim responses may precede the final one, so a hostile
+  server could stream 1xx heads until the client exhausted memory. The consumed
+  prefix is now dropped after each interim (the suffix glued behind it, when one
+  read carried both, is preserved), which bounds the buffer at one head plus one
+  read chunk.
+- **…and the reading stops.** Compacting bounds the memory that stream costs,
+  not the work: a server can still send interim responses forever, and a client
+  that obeys §15.2 literally never returns — a connect hung with nothing to
+  report, and neither driver applies a handshake deadline. Both now abandon the
+  attempt after 32 interim responses with the new
+  `ConnectError::TooManyInterimResponses { limit }`. 32 is set against what a
+  conforming server sends (RFC 9110 §10.1.1 allows one `100 (Continue)` per
+  request; RFC 8297's `103 (Early Hints)` arrives once or a small handful of
+  times), so it bounds a hostile peer's work at 32 heads without touching any
+  real pattern. It is a driver policy, not a protocol rule: `websocket-proto`
+  classifies one head per call and has no loop to bound.
 
 ## `http3-proto` — cycle 4 (Sans-I/O HTTP/3 tunnel core)
 
