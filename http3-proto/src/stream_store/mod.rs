@@ -11,7 +11,7 @@
 //! HTTP/3 has no `SETTINGS_MAX_CONCURRENT_STREAMS`; the real bound is QUIC's
 //! `MAX_STREAMS`. The driver sets that from [`StreamStore::capacity`]; a stream
 //! presented beyond capacity ([`insert`](StreamStore::insert) → `Err`) is reset
-//! with [`H3Error::RequestRejected`](crate::error::H3Error::RequestRejected) as a
+//! with [`H3Error::RequestRejected`] as a
 //! backstop, without failing the connection.
 
 use crate::event::StreamId;
