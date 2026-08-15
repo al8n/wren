@@ -24,6 +24,7 @@ pub use error::{AcceptError, ConnectError, Error};
 pub use maybe_tls::MaybeTls;
 pub use options::{AcceptOptions, ClientOptions};
 pub use runtime::Duplex;
+use websocket_proto::handshake::h1::ServerHandshake;
 pub use websocket_proto::{Negotiated, connection::Closed, frame::CloseCode, message::Message};
 
 /// Connects to a `ws://` or `wss://` URL and completes the opening
@@ -108,11 +109,12 @@ pub async fn accept_pending<R: RuntimeLite, S: Duplex>(
   mut stream: S,
   options: AcceptOptions,
 ) -> Result<PendingAccept<R, S>, AcceptError> {
-  let (head, summary) = handshake::drive_server_request(&mut stream).await?;
+  let pending = handshake::drive_server_request(&mut stream, &options).await?;
   Ok(PendingAccept {
     stream,
-    head,
-    summary,
+    handshake: pending.handshake,
+    summary: pending.summary,
+    buffered: pending.buffered,
     options,
     _rt: PhantomData,
   })
@@ -124,8 +126,15 @@ pub async fn accept_pending<R: RuntimeLite, S: Duplex>(
 #[derive(Debug)]
 pub struct PendingAccept<R, S> {
   stream: S,
-  head: Vec<u8>,
+  /// Classified, carrying RFC 6455 §4.2.2's request-bound answer — settled
+  /// while the request was readable, and held by the one connection that can
+  /// write it — and still owing the peer whichever answer the application
+  /// chooses.
+  handshake: ServerHandshake,
   summary: RequestSummary,
+  /// Frames the client pipelined behind its request head; they belong to the
+  /// connection machine, not to the handshake.
+  buffered: Vec<u8>,
   options: AcceptOptions,
   _rt: PhantomData<fn() -> R>,
 }
@@ -137,16 +146,22 @@ impl<R: RuntimeLite, S: Duplex> PendingAccept<R, S> {
   }
   /// Sends the 101 and establishes the connection.
   pub async fn accept(self) -> Result<(WebSocket<R, ServerRole, S>, RequestSummary), AcceptError> {
-    let (stream, outcome) =
-      handshake::finish_accept(self.stream, self.head, self.summary, &self.options).await?;
+    let (stream, outcome) = handshake::finish_accept(
+      self.stream,
+      self.handshake,
+      self.summary,
+      self.buffered,
+      &self.options,
+    )
+    .await?;
     let ws =
       WebSocket::<R, _, _>::server(stream, &outcome.negotiated, &self.options, outcome.leftover);
     Ok((ws, outcome.summary))
   }
   /// Answers with a non-101 rejection (status 300–599) and drops the
   /// transport.
-  pub async fn reject(self, status: u16, reason: &str) -> Result<(), AcceptError> {
-    handshake::finish_reject(self.stream, status, reason).await
+  pub async fn reject(mut self, status: u16, reason: &str) -> Result<(), AcceptError> {
+    handshake::finish_reject(&mut self.stream, self.handshake, status, reason).await
   }
 }
 
