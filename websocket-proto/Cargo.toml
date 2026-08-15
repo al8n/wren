@@ -1,6 +1,6 @@
 [package]
 name = "websocket-proto"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91.0"
 license = "MIT OR Apache-2.0"
@@ -24,8 +24,9 @@ std = [
   "bytes/std",
   "rand?/std",
   "rand?/thread_rng",
+  "http1-proto/std",
 ]
-alloc = ["dep:smol_str", "dep:bytes"]
+alloc = ["dep:smol_str", "dep:bytes", "http1-proto/alloc"]
 deflate = ["alloc", "dep:miniz_oxide"]
 # `no-atomic`: the heap tier for cores WITHOUT native atomic CAS (Cortex-M0+ /
 # thumbv6m / RP2040). Same Message/Negotiated owned storage as `alloc`, but the
@@ -39,6 +40,7 @@ no-atomic = [
   "dep:portable-atomic",
   "dep:portable-atomic-util",
   "portable-atomic/critical-section",
+  "http1-proto/no-atomic",
 ]
 # Internal: exposes `pub(crate)` hot paths so `tests/no_panic.rs` can wrap them
 # in `#[no_panic]` shims. Implies `std` (the test driver is std-only). Not for
@@ -50,6 +52,7 @@ thiserror.workspace = true
 derive_more.workspace = true
 rand_core.workspace = true
 sha1.workspace = true
+http1-proto = { workspace = true }
 smol_str = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 miniz_oxide = { workspace = true, optional = true, features = ["with-alloc"] }

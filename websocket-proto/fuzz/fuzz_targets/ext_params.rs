@@ -8,21 +8,20 @@ use websocket_proto::negotiation::{
 };
 
 fuzz_target!(|data: &[u8]| {
-  let Ok(value) = core::str::from_utf8(data) else { return };
+  // The field value is raw bytes: RFC 9110 §5.5 admits `obs-text`, so the
+  // input is fed in whole rather than through a UTF-8 gate.
 
-  // Client-side parse of arbitrary response text must never panic.
+  // Client-side parse of an arbitrary response value must never panic.
   let offer = DeflateOffer::new();
-  let _ = parse_deflate_response(value, &offer);
+  let _ = parse_deflate_response([data], &offer);
 
-  // Server-side scan of arbitrary offer text must never panic; on accept,
+  // Server-side scan of an arbitrary offer value must never panic; on accept,
   // the emitted response must round-trip through client validation to the
   // SAME params.
-  if let Some((params, response)) =
-    accept_deflate_offer([value].into_iter(), &ServerDeflateConfig::new())
-  {
+  if let Some((params, response)) = accept_deflate_offer([data], &ServerDeflateConfig::new()) {
     let mut buf = [0u8; 256];
     let n = response.write(&mut buf).expect("response fits 256 bytes");
-    let text = core::str::from_utf8(&buf[..n]).expect("response is ASCII");
+    let text = &buf[..n];
     // The server accepted the client's offer params, so validate against an
     // equivalent offer: reconstruct one carrying the same declarations.
     let mut check = DeflateOffer::new();
@@ -32,7 +31,7 @@ fuzz_target!(|data: &[u8]| {
     if params.client_no_context_takeover() {
       check = check.with_client_no_context_takeover(true);
     }
-    let client_params = parse_deflate_response(text, &check).expect("round trip");
+    let client_params = parse_deflate_response([text], &check).expect("round trip");
     assert_eq!(
       client_params.server_max_window_bits(),
       params.server_max_window_bits()

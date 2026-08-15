@@ -108,11 +108,10 @@ impl rand_core::TryRng for SeedRng {
   }
 
   fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
-    let mut chunks = dst.chunks_exact_mut(8);
-    for chunk in &mut chunks {
+    let (chunks, tail) = dst.as_chunks_mut::<8>();
+    for chunk in chunks.iter_mut() {
       chunk.copy_from_slice(&self.next_u64().to_le_bytes());
     }
-    let tail = chunks.into_remainder();
     if !tail.is_empty() {
       let bytes = self.next_u64().to_le_bytes();
       tail.copy_from_slice(&bytes[..tail.len()]);
@@ -201,7 +200,7 @@ fn client_handshake(stream: &mut TcpStream, path: &str) -> std::io::Result<(Nego
   let host = format!("{HOST}:{PORT}");
   let options = ClientOptions::new(&host, path).with_deflate(DeflateOffer::new());
   let mut rng = SeedRng::from_entropy();
-  let handshake = ClientHandshake::new(options, &mut rng).expect("valid client options");
+  let mut handshake = ClientHandshake::new(options, &mut rng).expect("valid client options");
 
   let mut out = vec![0u8; 1024];
   let n = handshake.encode_request(&mut out).expect("encode request");
@@ -210,6 +209,38 @@ fn client_handshake(stream: &mut TcpStream, path: &str) -> std::io::Result<(Nego
   let mut buf = Vec::new();
   let mut chunk = [0u8; 4096];
   loop {
+    // What is already buffered is offered BEFORE the next read: an interim
+    // response may have arrived glued to the final one, and a driver that read
+    // first would block for bytes the server already sent.
+    match handshake.handle(&buf) {
+      // RFC 9110 §15.2: consumed, and the answer is still to come — advance
+      // past it and offer the rest.
+      Ok(ClientProgress::Interim { consumed, .. }) => {
+        buf.drain(..consumed);
+        continue;
+      }
+      Ok(ClientProgress::Complete(done)) => {
+        let consumed = done.consumed();
+        let leftover = buf.split_off(consumed);
+        return Ok((done.into_negotiated(), leftover));
+      }
+      // The peer answered, and the answer is no. RFC 6455 §4.1 sends a real
+      // client on to "HTTP procedures" with the head at `buf[..consumed]` —
+      // authenticate on a 401, follow a 3xx — but this harness only ever asks
+      // for the switch, so the status is the whole report.
+      Ok(ClientProgress::Refused { status, .. }) => {
+        return Err(std::io::Error::other(format!(
+          "server refused the upgrade with status {status}"
+        )));
+      }
+      Err(e) => {
+        return Err(std::io::Error::other(format!("handshake failed: {e}")));
+      }
+      // `NeedMore`, and any future variant of the non-exhaustive enum: read
+      // more and offer again.
+      Ok(_) => {}
+    }
+
     let n = stream.read(&mut chunk)?;
     if n == 0 {
       return Err(std::io::Error::new(
@@ -218,20 +249,6 @@ fn client_handshake(stream: &mut TcpStream, path: &str) -> std::io::Result<(Nego
       ));
     }
     buf.extend_from_slice(&chunk[..n]);
-    match handshake.handle(&buf) {
-      Ok(ClientProgress::NeedMore) => continue,
-      Ok(ClientProgress::Complete(done)) => {
-        let consumed = done.consumed();
-        let leftover = buf.split_off(consumed);
-        return Ok((done.into_negotiated(), leftover));
-      }
-      Err(e) => {
-        return Err(std::io::Error::other(format!("handshake failed: {e}")));
-      }
-      // `ClientProgress` is non-exhaustive; treat any future variant as
-      // "need more input".
-      Ok(_) => continue,
-    }
   }
 }
 

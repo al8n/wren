@@ -926,7 +926,7 @@ mod deflate_tests {
     // direction uses client_max_window_bits → CompressionUnavailable.
     let offer = crate::negotiation::DeflateOffer::new();
     let params = crate::negotiation::parse_deflate_response(
-      "permessage-deflate; client_max_window_bits=10",
+      [b"permessage-deflate; client_max_window_bits=10".as_slice()],
       &offer,
     )
     .expect("a remote server may pick a smaller client window");
@@ -953,7 +953,7 @@ mod deflate_tests {
     // Negotiate server_no_context_takeover: the server's outbound context
     // resets per message. The receiving client must also reset per message.
     let (params, _) = accept_deflate_offer(
-      ["permessage-deflate; server_no_context_takeover"].into_iter(),
+      [b"permessage-deflate; server_no_context_takeover".as_slice()],
       &ServerDeflateConfig::new(),
     )
     .expect("offer must be accepted");
