@@ -60,7 +60,7 @@
 use crate::{
   body::encode::{CHUNK_TERMINATOR, encode_chunk_header, encode_last_chunk_and_trailers},
   connection::{
-    CONNECT, Client, Connection, Exchange, FAILED, General, Lifecycle, Mode, RecvState, Role,
+    CONNECT, Client, Connection, Exchange, FAILED, General, Lifecycle, RecvState,
     SWITCHING_PROTOCOLS, SendBody, SendState, Server, discharge_expect, mint, signal_close,
     tunnel::CONTINUE,
   },
@@ -904,7 +904,9 @@ impl Connection<Server, General> {
   }
 }
 
-impl<Ro: Role> Connection<Ro, General> {
+// `Ro` is free: `body_sendable`, `send_body` and `finish_body` turn on
+// `lifecycle` and `send` alone, never on `Role::IS_CLIENT`.
+impl<Ro> Connection<Ro, General> {
   /// The lifecycle gate for a BODY write, which differs from [`sendable`] in one
   /// place and for one reason.
   ///
@@ -1093,7 +1095,9 @@ impl<Ro: Role> Connection<Ro, General> {
   }
 }
 
-impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
+// Neither `Role` nor `Mode`: `sendable` reads only `lifecycle`, which every
+// `Connection<Ro, Mo>` carries whatever the two are filled with.
+impl<Ro, Mo> Connection<Ro, Mo> {
   /// Whether the connection is in a state that can still send anything at all.
   ///
   /// The lifecycle gate every send call opens with, so a failed or drained
@@ -1592,7 +1596,13 @@ fn put(out: &mut [u8], at: usize, bytes: &[u8]) -> Option<usize> {
 /// after the head: the option has to be INSIDE the field
 /// section, and going through the same encoder is what keeps it validated,
 /// measured, and written exactly like every other field.
-struct WithClose<'h, H: Headers + ?Sized> {
+///
+/// `H` carries no [`Headers`] bound here: the representation is one reference,
+/// which needs nothing of the supplier. The bound belongs to the impl below,
+/// which is what walks it. `?Sized` is a different matter and stays — it is
+/// structural, since the supplier being wrapped is the unsized slice
+/// `[(&str, &[u8])]`.
+struct WithClose<'h, H: ?Sized> {
   /// The caller's own section, written first.
   inner: &'h H,
 }

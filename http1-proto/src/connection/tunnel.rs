@@ -74,7 +74,7 @@
 
 use crate::{
   connection::{
-    CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Client, Connection, FAILED, Lifecycle, Role,
+    CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Client, Connection, FAILED, Lifecycle,
     SWITCHING_PROTOCOLS, Server, Tunnel, latch_read_closed,
     outbound::{
       Declared, INTERIM_STATES_NO_CLOSE, READ_SIDE_ENDED, announces_octets, continue_needs_content,
@@ -429,7 +429,13 @@ pub(crate) struct Handshake {
   version: Version,
 }
 
-impl<Ro: Role> Connection<Ro, Tunnel> {
+// `Ro` is free: nothing in this block — `live_phase`, `idle`, `handshake`,
+// `head_end`, `handle_eof`, `fail` — reads `Role::IS_CLIENT`. A tunnel
+// connection has no exchange and no receive/send FSM to tell a client and a
+// server apart on (see the module doc); General's `handle_eof` is the one
+// place that abandons a client's send side, and Tunnel's own `handle_eof`
+// deliberately has no such line.
+impl<Ro> Connection<Ro, Tunnel> {
   /// The phase, or the latch that has replaced it.
   ///
   /// A violation is handed back exactly once, by the call that found it; every
