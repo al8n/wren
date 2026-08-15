@@ -79,7 +79,15 @@ impl<'a> HeadView<'a> {
 
   /// Every value for `name` in arrival order, compared ASCII
   /// case-insensitively (RFC 9110 §5.1).
-  pub fn header_all<'n>(&self, name: &'n str) -> impl Iterator<Item = &'a [u8]> + use<'a, 'n> {
+  ///
+  /// `Clone`, because a field's cardinality and its content are two questions
+  /// over one walk: a consumer that must ask both — "is this field present at
+  /// all" and "what are its elements" — re-walks rather than buffering, which
+  /// is what a no-alloc reader can afford.
+  pub fn header_all<'n>(
+    &self,
+    name: &'n str,
+  ) -> impl Iterator<Item = &'a [u8]> + Clone + use<'a, 'n> {
     self
       .headers()
       .filter_map(move |(field, value)| field.eq_ignore_ascii_case(name).then_some(value))

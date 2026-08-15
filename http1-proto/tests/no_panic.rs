@@ -11,10 +11,12 @@
 //! their code. If a shim contains a reachable panic, the link fails with a
 //! `no-panic` error naming the symbol.
 //!
-//! Coverage: `find_head_end`, `parse_status_line` and `parse_chunk_size` are
-//! each link-checked via `#[no_panic]` shims — the head-terminator scan, the
-//! §4 status-line codec, and the `1*HEXDIG` reader whose checked accumulation
-//! is the crate's one arithmetic overflow risk.
+//! Coverage: `find_head_end`, `parse_status_line`, `parse_chunk_size` and
+//! `parameterised_list` are each link-checked via `#[no_panic]` shims — the
+//! head-terminator scan, the §4 status-line codec, the `1*HEXDIG` reader whose
+//! checked accumulation is the crate's one arithmetic overflow risk, and the
+//! join-aware RFC 9110 §5.6.6 list walk, whose cursors run over borrowed field
+//! lines the caller supplies and whose member boundaries cross the §5.2 join.
 //!
 //! Three paths are exercised as **smoke tests only** (NOT link-checked), each
 //! for a reason recorded at its own section: `parse_request_line` and
@@ -92,6 +94,7 @@ use http1_proto::{
     scan_head,
   },
   Target,
+  grammar::{ParamValue, parameterised_list},
 };
 
 // ── head-terminator scan ──────────────────────────────────────────────────────
@@ -185,6 +188,77 @@ fn parse_chunk_size_is_panic_free() {
   assert!(!shim_parse_chunk_size(black_box(b"")));
   assert!(!shim_parse_chunk_size(black_box(b"g")));
   assert!(!shim_parse_chunk_size(black_box(b" 1")));
+}
+
+// ── parameterised-list walk ───────────────────────────────────────────────────
+
+no_panic_shim! {
+  /// Shim over `grammar::parameterised_list` — the RFC 9110 §5.6.6 list walk,
+  /// driven through BOTH its levels, since the member iterator hands its work
+  /// to a `ParamIter` the caller drives separately.
+  ///
+  /// Returns the bytes it read, so nothing here can be optimized out as
+  /// unused: a call whose result is dead takes the shim's body with it and
+  /// proves nothing.
+  fn shim_parameterised_list(lines: &[&[u8]]) -> usize {
+    let mut seen = 0usize;
+    for member in parameterised_list(lines.iter().copied()) {
+      let Ok(member) = member else { break };
+      seen = seen.wrapping_add(member.name().len());
+      for param in member.params() {
+        let Ok((name, value)) = param else { break };
+        seen = seen.wrapping_add(name.len());
+        seen = seen.wrapping_add(match value {
+          ParamValue::Token(bytes) | ParamValue::Quoted(bytes) => bytes.len(),
+          // `#[non_exhaustive]`: `None` carries no bytes, and neither does a
+          // variant this file has not been taught yet.
+          _ => 0,
+        });
+      }
+    }
+    seen
+  }
+}
+
+#[test]
+fn parameterised_list_is_panic_free() {
+  // One line, with a quoted comma and a quoted semicolon that are data.
+  assert!(
+    shim_parameterised_list(black_box(&[
+      b"permessage-deflate; client_max_window_bits=10, x-private; note=\"a,b;c\"".as_slice(),
+    ]))
+      > 0
+  );
+  // A value that spans the §5.2 join, and the member behind it.
+  assert!(shim_parameterised_list(black_box(&[b"ext; q=\"a".as_slice(), b"b\", other"])) > 0);
+  // The same string left open when the LAST line ends.
+  assert!(shim_parameterised_list(black_box(&[b"ext; q=\"a".as_slice(), b"b"])) > 0);
+  // Empty elements, empty lines, and OWS-only lines.
+  assert!(
+    shim_parameterised_list(black_box(&[
+      b", ext ,, other,".as_slice(),
+      b"",
+      b" ",
+      b"last"
+    ]))
+      > 0
+  );
+  // A name that is not a token, a forbidden byte inside a quoted-string, no
+  // lines at all, an empty line, and garbage: Err or nothing, never a panic.
+  assert_eq!(
+    shim_parameterised_list(black_box(&[b"ext@1".as_slice()])),
+    0
+  );
+  assert_eq!(
+    shim_parameterised_list(black_box(&[b"ext; q=\"a\x00b\"".as_slice()])),
+    0
+  );
+  assert_eq!(shim_parameterised_list(black_box(&[])), 0);
+  assert_eq!(shim_parameterised_list(black_box(&[b"".as_slice()])), 0);
+  assert_eq!(
+    shim_parameterised_list(black_box(&[[0xff, 0xfe, 0x00].as_slice()])),
+    0
+  );
 }
 
 // ── request-line codec ────────────────────────────────────────────────────────

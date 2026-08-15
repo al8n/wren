@@ -53,6 +53,84 @@ fn ported_target_validators() {
   assert!(!is_valid_authority("bad host"));
 }
 
+#[test]
+fn parameterised_list_refuses_what_does_not_parse() {
+  // A name that is not a token.
+  assert_eq!(
+    parameterised_list([b"ext@1".as_slice()])
+      .next()
+      .unwrap()
+      .unwrap_err(),
+    ListError::NotAToken
+  );
+  // An unterminated quoted string.
+  assert_eq!(
+    parameterised_list([b"ext; q=\"unterminated".as_slice()])
+      .next()
+      .unwrap()
+      .unwrap()
+      .params()
+      .next()
+      .unwrap(),
+    Err(ListError::UnterminatedQuotedString)
+  );
+  // A parameter name that is not a token.
+  assert_eq!(
+    parameterised_list([b"ext; @=1".as_slice()])
+      .next()
+      .unwrap()
+      .unwrap()
+      .params()
+      .next()
+      .unwrap(),
+    Err(ListError::NotAToken)
+  );
+}
+
+// A quoted-string that crosses the §5.2 join and is STILL open when the last
+// field line ends is `UnterminatedQuotedString`, and NOT `ValueSpansFieldLines`.
+// The two are not interchangeable: `ValueSpansFieldLines` says the value is well
+// formed and merely not one slice, because it closed on a later line, while this
+// one closes nowhere and §5.2 has no further line to continue it with — a §5.6.4
+// violation. Collapsing them reports a broken value as a borrowing limitation.
+#[test]
+fn a_quoted_value_that_crosses_the_join_and_never_closes_is_unterminated() {
+  let lines: [&[u8]; 2] = [b"ext; q=\"a", b"b"];
+  let mut members = parameterised_list(lines);
+  let member = members.next().unwrap().unwrap();
+  // The boundary scan did cross the join: both lines are still ONE member.
+  assert_eq!(member.name(), b"ext");
+  assert_eq!(
+    member.params().next().unwrap(),
+    Err(ListError::UnterminatedQuotedString)
+  );
+  assert!(members.next().is_none());
+}
+
+// RFC 9110 §5.6.6: `parameters = *( OWS ";" OWS [ parameter ] )` — the
+// `[ parameter ]` is optional, so a `;` with nothing behind it states no
+// parameter rather than violating the production.
+#[test]
+fn an_empty_parameter_is_skipped_not_a_violation() {
+  let member = parameterised_list([b"ext; ; q=1;".as_slice()])
+    .next()
+    .unwrap()
+    .unwrap();
+  let mut params = member.params();
+  assert_eq!(
+    params.next().unwrap(),
+    Ok((b"q".as_slice(), ParamValue::Token(b"1")))
+  );
+  assert!(params.next().is_none());
+
+  let member = parameterised_list([b"ext;;".as_slice()])
+    .next()
+    .unwrap()
+    .unwrap();
+  assert_eq!(member.name(), b"ext");
+  assert!(member.params().next().is_none());
+}
+
 /// Tests that collect into a `Vec`: gated to the tiers that have a heap, since
 /// the bare `no_std` tier has neither an allocator nor the `alloc as std` alias.
 #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
@@ -68,5 +146,82 @@ mod heap {
       v,
       [b"chunked".as_slice(), b"gzip".as_slice(), b"x".as_slice()]
     );
+  }
+
+  // RFC 6455 §9.1: extension-list is a #-list of extensions, each with
+  // `token [ "=" ( token / quoted-string ) ]` parameters.
+  #[test]
+  fn parameterised_list_keeps_quoted_separators_inside_their_string() {
+    let v = b"permessage-deflate; client_max_window_bits=10, x-private; note=\"a,b;c\"";
+    let members: Vec<_> = parameterised_list([v.as_slice()])
+      .map(|m| m.unwrap())
+      .collect();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0].name(), b"permessage-deflate");
+    assert_eq!(members[1].name(), b"x-private");
+
+    let p0: Vec<_> = members[0].params().map(|p| p.unwrap()).collect();
+    assert_eq!(
+      p0,
+      [(
+        b"client_max_window_bits".as_slice(),
+        ParamValue::Token(b"10")
+      )]
+    );
+
+    let p1: Vec<_> = members[1].params().map(|p| p.unwrap()).collect();
+    assert_eq!(p1, [(b"note".as_slice(), ParamValue::Quoted(b"a,b;c"))]);
+  }
+
+  // RFC 9110 §5.6.4: a backslash escapes the next character inside a
+  // quoted-string.
+  #[test]
+  fn parameterised_list_carries_escapes_through() {
+    let v = b"ext; q=\"a\\\"b\"";
+    let m = parameterised_list([v.as_slice()]).next().unwrap().unwrap();
+    let p: Vec<_> = m.params().map(|p| p.unwrap()).collect();
+    assert_eq!(p, [(b"q".as_slice(), ParamValue::Quoted(b"a\\\"b"))]);
+  }
+
+  // RFC 9110 §5.6.1.2: a recipient ignores empty list elements.
+  #[test]
+  fn parameterised_list_ignores_empty_elements() {
+    let v = b", ext ,, other,";
+    let names: Vec<_> = parameterised_list([v.as_slice()])
+      .map(|m| m.unwrap().name().to_vec())
+      .collect();
+    assert_eq!(names, [b"ext".to_vec(), b"other".to_vec()]);
+  }
+
+  // RFC 6455 §9.1 permits splitting the field across lines; RFC 9110 §5.2 makes
+  // them one comma-joined value.
+  #[test]
+  fn a_list_split_across_field_lines_is_one_list() {
+    let lines: [&[u8]; 2] = [
+      b"permessage-deflate; server_no_context_takeover",
+      b"x-private",
+    ];
+    let names: Vec<_> = parameterised_list(lines)
+      .map(|m| m.unwrap().name().to_vec())
+      .collect();
+    assert_eq!(
+      names,
+      [b"permessage-deflate".to_vec(), b"x-private".to_vec()]
+    );
+  }
+
+  // The §5.2 join's comma is DATA inside an open quoted-string
+  // (`grammar::scan_quoted_after_join`): the two lines are ONE member, and the
+  // member after it is found at the right place. The spanning VALUE is not one
+  // slice, so reading it is a named refusal rather than a mis-slice.
+  #[test]
+  fn a_quoted_value_spanning_the_join_keeps_the_boundaries_and_refuses_the_value() {
+    let lines: [&[u8]; 2] = [b"ext; q=\"a", b"b\", other"];
+    let members: Vec<_> = parameterised_list(lines).collect();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0].as_ref().unwrap().name(), b"ext");
+    assert_eq!(members[1].as_ref().unwrap().name(), b"other");
+    let p = members[0].unwrap().params().next().unwrap();
+    assert_eq!(p, Err(ListError::ValueSpansFieldLines));
   }
 }
