@@ -12,6 +12,16 @@ its own.
   bytes — `field-vchar = VCHAR / obs-text` with interior SP/HTAB, OWS-trimmed,
   CTLs rejected — plus the RFC 3986 request-target validators and the §5.6.1
   list-element splitter.
+- **Parameterised lists** (`grammar::parameterised_list`): a borrowing walk of a
+  §5.6.6 parameterised `#`-list across ALL of a field's lines, which §5.2 makes
+  one comma-joined value. Splits only on the commas and semicolons OUTSIDE a
+  §5.6.4 quoted-string, skips §5.6.1.2's empty elements, and crosses the join
+  through the same `scan_quoted_after_join` the `Expect` parser uses — so a
+  string opened on one field line continues into the next instead of being
+  called unterminated. The one value such a walk cannot hand over is a
+  quoted-string that spans the join, since its content is not one slice: the
+  member's boundaries stay correct across it, and reading THAT value reports
+  `ListError::ValueSpansFieldLines` rather than mis-slicing it.
 - **Start lines** (`head::request_line`, `head::status_line`): RFC 9112 §3
   `request-line` with all four §3.2 target forms (origin / absolute / authority /
   asterisk) and §4 `status-line`. Single-SP separators only; the lenient
@@ -111,9 +121,10 @@ its own.
   **leftover** — the suffix of the offer belonging to the new protocol, or to the
   head that follows an interim — and carries the start line this core parsed;
   `Refused` is terminal and reports none. A 100 is enforced before a 101 when
-  both were asked for. A handshake head may carry `Content-Length: 0`: it
-  announces no octets (RFC 9110 §8.6), so both directions of this crate write and
-  classify it.
+  both were asked for, and `owes_continue()` reports that obligation so a caller
+  discharges it through `send_interim` instead of re-deriving it from `Expect`.
+  A handshake head may carry `Content-Length: 0`: it announces no octets (RFC
+  9110 §8.6), so both directions of this crate write and classify it.
 - **Public enums**: `Item`, `StartLine`, `Event`, `ClientTunnelOutcome` and
   `ServerTunnelRequest` are `#[non_exhaustive]` — they are what this core chooses
   to surface, and that can grow. `Target`, `BodyPlan` and `BodyFraming` are NOT:
@@ -138,8 +149,9 @@ its own.
 ### Tooling
 
 - **no-panic link test** (`tests/no_panic.rs`): `#[no_panic]` shims prove
-  `find_head_end`, `parse_status_line` and `parse_chunk_size` compile to
-  panic-free code at link time, plus four release smokes over the deeper paths.
+  `find_head_end`, `parse_status_line`, `parse_chunk_size` and
+  `parameterised_list` compile to panic-free code at link time, plus four
+  release smokes over the deeper paths.
   Requires `--release` **and fat LTO** (`CARGO_PROFILE_RELEASE_LTO=fat`) — the
   shims call across the crate boundary, so without it every one false-positives.
   Every argument goes through `core::hint::black_box`: a shim called with
@@ -170,5 +182,16 @@ its own.
   scan as resuming rather than restarting — asserted on CI too, at a looser
   margin, since a lost watermark makes the two halves EQUAL and no margin above
   1 tolerates that.
-- **288 tests** at `--all-features` (254 on the bare `no_std` tier), green on
-  every tier and on `cargo hack test --each-feature`.
+- **The suite** is one default-profile `cargo test -p http1-proto` run: the lib
+  unit tests, all five integration targets (`differential`, `no_panic`,
+  `smuggling`, `smuggling_outbound`, `split_robustness`), and the doc-tests,
+  including the compile-fail ones. Green on every tier and on `cargo hack test
+  --each-feature`. The bare `no_std` tier runs the same set minus the `no_panic`
+  shims, which need `std`, and minus the heap-gated lib tests.
+  No total is quoted, deliberately. A count is invalidated by every commit that
+  adds a test, nothing in CI checks it, and the figures this entry used to carry
+  went stale TWICE inside one PR — the second time because a doc-test was added
+  to `README.md`, which is not even a file a reader would think to re-measure
+  after. Naming the targets is the part that stays true; for the number as of any
+  given commit, run `cargo test -p http1-proto --all-features` (or
+  `--no-default-features` for the bare tier) at it.

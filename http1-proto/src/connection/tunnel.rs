@@ -912,6 +912,36 @@ impl Connection<Server, Tunnel> {
     })
   }
 
+  /// Whether RFC 9110 §7.8's ordering MUST is still outstanding: the classified
+  /// request carried `Expect: 100-continue` beside its `Upgrade`, so a `100
+  /// (Continue)` has to go out before the 101 and [`accept`](Self::accept)
+  /// refuses the switch until [`send_interim`](Self::send_interim) has sent one.
+  ///
+  /// A driver that could not ask would parse `Expect` itself to find out. That
+  /// rule is this core's, answered here from the head this connection already
+  /// classified, and a second implementation of it would be free to disagree
+  /// with the gate that actually refuses the switch.
+  ///
+  /// `false` for a handshake that never owed one, once a 100 has discharged it,
+  /// and in every phase that is not a live handshake — before classification,
+  /// after the switch, and on a connection whose remaining answer is a rejection.
+  pub const fn owes_continue(&self) -> bool {
+    match self.tunnel {
+      // A FAILED connection is excluded on the same terms `live_phase` sets: its
+      // one remaining answer is the rejection, so there is no 101 left for a 100
+      // to be ordered before. Belt-and-braces, as at `reject`'s own phase match —
+      // classification failure moves the phase to `RejectionOwed`, and no call
+      // reachable from a live handshake latches.
+      TunnelPhase::Handshaking(handshake) => {
+        handshake.interim_owed && !matches!(self.lifecycle, Lifecycle::Failed)
+      }
+      TunnelPhase::Idle
+      | TunnelPhase::Switched
+      | TunnelPhase::Refused
+      | TunnelPhase::RejectionOwed => false,
+    }
+  }
+
   /// Encodes an interim (1xx) response into `out`, returning the bytes written.
   ///
   /// RFC 9110 §15.2 lets any number of them precede the final answer, and none

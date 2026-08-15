@@ -6686,6 +6686,43 @@ mod tunnel {
     );
   }
 
+  // The same RFC 9110 §7.8 obligation, asked ABOUT rather than tripped over: a
+  // caller that can read the fact off the connection does not re-derive it by
+  // parsing `Expect` a second time, which is the rule this crate already owns.
+  #[test]
+  fn the_outstanding_continue_obligation_is_visible_to_the_caller() {
+    const REQUEST: &[u8] = b"GET /chat HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nExpect: 100-continue\r\n\r\n";
+    let mut s = Connection::<Server, Tunnel>::new();
+    // Nothing classified yet, so there is no handshake to owe anything.
+    assert!(!s.owes_continue());
+    assert!(matches!(
+      s.handle_request(REQUEST).unwrap(),
+      ServerTunnelRequest::Upgrade { .. }
+    ));
+    assert!(s.owes_continue());
+
+    let none: &[(&str, &[u8])] = &[];
+    let mut out = [0u8; 128];
+    s.send_interim(100, none, &mut out).unwrap();
+    // Discharged by the 100 that went out, which is the same transition `accept`
+    // reads — the accessor and the gate answer from one fact.
+    assert!(!s.owes_continue());
+  }
+
+  // The other side of §7.8's condition: the rule needs BOTH the `Upgrade` field
+  // and the expectation, so an offer without the expectation owes nothing.
+  #[test]
+  fn a_handshake_without_the_expectation_owes_nothing() {
+    const REQUEST: &[u8] =
+      b"GET /chat HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    let mut s = Connection::<Server, Tunnel>::new();
+    assert!(matches!(
+      s.handle_request(REQUEST).unwrap(),
+      ServerTunnelRequest::Upgrade { .. }
+    ));
+    assert!(!s.owes_continue());
+  }
+
   // RFC 9110 §15.2 (any number of interim responses may precede the final one)
   // with §15.2.2: a 101 is not informational — it ENDS the HTTP conversation —
   // so it goes through `accept`, and a final status never comes out of the

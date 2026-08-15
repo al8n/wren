@@ -3,8 +3,8 @@
 //! Field NAMES are tokens (§5.6.2 `tchar`); field VALUES are byte strings whose
 //! content is `field-vchar` / SP / HTAB with the surrounding OWS stripped
 //! (§5.5) — never `str`, because `obs-text` (0x80-0xFF) is legal field content
-//! and need not be UTF-8. Everything here is a pure predicate over borrowed
-//! bytes: no allocation, no panics, no state.
+//! and need not be UTF-8. Everything here works over borrowed bytes: no
+//! allocation, no panics, and no state beyond a walk's own cursor.
 //!
 //! The request-target validators (`is_valid_path_and_query`, `is_valid_query`,
 //! `is_valid_authority`) work on `&str` instead: a target is validated ASCII by
@@ -906,6 +906,429 @@ fn is_protocol(element: &[u8]) -> bool {
       _ => false,
     },
     None => is_token(element),
+  }
+}
+
+/// Why a parameterised-list walk stopped.
+///
+/// The first three are grammar violations the sender committed, and the value
+/// they describe cannot be read by anyone. The fourth is not: it names a value
+/// that is perfectly well formed and that a walker borrowing its input cannot
+/// hand over, which is a fact about this walk rather than about the field.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ListError {
+  /// A member name, a parameter name, or a bare parameter value is not the
+  /// `token` RFC 9110 §5.6.2 defines — the empty string included, since
+  /// `token = 1*tchar` names at least one character.
+  #[error("member name, parameter name, or bare value is not a token")]
+  NotAToken,
+  /// A quoted-string was never closed (RFC 9110 §5.6.4). Asked of the WHOLE
+  /// value: a string left open by one field line may still close on the next
+  /// one §5.2 joins to it, and only a string open when the last line ends is
+  /// unterminated.
+  #[error("quoted-string is never closed")]
+  UnterminatedQuotedString,
+  /// A byte RFC 9110 §5.6.4's `qdtext` / `quoted-pair` grammar forbids appeared
+  /// inside a quoted-string.
+  #[error("byte forbidden inside a quoted-string")]
+  InvalidQuotedByte,
+  /// The value is a quoted-string that spans an RFC 9110 §5.2 field-line join,
+  /// so its content is not one contiguous slice and cannot be borrowed. The
+  /// member's boundaries are still correct; only this value is unreadable.
+  #[error("quoted value spans a field-line join and is not one contiguous slice")]
+  ValueSpansFieldLines,
+}
+
+/// A parameter's value: a bare token, or the CONTENT of a quoted-string with
+/// its escapes still in place.
+///
+/// RFC 9110 §5.6.4 defines the `quoted-pair` escape but leaves what the
+/// unescaped value MEANS to the field that used it — RFC 6455 §9.1, for one,
+/// requires the unescaped form to be a `token` — so unescaping belongs to the
+/// caller and this hands over exactly the bytes between the delimiting DQUOTEs.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ParamValue<'a> {
+  /// The parameter carried no `=`. RFC 9110 §5.6.6's `parameter` requires one;
+  /// the fields whose parameters are optional-valued write that themselves, as
+  /// RFC 6455 §9.1's `extension-param = token [ "=" ( token / quoted-string ) ]`
+  /// does.
+  None,
+  /// A bare token (RFC 9110 §5.6.2).
+  Token(&'a [u8]),
+  /// The interior of a quoted-string (RFC 9110 §5.6.4), escapes untouched.
+  Quoted(&'a [u8]),
+}
+
+/// One member of a parameterised `#`-list: a name and its parameters, with
+/// quoted-string values kept intact.
+#[derive(Debug, Copy, Clone)]
+pub struct ListMember<'a> {
+  name: &'a [u8],
+  params: &'a [u8],
+  tail: QuotedTail,
+}
+
+impl<'a> ListMember<'a> {
+  /// The member's leading token, OWS-trimmed — RFC 9110 §5.6.3's whitespace
+  /// around a list element is not part of it.
+  #[inline]
+  pub const fn name(&self) -> &'a [u8] {
+    self.name
+  }
+
+  /// The parameters that followed it, `*( OWS ";" OWS [ parameter ] )`
+  /// (RFC 9110 §5.6.6).
+  #[inline]
+  pub const fn params(&self) -> ParamIter<'a> {
+    ParamIter {
+      params: self.params,
+      at: 0,
+      tail: self.tail,
+      done: false,
+    }
+  }
+}
+
+/// Walks a parameterised `#`-list spread over one or more field lines, splitting
+/// it on the commas that are NOT inside a quoted-string.
+///
+/// RFC 9110 §5.6.1's list construct separates members with commas and §5.6.6
+/// gives each member its `parameters`, so neither `split(b',')` nor
+/// [`list_elements`] can read one: a comma inside a §5.6.4 quoted-string is
+/// data, and a splitter that cuts there invents a member the sender never
+/// named. Empty members are skipped rather than reported — §5.6.1.2 makes a
+/// recipient "parse and ignore a reasonable number of empty list elements".
+///
+/// Pass one line as `[value]`; pass a field's several lines in wire order and
+/// they are walked as the single value RFC 9110 §5.2 defines, "concatenated in
+/// order, with each field line value separated by a comma". The join is walked
+/// rather than materialised: nothing is allocated and every slice handed out
+/// borrows the input.
+///
+/// # The join's comma
+///
+/// Inside an open quoted-string that comma is DATA, so a string opened on one
+/// field line legitimately continues into the next. This walk crosses the join
+/// through `scan_quoted_after_join` — the crate's one implementation of that
+/// rule — rather than restarting the scan at each physical line. A restart
+/// would call such a value unterminated and put the member boundary in the
+/// wrong place, which is two recipients disagreeing about what the field says.
+///
+/// The one thing a borrowing walker then cannot do is hand that value over: its
+/// content is not one contiguous slice. Boundaries are still computed across it
+/// — the member AFTER it is found where it really is — and only reading that
+/// one value fails, with [`ListError::ValueSpansFieldLines`].
+///
+/// A member that does not parse yields `Err` and ends the walk: a quoted-string
+/// this walk could not resolve leaves it unable to tell a separator from data,
+/// so nothing behind it can be trusted.
+#[inline]
+pub fn parameterised_list<'a, I>(
+  lines: I,
+) -> impl Iterator<Item = Result<ListMember<'a>, ListError>>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  ParameterisedList {
+    lines: lines.into_iter(),
+    // The walk starts with no line in hand, which is the same position as a
+    // line that has been spent: the next member comes from the next line.
+    line: &[],
+    at: 0,
+    exhausted: false,
+    done: false,
+  }
+}
+
+/// Walks one member's parameters, `*( OWS ";" OWS [ parameter ] )`
+/// (RFC 9110 §5.6.6). A parameter that does not parse yields `Err` and ends the
+/// walk.
+#[derive(Debug, Clone)]
+pub struct ParamIter<'a> {
+  params: &'a [u8],
+  at: usize,
+  tail: QuotedTail,
+  done: bool,
+}
+
+impl<'a> Iterator for ParamIter<'a> {
+  type Item = Result<(&'a [u8], ParamValue<'a>), ListError>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      if self.done {
+        return None;
+      }
+      let end = match scan_to_delim(self.params, self.at, b';') {
+        Delim::At(end) => end,
+        // A quoted-string open at the end of the member takes the rest of it
+        // with it: there is no further `;` to be outside of.
+        Delim::Open(_) => self.params.len(),
+        Delim::Invalid => {
+          self.done = true;
+          return Some(Err(ListError::InvalidQuotedByte));
+        }
+      };
+      let param = trim_ows(self.params.get(self.at..end).unwrap_or_default());
+      match self.params.get(end) {
+        Some(_) => self.at = end.saturating_add(1),
+        None => self.done = true,
+      }
+      // §5.6.6's `[ parameter ]` is optional, so `a;;b` states two parameters
+      // rather than violating anything.
+      if param.is_empty() {
+        continue;
+      }
+      let parsed = parse_param(param, self.tail);
+      if parsed.is_err() {
+        self.done = true;
+      }
+      return Some(parsed);
+    }
+  }
+}
+
+/// What became of a §5.6.4 quoted-string still open when a member's FIRST field
+/// line ended — the only such string a borrowing walk can be asked about, since
+/// the member's later lines are not part of the slice it hands out.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum QuotedTail {
+  /// Nothing was open there, or what was open never closed on any later line.
+  /// Either way what the member's first line holds is all there is of it.
+  Ends,
+  /// It closed on a later field line, across the comma RFC 9110 §5.2 joins them
+  /// with — so the value is real, and is not one contiguous slice.
+  Continues,
+}
+
+/// Where a scan for a top-level delimiter got to.
+enum Delim {
+  /// The delimiter — or the end of the input — is at this offset, with every
+  /// §5.6.4 quoted-string before it closed.
+  At(usize),
+  /// The input ended inside a quoted-string, carrying the escape state §5.2's
+  /// join comma has to be fed through.
+  Open(bool),
+  /// A byte §5.6.4 forbids appeared inside a quoted-string.
+  Invalid,
+}
+
+/// The next `delim` OUTSIDE a §5.6.4 quoted-string, scanning from `at`.
+///
+/// The whole reason a list walk is not `split(b',')` and a parameter walk is not
+/// `split(b';')`: a delimiter inside a quoted-string is data, and a splitter
+/// that cuts there reports a member or a parameter the sender never wrote.
+///
+/// [`list_element_end`] answers the same question for a value held whole, and
+/// answers it with `None` for anything it cannot resolve. This one keeps the
+/// two unresolved cases apart, because a walk that must cross RFC 9110 §5.2's
+/// join needs the open string's escape state to continue it. Both take what a
+/// quoted-string IS from [`scan_quoted`], which is where that rule lives.
+fn scan_to_delim(value: &[u8], at: usize, delim: u8) -> Delim {
+  let mut at = at;
+  loop {
+    match value.get(at) {
+      None => return Delim::At(at),
+      Some(&byte) if byte == delim => return Delim::At(at),
+      Some(&b'"') => match scan_quoted(value, at.saturating_add(1), false) {
+        QuotedScan::Closed(end) => at = end,
+        QuotedScan::Open { escape } => return Delim::Open(escape),
+        QuotedScan::Invalid => return Delim::Invalid,
+      },
+      Some(_) => at = at.saturating_add(1),
+    }
+  }
+}
+
+/// One `parameter = parameter-name "=" parameter-value` (RFC 9110 §5.6.6), over
+/// a slice already trimmed of the OWS that production puts around it.
+///
+/// The `=` is the first one outside a quoted-string, and §5.6.6 puts no BWS
+/// around it: `q = 1` names `q `, which is not a `token`, so it is not a
+/// parameter. The same reading as this crate's `Expect` parser, which is the
+/// point — one rule, one answer.
+fn parse_param(param: &[u8], tail: QuotedTail) -> Result<(&[u8], ParamValue<'_>), ListError> {
+  let (name, value) = match scan_to_delim(param, 0, b'=') {
+    Delim::At(eq) => match param.get(eq) {
+      Some(_) => (
+        param.get(..eq).unwrap_or_default(),
+        Some(param.get(eq.saturating_add(1)..).unwrap_or_default()),
+      ),
+      // No `=` at all: the bare-name form the field's own grammar allows.
+      None => (param, None),
+    },
+    // A quoted-string took the rest of the parameter, so any `=` behind it is
+    // data. What is left is the name, and it is not a token.
+    Delim::Open(_) => (param, None),
+    Delim::Invalid => return Err(ListError::InvalidQuotedByte),
+  };
+  if !is_token(name) {
+    return Err(ListError::NotAToken);
+  }
+  let Some(value) = value else {
+    return Ok((name, ParamValue::None));
+  };
+  // `parameter-value = ( token / quoted-string )` — one or the other, whole.
+  match value.first() {
+    Some(&b'"') => match scan_quoted(value, 1, false) {
+      QuotedScan::Closed(end) if end == value.len() => Ok((
+        name,
+        ParamValue::Quoted(value.get(1..end.saturating_sub(1)).unwrap_or_default()),
+      )),
+      // Bytes behind the closing DQUOTE: the value is neither a quoted-string
+      // nor a token.
+      QuotedScan::Closed(_) => Err(ListError::NotAToken),
+      QuotedScan::Open { .. } => Err(match tail {
+        // The string closed on a later field line, so the value exists and is
+        // well formed — it is simply not one slice to borrow.
+        QuotedTail::Continues => ListError::ValueSpansFieldLines,
+        QuotedTail::Ends => ListError::UnterminatedQuotedString,
+      }),
+      QuotedScan::Invalid => Err(ListError::InvalidQuotedByte),
+    },
+    _ if is_token(value) => Ok((name, ParamValue::Token(value))),
+    _ => Err(ListError::NotAToken),
+  }
+}
+
+/// The walk [`parameterised_list`] hands out: the field lines still to come, the
+/// one being walked, and where in it the next member starts.
+struct ParameterisedList<'a, I> {
+  lines: I,
+  line: &'a [u8],
+  at: usize,
+  /// `lines` answered `None` once. An `Iterator` is not required to keep doing
+  /// so, and RFC 9110 §5.2's value ends at the last line either way.
+  exhausted: bool,
+  done: bool,
+}
+
+impl<'a, I> Iterator for ParameterisedList<'a, I>
+where
+  I: Iterator<Item = &'a [u8]>,
+{
+  type Item = Result<ListMember<'a>, ListError>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      if self.done {
+        return None;
+      }
+      self.at = skip_ows(self.line, self.at);
+      match self.line.get(self.at) {
+        // This field line is spent OUTSIDE a quoted-string, so §5.2's join
+        // comma is a separator and the next line opens a new member.
+        None => match self.next_line() {
+          Some(next) => {
+            self.line = next;
+            self.at = 0;
+          }
+          None => {
+            self.done = true;
+            return None;
+          }
+        },
+        // §5.6.1.2: "a recipient MUST parse and ignore a reasonable number of
+        // empty list elements".
+        Some(&b',') => self.at = self.at.saturating_add(1),
+        Some(_) => {
+          let member = self.member();
+          if member.is_err() {
+            // Nothing behind an unresolved member can be trusted: the walk no
+            // longer knows which commas were separators.
+            self.done = true;
+          }
+          return Some(member);
+        }
+      }
+    }
+  }
+}
+
+impl<'a, I> ParameterisedList<'a, I>
+where
+  I: Iterator<Item = &'a [u8]>,
+{
+  /// The next field line of the value, or `None` once there are none left.
+  fn next_line(&mut self) -> Option<&'a [u8]> {
+    if self.exhausted {
+      return None;
+    }
+    let next = self.lines.next();
+    if next.is_none() {
+      self.exhausted = true;
+    }
+    next
+  }
+
+  /// Takes the member starting at the cursor, leaving the cursor on whatever
+  /// ended it — which may be on a LATER field line than the member began on.
+  fn member(&mut self) -> Result<ListMember<'a>, ListError> {
+    let head_line = self.line;
+    let start = self.at;
+    // What the member occupies on the field line it starts on — all a
+    // borrowing walk can hand out — plus, when a quoted-string held it open at
+    // that line's end, the escape state to continue that string with.
+    let (head_end, mut open) = match scan_to_delim(head_line, start, b',') {
+      Delim::At(end) => (end, None),
+      Delim::Open(escape) => (head_line.len(), Some(escape)),
+      Delim::Invalid => return Err(ListError::InvalidQuotedByte),
+    };
+    self.at = head_end;
+
+    // A quoted-string still open when a field line ends does NOT end the
+    // member: §5.2 joins the lines with a comma and §5.6.4 makes that comma
+    // data inside the string, so the member runs on into the next line and
+    // ends wherever the string closes. `scan_quoted_after_join` is this
+    // crate's one implementation of that rule; restarting the scan at each
+    // physical line would answer it differently.
+    let mut tail = QuotedTail::Ends;
+    while let Some(escape) = open.take() {
+      let Some(next) = self.next_line() else {
+        // No further field line, so the combined value ends inside the string:
+        // `tail` stays `Ends` and the value is unterminated rather than merely
+        // non-contiguous.
+        break;
+      };
+      self.line = next;
+      self.at = next.len();
+      match scan_quoted_after_join(next, escape) {
+        QuotedScan::Closed(end) => {
+          tail = QuotedTail::Continues;
+          // Past the string, the rest of this line is the member's like any
+          // other, up to the comma that ends it.
+          match scan_to_delim(next, end, b',') {
+            Delim::At(at) => self.at = at,
+            Delim::Open(escape) => open = Some(escape),
+            Delim::Invalid => return Err(ListError::InvalidQuotedByte),
+          }
+        }
+        QuotedScan::Open { escape } => open = Some(escape),
+        QuotedScan::Invalid => return Err(ListError::InvalidQuotedByte),
+      }
+    }
+
+    // The name runs to the member's first `;` outside a quoted-string (§5.6.6
+    // `parameters`), and is always on the member's first line: a `token`
+    // carries no DQUOTE, so nothing can hold a name open across the join.
+    let head = head_line.get(start..head_end).unwrap_or_default();
+    let (name, params) = match scan_to_delim(head, 0, b';') {
+      Delim::At(semi) => (
+        head.get(..semi).unwrap_or_default(),
+        head.get(semi.saturating_add(1)..).unwrap_or_default(),
+      ),
+      // No `;` outside a string: the whole member is its name, and the string
+      // the boundary scan resolved above belongs to whatever that turns out to
+      // be — which is not a token, so this reports the name.
+      Delim::Open(_) | Delim::Invalid => (head, [].as_slice()),
+    };
+    let name = trim_ows(name);
+    if !is_token(name) {
+      return Err(ListError::NotAToken);
+    }
+    Ok(ListMember { name, params, tail })
   }
 }
 
