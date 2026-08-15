@@ -490,7 +490,7 @@ pub(crate) const FAILED: &str = "connection failed on a protocol violation";
 /// written its request and a tunnel server's first byte is its request-line's.
 /// The General fields are documented as General's own below.
 #[derive(Debug)]
-pub struct Connection<Ro: Role, Mo: Mode> {
+pub struct Connection<Ro, Mo> {
   /// GENERAL. Bytes of the CURRENT offer that have been consumed. Reset by every
   /// [`handle`](Self::handle), because each offer starts at the driver's
   /// unconsumed byte; it lives here rather than in [`Items`] so that dropping
