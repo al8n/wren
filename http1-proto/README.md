@@ -246,11 +246,90 @@ fn main() {
 }
 ```
 
+### The client half
+
 A client is the mirror image: `open_request(method, target, fields, plan, out)`
 writes the request head into the caller's slice, and `handle` then yields the
 response's `Item::Head` carrying a `StartLine::Status` on the same
 `ExchangeId` — through any number of 1xx interim heads (`interim: true`) before
 the final one.
+
+Reading it back is the same pump, and it is the half a client cannot skip: a
+driver that writes a request and never runs the loop has no answer, and one
+that stops at the first head takes an interim response for it.
+
+```rust
+use http1_proto::{BodyPlan, Client, Connection, General, Item, StartLine, Target};
+
+fn main() -> Result<(), http1_proto::Error> {
+  // RFC 9112 §3.2 makes `Host` a MUST on every HTTP/1.1 request, and every
+  // request this crate writes is one — so `open_request` refuses a section
+  // without exactly one valid line, and writes nothing.
+  let fields: &[(&str, &[u8])] = &[("Host", b"example.com")];
+  let first = Target::Origin { path_and_query: "/status" };
+
+  let mut conn = Connection::<Client, General>::new();
+  let mut out = [0u8; 64];
+  let n = conn.open_request("GET", &first, fields, BodyPlan::None, &mut out)?;
+  assert_eq!(&out[..n], b"GET /status HTTP/1.1\r\nHost: example.com\r\n\r\n");
+  // ... write out[..n] to the socket, then read the answer back ...
+
+  // This read carried an interim response and the final one behind it. A driver
+  // accumulates exactly as the server example does — offer `buffer[start..]`,
+  // advance by `consumed()` — and here the whole answer arrived at once.
+  let response: &[u8] =
+    b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n\
+      HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+  let mut body: Vec<u8> = Vec::new();
+  let mut interims = 0usize;
+
+  let consumed = {
+    let mut items = conn.handle(response);
+    while let Some(item) = items.next()? {
+      match item {
+        Item::Head { exchange, view, line, interim } => {
+          let StartLine::Status(status) = line else {
+            unreachable!("a client connection reads status-lines")
+          };
+          // RFC 9110 §15.2 makes a 1xx informational and explicitly not the
+          // answer, so it opens no exchange of its own: both heads carry the id
+          // `open_request` minted.
+          assert_eq!(exchange.get(), 1);
+          if interim {
+            assert_eq!(status.code, 103);
+            assert_eq!(view.header("link"), Some(b"</style.css>; rel=preload".as_slice()));
+            interims += 1;
+          } else {
+            assert_eq!(status.code, 200);
+            // The reason-phrase is opaque bytes (RFC 9112 §4): never trimmed,
+            // possibly empty, and not necessarily UTF-8.
+            assert_eq!(status.reason, b"OK");
+          }
+        }
+        Item::BodyChunk { data, .. } => body.extend_from_slice(data),
+        Item::ExchangeComplete { .. } => {}
+        // `Item` is `#[non_exhaustive]`: forward what you do not know.
+        _ => {}
+      }
+    }
+    items.consumed()
+  };
+
+  assert_eq!(consumed, response.len());
+  assert_eq!(interims, 1);
+  assert_eq!(body, b"hi");
+
+  // Neither question is true, and on a CLIENT that is RFC 9112 §9.2's idle
+  // connection rather than a drained one: with nothing outstanding, arriving
+  // data would not be a response at all. The next move is the next request —
+  // which a driver that read this state as "drained" would never send.
+  assert!(!conn.wants_read() && !conn.is_awaiting_send());
+  let next = Target::Origin { path_and_query: "/next" };
+  let n = conn.open_request("GET", &next, fields, BodyPlan::None, &mut out)?;
+  assert_eq!(&out[..n], b"GET /next HTTP/1.1\r\nHost: example.com\r\n\r\n");
+  Ok(())
+}
+```
 
 `fields` must satisfy RFC 9112 §3.2's three `Host` MUSTs — **exactly one** field
 line, whose value is a **valid authority or empty**. §3.2 makes the field a
