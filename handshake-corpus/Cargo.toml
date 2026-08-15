@@ -1,0 +1,20 @@
+[package]
+name = "handshake-corpus"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+# Mirrors the `wren-*` layout deliberately: `deflate` is OFF by default so a
+# default `cargo test --workspace` still resolves `websocket-proto` with `std`
+# alone, and the crate's own feature-gated suite keeps the size it had before
+# this member existed. `xtask` always runs the corpus WITH the feature.
+default = []
+deflate = ["websocket-proto/deflate"]
+
+[dependencies]
+websocket-proto = { workspace = true, features = ["std"] }
+rand_core.workspace = true
+
+[lints]
+workspace = true
