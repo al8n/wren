@@ -1592,7 +1592,13 @@ fn put(out: &mut [u8], at: usize, bytes: &[u8]) -> Option<usize> {
 /// after the head: the option has to be INSIDE the field
 /// section, and going through the same encoder is what keeps it validated,
 /// measured, and written exactly like every other field.
-struct WithClose<'h, H: Headers + ?Sized> {
+///
+/// `H` carries no [`Headers`] bound here: the representation is one reference,
+/// which needs nothing of the supplier. The bound belongs to the impl below,
+/// which is what walks it. `?Sized` is a different matter and stays — it is
+/// structural, since the supplier being wrapped is the unsized slice
+/// `[(&str, &[u8])]`.
+struct WithClose<'h, H: ?Sized> {
   /// The caller's own section, written first.
   inner: &'h H,
 }
