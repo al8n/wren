@@ -513,7 +513,8 @@ pub fn validate_connect_request<'a>(
   // token (RFC 8441 §4), and RFC 9110 §7.8 says "recipients SHOULD use
   // case-insensitive comparison when matching each protocol-name to
   // supported protocols" — exact matching would reject a conforming peer.
-  // (Contrast subprotocols, whose §11.5 registry is case-sensitive.)
+  // (Contrast subprotocols, which RFC 6455 grants no such case-insensitive
+  // comparison anywhere, so they are matched exactly.)
   let protocol_ok = fields
     .protocol()
     .single()
@@ -649,7 +650,8 @@ impl<'a> ConnectAccept<'a> {
       None => Negotiated::none(),
       Some(chosen) => {
         // Offers were token-validated and deduplicated by the gate;
-        // membership (case-SENSITIVE, §11.5) is the remaining bind.
+        // membership (EXACT — RFC 6455 grants no folding here) is the
+        // remaining bind.
         if !request.subprotocols().any(|offer| offer == chosen) {
           return Err(ConnectAcceptError::SubprotocolNotOffered);
         }
@@ -1622,7 +1624,7 @@ mod tests {
     }
 
     // The response gate carries the rule on its own, not merely by standing in
-    // front of §4.1 step 6: with an offer present `permessage-deflate;` would
+    // front of §4.1 step 5: with an offer present `permessage-deflate;` would
     // otherwise reach `parse_deflate_response`, and the gate is what names the
     // fault as a grammar fault rather than a mismatch.
     #[cfg(feature = "deflate")]
@@ -1661,7 +1663,7 @@ mod tests {
 
     // Well formed but unsupported is not a grammar fault: the request gate
     // passes it (the server then simply declines), and the response gate
-    // reaches §4.1 step 6's "granted an extension we never offered".
+    // reaches §4.1 step 5's "granted an extension we never offered".
     let headers = with_extensions("x-private; a; b=c");
     assert!(validate_connect_request(&headers).is_ok());
     let response: &[(&str, &str)] = &[("sec-websocket-extensions", "x-private; a; b=c")];
@@ -1943,7 +1945,8 @@ mod tests {
     let response: &[(&str, &str)] = &[("sec-websocket-protocol", "nope")];
     assert!(validate_connect_response(response, &req).is_err());
 
-    // Case matters (RFC 6455 §11.5): "CHAT" is not the offered "chat".
+    // Case matters (RFC 6455 grants no folding here): "CHAT" is not the
+    // offered "chat".
     let response: &[(&str, &str)] = &[("sec-websocket-protocol", "CHAT")];
     assert!(matches!(
       validate_connect_response(response, &req).unwrap_err(),

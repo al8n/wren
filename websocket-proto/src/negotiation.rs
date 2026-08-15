@@ -488,7 +488,7 @@ fn parse_param(param: &[u8]) -> Result<(&[u8], ExtensionValue<'_>), Malformed> {
 /// said out of the same walk. Two implementations of one field could only agree
 /// by coincidence, and the DIRECTION of a disagreement decides how bad it is —
 /// on the offer path a stricter reader merely declines an extension, while on
-/// the response path RFC 7692 §8.1 makes a grant the client will not accept fail
+/// the response path RFC 7692 §7 makes a grant the client will not accept fail
 /// the connection, so there it refuses a conforming handshake.
 ///
 /// # Why not `http1_proto::grammar::parameterised_list`
@@ -990,7 +990,7 @@ mod deflate {
 
   /// Client-side: validates the server's `Sec-WebSocket-Extensions`
   /// response against `offer`, yielding the agreed parameters. Errors here
-  /// fail the WebSocket connection (RFC 7692 §8.1).
+  /// fail the WebSocket connection (RFC 7692 §7).
   ///
   /// The values are the field's LINES in wire order, read with RFC 6455 §9.1's
   /// own grammar — bytes rather than `&str` because a field value admits
@@ -1000,7 +1000,7 @@ mod deflate {
   /// The very walk
   /// [`extension_list_conforms`](crate::negotiation::extension_list_conforms)
   /// gates the handshake with, and that is the point: a response this reader
-  /// cannot resolve FAILS the connection (RFC 7692 §8.1), so a second, stricter
+  /// cannot resolve FAILS the connection (RFC 7692 §7), so a second, stricter
   /// reading here would refuse handshakes §9.1 admits rather than merely decline
   /// them.
   // `single_use_lifetimes` false-positive: anonymous lifetimes in `impl
@@ -1344,7 +1344,8 @@ where
 ///   characters in the range U+0021 to U+007E not including separator
 ///   characters").
 /// - The elements "MUST all be unique strings" (§4.1 item 10), compared
-///   case-SENSITIVELY, since §11.5 registers subprotocol identifiers that way.
+///   EXACTLY: RFC 6455 grants case-insensitivity where it wants one (§4.2.1
+///   items 3 and 4) and grants none to a subprotocol identifier.
 ///
 /// Two further rules are this reader's own, and they are rules about WORK rather
 /// than about the grammar: a value past [`MAX_SUBPROTOCOL_LIST_BYTES`] once its
@@ -1414,8 +1415,12 @@ where
 /// that the server supports. Returns `None` when there is no overlap —
 /// the server then accepts without a subprotocol.
 ///
-/// Matching is case-SENSITIVE: RFC 6455 §11.5 registers subprotocol
-/// identifiers as case-sensitive (unlike `Upgrade`/`Connection` tokens).
+/// Matching is EXACT. RFC 6455 nowhere states outright that subprotocol
+/// identifiers are case-sensitive; what it does is grant case-insensitivity
+/// wherever it wants one — `Upgrade` and `Connection` are "treated as an ASCII
+/// case-insensitive value" (§4.2.1 items 3 and 4) — and grant none to a
+/// subprotocol identifier, which §11.5 registers as nothing more than a token
+/// (§4.1 item 10). Exact match is the reading that invents no folding.
 ///
 /// The offers decide WHICH entry wins; the entry returned is `supported`'s,
 /// so the selection outlives the request head the offers were read from. A
@@ -1426,7 +1431,7 @@ where
 /// caller whose supported names live in owned strings elsewhere collects them
 /// into a temporary list, and the selection outlives that list.
 ///
-/// Both sides are `&str`: RFC 6455 §4.2.1.8 makes a subprotocol a token, so
+/// Both sides are `&str`: RFC 6455 §4.2.1 item 8 makes a subprotocol a token, so
 /// unlike an extension value there is no `obs-text` or quoted-string for
 /// `&str` to lose.
 // `single_use_lifetimes` false-positive: anonymous lifetimes in `impl Trait`
@@ -1581,7 +1586,7 @@ mod deflate_tests {
     // RFC 6455 §9.1 states its ABNF "including the 'implied *LWS rule'", so
     // whitespace stands between any two adjacent words and between words and
     // separators — around the `;` and around the `=` alike. A server writing
-    // the conforming spelling must not lose the negotiation: RFC 7692 §8.1
+    // the conforming spelling must not lose the negotiation: RFC 7692 §7
     // makes an extension response this side rejects FAIL the connection, so
     // "declined" here would mean "handshake refused". A reader holding this
     // value to a grammar stricter than §9.1's answers `is_err()` instead.
@@ -1955,8 +1960,8 @@ mod tests {
 
   #[test]
   fn subprotocol_matching_is_case_sensitive() {
-    // RFC 6455 §11.5: subprotocol identifiers are case-sensitive — `CHAT`
-    // is NOT the offered `chat`.
+    // RFC 6455 grants a subprotocol identifier no case-insensitive comparison
+    // (contrast §4.2.1 items 3 and 4), so `CHAT` is NOT the offered `chat`.
     assert_eq!(select_subprotocol(["chat"], &["CHAT"]), None);
     assert_eq!(select_subprotocol(["CHAT"], &["chat"]), None);
     assert_eq!(select_subprotocol(["chat"], &["chat"]), Some("chat"));
@@ -2224,8 +2229,8 @@ mod tests {
     assert_eq!(MAX_SUBPROTOCOL_LIST_BYTES, http1_proto::MAX_HEAD_BYTES);
   }
 
-  // RFC 6455 §11.5 registers subprotocol identifiers as case-sensitive, and the
-  // selected name must outlive the request head.
+  // RFC 6455 grants a subprotocol identifier no case-insensitive comparison, and
+  // the selected name must outlive the request head.
   #[test]
   fn the_selected_subprotocol_borrows_the_server_list() {
     let supported = ["chat", "superchat"];

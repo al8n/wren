@@ -6,8 +6,8 @@
 //! §3.2 `Host` and request-target rules, RFC 9110 §7.8's upgrade offer and the
 //! 101 that answers it — and this module owns what RFC 6455 adds on top: the
 //! GET-only rule, the `Sec-WebSocket-Key`/`-Accept` SHA-1, the version check,
-//! the subprotocol and extension negotiation, and the §4.2.1.1 resource-name
-//! policy.
+//! the subprotocol and extension negotiation, and the §4.2.1 item 1
+//! resource-name policy.
 //!
 //! # Answering takes two calls, and that is the point
 //!
@@ -70,7 +70,8 @@ use http1_proto::{
 /// item, so `'static` stands in; the size does not depend on the lifetime.)
 const _: () = assert!(core::mem::size_of::<RequestView<'static>>() <= 256);
 
-/// RFC 9110 §10.1.1's `100 (Continue)`, which §7.8 orders before the 101.
+/// RFC 9110 §15.2.1's `100 (Continue)` — the status code — sent to discharge
+/// §10.1.1's `Expect`, and which §7.8 orders before the 101.
 const CONTINUE: u16 = 100;
 
 /// An empty outbound field section — what a `100 (Continue)` carries.
@@ -92,7 +93,7 @@ pub enum ServerHandshakeError {
   NotAGet,
 
   /// The request target was neither origin-form nor an absolute http/https
-  /// URI (RFC 6455 §4.2.1.1), or contained whitespace/control bytes.
+  /// URI (RFC 6455 §4.2.1 item 1), or contained whitespace/control bytes.
   #[error("request target is not a websocket resource name")]
   InvalidTarget,
 
@@ -280,7 +281,8 @@ impl<'a> RequestView<'a> {
   /// `Sec-WebSocket-Protocol` headers and comma lists. Every element was
   /// token-validated, deduplicated, and held to RFC 6455 §11.3.4's `1#token`
   /// during [`ServerHandshake::handle`], so they are ASCII by construction and
-  /// there is at least one whenever the field was present (RFC 6455 §4.2.1.8).
+  /// there is at least one whenever the field was present (RFC 6455 §4.2.1
+  /// item 8).
   ///
   /// The same walk the gate ran — the `crate::negotiation` list reader that
   /// [`crate::negotiation::subprotocol_list_conforms`] is driven from — over
@@ -716,7 +718,7 @@ impl ServerHandshake {
       return Err(ServerHandshakeError::NotAnUpgrade);
     }
 
-    // §4.2.1.1 / §3: the resource name. http1-proto validated the target's
+    // §4.2.1 item 1 / §3: the resource name. http1-proto validated the target's
     // GRAMMAR and classified its form; the split into path and query, and the
     // http/https scheme policy, are RFC 6455's.
     let Some(target) = resource_name(&request.target) else {
@@ -1073,7 +1075,7 @@ struct TargetParts<'a> {
 /// Splits a validated request target into RFC 6455 §3's resource name.
 ///
 /// http1-proto has already classified the form and validated its grammar; what
-/// is applied here is RFC 6455 §4.2.1.1's own policy — the target is
+/// is applied here is RFC 6455 §4.2.1 item 1's own policy — the target is
 /// origin-form, or "an absolute HTTP/HTTPS URI containing the resource name",
 /// so the two other §3.2 forms name nothing this handshake could be answered
 /// for — and the split into the separately borrowable path and query the view
@@ -1095,7 +1097,7 @@ fn resource_name<'a>(target: &Target<'a>) -> Option<TargetParts<'a>> {
     }
     Target::Absolute { uri } => {
       // RFC 3986 §3.1 makes the scheme ASCII case-insensitive; RFC 6455
-      // §4.2.1.1 admits http and https only.
+      // §4.2.1 item 1 admits http and https only.
       let rest = ["http://", "https://"].iter().find_map(|scheme| {
         uri
           .get(..scheme.len())
@@ -1277,7 +1279,7 @@ Sec-WebSocket-Version: 13\r\n\
 
   /// Regression: the request target must be a websocket
   /// /resource name/ — origin-form, or an absolute http/https URI
-  /// (RFC 6455 §4.2.1.1 admits BOTH; absolute-form is deliberately
+  /// (RFC 6455 §4.2.1 item 1 admits BOTH; absolute-form is deliberately
   /// accepted, since rejecting it would fail conforming proxied clients).
   ///
   /// Every shape below is refused; WHICH layer refuses it follows the split
@@ -1446,8 +1448,8 @@ Sec-WebSocket-Version: 13\r\n\
     let offers: Vec<&str> = view(&stray).subprotocols().collect();
     assert_eq!(offers, ["admin"]);
 
-    // Case-only difference is NOT a duplicate (subprotocols are
-    // case-sensitive per RFC 6455 §11.5).
+    // Case-only difference is NOT a duplicate (RFC 6455 grants subprotocols no
+    // case-insensitive comparison).
     let cased = replaced(
       "Sec-WebSocket-Protocol: chat, superchat\r\n",
       "Sec-WebSocket-Protocol: chat, CHAT\r\n",
@@ -2023,7 +2025,8 @@ Sec-WebSocket-Version: 13\r\n\
         ServerHandshakeError::SubprotocolNotOffered
       ));
 
-      // Case matters (RFC 6455 §11.5): the client offered "chat", not "CHAT".
+      // Case matters (RFC 6455 grants no folding here): the client offered
+      // "chat", not "CHAT".
       assert!(matches!(
         pending
           .validate_accept(&Accept::new().with_subprotocol(Some("CHAT")))
