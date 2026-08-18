@@ -61,8 +61,12 @@ impl Pair<'_> {
 /// A lending iterator over the field lines of a QPACK field section.
 ///
 /// Construct with [`decode_field_section_into`] (no-alloc, caller scratch) or
-/// [`decode_field_section`] (owned scratch). Call [`FieldLines::next`] until it
+/// `decode_field_section` (owned scratch). Call [`FieldLines::next`] until it
 /// returns `Ok(None)`.
+///
+/// The owned-scratch constructor is named in plain code rather than linked: it
+/// exists only under `alloc`/`std`, and an intra-doc link to a gated item is a
+/// rustdoc error in every build without it. This type is not gated.
 pub struct FieldLines<'a> {
   input: &'a [u8],
   pos: usize,

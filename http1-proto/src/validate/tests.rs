@@ -795,7 +795,7 @@ fn a_quoted_parameter_may_span_the_line_join() {
 }
 
 // The RECIPIENT half of the §5.6.1.1 / §5.6.1.2 asymmetry, on the field where
-// the sender half had escaped: "a recipient MUST parse and ignore a reasonable
+// the sender half had escaped: "A recipient MUST parse and ignore a reasonable
 // number of empty list elements". The empty elements below change NOTHING about
 // the framing, and each of these values is one this core will not GENERATE.
 #[test]

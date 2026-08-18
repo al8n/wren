@@ -1570,7 +1570,7 @@ mod tests {
   }
 
   /// RFC 6455 §9.1's MUST is a rule about the NEGOTIATION, not about the
-  /// transport that carries it: "if a value is received by either the client or
+  /// transport that carries it: "If a value is received by either the client or
   /// the server during negotiation that does not conform to the ABNF below, the
   /// recipient of such malformed data MUST immediately _Fail the WebSocket
   /// Connection_." Both extended-CONNECT gates enforce it, on every tier, so

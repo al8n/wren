@@ -33,8 +33,12 @@ pub use websocket_proto::{Negotiated, connection::Closed, frame::CloseCode, mess
 /// `wss://` needs the `tls` feature. The default trust anchors are the
 /// webpki (Mozilla) roots — the platform certificate store is **not**
 /// consulted, so corporate or custom CAs need a caller-built connector via
-/// [`ClientOptions::with_tls_connector`]. Prefer the runtime-specific
-/// [`tokio::connect`] / [`smol::connect`] wrappers.
+/// `ClientOptions::with_tls_connector`. Prefer the runtime-specific
+/// `tokio::connect` / `smol::connect` wrappers.
+///
+/// All three are named in plain code rather than linked: each exists only under
+/// its own feature (`tls`, `tokio`, `smol`), and an intra-doc link to a gated
+/// item is a rustdoc error in every build without it.
 pub async fn connect<N: Net>(
   url: &str,
   options: ClientOptions,

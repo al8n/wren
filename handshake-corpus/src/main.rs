@@ -23,7 +23,9 @@
 //! - `equivalence-group` — a name when this case is one SPELLING of a logical
 //!   value that other cases in the same `(role, field)` spell differently, `-`
 //!   when it is not. Every member of a group must reach the identical verdict;
-//!   see [`is_role_singleton`] for the one exception the roles themselves make.
+//!   see `is_role_singleton` for the one exception the roles themselves make (it
+//!   is `deflate`-gated with the rest of the corpus, so it is named rather than
+//!   linked).
 //! - `outcome` — the verdict's variant path (`error/Http/TooManyHeaders`), which
 //!   is what a moved verdict is grouped BY.
 //! - `detail` — everything the surface resolved, so two cases compare equal only

@@ -70,11 +70,11 @@ pub(crate) fn encode_chunk_header(size: usize, out: &mut [u8]) -> Result<usize, 
 ///
 /// RFC 9110 §6.5.1: "A sender MUST NOT generate a trailer field unless the
 /// sender knows the corresponding header field name's definition permits the
-/// field to be sent in trailers", the reason being that "many fields cannot be
-/// processed outside the header section because their evaluation is necessary
-/// prior to receiving the content, such as those that describe message framing,
-/// routing, authentication, request modifiers, response controls, or content
-/// format".
+/// field to be sent in trailers". The same section gives the reason: "Many
+/// fields cannot be processed outside the header section because their
+/// evaluation is necessary prior to receiving the content, such as those that
+/// describe message framing, routing, authentication, request modifiers,
+/// response controls, or content format".
 ///
 /// # The rule, not a list
 ///

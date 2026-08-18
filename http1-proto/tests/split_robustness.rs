@@ -224,7 +224,7 @@ const CORPUS: &[Entry] = &[
     stream: b"HTTP/1.1 100 \r\n\r\nHTTP/1.1 101 Switching Protocols\r\n\
               Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n\x81\x03abc",
   },
-  // RFC 9110 §9.3.6: "any 2xx (Successful) response indicates that the sender …
+  // RFC 9110 §9.3.6: "Any 2xx (Successful) response indicates that the sender …
   // will switch to tunnel mode immediately after the response header section".
   Entry {
     name: "CONNECT tunnel",
@@ -1297,7 +1297,7 @@ fn the_mirror_records_what_the_close_delimited_response_states() {
   );
 }
 
-// RFC 9110 §9.3.6: "any 2xx (Successful) response indicates that the sender …
+// RFC 9110 §9.3.6: "Any 2xx (Successful) response indicates that the sender …
 // will switch to tunnel mode immediately after the response header section", so
 // the head is consumed and everything behind it is handed over verbatim — raw
 // TLS bytes here, which are not HTTP and are not this core's to touch.
