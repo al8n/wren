@@ -35,7 +35,8 @@ use crate::{
   body::{BodyDecoder, BodyItem},
   connection::{
     CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Exchange, FAILED, Lifecycle, RecvState,
-    SWITCHING_PROTOCOLS, SendState, abandon_send, latch, mint, settle, signal_close,
+    SWITCHING_PROTOCOLS, SendState, abandon_send, head_digest, latch, mint, settle, signal_close,
+    tunnel::names_a_protocol,
   },
   error::{Error, H1Error},
   event::{ExchangeId, Item, Items, StartLine},
@@ -93,7 +94,7 @@ pub(crate) fn pump<'a>(it: &mut Items<'a, '_>) -> Result<Option<Item<'a>>, Error
       Lifecycle::Failed => return Err(Error::InvalidState(FAILED)),
       // RFC 9112 §9.6: once the `close` connection option has been stated and
       // the exchange that was in flight is through, no further inbound byte is
-      // processed at all — "the server MUST NOT process any further requests
+      // processed at all: "The server MUST NOT process any further requests
       // received on that connection".
       Lifecycle::Draining => return Ok(None),
       // A closed READ side is not that rule and does not appear here at all: it
@@ -320,6 +321,10 @@ fn server_head<'a>(
     Err(error) => return Err(fail(it, error)),
   };
 
+  // RFC 9110 §7.8's two halves; `&&` short-circuits, so a request without
+  // `Upgrade` never runs the protocol-list scan — nor the digest below it.
+  let upgrade_offered = parsed.directives.has_upgrade && names_a_protocol(&parsed.view);
+
   // Commit: the id is minted, the bytes are counted, and the exchange enters its
   // body — all in the call that hands the head over.
   let id = mint(it.next_exchange);
@@ -336,6 +341,20 @@ fn server_head<'a>(
     // RESPONSE depends on the version the REQUEST stated, and the response is
     // not the message that stated it.
     version: parsed.version,
+    // RFC 9110 §10.1.1's ask, kept durably because the answer to it can outlive
+    // `RecvState::Body`'s own copy — see `Exchange::expect_unanswered`.
+    expect_unanswered: parsed.directives.expect_continue,
+    upgrade_offered,
+    // WHICH request offered it, for the connection this exchange may later
+    // transition into: `into_tunnel` carries the digest across, and the upgrade
+    // layer refuses a head that does not match it. Hashed only behind the offer
+    // — an ordinary request pays nothing for a mode transition it will never
+    // take, and a dead value is what `Exchange::head_digest` is written to hold.
+    head_digest: if upgrade_offered {
+      head_digest(parsed.view.block())
+    } else {
+      0
+    },
   });
   *it.send = SendState::Owed;
   Ok(Step::Yield(commit_head(

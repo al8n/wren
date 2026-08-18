@@ -11,12 +11,14 @@
 //! their code. If a shim contains a reachable panic, the link fails with a
 //! `no-panic` error naming the symbol.
 //!
-//! Coverage: `find_head_end`, `parse_status_line`, `parse_chunk_size` and
-//! `parameterised_list` are each link-checked via `#[no_panic]` shims — the
-//! head-terminator scan, the §4 status-line codec, the `1*HEXDIG` reader whose
-//! checked accumulation is the crate's one arithmetic overflow risk, and the
-//! join-aware RFC 9110 §5.6.6 list walk, whose cursors run over borrowed field
-//! lines the caller supplies and whose member boundaries cross the §5.2 join.
+//! Coverage: `find_head_end`, `parse_status_line`, `parse_chunk_size`,
+//! `parameterised_list` and `head_digest` are each link-checked via
+//! `#[no_panic]` shims — the head-terminator scan, the §4 status-line codec, the
+//! `1*HEXDIG` reader whose checked accumulation is the crate's one arithmetic
+//! overflow risk, the join-aware RFC 9110 §5.6.6 list walk, whose cursors run
+//! over borrowed field lines the caller supplies and whose member boundaries
+//! cross the §5.2 join, and the FNV-1a head fold, whose XOR and wrapping
+//! multiply run once per byte of a block up to `MAX_HEAD_BYTES` long.
 //!
 //! Three paths are exercised as **smoke tests only** (NOT link-checked), each
 //! for a reason recorded at its own section: `parse_request_line` and
@@ -90,10 +92,10 @@ use core::hint::black_box;
 
 use http1_proto::{
   __no_panic_internals::{
-    encode_request_head, find_head_end, parse_chunk_size, parse_request_line, parse_status_line,
-    scan_head,
+    encode_request_head, find_head_end, head_digest, parse_chunk_size, parse_request_line,
+    parse_status_line, scan_head,
   },
-  Target,
+  MAX_HEAD_BYTES, Target,
   grammar::{ParamValue, parameterised_list},
 };
 
@@ -258,6 +260,61 @@ fn parameterised_list_is_panic_free() {
   assert_eq!(
     shim_parameterised_list(black_box(&[[0xff, 0xfe, 0x00].as_slice()])),
     0
+  );
+}
+
+// ── head digest ───────────────────────────────────────────────────────────────
+
+no_panic_shim! {
+  /// Shim over `connection::head_digest` — the FNV-1a fold a connection keeps
+  /// of the head that armed it.
+  ///
+  /// Returns the digest rather than a `bool`, so the fold cannot be dropped as
+  /// dead: a call whose result is unused takes the shim's body with it and
+  /// proves nothing.
+  fn shim_head_digest(block: &[u8]) -> u64 {
+    head_digest(block)
+  }
+}
+
+#[test]
+fn head_digest_is_panic_free() {
+  // FNV-1a's offset basis: the zero-iteration fold, which is the shape an empty
+  // slice takes and the one a loop bound could get wrong.
+  assert_eq!(shim_head_digest(black_box(b"")), 0xcbf2_9ce4_8422_2325);
+
+  // The production input, and the only shape that reaches this function for
+  // real: a conforming RFC 9110 §7.8 upgrade head, terminator included.
+  const UPGRADE: &[u8] = b"GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+  const OTHER: &[u8] = b"GET /other HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+Connection: Upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n";
+  assert_ne!(
+    shim_head_digest(black_box(UPGRADE)),
+    shim_head_digest(black_box(OTHER))
+  );
+
+  // FULL SCALE, which is the point of this shim: the head scanner caps a block
+  // at `MAX_HEAD_BYTES`, so this is the longest fold production can ask for, and
+  // a twenty-byte fixture proves the least of it. The bound is the SCANNER's
+  // rather than this loop's, so one byte past the cap is exercised too — the
+  // fold itself has no length rule to break.
+  let mut block = [0u8; MAX_HEAD_BYTES + 1];
+  for (i, slot) in block.iter_mut().enumerate() {
+    // Every one of the 256 byte values, so the XOR runs over the whole range
+    // rather than over ASCII alone.
+    *slot = u8::try_from(i % 256).unwrap_or_default();
+  }
+  assert_ne!(
+    shim_head_digest(black_box(block.get(..MAX_HEAD_BYTES).unwrap_or_default())),
+    shim_head_digest(black_box(block.as_slice()))
+  );
+  // All-`0xff` against all-zero at the same scale: the multiply's high bits are
+  // what wrap, and a constant input is where a checked multiply would be easiest
+  // for the optimizer to prove away — and hardest to notice if it had not.
+  assert_ne!(
+    shim_head_digest(black_box([0xffu8; MAX_HEAD_BYTES].as_slice())),
+    shim_head_digest(black_box([0x00u8; MAX_HEAD_BYTES].as_slice()))
   );
 }
 

@@ -98,6 +98,27 @@ fn send_bodiless_response(c: &mut Connection<Server, General>) {
   assert_eq!(&out[..n], b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
 }
 
+/// Feeds the slice and pulls every item to exhaustion, so a request with a body
+/// ends at `RecvState::AwaitingRearm` and `ExchangeComplete` has been yielded.
+/// Returns the consumed byte count.
+fn drain(c: &mut Connection<Server, General>, input: &[u8]) -> usize {
+  let mut it = c.handle(input);
+  while it.next().unwrap().is_some() {}
+  it.consumed()
+}
+
+/// Has read the head of a `POST` carrying `Expect: 100-continue` and a
+/// `Content-Length`, with the body not yet fed, so `expect_unanswered` is set
+/// and the 100 is still owed.
+fn server_awaiting_expect() -> Connection<Server, General> {
+  let mut c = Connection::<Server, General>::new();
+  drain(
+    &mut c,
+    b"POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n",
+  );
+  c
+}
+
 // RFC 9112 §2.1 (`HTTP-message = start-line CRLF *( field-line CRLF ) CRLF
 // [ message-body ]`) with §6.3 item 6 (`Content-Length` frames the body): the
 // driver is handed the head, then the body octets, then the end of the
@@ -386,6 +407,92 @@ fn a_refused_interim_leaves_the_expectation_owed() {
     "a head that did not fit answered nothing"
   );
 }
+
+// The Expect fact must outlive the transient one: RecvState::Body's copy is
+// gone by the time an answer is written.
+#[test]
+fn the_expect_fact_survives_the_body_it_arrived_with() {
+  const REQ: &[u8] = b"POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\n\
+Content-Length: 3\r\n\r\nabc";
+  let mut c = Connection::<Server, General>::new();
+  drain(&mut c, REQ);
+  let exchange = c.exchange.expect("the exchange is still in flight");
+  assert!(exchange.expect_unanswered, "the answer still owes a 100");
+}
+
+#[test]
+fn a_hundred_continue_discharges_the_durable_expect_fact() {
+  let mut c = server_awaiting_expect();
+  let mut out = [0u8; 64];
+  c.send_interim(100, NO_FIELDS, &mut out).unwrap();
+  assert!(!c.exchange.expect("still in flight").expect_unanswered);
+}
+
+#[test]
+fn the_final_response_discharges_the_durable_expect_fact() {
+  let mut c = server_awaiting_expect();
+  let mut out = [0u8; 128];
+  c.send_response(200, b"OK", LENGTH_0, BodyPlan::None, &mut out)
+    .unwrap();
+  assert!(c.exchange.is_none_or(|e| !e.expect_unanswered));
+}
+
+// The ask is the CLIENT's to make (RFC 9110 §10.1.1), so a request that made
+// none leaves nothing owed. The negative half of the three tests above: without
+// it a field hardcoded to `true` would satisfy every one of them.
+#[test]
+fn a_request_without_an_expectation_owes_no_continue() {
+  let mut c = Connection::<Server, General>::new();
+  drain(&mut c, BODILESS);
+  let exchange = c.exchange.expect("the exchange is still in flight");
+  assert!(!exchange.expect_unanswered, "nothing asked for a 100");
+}
+
+// RFC 9110 §7.8's two halves, and the 1.0 MUST-ignore folded into has_upgrade.
+#[test]
+fn the_upgrade_offer_is_recorded_only_when_both_halves_name_a_protocol() {
+  let cases: &[(&[u8], bool)] = &[
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+      true,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\r\n",
+      false,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\n\r\n",
+      false,
+    ),
+    (b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", false),
+    (
+      b"GET / HTTP/1.0\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+      false,
+    ),
+    // The row that separates the two halves of the `&&`. Both fields are
+    // PRESENT on a 1.1 request, so `has_upgrade` is true, and the offer still
+    // names nothing: RFC 9110 §7.8's `Upgrade` field lists `protocol`s, and an
+    // empty value lists none. Without this row an implementation reading
+    // `has_upgrade` alone passes every case above, and `into_tunnel`'s
+    // `NO_UPGRADE_OFFERED` gate would rest on an untested conjunct.
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nUpgrade:\r\nConnection: Upgrade\r\n\r\n",
+      false,
+    ),
+  ];
+  for (req, expected) in cases {
+    let mut c = Connection::<Server, General>::new();
+    drain(&mut c, req);
+    assert_eq!(
+      c.exchange.expect("classified").upgrade_offered,
+      *expected,
+      "for {}",
+      core::str::from_utf8(req).unwrap()
+    );
+  }
+}
+
+const _: () = assert!(core::mem::size_of::<Connection<Server, General>>() <= 256);
 
 // RFC 9112 §5.1 (whitespace between a field name and its colon MUST be
 // rejected) with §11.2 (why): the violation surfaces once, the connection
@@ -2475,11 +2582,12 @@ const RELEASED: &str = "the peer ended the exchange before this body was sent";
 //
 // RFC 9112 §9.6 draws the distinction itself. A server that RECEIVES the option
 // closes "after it sends the final response"; a server that SENDS one closes
-// "after it sends the response CONTAINING the close connection option". A 1xx is
-// a response message (RFC 9110 §15.2), so the peer has committed to closing after
-// that head — and the final response this end was waiting for is one a conforming
-// server never sends. Deferring the release to it left `send_body` legal and the
-// caller waiting forever.
+// "after it sends the response containing the close connection option" — the
+// RESPONSE CARRYING IT, not the final one. A 1xx is a response message (RFC 9110
+// §15.2), so the peer has committed to closing after that head — and the final
+// response this end was waiting for is one a conforming server never sends.
+// Deferring the release to it left `send_body` legal and the caller waiting
+// forever.
 //
 // Both body framings, because the release must not depend on how this end framed
 // what it was sending.
@@ -2981,7 +3089,7 @@ fn a_half_closed_server_numbers_its_buffered_exchanges_in_order() {
 }
 
 // THE CONTROL, and the rule it must not break: RFC 9112 §9.6's `close` connection
-// option really does forbid processing anything further — "the server MUST NOT
+// option really does forbid processing anything further: "The server MUST NOT
 // process any further requests received on that connection". That rule belongs to
 // the OPTION, not to the transport, so a half-close after a request that stated
 // `close` still suppresses the request pipelined behind it.
@@ -3272,7 +3380,7 @@ fn a_buffered_request_with_a_close_option_is_served_and_ends_the_connection() {
   assert!(c.is_awaiting_send());
   send_bodiless_response(&mut c);
 
-  // …and request THREE is suppressed: §9.6's "the server MUST NOT process any
+  // …and request THREE is suppressed by §9.6: "The server MUST NOT process any
   // further requests received on that connection", which is the OPTION's rule
   // and still applies with the transport fact set beside it.
   serves(
@@ -3822,9 +3930,10 @@ fn server_chunked_response_with_trailers() {
 
 // RFC 9110 §6.5.1: "A sender MUST NOT generate a trailer field unless the sender
 // knows the corresponding header field name's definition permits the field to be
-// sent in trailers", because "many fields cannot be processed outside the header
-// section" — those describing "message framing, routing, authentication, request
-// modifiers, response controls, or content format" among them.
+// sent in trailers", and the same section says why: "Many fields cannot be
+// processed outside the header section" — those describing "message framing,
+// routing, authentication, request modifiers, response controls, or content
+// format" among them.
 //
 // The four this core can decide on its own are refused here: a framing field in
 // a trailer section would state a SECOND delimitation of a message already framed
@@ -3927,10 +4036,10 @@ fn trailers_refuse_the_fields_that_frame_or_route() {
 }
 
 // RFC 9112 §6.3 item 8 with §9.3: a response carrying NO framing field is
-// delimited by the connection closing, and "in order to remain persistent, all
-// messages on a connection need to have a self-defined message length" — so such
-// a response is the last one, whether or not the peer also spelled
-// `Connection: close`.
+// delimited by the connection closing, and §9.3 states the rule: "In order to
+// remain persistent, all messages on a connection need to have a self-defined
+// message length" — so such a response is the last one, whether or not the peer
+// also spelled `Connection: close`.
 //
 // The notice has to reach the driver at the HEAD, which is where the commitment
 // is made: a driver told only by the EOF would already have decided whether to
@@ -4391,9 +4500,9 @@ fn bodiless_statuses_refuse_framing_fields() {
   );
 }
 
-// RFC 9112 §6.2's sender MUST NOT is UNCONDITIONAL — "a sender MUST NOT send a
+// RFC 9112 §6.2's sender MUST NOT is UNCONDITIONAL: "A sender MUST NOT send a
 // Content-Length header field in any message that contains a Transfer-Encoding
-// header field" — and RFC 9110 §8.6 spells the field `1*DIGIT`. Neither rule is
+// header field". RFC 9110 §8.6 spells the field `1*DIGIT`. Neither rule is
 // suspended by §6.3 item 1: that item tells a RECIPIENT to ignore the fields of
 // a bodiless response, which is not a licence for the SENDER to write anything
 // into them. A pair of them on the wire is the §11.2 primitive whatever this end
@@ -4690,9 +4799,10 @@ fn a_local_close_lets_the_exchange_in_flight_finish() {
 
 // RFC 9112 §9.3: a recipient decides persistence from "the protocol version and
 // Connection header field (Section 7.6.1 of [HTTP]) in the most recently
-// received message" — with HTTP/1.0 and no `keep-alive` option, "the connection
-// will close after the current response". So the exchange finishes and the
-// connection does not re-arm behind it.
+// received message" — and with HTTP/1.0 and no `keep-alive` option the decision
+// list ends where every other branch does: "The connection will close after the
+// current response". So the exchange finishes and the connection does not re-arm
+// behind it.
 #[test]
 fn an_http_10_request_ends_the_connection_after_its_response() {
   const FIRST: usize = b"GET /a HTTP/1.0\r\nHost: h\r\n\r\n".len();
@@ -4943,7 +5053,7 @@ fn an_http_10_expectation_never_reaches_the_driver() {
 // RFC 9112 §6.3 item 8: the body is "determined by the number of octets received
 // prior to the server closing the connection", so the head declares nothing and
 // the close is part of the framing. §9.3 makes that close mandatory rather than
-// a policy choice — "in order to remain persistent, all messages on a connection
+// a policy choice: "In order to remain persistent, all messages on a connection
 // need to have a self-defined message length".
 #[test]
 fn a_close_delimited_response_is_framed_by_the_close() {
@@ -5086,7 +5196,7 @@ mod tunnel {
   };
 
   /// RFC 9110 §7.8 wants BOTH halves of an upgrade offer: the `upgrade`
-  /// connection option ("a sender of Upgrade MUST also send an `Upgrade`
+  /// connection option ("A sender of Upgrade MUST also send an `Upgrade`
   /// connection option in the Connection header field") and the `Upgrade` field
   /// that names the protocol.
   const OFFER: &[(&str, &[u8])] = &[
@@ -5707,7 +5817,7 @@ mod tunnel {
   // `Host` rules, the §3.2.3/§3.2.4 target-method pairing, and the §6.3 framing
   // faults alike.
   //
-  // What is Tunnel's own is cited where it is refused: §9.3.6's "a CONNECT
+  // What is Tunnel's own is cited where it is refused — §9.3.6: "A CONNECT
   // request message does not have content" (and no message this mode writes has
   // one), and §3.2.3's port. Those are rules about the HANDSHAKE, not about the
   // head, so they are properly mode-specific.
@@ -6928,7 +7038,7 @@ mod tunnel {
 
   // RFC 9110 §9.3.6: "Any 2xx (Successful) response indicates that the sender
   // (and all inbound proxies) will switch to tunnel mode immediately after the
-  // response header section." A 2xx therefore ACCEPTS a CONNECT — writing one as
+  // response header section". A 2xx therefore ACCEPTS a CONNECT — writing one as
   // a refusal would leave the peer tunnelling while this end had recorded the
   // handshake as refused, which is the two ends disagreeing about whether the
   // connection is still HTTP. It is the same rule the 101 gets on the upgrade
@@ -6951,7 +7061,7 @@ mod tunnel {
       assert_eq!(&out[..n], b"HTTP/1.1 403 Forbidden\r\n\r\n", "{code}");
     }
 
-    // Every non-2xx still refuses a CONNECT — §9.3.6: "any response other than a
+    // Every non-2xx still refuses a CONNECT — §9.3.6: "Any response other than a
     // successful response indicates that the tunnel has not yet been formed".
     for code in [407u16, 502] {
       let mut s = asked_for_a_tunnel();
@@ -6961,7 +7071,7 @@ mod tunnel {
     }
 
     // The upgrade side is untouched: only the 101 switches there, so a 200 is an
-    // ordinary refusal (§7.8 — "a server MAY ignore a received Upgrade header
+    // ordinary refusal (§7.8: "A server MAY ignore a received Upgrade header
     // field if it wishes to continue using the current protocol").
     let mut s = Connection::<Server, Tunnel>::new();
     assert!(
@@ -6989,8 +7099,8 @@ mod tunnel {
     for bad in [
       // The wire said CONNECT; we refused it for want of a port.
       b"CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n".as_slice(),
-      // The wire said CONNECT; we refused it because "a CONNECT request message
-      // does not have content".
+      // The wire said CONNECT; we refused it on §9.3.6: "A CONNECT request
+      // message does not have content".
       b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nContent-Length: 5\r\n\r\nhello",
       // Not a CONNECT at all — the blanket's second half: a malformed request
       // owes a rejection, and no 2xx is one.
@@ -7314,5 +7424,585 @@ mod tunnel {
     };
     assert_eq!(status.code, 426);
     assert_eq!(status.reason, b"Upgrade Required");
+  }
+}
+
+/// Mode-edge tests: the seam where a `Connection<_, General>` becomes the
+/// `Connection<_, Tunnel>` that finishes a protocol switch.
+///
+/// Its own module because it is the one place that needs BOTH sets of fixtures
+/// above — a request read through the General pump, and the tunnel that answers
+/// it — and because the argument every test here makes is the same one: the
+/// connection an edge produces is indistinguishable from the one the native path
+/// builds, field for field.
+mod mode_edges {
+  use super::*;
+
+  /// The conforming bodyless upgrade request both paths are fed. RFC 9110 §7.8's
+  /// two halves, on the HTTP/1.1 the same section requires.
+  const UPGRADE: &[u8] =
+    b"GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+  /// The framing of an answer that has BEGUN but is not through: a counted body
+  /// leaves `send` at `Sending` with the exchange and the receive side intact,
+  /// which is what makes `ANSWER_BEGUN` the deterministically first failure.
+  const LENGTH_3: &[(&str, &[u8])] = &[("Content-Length", b"3")];
+
+  /// Has read the head of a `POST` that states BOTH halves of RFC 9110 §7.8 and
+  /// a `Content-Length`, with the body not yet fed.
+  ///
+  /// The offer is not decoration: without it gate 2 fires before gate 3 and the
+  /// test below would assert the wrong constant while still passing.
+  fn server_mid_body() -> Connection<Server, General> {
+    let mut c = Connection::<Server, General>::new();
+    drain(
+      &mut c,
+      b"POST /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+Connection: Upgrade\r\nContent-Length: 3\r\n\r\n",
+    );
+    c
+  }
+
+  /// Has read a conforming bodyless upgrade request to `AwaitingRearm`, so
+  /// gates 1-5 pass and a single later mutation pins a single later gate.
+  fn server_with_upgrade_read() -> Connection<Server, General> {
+    let mut c = Connection::<Server, General>::new();
+    drain(&mut c, UPGRADE);
+    c
+  }
+
+  #[test]
+  fn the_server_edge_lands_where_the_native_path_lands() {
+    let mut native = Connection::<Server, Tunnel>::new();
+    native
+      .handle_request(UPGRADE)
+      .expect("a conforming upgrade");
+
+    let mut general = Connection::<Server, General>::new();
+    drain(&mut general, UPGRADE);
+    let edged = general.into_tunnel().expect("every gate passes");
+
+    assert_eq!(native.fingerprint(), edged.fingerprint());
+  }
+
+  // The sharpest case of the class, and the one `Exchange::expect_unanswered`
+  // exists for: RFC 9110 §7.8 puts the 100 before the 101, and
+  // `RecvState::Body`'s copy of the ask is gone by the time this edge runs.
+  #[test]
+  fn the_server_edge_carries_the_expect_obligation() {
+    const REQ: &[u8] = b"GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+Connection: Upgrade\r\nExpect: 100-continue\r\n\r\n";
+
+    let mut native = Connection::<Server, Tunnel>::new();
+    native.handle_request(REQ).unwrap();
+
+    let mut general = Connection::<Server, General>::new();
+    drain(&mut general, REQ);
+    let edged = general.into_tunnel().unwrap();
+
+    assert_eq!(native.fingerprint(), edged.fingerprint());
+    assert!(
+      edged.owes_continue(),
+      "RFC 9110 §7.8: the 100 goes before the 101"
+    );
+  }
+
+  /// A second conforming upgrade request, differing from `UPGRADE` only in a
+  /// field value — so a head-to-head comparison that read the OFFER rather than
+  /// the request would call the two the same.
+  const OTHER_UPGRADE: &[u8] =
+    b"GET /other HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+  /// A conforming CONNECT, which is the OTHER takeover and made no §7.8 offer.
+  const CONNECT_REQUEST: &[u8] = b"CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\n\r\n";
+
+  /// RFC 9110 §15.2.2's two halves, which `accept` requires in the 101.
+  const SWITCH_FIELDS: &[(&str, &[u8])] = &[("Upgrade", b"websocket"), ("Connection", b"Upgrade")];
+
+  fn view(bytes: &[u8]) -> crate::head::HeadView<'_> {
+    crate::head::scan_head(bytes).expect("the fixture is a well-formed head")
+  }
+
+  /// The identity a caller-supplied head is measured against, on BOTH paths: a
+  /// connection answers `Matches` for the head that armed it and `Mismatch` for
+  /// any other, whichever way it was armed.
+  ///
+  /// The two halves are one test on purpose — the transition and the native
+  /// classification have to agree about the digest as well as about the phase,
+  /// and the fingerprint differentials above prove the agreement while this
+  /// proves what the agreement is FOR.
+  #[test]
+  fn an_armed_connection_matches_only_the_head_that_armed_it() {
+    let mut native = Connection::<Server, Tunnel>::new();
+    native
+      .handle_request(UPGRADE)
+      .expect("a conforming upgrade");
+
+    let mut general = Connection::<Server, General>::new();
+    drain(&mut general, UPGRADE);
+    let edged = general.into_tunnel().expect("every gate passes");
+
+    for connection in [&native, &edged] {
+      assert_eq!(
+        connection.head_binding(&view(UPGRADE)),
+        HeadBinding::Matches
+      );
+      assert_eq!(
+        connection.head_binding(&view(OTHER_UPGRADE)),
+        HeadBinding::Mismatch
+      );
+    }
+  }
+
+  /// RFC 9110 §9.3.6's takeover made no §7.8 upgrade offer, so the question has
+  /// no affirmative answer for ANY head — its own included. Without this, a
+  /// caller could classify a CONNECT and then answer a synthetic upgrade head on
+  /// the same connection, whose `accept` would write `200 Connection
+  /// Established` beside the other layer's 101.
+  #[test]
+  fn a_connect_armed_connection_matches_nothing() {
+    let mut connection = Connection::<Server, Tunnel>::new();
+    connection
+      .handle_request(CONNECT_REQUEST)
+      .expect("a CONNECT naming a port");
+    assert_eq!(
+      connection.head_binding(&view(CONNECT_REQUEST)),
+      HeadBinding::Mismatch
+    );
+    assert_eq!(
+      connection.head_binding(&view(UPGRADE)),
+      HeadBinding::Mismatch
+    );
+  }
+
+  /// No handshake, no armed request, nothing for a head to contradict — which is
+  /// what keeps `Connection::new()` usable as the throwaway a caller
+  /// pre-validates a head against before spending the one-way transition.
+  #[test]
+  fn a_connection_holding_no_handshake_contradicts_no_head() {
+    assert_eq!(
+      Connection::<Server, Tunnel>::new().head_binding(&view(UPGRADE)),
+      HeadBinding::NoHandshake
+    );
+
+    // And after the switch: the phase is terminal, so the armed request is no
+    // longer a request anything can still be bound to.
+    let mut switched = Connection::<Server, Tunnel>::new();
+    switched
+      .handle_request(UPGRADE)
+      .expect("a conforming upgrade");
+    let mut out = [0u8; 128];
+    switched
+      .accept(SWITCH_FIELDS, &mut out)
+      .expect("the 101 states both halves of §7.8");
+    assert_eq!(
+      switched.head_binding(&view(UPGRADE)),
+      HeadBinding::NoHandshake
+    );
+  }
+
+  // RFC 9110 §15.2 makes a 1xx not the answer, so an interim already sent leaves
+  // the exchange being answered rather than answered: the edge still switches,
+  // and the ordering MUST §7.8 states is discharged rather than carried.
+  #[test]
+  fn an_interim_already_sent_does_not_begin_the_answer() {
+    const REQ: &[u8] = b"GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+Connection: Upgrade\r\nExpect: 100-continue\r\n\r\n";
+    let mut c = Connection::<Server, General>::new();
+    drain(&mut c, REQ);
+    let mut out = [0u8; 64];
+    c.send_interim(100, NO_FIELDS, &mut out)
+      .expect("RFC 9110 §7.8's 100 goes out before the 101");
+    let edged = c.into_tunnel().expect("an interim is not the answer");
+    assert!(
+      !edged.owes_continue(),
+      "the 100 that was sent discharged the ordering MUST"
+    );
+  }
+
+  // A capability the edge ADDS. The native path refuses a content-carrying
+  // upgrade request outright, because a tunnel has no body machinery; the edge
+  // accepts it once General has drained the body, which RFC 9110 §7.8 permits —
+  // the request has by then been completely sent, which is the only thing the
+  // rule asks.
+  #[test]
+  fn an_upgrade_request_with_content_switches_once_its_body_is_drained() {
+    const REQ: &[u8] = b"POST /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+Connection: Upgrade\r\nContent-Length: 3\r\n\r\nabc";
+
+    let mut native = Connection::<Server, Tunnel>::new();
+    assert!(
+      native.handle_request(REQ).is_err(),
+      "HANDSHAKE_HAS_NO_CONTENT"
+    );
+
+    let mut general = Connection::<Server, General>::new();
+    drain(&mut general, REQ);
+    general
+      .into_tunnel()
+      .expect("the request was completely sent");
+  }
+
+  // Nothing is in flight to switch, so gate 1 is the first and only failure.
+  #[test]
+  fn a_connection_with_nothing_in_flight_cannot_switch() {
+    let c = Connection::<Server, General>::new();
+    let (_, why) = c.into_tunnel().expect_err("no request has arrived");
+    assert_eq!(why, TransitionRefused::NO_EXCHANGE);
+  }
+
+  // `the_upgrade_offer_is_recorded_only_when_both_halves_name_a_protocol` pins
+  // where `upgrade_offered` is recorded; this pins the gate that reads it.
+  // HTTP/1.0 is the second row because RFC 9110 §7.8 makes ignoring its
+  // `Upgrade` field a MUST, which is a refusal rather than an omission.
+  #[test]
+  fn a_request_that_offered_no_upgrade_cannot_switch() {
+    for req in [
+      &b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"[..],
+      &b"GET / HTTP/1.0\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"[..],
+    ] {
+      let mut c = Connection::<Server, General>::new();
+      drain(&mut c, req);
+      let (mut back, why) = c.into_tunnel().expect_err("nothing was offered");
+      assert_eq!(why, TransitionRefused::NO_UPGRADE_OFFERED);
+      let mut out = [0u8; 128];
+      assert!(
+        back
+          .send_response(200, b"OK", LENGTH_0, BodyPlan::None, &mut out)
+          .is_ok(),
+        "the ordinary answer is still owed and still writable"
+      );
+    }
+  }
+
+  // RFC 9110 §7.8: the request must have been COMPLETELY sent, and a body still
+  // arriving is a body whose remaining octets are HTTP.
+  #[test]
+  fn a_request_still_arriving_cannot_switch() {
+    let c = server_mid_body();
+    let (mut back, why) = c.into_tunnel().expect_err("the body is still arriving");
+    assert_eq!(why, TransitionRefused::REQUEST_INCOMPLETE);
+    let mut out = [0u8; 128];
+    assert!(
+      back
+        .send_response(400, b"Bad Request", LENGTH_0, BodyPlan::None, &mut out)
+        .is_ok(),
+      "the response is still owed and still writable"
+    );
+  }
+
+  // The 101 IS this exchange's answer, so an answer already going out makes it a
+  // second response to one request. Begun with an UNFINISHED body on purpose: a
+  // `send_interim` leaves `send` at `Owed` — neither the exchange nor the
+  // connection moves — so the edge would succeed instead.
+  #[test]
+  fn a_server_that_has_begun_its_answer_cannot_switch() {
+    let mut c = server_with_upgrade_read();
+    let mut out = [0u8; 128];
+    c.send_response(200, b"OK", LENGTH_3, BodyPlan::ContentLength(3), &mut out)
+      .expect("the head announces the three octets that follow it");
+    let (mut back, why) = c
+      .into_tunnel()
+      .expect_err("this exchange is already being answered");
+    assert_eq!(why, TransitionRefused::ANSWER_BEGUN);
+    assert!(
+      back.send_body(b"abc", &mut out).is_ok(),
+      "the body the head announced is still writable"
+    );
+  }
+
+  // The only construction that can pin the lifecycle gate on this edge:
+  // `Connection: close` sets `peer_close` at commit and signals `Closing`, while
+  // the owed response keeps `settle` from clearing the exchange — so gates 1-4
+  // pass and gate 5 is the first failure.
+  #[test]
+  fn an_upgrade_request_stating_close_cannot_switch_but_can_still_be_answered() {
+    const REQ: &[u8] = b"GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+Connection: Upgrade, close\r\n\r\n";
+    let mut c = Connection::<Server, General>::new();
+    drain(&mut c, REQ);
+    let (mut back, why) = c.into_tunnel().expect_err("the peer asked to close");
+    assert_eq!(why, TransitionRefused::NOT_OPEN);
+    let mut out = [0u8; 256];
+    let n = back
+      .send_response(426, b"Upgrade Required", LENGTH_0, BodyPlan::None, &mut out)
+      .expect("the response is still owed and still writable");
+    assert!(
+      out
+        .get(..n)
+        .is_some_and(|w| w.starts_with(b"HTTP/1.1 426 "))
+    );
+  }
+
+  // `handle_eof` also queues an event, but gate 6 precedes the EVENT_UNDRAINED
+  // gate `take_over` checks last, so READ_CLOSED is what is reported.
+  #[test]
+  fn a_half_closed_peer_stops_the_edge() {
+    let mut c = server_with_upgrade_read();
+    c.handle_eof().expect("the transport fact is recordable");
+    let (_, why) = c.into_tunnel().expect_err("the peer stopped writing");
+    assert_eq!(why, TransitionRefused::READ_CLOSED);
+  }
+
+  // RFC 9112 §9.3.2: `AwaitingRearm` means the pipelined bytes were never
+  // consumed, and the edge must not consume them either.
+  #[test]
+  fn a_pipelined_request_survives_the_edge() {
+    // One const rather than a `Vec` built from two: this module states it uses
+    // no `Vec` and no `format!`, so that the whole of it runs on the bare
+    // `no_std` tier. Dev-dependencies happen to pull `alloc` into the test graph
+    // today, so a `Vec` would compile — which is exactly how a stated invariant
+    // stops being true without anything failing.
+    const PIPELINED: &[u8] = b"GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+Connection: Upgrade\r\n\r\nGET /next HTTP/1.1\r\nHost: h\r\n\r\n";
+    const SECOND: &[u8] = b"GET /next HTTP/1.1\r\nHost: h\r\n\r\n";
+
+    let mut c = Connection::<Server, General>::new();
+    let consumed = drain(&mut c, PIPELINED);
+    assert_eq!(PIPELINED.get(consumed..), Some(SECOND));
+    c.into_tunnel()
+      .expect("the edge does not touch what it did not consume");
+  }
+
+  // The client transition. `take_over`'s own gates (5-8) are proven above
+  // against the server's native path; what is left is this edge's own three
+  // gates, and the two gate-5-8 cases only a client can reach at all.
+
+  /// RFC 9110 §7.8's two halves, on the `Host` field `open_upgrade` also
+  /// requires (RFC 9112 §3.2) — what a caller of the client edge already
+  /// knows it wants to offer once the connection becomes a tunnel.
+  const UPGRADE_FIELDS: &[(&str, &[u8])] = &[
+    ("Host", b"h"),
+    ("Connection", b"Upgrade"),
+    ("Upgrade", b"websocket"),
+  ];
+
+  /// Has written a request and read its complete response back to the idle
+  /// boundary, so `exchange` is `None`, both FSMs are `Idle`, and RFC 9112
+  /// §9.2's tail barrier is lifted — the ordinary shape of a pooled connection
+  /// sitting between two exchanges.
+  fn client_after_one_completed_exchange() -> Connection<Client, General> {
+    let mut c = Connection::<Client, General>::new();
+    open_bodiless_request(&mut c, "GET");
+    let mut it = c.handle(b"HTTP/1.1 204 \r\n\r\n");
+    while it.next().unwrap().is_some() {}
+    c
+  }
+
+  /// Has read a bodiless response through `ExchangeComplete` and stopped
+  /// pulling before the boundary pass that would clear the tail: `exchange`
+  /// is `None`, both FSMs are `Idle`, and `tail_unresolved` is still `true`,
+  /// so a switch attempt reports gate 7 rather than gate 1.
+  ///
+  /// NOT "a response whose body is not fully read" — that leaves `recv: Body`
+  /// and `exchange: Some`, which would report `EXCHANGE_IN_FLIGHT` instead.
+  fn client_with_unread_tail() -> Connection<Client, General> {
+    // The tail is a second response this client never asked for, the same
+    // construction `a_client_cannot_open_a_request_over_an_unread_tail` uses.
+    const STREAM: &[u8] = b"HTTP/1.1 204 \r\n\r\nHTTP/1.1 204 \r\n\r\n";
+    let mut c = Connection::<Client, General>::new();
+    open_bodiless_request(&mut c, "GET");
+    {
+      let mut it = c.handle(STREAM);
+      assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+      assert!(matches!(
+        it.next().unwrap(),
+        Some(Item::ExchangeComplete { .. })
+      ));
+    }
+    c
+  }
+
+  /// Has opened a request with a body still owed, then read a final response
+  /// stating RFC 9112 §9.6's `close` option: that option's close-after-reading
+  /// MUST — not its "cease sending", whose object is requests — abandons the
+  /// unfinished body (`send: Abandoned`) at the same response that re-arms
+  /// the connection (`exchange: None`, `recv: Idle`) — the only construction
+  /// that leaves `send` anywhere but `Idle` on an otherwise idle connection.
+  fn client_with_an_abandoned_body() -> Connection<Client, General> {
+    let mut c = Connection::<Client, General>::new();
+    let mut out = [0u8; 64];
+    let counted: &[(&str, &[u8])] = &[("Host", b"h"), ("Content-Length", b"3")];
+    c.open_request(
+      "POST",
+      &ORIGIN,
+      counted,
+      BodyPlan::ContentLength(3),
+      &mut out,
+    )
+    .expect("a three-octet body is announced and not yet written");
+    {
+      let mut it = c.handle(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      while it.next().unwrap().is_some() {}
+    }
+    c
+  }
+
+  /// Has completed one exchange whose response stated RFC 9112 §9.6's `close`
+  /// option — the same shape as `client_after_one_completed_exchange`, except
+  /// keep-alive is over: `settle` drops `Lifecycle::Closing` to `Draining` the
+  /// moment it re-arms.
+  fn client_after_a_closing_exchange() -> Connection<Client, General> {
+    let mut c = Connection::<Client, General>::new();
+    open_bodiless_request(&mut c, "GET");
+    {
+      let mut it = c.handle(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      while it.next().unwrap().is_some() {}
+    }
+    c
+  }
+
+  #[test]
+  fn the_client_edge_lands_where_a_fresh_tunnel_lands() {
+    let native = Connection::<Client, Tunnel>::new();
+    let edged = Connection::<Client, General>::new()
+      .into_tunnel()
+      .expect("a fresh connection is idle");
+    assert_eq!(native.fingerprint(), edged.fingerprint());
+  }
+
+  #[test]
+  fn a_pooled_connection_upgrades_after_serving_ordinary_exchanges() {
+    let c = client_after_one_completed_exchange();
+    let mut tunnel = c.into_tunnel().expect("idle between exchanges");
+    let mut out = [0u8; 256];
+    // The host rides in the headers and the path in the target — `open_upgrade`
+    // takes `(&Target<'_>, &H, &mut [u8])`, not a host/path pair.
+    let target = Target::Origin {
+      path_and_query: "/chat",
+    };
+    assert!(
+      tunnel
+        .open_upgrade(&target, UPGRADE_FIELDS, &mut out)
+        .is_ok()
+    );
+  }
+
+  #[test]
+  fn a_connection_with_an_unresolved_tail_cannot_switch() {
+    let c = client_with_unread_tail();
+    let (_, why) = c.into_tunnel().expect_err("§9.2's barrier is up");
+    assert_eq!(why, TransitionRefused::TAIL_UNRESOLVED);
+  }
+
+  #[test]
+  fn a_half_closed_client_connection_cannot_switch() {
+    // The handshake response can never arrive, so the upgrade could only time out.
+    let mut c = Connection::<Client, General>::new();
+    c.handle_eof().ok();
+    let (_, why) = c.into_tunnel().expect_err("the peer stopped writing");
+    assert_eq!(why, TransitionRefused::READ_CLOSED);
+  }
+
+  // Nothing about the connection is idle: a request opened moments ago is
+  // still outstanding, so gate 1 is the first and only failure.
+  #[test]
+  fn a_connection_with_a_request_outstanding_cannot_switch() {
+    let mut c = Connection::<Client, General>::new();
+    open_bodiless_request(&mut c, "GET");
+    let (mut back, why) = c.into_tunnel().expect_err("the response has not arrived");
+    assert_eq!(why, TransitionRefused::EXCHANGE_IN_FLIGHT);
+    // The exchange the gate refused to drop is still exactly the one this
+    // connection was holding.
+    let mut it = back.handle(b"HTTP/1.1 204 \r\n\r\n");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+  }
+
+  // The only construction that leaves `send` anywhere but `Idle` on an
+  // otherwise idle connection, so gate 3 is the first and only failure.
+  #[test]
+  fn a_connection_with_an_abandoned_body_cannot_switch() {
+    let c = client_with_an_abandoned_body();
+    let (_, why) = c.into_tunnel().expect_err("an abandoned body is not idle");
+    assert_eq!(why, TransitionRefused::SEND_NOT_IDLE);
+  }
+
+  // The peer asked to close, so keep-alive is over even though every message
+  // gate passes: gate 5 is the first failure.
+  #[test]
+  fn a_connection_told_to_close_cannot_switch() {
+    let c = client_after_a_closing_exchange();
+    let (_, why) = c.into_tunnel().expect_err("the peer asked to close");
+    assert_eq!(why, TransitionRefused::NOT_OPEN);
+  }
+
+  // RFC 9112 §2.2's own gate, isolated: the tail is already resolved
+  // (`client_after_one_completed_exchange` clears it before the CR arrives),
+  // so a lone CR sitting at the idle cursor is the only unresolved fact left.
+  #[test]
+  fn a_connection_with_a_pending_cr_cannot_switch() {
+    let mut c = client_after_one_completed_exchange();
+    {
+      let mut it = c.handle(b"\r");
+      assert!(it.next().unwrap().is_none());
+    }
+    let (_, why) = c.into_tunnel().expect_err("the CR is still undecided");
+    assert_eq!(why, TransitionRefused::PENDING_CR);
+  }
+
+  // The ordering gate 7 exists to prove: a completed exchange whose
+  // re-offered tail ends in a lone CR sets BOTH `tail_unresolved` and
+  // `pending_cr`, and `take_over` checks the barrier before its one-byte
+  // special case — so TAIL_UNRESOLVED, not PENDING_CR, is what a switch
+  // attempt reports.
+  #[test]
+  fn a_completed_exchange_with_a_trailing_cr_reports_the_barrier_first() {
+    const STREAM: &[u8] = b"HTTP/1.1 204 \r\n\r\n\r";
+    let mut c = Connection::<Client, General>::new();
+    open_bodiless_request(&mut c, "GET");
+    {
+      let mut it = c.handle(STREAM);
+      while it.next().unwrap().is_some() {}
+    }
+    let (_, why) = c.into_tunnel().expect_err("both facts are unresolved");
+    assert_eq!(why, TransitionRefused::TAIL_UNRESOLVED);
+  }
+
+  // `Display` writes the reason and nothing else, so a driver logging a refusal
+  // does not have to `{:?}` a tuple struct to see which gate failed. Rendered
+  // into a comparison rather than a buffer, so the check costs no allocation and
+  // runs on the bare tier with the rest of this module.
+  #[test]
+  fn a_refusal_renders_the_gate_it_names() {
+    use core::fmt::Write as _;
+
+    /// Accepts a rendering only if every piece written is the next slice of
+    /// `rest`; what is left over afterwards is what the rendering omitted.
+    struct Verbatim<'a> {
+      rest: &'a str,
+    }
+
+    impl core::fmt::Write for Verbatim<'_> {
+      fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let Some(rest) = self.rest.strip_prefix(s) else {
+          return Err(core::fmt::Error);
+        };
+        self.rest = rest;
+        Ok(())
+      }
+    }
+
+    const GATES: &[TransitionRefused] = &[
+      TransitionRefused::NO_EXCHANGE,
+      TransitionRefused::NO_UPGRADE_OFFERED,
+      TransitionRefused::REQUEST_INCOMPLETE,
+      TransitionRefused::ANSWER_BEGUN,
+      TransitionRefused::NOT_OPEN,
+      TransitionRefused::READ_CLOSED,
+      TransitionRefused::TAIL_UNRESOLVED,
+      TransitionRefused::PENDING_CR,
+      TransitionRefused::EVENT_UNDRAINED,
+      TransitionRefused::EXCHANGE_IN_FLIGHT,
+      TransitionRefused::RECV_NOT_IDLE,
+      TransitionRefused::SEND_NOT_IDLE,
+    ];
+    for gate in GATES {
+      assert!(!gate.reason().is_empty(), "{gate:?}");
+      let mut rendered = Verbatim {
+        rest: gate.reason(),
+      };
+      write!(rendered, "{gate}").expect("the rendering is the reason");
+      assert!(rendered.rest.is_empty(), "{gate:?} rendered short");
+    }
   }
 }
