@@ -1,5 +1,6 @@
 mod handshake_diff;
 mod qpack_data;
+mod quote_check;
 
 use std::{
   collections::BTreeMap,
@@ -59,6 +60,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       }
       handshake_diff::run(&base, head.as_deref())?;
     }
+    "quote-check" => {
+      let mut fetch = false;
+      let mut dir = None;
+      for arg in args {
+        match arg.as_str() {
+          "--fetch" => fetch = true,
+          other if other.starts_with('-') => {
+            return Err(format!("unexpected quote-check argument: {other}").into());
+          }
+          other if dir.is_none() => dir = Some(other.to_string()),
+          _ => return Err("too many quote-check arguments".into()),
+        }
+      }
+      quote_check::run(dir.as_deref(), fetch)?;
+    }
     "-h" | "--help" | "help" => print_help(),
     other => return Err(format!("unknown command: {other}").into()),
   }
@@ -73,13 +89,25 @@ Usage:
   cargo run -p xtask -- qpack-codegen
   cargo run -p xtask -- qpack-codegen --check
   cargo run -p xtask -- handshake-diff <base-rev> [head-rev]
+  cargo run -p xtask -- quote-check [--fetch] [<spec-dir>]
 
 `handshake-diff` runs `handshake-corpus` against two revisions of
 `websocket-proto` and reports the verdicts that moved, grouped by
 (role, field, reason), plus whether equivalent spellings of one field value
 still reach one verdict. `head-rev` defaults to the working tree. It works in
 $TMPDIR and leaves the repository untouched.
-"
+
+`quote-check` reads every RFC quotation out of the workspace's comments and
+fails on any whose characters are not the spec's own — a re-cased sentence, a
+reworded one. It is case-SENSITIVE and joins wrapped comment lines, which is
+what the manual sweeps that missed this defect did not do.
+
+<spec-dir> holds the `.txt` rendering of each RFC, named `rfcNNNN.txt`; they
+are at https://www.rfc-editor.org/rfc/rfcNNNN.txt. It defaults to `{}/`,
+which is gitignored. `--fetch` downloads the RFCs this workspace cites into
+it with `curl`; nothing else here touches the network.
+",
+    quote_check::DEFAULT_DIR
   );
 }
 
