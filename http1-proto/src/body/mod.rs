@@ -99,7 +99,12 @@ pub(crate) enum BodyItem<'a> {
 /// The chunked coding (RFC 9112 §7.1) has states of its own, which live in the
 /// `chunked` sub-machine; the shell keeps the framing decision, the boundary
 /// rule, and the two-phase finish that every framing here shares.
+// Equality under `cfg(test)` alone. A mode-edge differential compares a whole
+// `Connection` against the one its native path built, and a decoder reaches that
+// comparison inside `RecvState::Body`; no product path asks whether two decoders
+// are the same, so the impl is the tests' and stays there.
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct BodyDecoder {
   state: State,
 }

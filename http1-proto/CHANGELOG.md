@@ -42,6 +42,10 @@ its own.
 - **Lazy head view** (`head::view`): `HeadView` walks field lines out of the
   borrowed block on demand — no table, no copies — with case-insensitive
   lookup, repeated-line iteration, and the field count the scan recorded.
+  `request_line()` reads the §3 request-line back out of the same block, so a
+  consumer that needs the method, the request-target or the version gets what the
+  ONE §3 codec in this crate produced rather than a second reading of the same
+  bytes. It is `None` on a response head, whose start line is the §4 status-line.
 - **Encoders** (`head::encode`, `body::encode`): validated request/status heads
   and chunk framing written into a caller-supplied slice, with exact sizing,
   no partial writes on a short buffer, and refusal of any field a parser would
@@ -125,10 +129,48 @@ its own.
   discharges it through `send_interim` instead of re-deriving it from `Expect`.
   A handshake head may carry `Content-Length: 0`: it announces no octets (RFC
   9110 §8.6), so both directions of this crate write and classify it.
+- **Mode edges**: `Connection::<Server, General>::into_tunnel` answers an upgrade
+  request the General pump has ALREADY read. RFC 9110 §7.8 makes the switch an
+  answer and permits it only once the client "has completely sent the request
+  message", so the edge runs after the read rather than instead of it — which is
+  also why an upgrade request carrying CONTENT is switchable here and is not on
+  the native path: General has drained the body by then. It lands the connection
+  where `handle_request` leaves one, so `accept` writes the 101.
+- `Connection::<Client, General>::into_tunnel` is the other edge: it spends an
+  IDLE pooled connection on a handshake — a decision this end takes rather than
+  an answer it owes, so what it gates on is that nothing is outstanding. Both
+  edges are consuming, since the General state has no meaning past the switch,
+  and both hand the connection back beside a refusal
+  (`Err((Self, TransitionRefused))`): a switch that cannot be taken is a reason
+  to answer differently, not a reason to lose the ability to answer at all.
+- `TransitionRefused` names ONE gate rather than reporting a set. The gates are
+  checked in a FIXED order, several of them fail together on the same connection
+  — a peer that stated `close` moved the lifecycle and queued a notice in the
+  same step — and a caller told a different reason on different runs could act on
+  none of them. Branch by comparing against the named constants; `reason()` and
+  `Display` write the same string for a log line.
+- **Head binding**: `Connection::<Server, Tunnel>::head_binding` answers whether
+  a head the caller is holding is the head that armed this connection's
+  handshake — the identity no signature can state, since `into_tunnel` CONSUMES
+  the connection a lifetime brand would be tied to while the head outlives it,
+  and the transition resets the exchange counter so `ExchangeId` cannot say it
+  either. `HeadBinding` has three answers rather than two: `Matches`; `Mismatch`
+  for a live handshake this head did not arm, RFC 9110 §9.3.6's CONNECT among
+  them, since it made no §7.8 offer for any head to be; and `NoHandshake` for a
+  connection holding no handshake at all, which is what keeps a throwaway
+  `Connection::new()` usable for validating a head BEFORE spending the one-way
+  transition. `Matches` is FNV-1a digest equality over the whole head block,
+  computed only for a request that offered a switch, so an ordinary request pays
+  nothing for it. It refuses an accidental mispairing and is NOT a security
+  boundary: head content is peer-controlled and a colliding pair is
+  constructible offline.
 - **Public enums**: `Item`, `StartLine`, `Event`, `ClientTunnelOutcome` and
   `ServerTunnelRequest` are `#[non_exhaustive]` — they are what this core chooses
   to surface, and that can grow. `Target`, `BodyPlan` and `BodyFraming` are NOT:
-  the RFCs close those sets, so a consumer may match them exhaustively.
+  the RFCs close those sets, so a consumer may match them exhaustively. Nor is
+  `HeadBinding`, whose three answers are closed by the question rather than by a
+  spec: a head either armed this connection's handshake, did not, or has no
+  handshake to have armed.
 - **Errors**: every protocol violation carries a byte offset
   (`MalformedDetail { at, what }`) and, where a server would answer, a
   `SuggestedStatus` (400 / 414 / 431 / 501 / 505).

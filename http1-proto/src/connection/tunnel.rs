@@ -4,7 +4,7 @@
 //! TWO TAKEOVERS, ONE SHAPE. RFC 9110 §7.8's protocol upgrade — answered by the
 //! §15.2.2 `101 (Switching Protocols)` — and §9.3.6's CONNECT tunnel — answered
 //! by any 2xx — both end HTTP framing at the empty line that closes a head.
-//! After that line "the data stream switches to" the new protocol (§7.8), and
+//! After that line the "data stream switches to" the new protocol (§7.8), and
 //! "data received after that header section is from the server identified by the
 //! request target" (§9.3.6). Everything in this module exists to reach that line
 //! and hand the rest of the stream over untouched.
@@ -72,10 +72,13 @@
 //! announces no content it will not send, and the head that switches carries no
 //! framing field at all.
 
+use core::marker::PhantomData;
+
 use crate::{
   connection::{
-    CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Client, Connection, FAILED, Lifecycle,
-    SWITCHING_PROTOCOLS, Server, Tunnel, latch_read_closed,
+    CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Client, Connection, FAILED, General,
+    Lifecycle, RecvState, SWITCHING_PROTOCOLS, SendState, Server, TransitionRefused, Tunnel,
+    head_digest, latch_read_closed,
     outbound::{
       Declared, INTERIM_STATES_NO_CLOSE, READ_SIDE_ENDED, announces_octets, continue_needs_content,
       declared, requires_host,
@@ -184,10 +187,14 @@ pub(super) const CONNECT_TARGET_NEEDS_A_PORT: &str =
 pub(super) const CONTINUE_BEFORE_SWITCH: &str = "a 100 (Continue) is owed before this 101";
 
 /// The statuses that MAKE the switch rather than talk about one: the 101, which
-/// RFC 9110 §15.2.2 makes the end of the HTTP conversation, and — wherever the
-/// peer would read one as the tunnel — any 2xx, since §9.3.6 says "any 2xx
-/// (Successful) response indicates that the sender (and all inbound proxies)
-/// will switch to tunnel mode immediately after the response header section".
+/// RFC 9110 §7.8 makes the last thing this end says as HTTP — immediately after
+/// sending it the server is expected "to continue responding to the original
+/// request as if it had received its equivalent within the new protocol", while
+/// §15.2.2 defines the status code rather than the rule about what follows it —
+/// and, wherever the peer would read one as the tunnel, any 2xx — §9.3.6: "Any
+/// 2xx (Successful) response indicates that the sender (and all inbound
+/// proxies) will switch to tunnel mode immediately after the response header
+/// section".
 /// Neither is something said while a handshake is being decided, and neither
 /// REFUSES one: `accept` writes them, because it is the call that records that
 /// this connection stopped being HTTP.
@@ -286,8 +293,8 @@ pub enum ClientTunnelOutcome<'a> {
     /// The bytes after it — where the next head begins.
     leftover: &'a [u8],
   },
-  /// The switch will not happen (RFC 9110 §7.8 — "Upgrade cannot be used to
-  /// insist on a protocol change"; §9.3.6 — "any response other than a successful
+  /// The switch will not happen (RFC 9110 §7.8: "Upgrade cannot be used to
+  /// insist on a protocol change"; §9.3.6: "Any response other than a successful
   /// response indicates that the tunnel has not yet been formed").
   ///
   /// Any final response that is not the switch, AND an interim one that states
@@ -412,7 +419,7 @@ pub(crate) enum TunnelPhase {
   RejectionOwed,
 }
 
-/// What the handshake in flight is, in the two facts its answer depends on.
+/// What the handshake in flight is, in the facts its answer depends on.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct Handshake {
   /// RFC 9110 §9.3.6's CONNECT tunnel rather than §7.8's protocol upgrade —
@@ -427,6 +434,65 @@ pub(crate) struct Handshake {
   /// load-bearing for the server: no 1xx may be sent to a 1.0 client. A client
   /// records the 1.1 `head::encode` wrote.
   version: Version,
+  /// WHICH request armed this handshake, as [`head_digest`] of its whole head
+  /// block — what [`head_binding`](Connection::head_binding) answers from, so
+  /// that a layer above this one can refuse a head the connection never read.
+  ///
+  /// NO ABSENT REPRESENTATION, and none is wanted: a CONNECT arm and a client's
+  /// own [`begin`](Connection::begin) write a dead value, and every reader is
+  /// already behind the guard that makes the field meaningful — a live
+  /// handshake with `connect` false. See [`Exchange::head_digest`], whose value
+  /// this is on the transitioned path, for the whole of that reasoning.
+  ///
+  /// [`Exchange::head_digest`]: super::Exchange::head_digest
+  head_digest: u64,
+}
+
+/// How a caller-supplied head stands to the request a tunnel connection is
+/// holding — what [`head_binding`](Connection::head_binding) answers.
+///
+/// The question exists because a layer above this one may be handed a head that
+/// a DIFFERENT object read: a server that speaks ordinary HTTP first reads the
+/// request on a [`General`] connection, keeps the head, and takes the mode edge
+/// — so the head and the connection reach that layer as two separate values,
+/// and pairing the wrong two is a mistake no signature can refuse. This is the
+/// fact that lets it be refused at runtime instead.
+///
+/// Three values rather than a `bool`, because neither `bool` can be written
+/// correctly: "no" for a connection that classified nothing would refuse
+/// pre-validating a head against a THROWAWAY [`Connection::new`], which is the
+/// recipe [`into_tunnel`](Connection::into_tunnel) documents and the only way to
+/// validate before spending a one-way transition; "yes" for that same
+/// connection would make a CONNECT-armed one answer vacuously, which is the
+/// crossing this type exists to catch.
+///
+/// [`General`]: super::General
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum HeadBinding {
+  /// A live upgrade handshake, and `head` is the head that armed it.
+  ///
+  /// Digest equality, not byte equality — see
+  /// [`head_binding`](Connection::head_binding) for what that does and does not
+  /// claim.
+  Matches,
+  /// A live handshake that `head` did not arm — a different upgrade request, or
+  /// a CONNECT, which no `Upgrade` offer produced.
+  ///
+  /// A CONNECT-armed connection answers this for EVERY head, its own included:
+  /// the question is about the RFC 9110 §7.8 upgrade offer, and a CONNECT made
+  /// none. A layer that answers §7.8 upgrades therefore has nothing here it can
+  /// answer, whatever head it was handed.
+  Mismatch,
+  /// No handshake is in flight, so there is no armed request `head` could
+  /// contradict.
+  ///
+  /// A fresh [`Connection::new`] answers this, which is what keeps the
+  /// pre-validation recipe working, and so does a connection whose handshake is
+  /// over. A connection whose lifecycle has FAILED answers it too, on the
+  /// belt-and-braces [`owes_continue`](Connection::owes_continue) already uses:
+  /// a failed connection with a live handshake is unreachable today, and a
+  /// coincidence between today's writers is not a rule this type enforces.
+  NoHandshake,
 }
 
 // `Ro` is free: nothing in this block — `live_phase`, `idle`, `handshake`,
@@ -580,7 +646,7 @@ impl Connection<Client, Tunnel> {
   /// handshake, returning the bytes written.
   ///
   /// A GET, with the caller's fields. What this core checks is §7.8's own rule
-  /// about the OFFER — "a sender of Upgrade MUST also send an `Upgrade`
+  /// about the OFFER: "A sender of Upgrade MUST also send an `Upgrade`
   /// connection option in the Connection header field", and each protocol named
   /// is `protocol-name ["/" protocol-version]` — because an offer missing either
   /// half asks for a switch no conformant server will make. WHICH protocol is
@@ -829,6 +895,10 @@ impl Connection<Client, Tunnel> {
       interim_owed: false,
       // What `head::encode` just wrote (RFC 9112 §2.3).
       version: Version::Http11,
+      // A dead value: `head_binding` is a server-side question about a head
+      // somebody else read, and this end wrote its own request. See
+      // `Handshake::head_digest`.
+      head_digest: 0,
     });
   }
 }
@@ -845,9 +915,9 @@ impl Connection<Server, Tunnel> {
   /// validation (RFC 9112 §3.2's `Host` rules and the §3.2.3/§3.2.4 target-method
   /// pairing among them):
   ///
-  /// - A CONNECT, whose §3.2.3 authority-form target states a port — "a server
-  ///   MUST reject a CONNECT request that targets an empty or invalid port
-  ///   number" (RFC 9110 §9.3.6).
+  /// - A CONNECT, whose §3.2.3 authority-form target states a port — RFC 9110
+  ///   §9.3.6: "A server MUST reject a CONNECT request that targets an empty or
+  ///   invalid port number".
   /// - A request stating both halves of an RFC 9110 §7.8 upgrade offer. The
   ///   METHOD is not constrained: §7.8 makes the offer a property of the fields
   ///   and names OPTIONS explicitly ("an OPTIONS request can be honored by any
@@ -858,7 +928,7 @@ impl Connection<Server, Tunnel> {
   ///
   /// Neither shape carries content — RFC 9110 §9.3.6 says so for CONNECT, and an
   /// upgrade request with a body would have to be read to its end before the
-  /// switch (§7.8: "a client cannot begin using an upgraded protocol on the
+  /// switch (§7.8: "A client cannot begin using an upgraded protocol on the
   /// connection until it has completely sent the request message"), which is
   /// body machinery a tunnel does not have.
   ///
@@ -948,11 +1018,68 @@ impl Connection<Server, Tunnel> {
     }
   }
 
+  /// Whether `head` is the head that armed the handshake this connection is
+  /// holding — the identity the type system cannot state, answered at runtime.
+  ///
+  /// A layer that answers RFC 9110 §7.8 upgrades on a connection it did not
+  /// read the request on holds two values per exchange, the head and the
+  /// connection, and nothing in either one's type says they belong together. A
+  /// lifetime cannot say it: [`into_tunnel`](Connection::into_tunnel) CONSUMES
+  /// the connection a brand would be tied to, while the head borrows the
+  /// driver's buffer and outlives it. [`ExchangeId`](crate::ExchangeId) cannot
+  /// say it either — the transition resets the counter to 1, by design. So the
+  /// connection keeps a digest of the block instead, and this is the question it
+  /// answers.
+  ///
+  /// # What this claims, and what it does not
+  ///
+  /// [`Matches`](HeadBinding::Matches) is DIGEST equality, so it is a
+  /// probabilistic answer and it is worth being exact about which direction the
+  /// guarantee runs in. Against an accidental mispairing — an application
+  /// holding two heads and passing the wrong one — the miss probability is
+  /// 2⁻⁶⁴ per event. Against ADVERSARIALLY shaped traffic it detects nothing:
+  /// head content is peer-controlled and arbitrary field lines are free padding,
+  /// and the FNV-1a digest behind this answer is invertible per byte-step, so a
+  /// colliding pair is constructible offline. It is therefore a caller-error
+  /// check and not a security boundary, and a caller that can let the connection
+  /// read its own head ([`handle_request`](Self::handle_request)) should still
+  /// do that instead.
+  ///
+  /// Nor does it defend against a head from a DIFFERENT connection that happens
+  /// to be byte-identical — that case answers a request with facts identical to
+  /// its own.
+  pub fn head_binding(&self, head: &HeadView<'_>) -> HeadBinding {
+    // A FAILED connection is excluded on the terms `live_phase` sets and
+    // `owes_continue` restates, and on the same belt-and-braces footing: its one
+    // remaining answer is the rejection, so there is no switch left for a head
+    // to be bound to.
+    if matches!(self.lifecycle, Lifecycle::Failed) {
+      return HeadBinding::NoHandshake;
+    }
+    match self.tunnel {
+      // RFC 9110 §9.3.6's takeover made no §7.8 offer, so no head is the head
+      // that offered one — its own included. The digest is not read on this arm
+      // at all, which is what lets a CONNECT write a dead one.
+      TunnelPhase::Handshaking(handshake) if handshake.connect => HeadBinding::Mismatch,
+      TunnelPhase::Handshaking(handshake) => {
+        if head_digest(head.block()) == handshake.head_digest {
+          HeadBinding::Matches
+        } else {
+          HeadBinding::Mismatch
+        }
+      }
+      TunnelPhase::Idle
+      | TunnelPhase::Switched
+      | TunnelPhase::Refused
+      | TunnelPhase::RejectionOwed => HeadBinding::NoHandshake,
+    }
+  }
+
   /// Encodes an interim (1xx) response into `out`, returning the bytes written.
   ///
   /// RFC 9110 §15.2 lets any number of them precede the final answer, and none
   /// of them ends the handshake. The one this core is strict about is the `100
-  /// (Continue)` §7.8 requires: "if a server receives both an Upgrade and an
+  /// (Continue)` §7.8 requires: "If a server receives both an Upgrade and an
   /// Expect header field with the `100-continue` expectation, the server MUST
   /// send a 100 (Continue) response before sending a 101 (Switching Protocols)
   /// response" — sending it here is what discharges that order, and
@@ -962,7 +1089,7 @@ impl Connection<Server, Tunnel> {
   /// decided, it IS the decision, and it goes through [`accept`](Self::accept).
   /// A final status is refused for the mirror reason.
   ///
-  /// An HTTP/1.0 request gets no interim response at all (§15.2: "since HTTP/1.0
+  /// An HTTP/1.0 request gets no interim response at all (§15.2: "Since HTTP/1.0
   /// did not define any 1xx status codes, a server MUST NOT send a 1xx response
   /// to an HTTP/1.0 client"), no framing field belongs in one (RFC 9112 §6.1,
   /// RFC 9110 §8.6), and neither does `Connection: close` — §9.6 binds that
@@ -1022,7 +1149,7 @@ impl Connection<Server, Tunnel> {
   /// [`reject`](Self::reject).
   ///
   /// For the 101 the head must state both halves of §7.8 — §15.2.2 makes the
-  /// `Upgrade` field a MUST ("the server MUST generate an Upgrade header field
+  /// `Upgrade` field a MUST ("The server MUST generate an Upgrade header field
   /// in the response that indicates which protocol(s) will be in effect after
   /// this response") and §7.8 requires the connection option beside it. THAT the
   /// protocol named is one the client offered is the caller's check, for the
@@ -1135,10 +1262,10 @@ impl Connection<Server, Tunnel> {
       // (1) Classification FAILED, so this phase does not know which method
       // arrived; it may well have been a CONNECT this core refused for a reason
       // of its own (no port, RFC 9112 §3.2.3; content, RFC 9110 §9.3.6). What
-      // §9.3.6 binds is the PEER's reading — "any 2xx (Successful) response
+      // §9.3.6 binds is the PEER's reading: "Any 2xx (Successful) response
       // indicates that the sender … will switch to tunnel mode immediately after
-      // the response header section" — and a client that sent CONNECT reads a
-      // 2xx that way whatever this end's classifier concluded.
+      // the response header section". A client that sent CONNECT reads a 2xx
+      // that way whatever this end's classifier concluded.
       //
       // (2) Independently of the method: a phase whose whole meaning is "a
       // rejection is owed" has no success class to state. The blanket costs
@@ -1191,6 +1318,341 @@ impl Connection<Server, Tunnel> {
   }
 }
 
+// `into_tunnel`'s `Err` pairs a whole `Connection` with `TransitionRefused`,
+// which is the pair `clippy::result_large_err` measures on the `#[allow]`
+// below — not the bare `Connection` that `connection::mod`'s own size asserts
+// cover. Proven here rather than merely claimed in the comment beside it.
+const _: () =
+  assert!(core::mem::size_of::<(Connection<Server, General>, TransitionRefused)>() <= 256);
+
+/// The mode EDGE: a General server that has read an upgrade request, turning
+/// into the tunnel that answers it.
+impl Connection<Server, General> {
+  /// Answers an upgrade request by switching (RFC 9110 §7.8), turning this
+  /// connection into the tunnel that writes the 101.
+  ///
+  /// A General server refuses an inbound takeover where it ARRIVES — the mode is
+  /// not something a peer talks this end into — so the switch is a decision this
+  /// end takes, once, with the request already in hand. What comes back is the
+  /// [`Tunnel`] connection at the same point [`handle_request`] leaves one: the
+  /// handshake is classified and its answer is owed, so
+  /// [`accept`](Connection::accept) writes the 101 and
+  /// [`reject`](Connection::reject) declines it.
+  ///
+  /// The transition is CONSUMING because it is not reversible: the General state
+  /// — the exchange, the receive FSM, the keep-alive gate — has no meaning after
+  /// the 101, where RFC 9110 §7.8 has the "data stream" switch to the new
+  /// protocol, and a connection that could switch back would be offering an API
+  /// for bytes that are no longer HTTP.
+  ///
+  /// What it does NOT do is read the request: that already happened, through the
+  /// General pump, and the two facts the answer turns on — the RFC 9110 §7.8
+  /// offer and §10.1.1's outstanding expectation — travel on the exchange the
+  /// pump minted rather than being re-derived from a head this call no longer
+  /// has.
+  ///
+  /// # A capability the native path does not have
+  ///
+  /// [`handle_request`] refuses an upgrade request that carries content, because
+  /// a tunnel has no body machinery to drain it with. This edge accepts one: by
+  /// the time it runs, the General pump HAS drained the body, and §7.8 asks for
+  /// exactly that: "A client cannot begin using an upgraded protocol on the
+  /// connection until it has completely sent the request message".
+  ///
+  /// # Decide before spending the connection
+  ///
+  /// The gates below are HTTP's, and they are all this call can check. A request
+  /// that passes every one of them may still be invalid to the protocol layered
+  /// on top — RFC 6455 §4.2.1's key, version and resource-name rules are that
+  /// layer's, not §7.8's — and the transition is one-way, so a caller that
+  /// switches first and validates second is holding a tunnel on a request it has
+  /// to reject, with no keep-alive HTTP connection left to reject it on.
+  ///
+  /// Validate first, then switch. The upgrade layer's own validation runs
+  /// against a THROWAWAY [`Connection<Server, Tunnel>::new`](Connection::new):
+  /// it reads the head the General pump produced and settles nothing on this
+  /// connection, so a request it turns down leaves this one General and
+  /// answerable. Take the transition only once the answer is yes; a refusal
+  /// before it is an ordinary response like any other.
+  ///
+  /// # Errors
+  ///
+  /// Returns the connection unchanged beside the failed gate. The caller still
+  /// owes its peer a response — RFC 6455 §4.2.1 requires one — so the connection
+  /// must come back: a refused switch is a reason to answer differently, not a
+  /// reason to lose the ability to answer at all.
+  ///
+  /// [`handle_request`]: Connection::handle_request
+  // The large `Err` IS the signature's point rather than an oversight: a refused
+  // switch hands the connection back because the response it owes its peer is
+  // still owed. The lint's own remedy is a box, which is an allocation this
+  // crate does not make on any tier. `connection::mod` const-asserts the
+  // 256-byte budget for `Connection` alone, which covers the `Ok` side; the
+  // assertion above covers the `Err` side — the pair the lint actually
+  // measures — since a tuple is not a `Connection` that assert reaches.
+  #[allow(clippy::result_large_err)]
+  pub fn into_tunnel(self) -> Result<Connection<Server, Tunnel>, (Self, TransitionRefused)> {
+    // The gates about the REQUEST first, then the gates about the CONNECTION:
+    // see `take_over` for why the split is where it is.
+    let handshake = match self.offered_switch() {
+      Ok(handshake) => handshake,
+      Err(refused) => return Err((self, refused)),
+    };
+    match take_over(&self, TunnelPhase::Handshaking(handshake)) {
+      Ok(tunnel) => Ok(tunnel),
+      Err(refused) => Err((self, refused)),
+    }
+  }
+
+  /// The four gates that are about the REQUEST this server is holding, and the
+  /// handshake they prove.
+  ///
+  /// Ordered, and the order is the reported reason: a request that offered
+  /// nothing AND is still arriving fails both gate 2 and gate 3, so the one
+  /// named has to be fixed rather than incidental.
+  fn offered_switch(&self) -> Result<Handshake, TransitionRefused> {
+    let Some(exchange) = self.exchange else {
+      return Err(TransitionRefused::NO_EXCHANGE);
+    };
+    // RFC 9110 §7.8: "A server MUST NOT switch to a protocol that was not
+    // indicated by the client in the corresponding request's Upgrade header
+    // field." The fact is the REQUEST head's and was recorded when it arrived;
+    // re-deriving it here is not an option, since the head is gone. Passing this
+    // gate is also what re-establishes the classification invariant `accept`
+    // trusts, which is why the fact itself does not travel on into the
+    // `Handshake`.
+    if !exchange.upgrade_offered {
+      return Err(TransitionRefused::NO_UPGRADE_OFFERED);
+    }
+    // §7.8 again: the request must have been COMPLETELY sent. `AwaitingRearm` is
+    // that fact — the inbound side of the exchange is through, whatever framing
+    // delimited it — and it is the only receive state a live server exchange can
+    // be in besides `Body`, since `settle` clears the exchange and the state
+    // together.
+    if !matches!(self.recv, RecvState::AwaitingRearm) {
+      return Err(TransitionRefused::REQUEST_INCOMPLETE);
+    }
+    // The 101 IS this exchange's answer, so the answer must not have started.
+    // `Owed` is the state that says the response head has not gone out (RFC 9110
+    // §15.2 is why an interim response leaves it here: a 1xx is not the answer,
+    // so a 100 already sent still passes this gate).
+    if !matches!(self.send, SendState::Owed) {
+      return Err(TransitionRefused::ANSWER_BEGUN);
+    }
+    Ok(Handshake {
+      // RFC 9110 §9.3.6's takeover never reaches here: `inbound` refuses a
+      // CONNECT request on a General connection (`CONNECT_NEEDS_TUNNEL`) before
+      // it can open an exchange, so the only switch this edge can be carrying is
+      // §7.8's.
+      connect: false,
+      // §7.8's ordering MUST, read off the durable fact for the reason
+      // `Exchange::expect_unanswered` states: the transient copy in
+      // `RecvState::Body` is gone by the time an answer is written, and the two
+      // sends that discharge the ask cleared this one alongside it.
+      interim_owed: exchange.expect_unanswered,
+      // §6.1/§15.2 both turn on the version the REQUEST stated, which no
+      // response can be read for.
+      version: exchange.version,
+      // WHICH request offered the switch, carried across for the reason
+      // `interim_owed` is: the head is gone by the time the layer above
+      // validates one, so a fact about it has to travel or be lost. The gate
+      // above is what makes it meaningful — `upgrade_offered` is exactly the
+      // condition `inbound` hashed under.
+      head_digest: exchange.head_digest,
+    })
+  }
+}
+
+// Same reason as the server edge's own assertion above: this edge's `Err`
+// pairs a whole `Connection` with `TransitionRefused`, which is its own pair
+// for `clippy::result_large_err` to measure on the `#[allow]` below, and its
+// own proof that the pair stays inside the crate's 256-byte budget.
+const _: () =
+  assert!(core::mem::size_of::<(Connection<Client, General>, TransitionRefused)>() <= 256);
+
+/// The mode EDGE: an idle General client connection, turning into the tunnel
+/// that carries a handshake it already knows it wants.
+impl Connection<Client, General> {
+  /// Turns an idle pooled connection into a tunnel, so a caller that already
+  /// knows which upgrade it wants can carry the handshake on a connection kept
+  /// warm by ordinary keep-alive exchanges, instead of opening a new one.
+  ///
+  /// Unlike the server edge, this is not an ANSWER: RFC 9110 §7.8's offer has
+  /// not been written yet, and nothing about the connection says a switch is
+  /// coming — it is the caller's own decision, made on a connection this end
+  /// otherwise has nothing outstanding on. What comes back is the [`Tunnel`]
+  /// connection at the point [`Connection::new`] leaves a fresh one at: the
+  /// handshake has not begun, so either [`open_upgrade`](Connection::open_upgrade)
+  /// or [`open_connect`](Connection::open_connect) may start it.
+  ///
+  /// The transition is CONSUMING for the reason it is on the server edge:
+  /// General's message state has no meaning once the switch is committed, and
+  /// a connection that could step back out of it would be offering an API for
+  /// bytes a peer may already be reading as the new protocol's.
+  ///
+  /// # The two client-only gates this edge does not add
+  ///
+  /// `tail_unresolved` and `pending_cr` are RFC 9112 §9.2's barrier and its
+  /// one-byte CR special case (§2.2) — fields only a client's own receive path
+  /// writes. `take_over` gates on both already, so this edge does not re-check
+  /// them: skipping the call instead would let
+  /// [`open_upgrade`](Connection::open_upgrade) read a stale tail as the
+  /// handshake's own response, exactly what
+  /// [`open_request`](Connection::open_request) already refuses on the
+  /// ordinary path.
+  ///
+  /// # Errors
+  ///
+  /// Returns the connection unchanged beside the failed gate: a caller that
+  /// cannot switch this connection still has an ordinary General connection to
+  /// go on using, or to return to its pool.
+  // The large `Err` IS the signature's point here too — see the server edge's
+  // `into_tunnel` for why, and the assertion above for the proof that applies
+  // to this edge's own pair.
+  #[allow(clippy::result_large_err)]
+  pub fn into_tunnel(self) -> Result<Connection<Client, Tunnel>, (Self, TransitionRefused)> {
+    if let Err(refused) = self.nothing_outstanding() {
+      return Err((self, refused));
+    }
+    match take_over(&self, TunnelPhase::Idle) {
+      Ok(tunnel) => Ok(tunnel),
+      Err(refused) => Err((self, refused)),
+    }
+  }
+
+  /// The three gates about the MESSAGE STATE this client itself is holding,
+  /// checked before the connection gates `take_over` carries.
+  ///
+  /// The server edge reads its four off a REQUEST it is holding; this end
+  /// has no request to read one off — a client decides to switch on its own,
+  /// so the only facts available are the three that say whether anything is
+  /// outstanding at all.
+  fn nothing_outstanding(&self) -> Result<(), TransitionRefused> {
+    // An outstanding exchange is a response this end is still OWED, not one it
+    // owes. RFC 9112 §9.3.2 lets a client pipeline; keeping exactly one request
+    // of its own in flight is THIS core's choice, and the same fact
+    // `open_request`'s `ONE_REQUEST_AT_A_TIME` refuses a second request on. The
+    // switch would silently discard the receive state that answer arrives into,
+    // and the answer with it.
+    if self.exchange.is_some() {
+      return Err(TransitionRefused::EXCHANGE_IN_FLIGHT);
+    }
+    // On today's writers this can never be the reported reason: `recv` leaves
+    // `Idle` only once `open_request` has minted an exchange, so the gate
+    // above always fires first. Gated all the same, for the reason
+    // `EVENT_UNDRAINED` is in `take_over` below — a coincidence between
+    // today's writers is not a rule this type enforces.
+    if !matches!(self.recv, RecvState::Idle) {
+      return Err(TransitionRefused::RECV_NOT_IDLE);
+    }
+    // `send` can sit at `Abandoned` on an otherwise idle connection: a request
+    // body this end was released from finishing when the peer's `close` or a
+    // read EOF arrived mid-write. The release is RFC 9112 §9.6's
+    // close-after-reading MUST, not its "cease sending", whose object is
+    // requests. Abandoned is not idle — the switch would go on as if that write
+    // had never mattered.
+    if !matches!(self.send, SendState::Idle) {
+      return Err(TransitionRefused::SEND_NOT_IDLE);
+    }
+    Ok(())
+  }
+}
+
+/// The half of a mode transition that is the same at both ends: the gates about
+/// the CONNECTION, and what the tunnel keeps of the General connection it
+/// replaces.
+///
+/// ONE routine rather than one per edge, and that is load-bearing rather than
+/// tidy. Each edge is proven by comparing it against its OWN native path — a
+/// server that read its request through [`handle_request`](Connection::handle_request),
+/// a client that opened its handshake through
+/// [`open_upgrade`](Connection::open_upgrade) — and never against the other
+/// edge, so two copies of this could drift apart with no test able to see it.
+///
+/// What the ROLE decides is left to the caller, because it is a question about
+/// the MESSAGE in flight: a server holds a request it has read and a client is
+/// waiting for a response it has not. Those gates therefore run first, in the
+/// caller, and this one runs after with the phase the handshake begins in.
+///
+/// # What is inherited, and why the rest is not
+///
+/// `lifecycle`, `read_closed` and `peer_close` are facts about the CONNECTION,
+/// and the connection is the thing that survives — a transition is not a new
+/// connection, so a fact that was true of the transport a moment ago is still
+/// true. Everything else is General's message state, which is why the gates
+/// above prove it empty before it is dropped: no exchange, nothing owed, no
+/// undrained notice. `next_exchange` goes back to `1` rather than being
+/// carried over from `from`: a `Tunnel` connection mints no exchange, so the
+/// count is not a fact worth preserving the way `lifecycle` is. `1` is the
+/// crate's own invariant that an id never starts at `0`, and it is also the
+/// value [`Connection::new`] already gives a fresh [`Tunnel`] connection —
+/// carrying `from`'s own count instead would build a connection the native
+/// path above never produces.
+fn take_over<Ro>(
+  from: &Connection<Ro, General>,
+  tunnel: TunnelPhase,
+) -> Result<Connection<Ro, Tunnel>, TransitionRefused> {
+  // RFC 9112 §9.6: `close` promises to end the connection BEHIND this exchange,
+  // and a tunnel is the opposite promise. `Failed` and `Draining` land here too,
+  // and for the same reason a live handshake needs an open connection.
+  if !matches!(from.lifecycle, Lifecycle::Open) {
+    return Err(TransitionRefused::NOT_OPEN);
+  }
+  // The transport fact, checked after the policy one because a peer that stated
+  // `close` and then half-closed did both, and §9.6 makes the option the
+  // stronger statement. A switched protocol whose peer can send nothing is a
+  // tunnel with one end already gone.
+  if from.read_closed {
+    return Err(TransitionRefused::READ_CLOSED);
+  }
+  // §9.2's barrier and §2.2's undecided terminator. Both are bytes the General
+  // side has not finished accounting for, and the tunnel would hand them to the
+  // next protocol as its own.
+  //
+  // Neither can be the FIRST failure on the server edge: both are written on
+  // client paths alone (`inbound::idle_client_bytes`, and the `|= is_client`
+  // that sets the tail), so a server reaches this call with both false. They are
+  // gated anyway, because that is a fact about today's writers rather than a
+  // rule — and the client edge can reach both.
+  if from.tail_unresolved {
+    return Err(TransitionRefused::TAIL_UNRESOLVED);
+  }
+  if from.pending_cr {
+    return Err(TransitionRefused::PENDING_CR);
+  }
+  // Last, and it can never be the first failure today: every writer of `event`
+  // or `aborted` also moves the lifecycle off `Open` or latches `read_closed`,
+  // so the gate above it always fires first. Gated all the same, for the reason
+  // the two above are — a coincidence between today's writers is not a rule.
+  if from.event.is_some() || from.aborted.is_some() {
+    return Err(TransitionRefused::EVENT_UNDRAINED);
+  }
+  // Field by field rather than from `new()` with the differences applied: a
+  // field added to `Connection` is then a compile error HERE, which is where the
+  // decision to carry it or drop it belongs.
+  Ok(Connection {
+    consumed: 0,
+    watermark: 0,
+    next_exchange: 1,
+    recv: RecvState::Idle,
+    exchange: None,
+    send: SendState::Idle,
+    // Inherited rather than reset to the open state the gates just proved: the
+    // gate is what makes the two the same today, and reading the connection is
+    // what keeps that true if one is ever relaxed.
+    lifecycle: from.lifecycle,
+    read_closed: from.read_closed,
+    peer_close: from.peer_close,
+    tail_unresolved: false,
+    aborted: None,
+    event: None,
+    tunnel,
+    pending_cr: false,
+    idle_crlfs: 0,
+    shape: PhantomData,
+  })
+}
+
 /// Classifies a complete request head as one of the two takeovers, or says why
 /// it is neither.
 ///
@@ -1237,6 +1699,10 @@ fn classify(head: &[u8]) -> Result<(HeadView<'_>, RequestLine<'_>, Handshake), H
         // answered with one.
         interim_owed: false,
         version: request.version,
+        // A dead value, and unreadable: a CONNECT made no §7.8 offer, so
+        // `head_binding` answers `Mismatch` for every head on this phase
+        // WITHOUT reading the digest. See `Handshake::head_digest`.
+        head_digest: 0,
       },
     ));
   }
@@ -1254,6 +1720,11 @@ fn classify(head: &[u8]) -> Result<(HeadView<'_>, RequestLine<'_>, Handshake), H
         connect: false,
         interim_owed: directives.expect_continue,
         version: request.version,
+        // The one arm on this path that hashes, and it is behind both halves of
+        // the offer above — the native mirror of what `inbound` records for a
+        // General exchange, so the transition and this path arm a connection
+        // with the same fact about the same bytes.
+        head_digest: head_digest(view.block()),
       },
     ));
   }
@@ -1275,7 +1746,7 @@ fn target_at(method: &str) -> usize {
 /// field (RFC 9110 §5.2), and only the protocol grammar re-reads the block —
 /// through [`lists_a_protocol`], which folds the `Upgrade` lines the same way
 /// rather than asking each of them to satisfy the whole list grammar alone.
-fn names_a_protocol(view: &HeadView<'_>) -> bool {
+pub(crate) fn names_a_protocol(view: &HeadView<'_>) -> bool {
   let key = view.key_fields();
   !key.connection_malformed
     && key.connection_upgrade
@@ -1294,9 +1765,9 @@ fn names_a_protocol(view: &HeadView<'_>) -> bool {
 /// the way it does: an IP-literal's own colons are the address's, so the port is
 /// what follows the `]`.
 ///
-/// PRESENCE, which §9.3.6 states outright — "there is no default port; a client
+/// PRESENCE — §9.3.6 states it outright: "There is no default port; a client
 /// MUST send the port number" — and the NUMBER, which is the same section's
-/// server-side MUST: "a server MUST reject a CONNECT request that targets an
+/// server-side MUST: "A server MUST reject a CONNECT request that targets an
 /// empty or invalid port number". RFC 3986 spells `port = *DIGIT` because a URI
 /// scheme decides what its port means; here the port is the TCP port of the
 /// tunnel's far end, so [`port_number`] is what "invalid" is measured against.
@@ -1344,7 +1815,7 @@ fn port_number(port: &str) -> Option<u16> {
 
 /// Refuses a head that announces octets this core is not about to write.
 ///
-/// RFC 9110 §9.3.6 states it for the CONNECT request ("a CONNECT request message
+/// RFC 9110 §9.3.6 states it for the CONNECT request ("A CONNECT request message
 /// does not have content"), and every other message this module writes is its
 /// head for the same reason: Tunnel mode has no body machinery, so an announced
 /// body would leave the peer waiting for octets that never come (RFC 9112 §6.3

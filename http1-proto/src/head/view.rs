@@ -12,6 +12,7 @@
 
 use super::{
   LineEnd, delimit_line,
+  request_line::{RequestLine, parse_request_line},
   scan::{FieldSpan, KeyFields},
   split_field,
 };
@@ -97,6 +98,39 @@ impl<'a> HeadView<'a> {
   /// repeated field counts once per line.
   pub fn field_count(&self) -> usize {
     usize::from(self.field_count)
+  }
+
+  /// The RFC 9112 §3 request-line this head begins with, or `None` when it
+  /// begins with something else.
+  ///
+  /// Derived rather than re-verified: the block is immutable, this view is
+  /// `Copy`, and the parse is a pure function over the same byte range the
+  /// receive path already ran it over — so a consumer that needs the method,
+  /// the request-target or the version reads what the ONE §3 codec in this
+  /// crate produced, instead of re-implementing it in a crate of its own.
+  ///
+  /// `None` collapses two cases. The first is a RESPONSE head, whose start line
+  /// is the §4 status-line: a caller holding a view of one asks a question that
+  /// has no answer, and `None` is that answer. The second is a start line
+  /// NEITHER start-line grammar accepts, and it is UNREACHABLE on any view a
+  /// caller can hold: the scan only DELIMITS the start line, but every receive
+  /// path that hands a view out has already run the §3 or the §4 codec over
+  /// these same bytes and had it succeed.
+  pub fn request_line(&self) -> Option<RequestLine<'a>> {
+    parse_request_line(self.start_line_bytes()).ok()
+  }
+
+  /// The complete head block, exactly as it was scanned: start line, field
+  /// lines, and the empty line that ends them.
+  ///
+  /// `pub(crate)`, and deliberately so — this is the view's whole borrowed
+  /// extent, and handing it out would let a consumer re-parse the head with a
+  /// grammar of its own instead of reading it back through the accessors above.
+  /// What the crate itself needs it for is identity rather than content:
+  /// `connection::head_digest` folds these bytes into the fact a connection
+  /// keeps about WHICH request armed it.
+  pub(crate) const fn block(&self) -> &'a [u8] {
+    self.head
   }
 
   /// What the scan recorded about the fields whose values the core reads back.
@@ -205,6 +239,28 @@ mod tests {
     );
     assert_eq!(parse_status_line(r.start_line_bytes()).unwrap().code, 101);
     assert_eq!(r.field_count(), 1);
+  }
+
+  // RFC 9112 §3: the request-line reads back out of the block, and it is the
+  // same line the §3 codec produces from `start_line_bytes` — one parser, and a
+  // consumer that needs the method or the target gets what it produced rather
+  // than a second reading of the same bytes.
+  //
+  // A RESPONSE head answers `None`: its start line is the §4 status-line, so the
+  // question has no answer, and that is what `None` says.
+  #[test]
+  fn request_line_is_derived_from_the_block_and_absent_on_a_response() {
+    let v = scan_head(HEAD).unwrap();
+    let derived = v.request_line().expect("the fixture is a request head");
+    let parsed = parse_request_line(v.start_line_bytes()).unwrap();
+    assert_eq!(derived.method, parsed.method);
+    assert_eq!(derived.target, parsed.target);
+    assert_eq!(derived.version, parsed.version);
+    assert_eq!(derived.method, "GET");
+
+    let r = scan_head(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n").unwrap();
+    assert!(r.request_line().is_none());
+    assert_eq!(parse_status_line(r.start_line_bytes()).unwrap().code, 101);
   }
 
   // RFC 9110 §5.1 (field names are ASCII case-insensitive) and §5.5 (a field

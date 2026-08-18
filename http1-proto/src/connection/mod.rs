@@ -82,6 +82,8 @@ pub(crate) mod tunnel;
 
 use core::marker::PhantomData;
 
+use derive_more::Display;
+
 use crate::{
   body::BodyDecoder,
   error::{Error, H1Error},
@@ -91,7 +93,7 @@ use crate::{
 
 pub use outbound::{BodyPlan, NO_TRAILERS};
 use tunnel::TunnelPhase;
-pub use tunnel::{ClientTunnelOutcome, ServerTunnelRequest};
+pub use tunnel::{ClientTunnelOutcome, HeadBinding, ServerTunnelRequest};
 
 // The no-buffer budget, checked at module scope so that every `cargo check` on
 // every tier enforces it — inside a `#[test]` it would only fire under `cargo
@@ -113,6 +115,48 @@ pub(crate) const SWITCHING_PROTOCOLS: u16 = 101;
 /// RFC 9110 §9.3.6, and the one method whose request-target is RFC 9112 §3.2.3's
 /// authority-form.
 pub(crate) const CONNECT: &str = "CONNECT";
+
+/// Folds a complete head block into the 64-bit digest a connection keeps of the
+/// request that armed it — FNV-1a, one wrapping pass over borrowed bytes.
+///
+/// WHAT IT IS FOR, stated sharply, because the guarantee runs in one direction
+/// only. It answers "did this head arm this connection", so that
+/// [`Connection::head_binding`] can refuse a head the caller took from
+/// somewhere else. Against that mistake — an application holding two heads and
+/// pairing the wrong one — the miss probability is 2⁻⁶⁴ per event, which is the
+/// whole of what a driver needs.
+///
+/// It is NOT a commitment and MUST NOT be read as a security boundary. Head
+/// content is peer-controlled and arbitrary field lines are free padding; FNV-1a
+/// is invertible per byte-step, so a colliding pair is constructible offline and
+/// a second preimage against a KNOWN target costs about 2³² by
+/// meet-in-the-middle. A shared intermediary whose head-to-connection pairing is
+/// defective, where one peer supplies or predicts both blocks, is exactly the
+/// shape this buys nothing against; there the content checks the upgrade layer
+/// runs, and the client's own RFC 6455 §4.1 `Sec-WebSocket-Accept` check, are
+/// the residue. Two facts narrow that shape rather than closing it: the upgrade
+/// layer's once-only latch makes classification one-shot per handshake, so there
+/// is no online oracle, and a WebSocket head embeds a 128-bit random key, so the
+/// known-target shape needs a victim head carrying no entropy of its own. A
+/// keyed hash is the upgrade path if that guarantee is ever wanted; the `no_std`
+/// core has no RNG to key one with, which is why it is not what runs here.
+///
+/// One bounded pass over at most [`MAX_HEAD_BYTES`](crate::MAX_HEAD_BYTES), and
+/// only for a head that offered a switch — the callers gate on that before
+/// spending it, so an ordinary request pays nothing for a mechanism that exists
+/// to cross a mode transition.
+pub(crate) fn head_digest(block: &[u8]) -> u64 {
+  // FNV-1a's published 64-bit parameters. Wrapping is the algorithm rather than
+  // an overflow guard, which is also what keeps this inside the crate's
+  // no-panic wall: nothing here indexes, divides or can overflow a check.
+  const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+  const PRIME: u64 = 0x0000_0100_0000_01b3;
+  let mut hash = OFFSET_BASIS;
+  for &byte in block {
+    hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
+  }
+  hash
+}
 
 mod sealed {
   pub trait Sealed {}
@@ -264,6 +308,132 @@ impl sealed::SealedMode for Tunnel {}
 impl Mode for General {}
 impl Mode for Tunnel {}
 
+/// Why a mode transition was refused, naming the gate that failed.
+///
+/// A [`General`] connection does not become a [`Tunnel`] on request. RFC 9110
+/// §7.8 lets a server switch only in answer to a request that offered the
+/// protocol and has been completely sent, and everything a General connection
+/// carries beyond that request — an unanswered exchange, an undrained notice, a
+/// half-closed read side — is state the tunnel has nowhere to put. Each of those
+/// conditions is therefore a gate of its own, and the one that failed is what
+/// comes back.
+///
+/// The gates are checked in a FIXED order, which is why this names one rather
+/// than reporting a set: several of them fail together on the same connection —
+/// a peer that stated `close` moved the lifecycle and queued a notice in the
+/// same step — and a caller told a different reason on different runs could act
+/// on none of them.
+///
+/// The gate is the machine-readable half and the reason string is the human one:
+/// a driver that BRANCHES compares against the constants below, and one that
+/// LOGS reads [`reason`](Self::reason) or renders the value through
+/// [`Display`](core::fmt::Display), which writes that same string.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Display)]
+#[display("{_0}")]
+pub struct TransitionRefused(&'static str);
+
+impl TransitionRefused {
+  /// No exchange is in flight, so there is no request whose offer could be
+  /// answered. The switch is an ANSWER, and RFC 9110 §7.8 says so: "A server
+  /// MUST NOT switch to a protocol that was not indicated by the client in the
+  /// corresponding request's Upgrade header field." With no request there is no
+  /// indication to have been given.
+  pub const NO_EXCHANGE: Self = Self("no exchange is in flight to switch");
+
+  /// The request stated no RFC 9110 §7.8 offer — one half of it, neither, or an
+  /// `Upgrade` field naming no protocol — or stated one on an HTTP/1.0 request,
+  /// where §7.8 makes ignoring the field a MUST.
+  pub const NO_UPGRADE_OFFERED: Self = Self("the request offered no protocol to switch to");
+
+  /// The request has not been completely received. RFC 9110 §7.8: "A client
+  /// cannot begin using an upgraded protocol on the connection until it has
+  /// completely sent the request message" — so a body still arriving is a body
+  /// whose remaining octets are HTTP, and a tunnel has no framing left to read
+  /// them with.
+  pub const REQUEST_INCOMPLETE: Self = Self("the request has not been completely received");
+
+  /// This exchange's final response has already begun going out, so the 101
+  /// would be a SECOND answer to one request. RFC 9112 §2.1 makes a response one
+  /// message; a switch appended to — or injected into — bytes the peer is
+  /// already reading as the answer is §11.1 response splitting.
+  pub const ANSWER_BEGUN: Self = Self("this exchange's answer has already begun");
+
+  /// Keep-alive is over or the connection has failed. RFC 9112 §9.6 makes the
+  /// `close` connection option a promise to close BEHIND the exchange in flight,
+  /// and a tunnel that outlives that exchange is the opposite of one; a failed
+  /// connection has only its single error response left to send.
+  pub const NOT_OPEN: Self = Self("the connection is no longer open");
+
+  /// The peer's write side has ended, so nothing it sends can reach the switched
+  /// protocol. The 101 is still writable as a RESPONSE (RFC 9112 §9.6: a
+  /// connection half-closed by the client "does not delimit a request message,
+  /// nor does it imply that the client is no longer interested in a response"),
+  /// which is exactly why the answer stays with the General connection that owes
+  /// it rather than moving to a tunnel with no inbound stream.
+  pub const READ_CLOSED: Self = Self("the peer's write side has ended");
+
+  /// A completed exchange left bytes this connection has not read back. RFC 9112
+  /// §9.2's barrier: those octets arrived before anything this end would switch
+  /// for, so handing them to the new protocol would give it bytes that are not
+  /// its own.
+  pub const TAIL_UNRESOLVED: Self = Self("an unread tail of the last exchange is outstanding");
+
+  /// A lone `\r` is sitting undecided at the connection's cursor. RFC 9112 §2.2
+  /// makes a CR a line terminator only once its LF has arrived, so the byte
+  /// belongs to a decision HTTP has not finished making and the tunnel would
+  /// inherit it as opaque data.
+  pub const PENDING_CR: Self = Self("an undecided line terminator is pending");
+
+  /// A connection-scoped notice or an exchange abort is still queued. The
+  /// transition drops the General state that queued it, so a driver that had not
+  /// yet called [`poll_event`](Connection::poll_event) would lose the notice
+  /// outright — and [`Event::CloseSignaled`] is documented as once per
+  /// connection, which a lost one silently breaks.
+  pub const EVENT_UNDRAINED: Self = Self("a queued notice has not been drained");
+
+  /// An exchange is already outstanding on this connection. The client edge has
+  /// no request to answer the way the server edge does — it is deciding, on its
+  /// own, to spend a connection on a handshake — so what is outstanding here is
+  /// a response this end is still OWED rather than one it owes. RFC 9112 §9.3.2
+  /// lets a client pipeline, but this core keeps exactly one request of its own
+  /// in flight, so that single answer is the whole of what the switch would
+  /// silently drop: the transition discards the General receive state the
+  /// response was going to arrive into, and the response with it.
+  pub const EXCHANGE_IN_FLIGHT: Self =
+    Self("an exchange is already outstanding on this connection");
+
+  /// The receive side is not between messages — a response is being read, or
+  /// its completion is still waiting on this end's own send side.
+  ///
+  /// On today's writers this can never be the reported reason: a client's
+  /// `recv` leaves `Idle` only once an exchange exists, so
+  /// [`EXCHANGE_IN_FLIGHT`](Self::EXCHANGE_IN_FLIGHT) always fires first.
+  /// Named and gated anyway — a coincidence between today's writers is not a
+  /// rule this type enforces.
+  pub const RECV_NOT_IDLE: Self = Self("the receive side is not between messages");
+
+  /// The send side is not between messages: a request body is still being
+  /// written, or was abandoned mid-write when the peer's answer released this
+  /// end from finishing it. The release is RFC 9112 §9.6's close-after-reading
+  /// MUST rather than its "cease sending", whose object is requests: an end told
+  /// to "close the connection after reading the response message" is one the
+  /// rest of that body will never go out on. Abandoned is not idle — a
+  /// switch taken over it would proceed as though that write had never mattered.
+  pub const SEND_NOT_IDLE: Self = Self("the send side is not between messages");
+
+  /// The reason this refusal names, which is also what
+  /// [`Display`](core::fmt::Display) writes.
+  ///
+  /// For a log line or an error message. A driver that RECOVERS differently per
+  /// gate compares against the constants above instead: the wording is a
+  /// message rather than an identifier, and two gates that came to read alike
+  /// would still be two distinct values.
+  #[inline(always)]
+  pub const fn reason(&self) -> &'static str {
+    self.0
+  }
+}
+
 /// The exchange the connection is currently carrying.
 ///
 /// Minted by the server when a request head arrives, and by the client when it
@@ -306,6 +476,31 @@ pub(crate) struct Exchange {
   /// On a client this is the version of the request THIS end wrote, which
   /// `head::encode` fixes at HTTP/1.1; the field is the server side's to read.
   pub(crate) version: Version,
+  /// RFC 9110 §7.8's ordering MUST, kept for the answer rather than for the
+  /// receive side: `RecvState::Body`'s copy is cleared when the item is yielded
+  /// and overwritten wholesale when the body ends, so by the time an answer is
+  /// written the transient fact is gone. The response cannot be read to recover
+  /// it.
+  pub(crate) expect_unanswered: bool,
+  /// Whether the request offered a §7.8 upgrade — both halves, and not on a 1.0
+  /// request, since the MUST-ignore is folded into `has_upgrade`. RFC 9110 §7.8:
+  /// "A server MUST NOT switch to a protocol that was not indicated by the
+  /// client in the corresponding request's Upgrade header field."
+  pub(crate) upgrade_offered: bool,
+  /// WHICH request that offer came in, as [`head_digest`] of its whole head
+  /// block — the fact a `Tunnel` connection answers
+  /// [`head_binding`](Connection::head_binding) from once
+  /// [`into_tunnel`](Connection::into_tunnel) has carried it across.
+  ///
+  /// NO ABSENT REPRESENTATION, deliberately. Every construction site that did
+  /// not hash a head writes a dead value, and the validity is carried by the
+  /// facts already beside it — [`upgrade_offered`](Self::upgrade_offered) here,
+  /// and a live non-CONNECT handshake on the other side of the transition — so
+  /// the field is never read outside those guards. The phase IS the validity,
+  /// which is what keeps this at eight bytes rather than `Option<u64>`'s sixteen
+  /// on a struct with a const-asserted budget, and what makes a genuine digest
+  /// of `0` harmless rather than a sentinel collision.
+  pub(crate) head_digest: u64,
 }
 
 /// Where the inbound side of the connection stands.
@@ -313,7 +508,11 @@ pub(crate) struct Exchange {
 /// Three states, because the driver-visible questions are three: is the next
 /// byte the start of a message, part of the body of one, or the first byte the
 /// connection may not touch until its own send side catches up?
+// Equality under `cfg(test)` alone, for the reason `BodyDecoder`'s own derive
+// carries: a mode-edge differential compares whole connections, and no product
+// path asks whether two receive states are the same.
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) enum RecvState {
   /// Between messages. The next bytes begin one — a request for a server, the
   /// response to the outstanding request for a client — or, when a client has
@@ -370,9 +569,11 @@ pub(crate) enum SendState {
   /// The exchange ended from the RECEIVE side while this end was still writing
   /// its request body, so the body is abandoned and nothing more may be written.
   ///
-  /// RFC 9112 §9.6 tells the sender of a request to "cease sending" once the
-  /// peer is closing, and §9.5 makes a response that ends the connection the end
-  /// of the exchange whatever this end had left to say. Nothing is OWED — the
+  /// RFC 9112 §9.6 makes a client that read the peer's `close` option "close the
+  /// connection after reading the response message", so the rest of the body
+  /// never goes out; §9.5 says it of the body itself — "the client SHOULD
+  /// immediately cease transmitting the body and close its side of the
+  /// connection". Nothing is OWED — the
   /// re-arm gate treats this as idle, so receive completion can settle and
   /// `is_awaiting_send` goes false — but it is not [`Idle`](Self::Idle) either:
   /// a caller that goes on writing is told what happened rather than being given
@@ -482,13 +683,18 @@ pub(crate) const FAILED: &str = "connection failed on a protocol violation";
 /// # Which fields which mode uses
 ///
 /// The struct is shared by both modes and the type-state decides which of it is
-/// live. A [`Tunnel`] connection uses exactly three of the fields below —
-/// `watermark` (the same resumable head scan), `lifecycle` (the failure latch),
-/// and `tunnel` — and touches none of the others: it has no exchange to number,
-/// no receive or send FSM to advance, no notice to queue, and no idle cursor a
-/// stray CRLF could sit at, since a tunnel client reads nothing before it has
-/// written its request and a tunnel server's first byte is its request-line's.
-/// The General fields are documented as General's own below.
+/// live. A [`Tunnel`] connection uses five of the fields below: `watermark` (the
+/// same resumable head scan), `lifecycle` (the failure latch), `tunnel`, and the
+/// pair that carries the TRANSPORT's own ending, which is not a General fact —
+/// `read_closed`, which its reads consult to tell a stop for want of bytes from
+/// a truncation, and `event`, which `latch_read_closed` writes
+/// [`Event::CloseSignaled`] into for the mode-generic
+/// [`poll_event`](Self::poll_event) to drain. It touches none of the rest: it
+/// has no exchange to number, no receive or send FSM to advance, no tail to
+/// resolve, and no idle cursor a stray CRLF could sit at, since a tunnel client
+/// reads nothing before it has written its request and a tunnel server's first
+/// byte is its request-line's. The General fields are documented as General's
+/// own below.
 #[derive(Debug)]
 pub struct Connection<Ro, Mo> {
   /// GENERAL. Bytes of the CURRENT offer that have been consumed. Reset by every
@@ -1027,9 +1233,9 @@ pub(crate) struct Borrows<'c> {
 /// the property, not a convention. It reads it for one purpose only: the notice
 /// below is once per connection, and a read-EOF may already have given it.
 ///
-/// The option is what makes §9.6's "the server MUST NOT process any further
-/// requests received on that connection" true, which is why it — and not a
-/// transport event — leads to [`Lifecycle::Draining`] through [`settle`].
+/// The option is what makes the §9.6 rule true: "The server MUST NOT process
+/// any further requests received on that connection". That is why it — and not
+/// a transport event — leads to [`Lifecycle::Draining`] through [`settle`].
 pub(crate) fn signal_close(
   lifecycle: &mut Lifecycle,
   event: &mut Option<Event>,
@@ -1053,9 +1259,9 @@ pub(crate) fn signal_close(
 /// in a SEPARATE place. The two answer different questions, and RFC 9112 §9.6
 /// keeps them apart in as many words:
 ///
-/// - `signal_close` is the `close` connection OPTION. It is what makes "the
-///   server MUST NOT process any further requests received on that connection"
-///   true, so it is a statement about POLICY and it ends in
+/// - `signal_close` is the `close` connection OPTION. It is what makes the §9.6
+///   rule true: "The server MUST NOT process any further requests received on
+///   that connection". So it is a statement about POLICY, and it ends in
 ///   [`Lifecycle::Draining`].
 /// - This is a TRANSPORT event, which §9.6 says carries no such meaning: "a TCP
 ///   connection that is half-closed by the client does not delimit a request
@@ -1170,12 +1376,15 @@ pub(crate) fn latch(
 
 /// Abandons a client's outstanding request body, if it has one.
 ///
-/// RFC 9112 §9.6: "cease sending". ONE rule with two triggers, and they must not
-/// drift — the peer's final response ending keep-alive (`inbound::commit_head`)
-/// and the transport's read side ending
-/// ([`handle_eof`](Connection::handle_eof)) both end the exchange from the
-/// receive side while this end may still be mid-body, and both resolve the
-/// obligation identically.
+/// Not §9.6's "cease sending", which governs requests: what releases this end
+/// from finishing a body already in flight is the close-after-reading MUST
+/// beside it, and RFC 9112 §9.5 states the same of the body — "the client SHOULD
+/// immediately cease transmitting the body and close its side of the
+/// connection". ONE rule with two triggers, and they must not drift — the peer's
+/// final response ending keep-alive (`inbound::commit_head`) and the transport's
+/// read side ending ([`handle_eof`](Connection::handle_eof)) both end the
+/// exchange from the receive side while this end may still be mid-body, and both
+/// resolve the obligation identically.
 ///
 /// A no-op unless a body is actually in flight, so an idle send side stays
 /// [`SendState::Idle`] and keeps its own diagnostics.
@@ -1225,10 +1434,10 @@ pub(crate) fn settle(
     RecvState::Idle => exchange.is_none(),
     RecvState::Body { .. } => false,
   };
-  // `Abandoned` owes nothing: RFC 9112 §9.6 released this end from writing the
-  // rest of its body, so the exchange is through in both directions and the
-  // connection may settle. It is kept distinct from `Idle` only so a caller that
-  // writes anyway is told why it cannot.
+  // `Abandoned` owes nothing: RFC 9112 §9.6's close-after-reading MUST released
+  // this end from writing the rest of its body, so the exchange is through in
+  // both directions and the connection may settle. It is kept distinct from
+  // `Idle` only so a caller that writes anyway is told why it cannot.
   if !between_messages || !matches!(*send, SendState::Idle | SendState::Abandoned) {
     return;
   }
@@ -1253,6 +1462,81 @@ pub(crate) fn settle(
   // an exchange boundary is not a place one can still be pending.
   *watermark = 0;
   *pending_cr = false;
+}
+
+/// Every field of a [`Connection`], borrowed for comparison.
+///
+/// What the mode-edge differentials are written against: a transition is
+/// correct when the connection it produces is INDISTINGUISHABLE from the one the
+/// native path builds, and "indistinguishable" has to mean every field or the
+/// claim is only about the fields somebody remembered.
+///
+/// A named struct rather than a tuple because std's `Debug` and `PartialEq`
+/// impls stop at twelve elements, and a borrowing one because [`RecvState`] is
+/// not `Copy`.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct Fingerprint<'a> {
+  consumed: &'a usize,
+  watermark: &'a usize,
+  next_exchange: &'a u64,
+  recv: &'a RecvState,
+  exchange: &'a Option<Exchange>,
+  send: &'a SendState,
+  lifecycle: &'a Lifecycle,
+  read_closed: &'a bool,
+  peer_close: &'a bool,
+  aborted: &'a Option<ExchangeId>,
+  tail_unresolved: &'a bool,
+  event: &'a Option<Event>,
+  tunnel: &'a TunnelPhase,
+  pending_cr: &'a bool,
+  idle_crlfs: &'a u8,
+}
+
+#[cfg(test)]
+impl<Ro, Mo> Connection<Ro, Mo> {
+  /// Every field, bound exhaustively so that adding one is a compile error
+  /// rather than a silently uncompared value.
+  pub(crate) fn fingerprint(&self) -> Fingerprint<'_> {
+    let Self {
+      consumed,
+      watermark,
+      next_exchange,
+      recv,
+      exchange,
+      send,
+      lifecycle,
+      read_closed,
+      peer_close,
+      aborted,
+      tail_unresolved,
+      event,
+      tunnel,
+      pending_cr,
+      idle_crlfs,
+      // The type-state, which is zero-sized and is the one thing the two sides
+      // of a differential are ALLOWED to differ in until the transition runs.
+      shape: _,
+    } = self;
+    Fingerprint {
+      consumed,
+      watermark,
+      next_exchange,
+      recv,
+      exchange,
+      send,
+      lifecycle,
+      read_closed,
+      peer_close,
+      aborted,
+      tail_unresolved,
+      event,
+      tunnel,
+      pending_cr,
+      idle_crlfs,
+    }
+  }
 }
 
 #[cfg(test)]

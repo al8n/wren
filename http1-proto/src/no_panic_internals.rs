@@ -2,12 +2,12 @@
 //!
 //! Gated behind `test-no-panic`, doc-hidden, and exempt from semver: these
 //! `pub` forwarders expose the crate's leaf entry points so the test can wrap
-//! them in `#[no_panic]` shims — `find_head_end`, `parse_status_line` and
-//! `parse_chunk_size` — or run them as plain smoke tests, which is what
-//! `parse_request_line`, `encode_request_head` and `scan_head` get. The test
-//! file records why each of those three cannot be link-checked; the reasons are
-//! properties of `no-panic` and of the call trees, not of the code's
-//! panic-freedom.
+//! them in `#[no_panic]` shims — `find_head_end`, `parse_status_line`,
+//! `parse_chunk_size` and `head_digest` — or run them as plain smoke tests,
+//! which is what `parse_request_line`, `encode_request_head` and `scan_head`
+//! get. The test file records why each of those three cannot be link-checked;
+//! the reasons are properties of `no-panic` and of the call trees, not of the
+//! code's panic-freedom.
 //!
 //! A `pub use` of a `pub(crate)` item is illegal (E0364/E0365), so these are
 //! thin forwarders rather than re-exports. Being `#[inline]` keeps the
@@ -83,4 +83,19 @@ pub fn encode_request_head(
 #[inline]
 pub fn scan_head(head: &[u8]) -> Result<HeadView<'_>, H1Error> {
   crate::head::scan_head(head)
+}
+
+/// Forwards to `crate::connection::head_digest` — the FNV-1a fold a connection
+/// keeps of the head that armed it, and the crate's one unbounded-length
+/// arithmetic loop over borrowed bytes.
+///
+/// A true leaf: no call tree at all, so unlike `scan_head` it inlines whole
+/// into a shim and is LINK-CHECKED rather than smoke-tested. What the check is
+/// worth is the loop itself — the XOR and the wrapping multiply over every byte
+/// of a block that may be `MAX_HEAD_BYTES` long — since a bounds check or an
+/// overflow check surviving there would be a panic edge on a path every upgrade
+/// request takes.
+#[inline]
+pub fn head_digest(block: &[u8]) -> u64 {
+  crate::connection::head_digest(block)
 }

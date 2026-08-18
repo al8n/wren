@@ -115,14 +115,14 @@ pub enum BodyPlan {
   /// NEITHER framing field, [`send_body`](Connection::send_body) writes the
   /// octets raw, and the connection closes behind the message.
   ///
-  /// RESPONSES ONLY. §6.3's note is explicit that "request messages are never
+  /// RESPONSES ONLY. §6.3's note is explicit: "Request messages are never
   /// close-delimited … with the absence of both implying the request ends
   /// immediately after the header section", so
   /// [`open_request`](Connection::open_request) refuses this plan — a client
   /// that wants no body is asking for [`None`](Self::None).
   ///
   /// It FORCES the close, which is why it is not merely a fourth framing. §9.3:
-  /// "in order to remain persistent, all messages on a connection need to have a
+  /// "In order to remain persistent, all messages on a connection need to have a
   /// self-defined message length (i.e., one not defined by closure of the
   /// connection)" — so a connection that re-armed behind such a message would
   /// leave the peer with no way to tell where it ended. The close is signalled
@@ -133,9 +133,9 @@ pub enum BodyPlan {
   /// distinguish a successfully completed, close-delimited response message from
   /// a partially received message interrupted by network failure", so a sender
   /// "SHOULD generate encoding or length-delimited messages whenever possible".
-  /// What it is FOR is the peer that has no other option — "the close-delimiting
-  /// feature exists primarily for backwards compatibility with HTTP/1.0", which
-  /// is exactly the peer §6.1 forbids sending a `Transfer-Encoding` to.
+  /// What it is FOR is stated outright: "The close-delimiting feature exists
+  /// primarily for backwards compatibility with HTTP/1.0", which is exactly the
+  /// peer §6.1 forbids sending a `Transfer-Encoding` to.
   CloseDelimited,
 }
 
@@ -323,9 +323,9 @@ const BODILESS_TAKES_NO_BODY: &str = "this status can carry no body";
 /// neither framing field belongs in a message that cannot be framed.
 pub(super) const BODILESS_STATUS_FRAMING: &str = "a 1xx or 204 carries no framing field";
 
-/// RFC 9112 §6.2 states it as an unconditional sender rule — "a sender MUST NOT
+/// RFC 9112 §6.2 states it as an unconditional sender rule: "A sender MUST NOT
 /// send a Content-Length header field in any message that contains a
-/// Transfer-Encoding header field" — and §6.3 item 3 is what a recipient of one
+/// Transfer-Encoding header field". §6.3 item 3 is what a recipient of one
 /// does: a message carrying both fields is the smuggling primitive itself
 /// (§11.2), and this core will not write one at ANY status, item 1's
 /// recipient-ignores rule included.
@@ -343,7 +343,7 @@ pub(super) const TE_WITHOUT_CHUNKED: &str =
 /// The head announces a length this core is not about to write.
 pub(super) const LENGTH_DISAGREES: &str = "Content-Length disagrees with the body plan";
 
-/// RFC 9110 §5.6.1.1: "in any production that uses the list construct, a sender
+/// RFC 9110 §5.6.1.1: "In any production that uses the list construct, a sender
 /// MUST NOT generate empty list elements."
 ///
 /// The sender-versus-recipient asymmetry, generalised to every list field this
@@ -627,6 +627,19 @@ impl Connection<Client, General> {
       // What `head::encode` just wrote: this core states RFC 9112 §2.3's
       // `HTTP/1.1` on every request it sends.
       version: Version::Http11,
+      // The 100 `Exchange::expect_unanswered` tracks is owed by whichever end
+      // ANSWERS this request — a `Connection<Client, General>` has no
+      // `send_interim`/`send_response` to owe it through, so the fact never
+      // applies here.
+      expect_unanswered: false,
+      // Unreachable rather than merely unset: an offer was already refused
+      // above with `UPGRADE_NEEDS_TUNNEL`, so a General client's own request
+      // never carries one to record.
+      upgrade_offered: false,
+      // A dead value, and the line above is why it may be one: the digest is
+      // read only behind an offer, and this end records none. See
+      // `Exchange::head_digest` for why the field has no absent spelling.
+      head_digest: 0,
     });
     self.send = started(body);
     Ok(written)
@@ -654,9 +667,9 @@ impl Connection<Server, General> {
   /// option binds to the response CARRYING it and this call is the one that does
   /// not end the exchange. See `INTERIM_STATES_NO_CLOSE`.
   ///
-  /// An HTTP/1.0 request is answered with NO interim response at all: §15.2 is
-  /// explicit that "since HTTP/1.0 did not define any 1xx status codes, a server
-  /// MUST NOT send a 1xx response to an HTTP/1.0 client", so the call is
+  /// An HTTP/1.0 request is answered with NO interim response at all, and §15.2
+  /// is explicit about it: "Since HTTP/1.0 did not define any 1xx status codes, a
+  /// server MUST NOT send a 1xx response to an HTTP/1.0 client", so the call is
   /// [`Error::InvalidState`] whatever the code. Nothing in such a request can
   /// have asked for one either — §10.1.1 makes a server ignore its expectation,
   /// so no [`Item::ExpectContinue`](crate::Item::ExpectContinue) is ever raised
@@ -708,6 +721,12 @@ impl Connection<Server, General> {
     // owed HERE, whether or not the driver ever pulled the item that states it.
     if code == CONTINUE {
       discharge_expect(&mut self.recv);
+      // The durable copy on `Exchange` is discharged alongside the transient
+      // one: see `Exchange::expect_unanswered`'s own doc for why a second
+      // writer is needed here.
+      if let Some(exchange) = self.exchange.as_mut() {
+        exchange.expect_unanswered = false;
+      }
     }
     Ok(written)
   }
@@ -778,6 +797,11 @@ impl Connection<Server, General> {
     // surfaces as an `ExpectContinue` item behind a final response, and a driver
     // that acted on it would write a 1xx §15.2 forbids.
     discharge_expect(&mut self.recv);
+    // Same discharge, on the durable copy `Exchange` carries: see
+    // `Exchange::expect_unanswered`'s own doc.
+    if let Some(exchange) = self.exchange.as_mut() {
+      exchange.expect_unanswered = false;
+    }
     // RFC 9112 §9.6 next, so that a response which states `close` drains the
     // connection in this same call rather than re-arming it: a sender of the
     // option "MUST initiate a close of the connection after it sends the
