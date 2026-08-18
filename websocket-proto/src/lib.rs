@@ -48,6 +48,36 @@ compile_error!(
 #[macro_use]
 mod macros;
 
+/// The HTTP/1.1 core this crate's h1 handshakes are built on.
+///
+/// Re-exported because the h1 handshake surface NAMES its types:
+/// [`ServerHandshake::adopt`](handshake::h1::ServerHandshake::adopt) takes a
+/// `Connection<Server, Tunnel>` by value,
+/// [`classify`](handshake::h1::ServerHandshake::classify) takes a `HeadView`, and
+/// [`with_connection`](handshake::h1::ClientHandshake::with_connection) takes a
+/// `Connection<Client, Tunnel>`. A type a caller cannot name is one it cannot
+/// build an argument out of.
+///
+/// Reaching them through HERE is also what makes them the same types: a
+/// downstream that depends on `http1-proto` directly agrees with this crate only
+/// while the two version requirements resolve to one crate. The day they do not,
+/// the two `Connection`s are distinct types printed with the same name, and the
+/// mismatch surfaces as the notoriously unhelpful "expected `Connection`, found
+/// `Connection`". This path cannot drift, because it IS the copy this crate
+/// compiled against.
+///
+/// ```
+/// use websocket_proto::handshake::h1::ServerHandshake;
+/// use websocket_proto::http1_proto::{Connection, Server, Tunnel};
+///
+/// // The argument `adopt` takes, built entirely through this re-export. The
+/// // call is the proof: were this path ever a DIFFERENT `http1-proto` from the
+/// // one the signature was compiled against, it would not type-check.
+/// let connection: Connection<Server, Tunnel> = Connection::new();
+/// let _handshake = ServerHandshake::adopt(connection);
+/// ```
+pub use http1_proto;
+
 /// Protocol-level constants (RFC 6455 limits and well-known values).
 pub mod constants;
 
