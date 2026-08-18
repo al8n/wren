@@ -15,9 +15,19 @@
 //! encoders, so each builds that half of the exchange by hand and drives the
 //! other half — the peer's message is still answered by real machinery, never
 //! compared against expected bytes.
+//!
+//! Three plain tests at the end reach one step further again, across the crate
+//! boundary rather than around this crate's own encoders: a request read as
+//! ordinary HTTP on an `http1-proto` `General` connection, answered here after
+//! the mode transition. Neither crate can state that claim alone, because the
+//! claim IS the seam — a fact one side stops carrying across it fails nowhere
+//! else.
 
 #![cfg(feature = "std")]
 
+use http1_proto::{
+  BodyPlan, Client, Connection, General, HeadView, Item, Server, StartLine, TransitionRefused,
+};
 use proptest::{prelude::*, test_runner::TestCaseError};
 use websocket_proto::{
   Negotiated,
@@ -801,5 +811,189 @@ fn sixty_subprotocol_offers_round_trip_through_our_own_server() {
       assert_eq!(complete.negotiated().subprotocol(), chosen);
     }
     other => panic!("complete response head: {other:?}"),
+  }
+}
+
+/// Reads exactly one request head on a `General` server connection and keeps
+/// it once the read is over.
+///
+/// The head outlives the pump because `Item<'a>` borrows the INPUT rather than
+/// the iterator, which is what lets the caller drop the iterator and then
+/// consume the connection.
+///
+/// Drains the offer to `Item::ExchangeComplete` rather than stopping at the
+/// head: RFC 9110 §7.8 permits the switch only once the client "has completely
+/// sent the request message", and a receive side still mid-message is refused
+/// with `TransitionRefused::REQUEST_INCOMPLETE`.
+fn read_one_head<'a>(
+  connection: &mut Connection<Server, General>,
+  data: &'a [u8],
+) -> (HeadView<'a>, usize) {
+  let mut head = None;
+  let mut items = connection.handle(data);
+  while let Some(item) = items.next().expect("the fixture is a well-formed request") {
+    // `Item` is `#[non_exhaustive]`, and a request head is the only item these
+    // bodiless fixtures carry beyond the completion that ends them.
+    if let Item::Head {
+      view,
+      line: StartLine::Request(_),
+      ..
+    } = item
+    {
+      head = Some(view);
+    }
+  }
+  let consumed = items.consumed();
+  // The request-line rides in the head, and `classify` reads it back out of
+  // there rather than taking one beside it.
+  (
+    head.expect("the fixture carries one complete request head"),
+    consumed,
+  )
+}
+
+/// The server half of "one port" for an upgrade: a `General` connection reads
+/// the request, `into_tunnel` answers the offer it carried, and the adopted
+/// handshake validates the head the caller kept. Returns the length of the 101.
+fn answer_one_upgrade(request: &[u8], out: &mut [u8]) -> usize {
+  let mut connection = Connection::<Server, General>::new();
+  let (view, consumed) = read_one_head(&mut connection, request);
+  let leftover = request
+    .get(consumed..)
+    .expect("consumed is within the offer");
+
+  // Only now, with the request read, is there an offer to answer.
+  let tunnel = connection
+    .into_tunnel()
+    .map_err(|(_, refused)| refused)
+    .expect("a completely received request that offered `websocket` may switch");
+  let mut server = ServerHandshake::adopt(tunnel);
+  {
+    let ServerProgress::Upgrade(mut pending) = server
+      .classify(&view, leftover)
+      .expect("what our own client wrote, our own server validates")
+    else {
+      panic!("a complete head is not NeedMore")
+    };
+    pending
+      .validate_accept(&Accept::new())
+      .expect("an accept that names nothing is always available");
+  }
+  let (n, _) = server
+    .encode_response(&ExtraHeaders::new(), out)
+    .expect("our acceptance encodes");
+  n
+}
+
+/// The shape issue #41 asked for: a server that does not yet know what kind of
+/// request is arriving reads it as ordinary HTTP, and only then switches.
+///
+/// A unit test on either crate cannot show this — the claim is about the seam
+/// between them. `http1-proto` carries the request across the mode edge and
+/// `websocket-proto` validates the head the General pump produced, so a fact
+/// either side stopped carrying fails here.
+#[test]
+fn a_server_reads_an_upgrade_through_general_and_completes_the_handshake() {
+  let options = ClientOptions::new("example.com", "/chat");
+  let mut client = ClientHandshake::new(options, &mut TestRng(0x5EED)).expect("options are valid");
+  let mut request = [0u8; 1024];
+  let n = client
+    .encode_request(&mut request)
+    .expect("request encodes");
+  let request = request
+    .get(..n)
+    .expect("the encoder reported its own write");
+
+  let mut response = [0u8; 1024];
+  let n = answer_one_upgrade(request, &mut response);
+  let response = response
+    .get(..n)
+    .expect("the encoder reported its own write");
+
+  match client
+    .handle(response)
+    .expect("our 101 passes our own client")
+  {
+    ClientProgress::Complete(_) => {}
+    other => panic!("the handshake completes across the seam: {other:?}"),
+  }
+}
+
+/// The other half of "one port": the same server, the same connection type, and
+/// an ordinary request that offers nothing to switch to.
+///
+/// The assertion that matters is the last one. A refused edge that swallowed the
+/// connection would make the design useless — RFC 6455 §4.2.1 and RFC 9110 §7.8
+/// both leave a response owed on a request that could not be switched — so the
+/// refusal hands the connection back, and only answering with it proves that.
+#[test]
+fn the_same_server_still_serves_an_ordinary_request() {
+  const REQUEST: &[u8] = b"GET /health HTTP/1.1\r\nHost: h\r\n\r\n";
+  /// `BodyPlan::None` states that no content follows, which RFC 9112 §6.3 item 6
+  /// still wants framed: the zero length is the frame.
+  const LENGTH_0: &[(&str, &[u8])] = &[("Content-Length", b"0")];
+
+  let mut connection = Connection::<Server, General>::new();
+  let (view, ..) = read_one_head(&mut connection, REQUEST);
+  assert!(
+    view.header("Upgrade").is_none(),
+    "an ordinary request states no RFC 9110 §7.8 offer"
+  );
+
+  let Err((mut connection, refused)) = connection.into_tunnel() else {
+    panic!("a request offering no protocol cannot become a tunnel")
+  };
+  assert_eq!(refused, TransitionRefused::NO_UPGRADE_OFFERED);
+
+  let mut out = [0u8; 256];
+  let n = connection
+    .send_response(200, b"OK", LENGTH_0, BodyPlan::None, &mut out)
+    .expect("the refusal left the connection able to answer");
+  assert!(
+    out
+      .get(..n)
+      .expect("the encoder reported its own write")
+      .starts_with(b"HTTP/1.1 200 OK\r\n"),
+    "the ordinary answer goes out on the connection the edge handed back"
+  );
+}
+
+/// The client edge end to end: a connection that started life as ordinary HTTP
+/// — the shape a pool hands back — is spent on a handshake and completes one.
+///
+/// Same counterparty as the server-edge test above, so what this adds is the
+/// left-hand side alone: `with_connection` opens on a connection the caller
+/// transitioned, where `new` opens on one it never had to name.
+#[test]
+fn a_pooled_client_connection_completes_a_handshake_after_the_edge() {
+  let pooled = Connection::<Client, General>::new();
+  let tunnel = pooled
+    .into_tunnel()
+    .map_err(|(_, refused)| refused)
+    .expect("an idle pooled connection has nothing outstanding to lose");
+
+  let options = ClientOptions::new("example.com", "/chat");
+  let mut client = ClientHandshake::with_connection(options, &mut TestRng(0xB0A7), tunnel)
+    .expect("options are valid");
+  let mut request = [0u8; 1024];
+  let n = client
+    .encode_request(&mut request)
+    .expect("the adopted connection writes its request");
+  let request = request
+    .get(..n)
+    .expect("the encoder reported its own write");
+
+  let mut response = [0u8; 1024];
+  let n = answer_one_upgrade(request, &mut response);
+  let response = response
+    .get(..n)
+    .expect("the encoder reported its own write");
+
+  match client
+    .handle(response)
+    .expect("our 101 passes our own client")
+  {
+    ClientProgress::Complete(_) => {}
+    other => panic!("the handshake completes on a connection the edge produced: {other:?}"),
   }
 }
