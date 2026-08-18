@@ -79,7 +79,7 @@ pub fn trim_ows(v: &[u8]) -> &[u8] {
 }
 
 /// Splits a comma-separated list value into its non-empty, OWS-trimmed
-/// elements. RFC 9110 §5.6.1.2: "a recipient MUST parse and ignore a
+/// elements. RFC 9110 §5.6.1.2: "A recipient MUST parse and ignore a
 /// reasonable number of empty list elements" — EVERY list consumer routes
 /// through here, so the empty-element rule lives in exactly one place instead
 /// of being rediscovered per open-coded `split(b',')`.
@@ -496,7 +496,7 @@ pub(crate) enum ListShape {
 
 /// The SHAPE of a list a sender proposes to generate.
 ///
-/// RFC 9110 §5.6.1.1: "in any production that uses the list construct, a sender
+/// RFC 9110 §5.6.1.1: "In any production that uses the list construct, a sender
 /// MUST NOT generate empty list elements", i.e. `1#element => element *( OWS ","
 /// OWS element )`. So no leading comma, no trailing comma, no two in a row, and
 /// not an empty value.
@@ -849,7 +849,7 @@ impl Expectations {
 /// value names at least one protocol and every element of it is well formed.
 ///
 /// Per LINE, and strict about empty elements, because that is what §5.6.1.1
-/// requires of a sender: "in any production that uses the list construct, a
+/// requires of a sender: "In any production that uses the list construct, a
 /// sender MUST NOT generate empty list elements". A caller handing this core an
 /// `Upgrade:` with nothing in it is asking it to put an empty element on the
 /// wire, and this refuses.
@@ -880,9 +880,9 @@ pub(crate) fn is_protocol_list(value: &[u8]) -> bool {
 /// `"foo , ,bar,charlie"` as a legal `1#element` and only `""`, `","` and
 /// `",   ,"` as invalid, "since at least one non-empty element is required".
 ///
-/// So the cardinality is global. Empty elements never contribute to it —
-/// "a recipient MUST parse and ignore a reasonable number of empty list
-/// elements", which [`list_elements`] does by dropping them — while a
+/// So the cardinality is global. Empty elements never contribute to it, and
+/// §5.6.1.2 says why: "A recipient MUST parse and ignore a reasonable number of
+/// empty list elements", which [`list_elements`] does by dropping them — while a
 /// NON-empty element that is not a `protocol` still fails the list.
 pub(crate) fn lists_a_protocol<'a>(values: impl Iterator<Item = &'a [u8]>) -> bool {
   let mut named = false;
@@ -1230,7 +1230,7 @@ where
             return None;
           }
         },
-        // §5.6.1.2: "a recipient MUST parse and ignore a reasonable number of
+        // §5.6.1.2: "A recipient MUST parse and ignore a reasonable number of
         // empty list elements".
         Some(&b',') => self.at = self.at.saturating_add(1),
         Some(_) => {

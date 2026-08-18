@@ -350,7 +350,7 @@ impl<'a, I: Iterator<Item = &'a [u8]>> Iterator for ExtensionList<'a, I> {
         // RFC 2616 §2.1's `#rule`, which is what `1#extension` is written in:
         // "null elements are allowed, but do not contribute to the count of
         // elements present". (RFC 9110 §5.6.1.2 says the same in the modern
-        // spelling: "a recipient MUST parse and ignore a reasonable number of
+        // spelling: "A recipient MUST parse and ignore a reasonable number of
         // empty list elements".)
         continue;
       }
@@ -477,19 +477,19 @@ fn parse_param(param: &[u8]) -> Result<(&[u8], ExtensionValue<'_>), Malformed> {
 /// whatever extensions the build supports: §9.1's other freedom — a recipient
 /// may decline any extension for any reason — is about extensions it does not
 /// WANT, not about data it cannot READ. Declining stays
-/// [`accept_deflate_offer`]'s answer; this one decides whether there is a
+/// `accept_deflate_offer`'s answer; this one decides whether there is a
 /// handshake left to decline within.
 ///
 /// # One grammar
 ///
 /// This is not a separate reading standing in front of the negotiation: it is
-/// the crate's one §9.1 walk driven to the end, and
-/// [`accept_deflate_offer`] / [`parse_deflate_response`] resolve what the peer
-/// said out of the same walk. Two implementations of one field could only agree
-/// by coincidence, and the DIRECTION of a disagreement decides how bad it is —
-/// on the offer path a stricter reader merely declines an extension, while on
-/// the response path RFC 7692 §7 makes a grant the client will not accept fail
-/// the connection, so there it refuses a conforming handshake.
+/// the crate's one §9.1 walk driven to the end, and `accept_deflate_offer` /
+/// `parse_deflate_response` resolve what the peer said out of the same walk. Two
+/// implementations of one field could only agree by coincidence, and the
+/// DIRECTION of a disagreement decides how bad it is — on the offer path a
+/// stricter reader merely declines an extension, while on the response path RFC
+/// 7692 §7 makes a grant the client will not accept fail the connection, so
+/// there it refuses a conforming handshake.
 ///
 /// # Why not `http1_proto::grammar::parameterised_list`
 ///
@@ -528,8 +528,10 @@ fn parse_param(param: &[u8]) -> Result<(&[u8], ExtensionValue<'_>), Malformed> {
 /// them: a field present but naming nothing does not conform, while a field that
 /// is absent (no lines at all) conforms vacuously.
 ///
-/// [`accept_deflate_offer`]: crate::negotiation::accept_deflate_offer
-/// [`parse_deflate_response`]: crate::negotiation::parse_deflate_response
+/// `accept_deflate_offer` and `parse_deflate_response` are named above in plain
+/// code rather than linked: they exist only under the `deflate` feature, and an
+/// intra-doc link to a gated item is a rustdoc error in every build without it.
+/// This function is not gated.
 // `single_use_lifetimes` false-positive: anonymous lifetimes in `impl Trait`
 // argument position are unstable (E0658), so the once-used lifetime must be
 // named.

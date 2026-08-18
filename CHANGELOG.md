@@ -1,5 +1,181 @@
 # UNRELEASED
 
+## `http1-proto` — cycle 6 (the General ↔ Tunnel mode edges)
+
+PR1 of the cycle. A server could not answer WebSocket upgrades and ordinary HTTP
+on one port, because `Connection`'s mode is a compile-time type-state and had to
+be chosen before the request that decides it had been read. The type-state is
+unchanged; what is new is an EDGE between the two modes, taken AFTER the read
+rather than instead of it.
+
+### Added
+
+- **`Connection::<Server, General>::into_tunnel`**: answers an upgrade request
+  the General pump has ALREADY read. RFC 9110 §7.8 makes the switch an answer and
+  permits it only once the client "has completely sent the request message", so
+  the edge runs after the read — which is also why an upgrade request carrying
+  CONTENT is switchable here and is not on the native path: General has drained
+  the body by then. It lands the connection where `handle_request` leaves one, so
+  `accept` writes the 101.
+- **`Connection::<Client, General>::into_tunnel`**: spends an IDLE pooled
+  connection on a handshake — a decision this end takes rather than an answer it
+  owes, so what it gates on is that nothing is outstanding. Both edges are
+  consuming, since the General state has no meaning past the switch.
+- **`TransitionRefused`**: a refused transition hands the connection back beside
+  it (`Err((Self, TransitionRefused))`), because a switch that cannot be taken is
+  a reason to answer differently, not a reason to lose the ability to answer at
+  all. It names ONE gate rather than reporting a set: the gates are checked in a
+  FIXED order, several of them fail together on the same connection — a peer that
+  stated `close` moved the lifecycle and queued a notice in the same step — and a
+  caller told a different reason on different runs could act on none of them.
+  Branch by comparing against the named constants; `reason()` and `Display` write
+  the same string for a log line.
+- **`HeadBinding` and `Connection::<Server, Tunnel>::head_binding`**: whether a
+  head the caller is holding is the head that armed this connection's handshake.
+  A layer that answers RFC 9110 §7.8 upgrades on a connection it did not read the
+  request on holds two values per exchange, and nothing in either one's type says
+  they belong together: `into_tunnel` CONSUMES the connection a lifetime brand
+  would be tied to while the head outlives it, and `ExchangeId` cannot say it
+  either, since the transition resets the counter. Three answers rather than a
+  `bool`, because neither `bool` can be written correctly — `Matches`; `Mismatch`
+  for a live handshake this head did not arm, RFC 9110 §9.3.6's CONNECT included,
+  which made no §7.8 offer for any head to be; and `NoHandshake` for a connection
+  holding no handshake at all, which is the answer a throwaway
+  `Connection::new()` gives and the reason it stays usable for validating a head
+  BEFORE spending the one-way transition. `Matches` is FNV-1a digest equality
+  over the whole head block, computed only for a request that offered a switch,
+  so an ordinary request pays nothing for it. Against an accidental mispairing
+  the miss probability is 2⁻⁶⁴ per event; it is NOT a security boundary, since
+  head content is peer-controlled and a colliding pair is constructible offline.
+- **`HeadView::request_line`**: the RFC 9112 §3 request-line read back out of the
+  block the view already borrows, so a consumer that needs the method, the
+  request-target or the version reads what the ONE §3 codec in this crate
+  produced instead of re-implementing it. `None` on a response head, whose start
+  line is the §4 status-line.
+
+### Internals
+
+- **An `Exchange` carries four facts durably** — `expect_unanswered`, `version`,
+  `upgrade_offered` and `head_digest`, which are exactly the four `into_tunnel`
+  reads off it — because a transition is where a transient copy is lost.
+  `expect_unanswered` is RFC 9110 §7.8's outstanding `100 (Continue)`: the
+  transient copy lives in `RecvState::Body` and is gone by the time an answer is
+  written, so both sends that discharge the ask clear the durable copy alongside
+  it and `into_tunnel` reads the obligation off that. `version` is the version
+  the REQUEST stated, which RFC 9112 §6.1 and RFC 9110 §15.2 both turn on and
+  which no response can be read for. `upgrade_offered` is §7.8's two-halved offer
+  as the receive side decided it, which cannot be re-derived once the head is
+  gone. `head_digest` is WHICH request made that offer, and it is the fact
+  `head_binding` answers from on the far side of the edge. Without the four, a
+  Tunnel handed back across it would owe an interim it cannot know about, would
+  answer under a version it can no longer see, could not tell that a switch was
+  offered at all, and could not tell the request it is holding from any other.
+
+## `websocket-proto` — cycle 6 (handshakes on a connection the caller holds)
+
+PR1 of the cycle. Both h1 handshakes can now be driven on a connection the caller
+transitioned out of `http1-proto`'s General mode, so one port can serve WebSocket
+upgrades and ordinary HTTP, and a client handshake can ride a connection kept
+warm by ordinary keep-alive exchanges. The handshake that opens its own
+connection is unchanged; what is added is a second way in.
+
+### Breaking
+
+- **`classify` DERIVES the request-line rather than taking one beside the head.**
+  The signature is `classify(&head, leftover)`; what was a `RequestLine` argument
+  is now `HeadView::request_line` read out of the block this call was handed. A
+  caller-supplied line is exactly the class of mistake this call exists to
+  refuse: RFC 9112 §3.2.2 makes an absolute-form target override `Host`, so a
+  foreign line grants the right request's key against a different request's
+  resource name and authority, and the head digest says nothing about it. A head
+  that begins with no §3 request-line answers `NotARequestHead`, which is a
+  refusal the old signature had no way to express.
+
+### Added
+
+- **`ServerHandshake::adopt`**: takes the `Connection<Server, Tunnel>` the caller
+  transitioned, where `new` creates one. It pairs with `classify`, and the pair
+  is also how a caller pre-validates WITHOUT spending a connection: because
+  `Connection::into_tunnel` is one-way, a request that is a valid RFC 9110 §7.8
+  upgrade but an invalid RFC 6455 §4.2.1 handshake leaves a caller that
+  transitioned FIRST holding a tunnel it must reject and no keep-alive HTTP
+  connection left to serve. `adopt(Connection::new())` plus `classify` runs every
+  §4.2.1 check against the head the General pump produced, touching neither that
+  pump's connection nor the throwaway one — `classify` advances nothing — so a
+  rejection costs a discarded handshake and an acceptance is the go-ahead to
+  transition for real. Discarding it is REQUIRED rather than tidy: a refused head
+  spends the one request that handshake is offered.
+- **`ServerHandshake::classify`**: validates the request head the CALLER read,
+  where `handle` reads one itself. Nothing binds a borrowed head to a connection
+  at compile time, so the binding is stated at RUNTIME:
+  `Connection::head_binding` is asked ahead of every §4.2.1 check, and a
+  `Mismatch` — a head that armed some OTHER connection, or a connection armed by
+  RFC 9110 §9.3.6's CONNECT — is refused with `HeadMismatch`. `NoHandshake`
+  PROCEEDS rather than refusing, which is what keeps the pre-validation recipe
+  above working, and `accept` refuses a 101 on such a connection anyway. Three
+  content checks stand behind the binding, and on the throwaway path, where no
+  identity check runs, the first two are the WHOLE of the protection. Two restore
+  §4.2.1 items the native path proves as it reads the head — item 1's HTTP/1.1
+  floor, which RFC 9110 §7.8 makes a MUST by making an HTTP/1.0 `Upgrade` field a
+  MUST-ignore, and item 4's `Connection` naming `upgrade`. The third is §7.8's
+  outstanding `100 (Continue)`, and it is ONE-DIRECTIONAL: a connection owing one
+  against a head that states no such expectation is a mismatched pair, while the
+  converse is a conforming sequence — an interim sent on the General connection
+  before the transition discharges the obligation and leaves the answer owed.
+- **`ClientHandshake::with_connection`**: opens the handshake on a connection the
+  caller transitioned. It and `new` are two callers of one private validation
+  path, so neither entry point can grow a gate the other lacks. It checks the
+  connection itself not at all: `TunnelPhase` is crate-private to `http1-proto`,
+  so this crate cannot read whether a handshake is already outstanding on the
+  connection it was handed — and none is needed, since `open_upgrade` refuses
+  such a connection when `encode_request` reaches it, which is where the bytes
+  would have been written and where the caller can act on it.
+- **`pub use http1_proto`**: the h1 handshake surface NAMES that crate's types —
+  `adopt` takes a `Connection<Server, Tunnel>`, `classify` a `HeadView`,
+  `with_connection` a `Connection<Client, Tunnel>` — and a type a caller cannot
+  name is one it cannot build an argument out of. Reaching them through here is
+  also what makes them the SAME types: a downstream that depends
+  on `http1-proto` directly agrees with this crate only while the two version
+  requirements resolve to one crate, and the day they do not, the two
+  `Connection`s are distinct types printed with the same name. A doctest builds
+  `adopt`'s argument entirely through this path, so a version split stops
+  compiling instead.
+- **Five `ServerHandshakeError` variants**: `UnsupportedHttpVersion`, the head
+  is not HTTP/1.1 — distinct from `UnsupportedVersion`, which is §4.2.1 item 6's
+  `Sec-WebSocket-Version` and is answered with a 426, since there is no HTTP
+  version to advertise back; `ExpectationMismatch`, the connection owes a
+  `100 (Continue)` while the head states no such expectation, so the two describe
+  different requests; `HeadMismatch`, the head is not the one the adopted
+  connection read — either a head that armed some other connection, or a
+  connection armed by RFC 9110 §9.3.6's CONNECT, which made no §7.8 offer for any
+  head to be; `NotARequestHead`, the head begins with no RFC 9112 §3
+  request-line, of which a view of a RESPONSE head is the reachable case, kept
+  distinct from `HeadMismatch` because a status-line head handed to a connection
+  holding nothing raises no binding question at all; and `AlreadyClassified`,
+  below.
+
+### Changed
+
+- **A handshake is offered its one request exactly once** — whichever entry point
+  offers it, and WHATEVER the outcome. `handle` and `classify` read one latch,
+  and both spend it on the ATTEMPT rather than on success: the connection was
+  armed with its one request before the handshake existed, so a head that fails a
+  check is definitively not that request, and the next head has no better claim
+  to being it. A second request offered to either now answers
+  `AlreadyClassified`, which is a NEW answer on paths that previously gave a
+  lower-layer error or none at all — a second `handle`, which fell through to
+  `http1-proto`'s own narrower guard against a connection that is no longer idle;
+  `handle` after `classify` and `classify` after `handle`, which cross entry
+  points and were caught by neither; and a request this layer REFUSED, a generic
+  upgrade or RFC 9110 §9.3.6's CONNECT, which left the offer open on a connection
+  `http1-proto` had already armed. Answering a second head would pair a
+  `Sec-WebSocket-Accept` with a request the client did not make, which §7.8
+  forbids, and would set it beside whatever RFC 6455 §4.2.2 grants an earlier
+  head had settled. A `NeedMore` and a `Closed` consumed no request, so neither
+  spends the offer. On error the handshake survives and stays reject-only, so
+  §4.2.1's "return an HTTP response with an appropriate error code" is still
+  writable — but a corrected pairing needs a fresh handshake.
+
 ## `http1-proto` — cycle 5 (Sans-I/O HTTP/1.1 core)
 
 A hand-rolled Sans-I/O HTTP/1.1 message and connection core — no_std +

@@ -2,13 +2,18 @@
 //! flavor selected by the `alloc`/`std` (native-atomic) vs `no-atomic`
 //! (portable-atomic) tier.
 //!
-//! - **atomic** (`alloc`/`std`): [`bytes::Bytes`], cheap-clone via native atomics.
-//! - **no-atomic** (`no-atomic`): [`portable_atomic_util::Arc<[u8]>`], cheap-clone
+//! - **atomic** (`alloc`/`std`): `bytes::Bytes`, cheap-clone via native atomics.
+//! - **no-atomic** (`no-atomic`): `portable_atomic_util::Arc<[u8]>`, cheap-clone
 //!   via `portable-atomic` + a `critical-section` impl from the final binary —
 //!   for cores without native atomic CAS (Cortex-M0+ / thumbv6m / RP2040).
 //! - **bare `no_std`** (no heap features): no shared type; DATA bytes are copied
 //!   into caller TX storage. `DataBufMarker` is a zero-sized placeholder so the
 //!   tier exposes a consistent name.
+//!
+//! Both crates above are named in plain code rather than linked: each is a
+//! dependency only its own tier pulls in, and an intra-doc link to an item a
+//! build does not have is a rustdoc error in every build without it. This module
+//! is documented on every tier.
 //!
 //! Discipline: only the cheap-clone + `&[u8]` (+ offset) surface is used, so
 //! `Arc<[u8]>` is a literal drop-in for `Bytes` (no `Bytes`-specific zero-copy

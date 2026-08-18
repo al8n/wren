@@ -152,7 +152,7 @@ mod why {
   pub const DRIFTED: &str = "outbound headers changed between the walks that frame and write them";
 
   // ── tunnel handshakes (`connection::tunnel`) ──────────────────────────────
-  /// RFC 9110 §9.3.6: "a CONNECT request message does not have content", and no
+  /// RFC 9110 §9.3.6: "A CONNECT request message does not have content", and no
   /// message this mode writes has one.
   pub const HANDSHAKE_HAS_NO_CONTENT: &str = "a tunnel handshake message carries no content";
   /// RFC 9112 §6.1 with RFC 9110 §8.6 and §9.3.6: the head that switches frames
@@ -1593,7 +1593,7 @@ fn an_empty_chunk_is_never_written_as_a_zero_size_header() {
 
 // ── tunnel handshakes ─────────────────────────────────────────────────────────
 
-// RFC 9110 §9.3.6 ("a CONNECT request message does not have content") and §7.8:
+// RFC 9110 §9.3.6 ("A CONNECT request message does not have content") and §7.8:
 // every message a tunnel writes IS its head, so a head announcing octets would
 // leave the peer waiting for a body this mode has no machinery to send. The
 // §7.8 offer rules and the §3.2.3 port rule are checked in the same place.
@@ -1688,7 +1688,7 @@ fn a_tunnel_handshake_refuses_what_it_cannot_write() {
   );
 
   // RFC 9110 §9.3.6: "There is no default port; a client MUST send the port
-  // number", whose server half is a MUST to reject "an empty or INVALID port
+  // number", whose server half is a MUST to reject "an empty or invalid port
   // number". RFC 3986 §3.2.3's `port = *DIGIT` bounds neither, because a URI
   // scheme decides what its port means; a CONNECT port is the TCP port of the
   // tunnel's far end, so a number past 65535 addresses nothing and `0` is not a
@@ -1913,7 +1913,7 @@ fn a_tunnel_interim_neither_switches_nor_frames() {
   }
 }
 
-// RFC 9110 §9.3.6: "any 2xx (Successful) response indicates that the sender …
+// RFC 9110 §9.3.6: "Any 2xx (Successful) response indicates that the sender …
 // will switch to tunnel mode immediately after the response header section" — so
 // a 2xx written as a REFUSAL of a CONNECT would leave the peer tunnelling while
 // this end recorded a refusal, and the two would disagree about whether the

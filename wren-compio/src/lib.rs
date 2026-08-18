@@ -25,7 +25,9 @@ pub type ClientWebSocket = WebSocket<ClientRole, MaybeTls>;
 /// `wss://` needs the `tls` feature. The default trust anchors are the
 /// webpki (Mozilla) roots — the platform certificate store is **not**
 /// consulted, so corporate or otherwise custom CAs need a caller-built
-/// connector via [`ClientOptions::with_tls_connector`].
+/// connector via `ClientOptions::with_tls_connector` — named in plain code
+/// rather than linked, because it exists only under `tls` and an intra-doc link
+/// to a gated item is a rustdoc error in every build without it.
 pub async fn connect(
   url: &str,
   options: ClientOptions,

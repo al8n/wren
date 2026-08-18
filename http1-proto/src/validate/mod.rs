@@ -177,7 +177,7 @@ pub(crate) fn validate_request(
 ///    `Transfer-Encoding` it received in such a message.
 /// 3. Only now are the fields read, and a message carrying BOTH is a framing
 ///    error (item 3). The item is written over "a message", not over a request:
-///    "such a message might indicate an attempt to perform request smuggling
+///    "Such a message might indicate an attempt to perform request smuggling
 ///    (Section 11.2) or response splitting (Section 11.1) and ought to be
 ///    handled as an error" — and §11.1 is the RESPONSE half of that pair, so
 ///    taking the error branch on a request and the override branch on a response
@@ -529,11 +529,15 @@ fn request_framing(version: Version, v: &HeadView<'_>) -> Result<BodyFraming, H1
 /// RFC 9112 §9.6's `close` connection option is the explicit half. §9.3 is the
 /// other, and it is the one a raw reading of the field loses: "HTTP/1.1 defaults
 /// to the use of persistent connections", while an HTTP/1.0 message is
-/// non-persistent unless it says otherwise — "a client that supports persistent
-/// connections MAY 'hang up' … only if the last response received … contains a
-/// Connection header field with the 'keep-alive' connection option". So a 1.0
-/// message WITHOUT that option ends persistence just as surely as an explicit
-/// `close` does.
+/// non-persistent unless it says otherwise. §9.3's decision list reaches
+/// persistence for a 1.0 message on one branch only: "If the received protocol
+/// is HTTP/1.0, the `keep-alive` connection option is present, either the
+/// recipient is not a proxy or the message is a response, and the recipient
+/// wishes to honor the HTTP/1.0 `keep-alive` mechanism, the connection will
+/// persist after the current response". Off that branch the list ends where
+/// every other one does: "The connection will close after the current response".
+/// So a 1.0 message WITHOUT that option ends persistence just as surely as an
+/// explicit `close` does.
 ///
 /// `pub(crate)` because Tunnel mode asks it too. Re-deriving the answer from
 /// `KeyFields::connection_close` alone loses the version half, which leaves an

@@ -387,8 +387,12 @@ impl<'req, ReqBuf> StreamEntry<'req, ReqBuf> {
 /// The default per-tier [`StreamStore`] the [`Connection`] holds.
 ///
 /// On the heap tiers (`std` / `alloc` / `no-atomic`) it is the dynamically
-/// growing [`SlabStore`](crate::stream_store::SlabStore); [`Connection::new`]
+/// growing [`SlabStore`](crate::stream_store::SlabStore); `Connection::new`
 /// builds it internally.
+///
+/// That constructor is named in plain code rather than linked: it exists only
+/// under `alloc`/`std`, while this alias also exists under `no-atomic`, and an
+/// intra-doc link to a gated item is a rustdoc error in every build without it.
 #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
 pub type DefaultStreamStore<'req, ReqBuf> =
   crate::stream_store::SlabStore<StreamEntry<'req, ReqBuf>>;
@@ -2154,11 +2158,16 @@ where
   /// A fresh connection backed by caller-provided storage buffers (heap tiers).
   ///
   /// This constructor is the no-alloc-`Connection`-value alternative to
-  /// [`new`](Connection::new): put the buffers wherever your application wants
-  /// (arena, static storage, stack, or an allocator outside this crate) and the
-  /// connection value itself stores only the buffer handles. On the heap tiers
-  /// the [`StreamStore`] grows dynamically, so it is constructed internally — no
+  /// `new`: put the buffers wherever your application wants (arena, static
+  /// storage, stack, or an allocator outside this crate) and the connection
+  /// value itself stores only the buffer handles. On the heap tiers the
+  /// [`StreamStore`] grows dynamically, so it is constructed internally — no
   /// caller-provided slots are needed.
+  ///
+  /// `new` is named in plain code rather than linked: it exists only under
+  /// `alloc`/`std`, while this constructor also exists under `no-atomic`, and an
+  /// intra-doc link to a gated item is a rustdoc error in every build without
+  /// it.
   #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
   pub fn with_buffers(
     request_headers: ReqBuf,
@@ -3493,11 +3502,13 @@ where
   /// (`enqueue_data_on`), so the DATA frame travels the exact same per-id path as a
   /// general request/response body. The difference is only the signature and the implicit
   /// id: it keeps the tunnel's `send_data(&[u8])` arity (copying the borrowed slice into a
-  /// [`DataBuf`](crate::backend::DataBuf) on the heap tiers, since the caller hands no
-  /// owned buffer) and targets the single tunnel-slot pointer (`tunnel_id`) instead of an
-  /// explicit id. As a [`Tunnel`] method, a framing/transport error here is
-  /// CONNECTION-fatal (one tunnel = one connection), where a general stream resets
-  /// per-stream.
+  /// `backend::DataBuf` on the heap tiers, since the caller hands no owned buffer) and
+  /// targets the single tunnel-slot pointer (`tunnel_id`) instead of an explicit id. That
+  /// alias is named in plain code rather than linked: it exists only under `alloc`/`std`,
+  /// and an intra-doc link to a gated item is a rustdoc error in every build without it.
+  ///
+  /// As a [`Tunnel`] method, a framing/transport error here is CONNECTION-fatal (one
+  /// tunnel = one connection), where a general stream resets per-stream.
   ///
   /// Returns:
   /// - [`Err`]`(`[`Error::Closed`]`)` before the tunnel is established or after

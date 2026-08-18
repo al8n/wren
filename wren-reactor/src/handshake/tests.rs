@@ -83,7 +83,7 @@ async fn pending_accept_can_reject_before_the_upgrade() {
 }
 
 /// A request that broke a WebSocket rule, in the one shape RFC 6455 §4.2.2
-/// answers with something other than a 400: "if the server doesn't support the
+/// answers with something other than a 400: "If the server doesn't support the
 /// requested version, it MUST respond with a `Sec-WebSocket-Version` header
 /// field ... containing the version(s) the server is capable of". A driver that
 /// dropped the transport would leave the client unable to tell an unsupported

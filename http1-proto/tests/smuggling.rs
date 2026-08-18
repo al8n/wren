@@ -122,7 +122,7 @@ mod why {
   pub const LENGTH_NOT_DIGITS: &str = "Content-Length is not 1*DIGIT";
   /// RFC 9112 §6.3 item 4: `chunked` present but not last.
   pub const CHUNKED_NOT_FINAL: &str = "chunked is not the final transfer coding";
-  /// RFC 9112 §7.1: "the chunked coding does not define any parameters".
+  /// RFC 9112 §7.1: "The chunked coding does not define any parameters".
   pub const CHUNKED_PARAMETERIZED: &str = "chunked transfer coding carries parameters";
   /// A `Transfer-Encoding` whose list is empty (RFC 9110 §5.6.1.2 drops empty
   /// elements, so a value of nothing but OWS names no coding at all).
@@ -654,8 +654,8 @@ fn content_lengths_must_agree_and_an_identical_list_frames_forty_two() {
   );
 }
 
-// RFC 9112 §5.2: obs-fold is a continuation line, and this core does not accept
-// one — "a sender MUST NOT generate a message that includes line folding", and a
+// obs-fold is a continuation line, and this core does not accept one. RFC 9112
+// §5.2: "A sender MUST NOT generate a message that includes line folding", and a
 // recipient that unfolded it would read a different field value than one that
 // treated the continuation as a new field line. The value the sender meant is
 // expressible on ONE line, which is the accept side.
