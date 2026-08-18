@@ -56,10 +56,15 @@ const VERSION: &str = "sec-websocket-version";
 const PROTOCOL: &str = "sec-websocket-protocol";
 /// `Sec-WebSocket-Extensions` (RFC 6455 §9.1).
 const EXTENSIONS: &str = "sec-websocket-extensions";
-/// `Connection` (RFC 9110 §7.6.1). Never read here — `http1-proto` owns RFC
-/// 9110 §7.8's upgrade pairing — but the handshake machines WRITE it, so it
-/// belongs to the managed set below.
+/// `Connection` (RFC 9110 §7.6.1). Read only where `http1-proto` has not
+/// already proven §7.8's upgrade pairing for itself — a head the CALLER read
+/// and handed to the server handshake — and written by the handshake machines
+/// either way, so it belongs to the managed set below.
 const CONNECTION: &str = "connection";
+/// `Expect` (RFC 9110 §10.1.1). Read for the same reason `Connection` is, and
+/// nowhere else: the outstanding `100 (Continue)` a tunnel connection reports
+/// is `http1-proto`'s own reading of this field.
+const EXPECT: &str = "expect";
 
 /// The field names the handshake machines write themselves, so a caller's
 /// extra header must not collide with one: the wire would then contradict the
@@ -138,9 +143,14 @@ pub(crate) const SINGLETON: &[&str] = &[ORIGIN, HOST, KEY, ACCEPT];
 /// an application can also reach by name — so the first-occurrence escape hatch
 /// must route it back through its own accessor rather than answer it itself.
 ///
-/// `Origin` is the whole of it, on both transports: every other resolved field
+/// `Origin` is the whole of it, on both transports. Every other resolved field
 /// is either in [`MANAGED`] (refused as an extra outright, and read by its
-/// accessor here) or a pseudo-header, which has an accessor and no h1 spelling.
+/// accessor here), or a pseudo-header, which has an accessor and no h1
+/// spelling, or a field whose accessor here resolves it as a LIST — `Expect`
+/// (RFC 9110 §10.1.1's `#expectation`) — where the hatch's first-line answer
+/// contradicts no singleton this module decided, and
+/// [`RequestView::header`](crate::handshake::h1::RequestView::header)'s own
+/// warning already scopes itself to a value that is not a list.
 /// The predicate is one function so the two `other`s cannot come to disagree
 /// about which names the hatch may answer.
 fn resolved_by_name(name: &str) -> bool {
@@ -149,8 +159,8 @@ fn resolved_by_name(name: &str) -> bool {
 
 /// A field whose value is not a list arrived on more than one line, which RFC
 /// 9110 §5.3 forbids ("a sender MUST NOT generate multiple field lines with the
-/// same field name ... unless the field value is defined as a comma-separated
-/// list").
+/// same name in a message … unless that field's definition allows multiple field
+/// line values to be recombined as a comma-separated list").
 ///
 /// Its own type rather than an `Option`: [`FieldValue::single`] has THREE
 /// answers — absent, exactly one (possibly empty), and repeated — and a reader
@@ -306,6 +316,19 @@ impl<'a> RequestFields<'a> {
   /// occurrence (proxies split lists across lines).
   pub(crate) fn upgrade(self) -> FieldValue<impl Iterator<Item = &'a [u8]> + Clone> {
     h1(self.head, UPGRADE)
+  }
+
+  /// `Connection` — RFC 9110 §7.6.1's `#connection-option`, the other half of
+  /// §7.8's upgrade offer, on the same any-occurrence terms as
+  /// [`upgrade`](Self::upgrade).
+  pub(crate) fn connection(self) -> FieldValue<impl Iterator<Item = &'a [u8]> + Clone> {
+    h1(self.head, CONNECTION)
+  }
+
+  /// `Expect` — RFC 9110 §10.1.1's `#expectation`, and a list like the two
+  /// above, so the `100-continue` expectation may arrive in any occurrence.
+  pub(crate) fn expect(self) -> FieldValue<impl Iterator<Item = &'a [u8]> + Clone> {
+    h1(self.head, EXPECT)
   }
 
   /// `Host` — RFC 9112 §3.2's singleton, already held to "exactly one line

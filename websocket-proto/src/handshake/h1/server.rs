@@ -50,6 +50,24 @@
 //! all — they are the server's own configuration, and checking them (token
 //! names, no collision with the fields this handshake manages) never needed a
 //! request. They are passed to `encode_response` and validated there.
+//!
+//! # A request may arrive already read
+//!
+//! A server that speaks ordinary HTTP before it speaks WebSocket reads the
+//! upgrade request on an `http1-proto` General connection — which has the body
+//! machinery a tunnel does not — and takes that crate's mode edge once it
+//! decides to switch. [`ServerHandshake::adopt`] takes the connection that comes
+//! back, and [`classify`](ServerHandshake::classify) validates the head the
+//! caller kept, in place of [`handle`](ServerHandshake::handle) reading one.
+//!
+//! Everything above still holds on that path, and one thing more is weaker
+//! rather than absent: `handle` knows the head it validates is the head its
+//! connection read, and no signature can say that about a head a caller kept.
+//! `classify` asks the connection instead — [`Connection::head_binding`]
+//! compares the head against a digest of the one that armed it, and a mismatch
+//! is refused — and behind that runtime binding it keeps §4.2.1's HTTP/1.1
+//! floor, RFC 9110 §7.8's two-halved offer, §7.8's outstanding `100 (Continue)`,
+//! and one request per handshake. All of it is documented on the call.
 
 use crate::{
   constants,
@@ -59,7 +77,8 @@ use crate::{
 };
 use derive_more::{IsVariant, TryUnwrap};
 use http1_proto::{
-  Connection, HeadView, Headers, Server, ServerTunnelRequest, Target, Tunnel,
+  Connection, HeadBinding, HeadView, Headers, RequestLine, Server, ServerTunnelRequest, Target,
+  Tunnel, Version,
   grammar::{is_token, token_list_contains},
 };
 
@@ -108,6 +127,57 @@ pub enum ServerHandshakeError {
   /// `Upgrade`/`Connection` did not contain the required tokens.
   #[error("request is not a websocket upgrade")]
   NotAnUpgrade,
+
+  /// The head handed to [`classify`](ServerHandshake::classify) announced a
+  /// version below HTTP/1.1, whose `Upgrade` field RFC 9110 §7.8 makes a server
+  /// MUST ignore — so RFC 6455 §4.2.1 item 1's floor is not met and no 101 can
+  /// answer it.
+  ///
+  /// Distinct from [`UnsupportedVersion`](Self::UnsupportedVersion), which is
+  /// RFC 6455 §4.2.1 item 6's `Sec-WebSocket-Version` and is answered with a
+  /// 426: this is the HTTP version, and there is no version to advertise back.
+  #[error("upgrade request is not HTTP/1.1")]
+  UnsupportedHttpVersion,
+
+  /// The connection still owes RFC 9110 §7.8's `100 (Continue)` while the head
+  /// handed to [`classify`](ServerHandshake::classify) states no such
+  /// expectation, so the two describe different requests.
+  #[error("head states no 100-continue expectation, which the connection owes")]
+  ExpectationMismatch,
+
+  /// The head handed to [`classify`](ServerHandshake::classify) is not the head
+  /// the adopted connection read: [`HeadBinding::Mismatch`], which is either a
+  /// head that armed some OTHER connection or a connection armed by RFC 9110
+  /// §9.3.6's CONNECT, which made no §7.8 upgrade offer for any head to be.
+  ///
+  /// Answering it would answer one request out of another's facts, against RFC
+  /// 9110 §7.8's "A server MUST NOT switch to a protocol that was not indicated
+  /// by the client in the corresponding request's Upgrade header field" — so the
+  /// pairing is refused instead. A connection this handshake did not adopt from
+  /// a caller cannot produce it: [`handle`](ServerHandshake::handle) reads the
+  /// head it validates.
+  #[error("this connection did not read this head, or its handshake is a CONNECT")]
+  HeadMismatch,
+
+  /// The head handed to [`classify`](ServerHandshake::classify) does not begin
+  /// with an RFC 9112 §3 request-line, so there is no method, request-target or
+  /// version to validate RFC 6455 §4.2.1 against.
+  ///
+  /// A view of a RESPONSE head is the reachable case. Distinct from
+  /// [`HeadMismatch`](Self::HeadMismatch) on purpose: a status-line head handed
+  /// to a connection holding nothing raises no binding question at all, so
+  /// reporting one would be untrue.
+  #[error("head does not begin with a request-line")]
+  NotARequestHead,
+
+  /// [`classify`](ServerHandshake::classify) was offered a second request.
+  ///
+  /// RFC 6455 §4.2.2 binds one answer to one request: a second classification
+  /// would replace the key the `Sec-WebSocket-Accept` is derived from while
+  /// leaving the subprotocol and extension grants settled against the first
+  /// request, which is the cross-pairing this module exists to refuse.
+  #[error("this handshake has already classified a request")]
+  AlreadyClassified,
 
   /// `Sec-WebSocket-Key` missing or not the base64 of 16 bytes.
   #[error("missing or malformed Sec-WebSocket-Key")]
@@ -612,16 +682,63 @@ impl<'a> Rejection<'a> {
 /// The server side of the h1 opening handshake (RFC 6455 §4.2), driving one
 /// `http1-proto` tunnel connection.
 ///
-/// STATEFUL, and one instance serves ONE handshake: [`handle`](Self::handle)
-/// advances the connection, so a request is classified exactly once and the
-/// bytes cannot be replayed. What the decision needs later — the key, and
-/// whether RFC 9110 §7.8 still owes a `100 (Continue)` — is kept here rather
-/// than re-read from a buffer that has moved on.
+/// STATEFUL, and one instance serves ONE handshake. What the decision needs
+/// later — the key, and whether RFC 9110 §7.8 still owes a `100 (Continue)` —
+/// is kept here rather than re-read from a buffer that has moved on.
+///
+/// # Two ways a request reaches one
+///
+/// [`new`](Self::new) opens a connection this handshake reads the request on
+/// itself, through [`handle`](Self::handle). [`adopt`](Self::adopt) takes one
+/// the caller already read the request on — an `http1-proto` General connection
+/// it transitioned once it saw RFC 9110 §7.8's offer — and
+/// [`classify`](Self::classify) validates the head the caller kept.
+///
+/// The single-handshake rule is ONE rule over both, not one per path: a
+/// handshake is OFFERED a request exactly once, whichever entry point offers it
+/// and whatever this layer then makes of it. The offer is spent when the request
+/// becomes irrevocable — the connection has taken it, or a head has been handed
+/// to [`classify`](Self::classify) — and not when validation succeeds, because
+/// between those two points sit every way this layer can refuse a request the
+/// connection is nonetheless committed to. Both entry points read that one
+/// latch before either looks at a request.
+///
+/// A refusal therefore ends the handshake rather than inviting a second attempt.
+/// That is not a convenience: the connection carries ONE armed request, so there
+/// is exactly one correct head for it, and nothing here can show that a second
+/// head is that one. A retry that might be legitimate is indistinguishable from
+/// an attempt to answer a different request on this connection. A caller with
+/// several candidate heads spends a `ServerHandshake` per head, which costs
+/// nothing — see [`adopt`](Self::adopt).
+///
+/// The connection's own idle gate sits behind the latch as a second, narrower
+/// guard that only [`handle`](Self::handle) reaches, and it is not enough on its
+/// own: `classify` never advances the connection, and the gate says nothing
+/// about a request the connection took and this layer refused. Everything
+/// downstream of classification — the answer, the 101, the rejection — is one
+/// path for both.
 #[derive(Debug)]
 pub struct ServerHandshake {
   connection: Connection<Server, Tunnel>,
+  /// THE LATCH: whether this handshake has been offered its one request.
+  ///
+  /// A fact of its own rather than one read off some other field's value,
+  /// because every artifact of a SUCCESSFUL classification says something
+  /// narrower than what the latch has to mean: by the time either entry point
+  /// can fail, the connection is already committed to the one request that
+  /// armed it. The rule this carries, and what answering a second request on
+  /// that connection would break, are on [`ServerHandshake`] itself.
+  ///
+  /// Set at the point the offer becomes IRREVOCABLE — see
+  /// [`take_request`](Self::take_request) — never at the point validation
+  /// succeeds.
+  request_offered: bool,
   /// The key of the classified request (RFC 6455 §4.1), stored so that
   /// encoding does not need the expired borrow.
+  ///
+  /// Not the latch, and deliberately not: it is written only when RFC 6455
+  /// §4.2.1 validation SUCCEEDS, so a latch read off it would be open on every
+  /// connection a request had armed and this layer had then refused.
   key: Option<[u8; constants::SEC_WEBSOCKET_KEY_LEN]>,
   /// RFC 9110 §7.8's outstanding ordering MUST, as the tunnel reported it at
   /// classification.
@@ -654,6 +771,7 @@ impl ServerHandshake {
   pub const fn new() -> Self {
     Self {
       connection: Connection::new(),
+      request_offered: false,
       key: None,
       continue_owed: false,
       answer: None,
@@ -664,18 +782,47 @@ impl ServerHandshake {
   ///
   /// `data` is the driver's accumulated buffer from its unconsumed start.
   /// [`ServerProgress::NeedMore`] consumes nothing — offer the same bytes again
-  /// with more behind them — and a classified request is classified once: this
-  /// is not a replayable re-parse, and a second call after one succeeds is
-  /// caller-side misuse.
+  /// with more behind them — and a request the connection TAKES is taken once:
+  /// this is not a replayable re-parse.
+  ///
+  /// # Errors
+  ///
+  /// [`AlreadyClassified`](ServerHandshakeError::AlreadyClassified) once this
+  /// handshake has been offered a request — by this call OR by
+  /// [`classify`](Self::classify), which is the same latch and the same answer,
+  /// and whatever RFC 6455 §4.2.1 then made of that request. A `NeedMore` and a
+  /// `Closed` consumed none, so neither spends the offer. Otherwise whatever
+  /// §4.2.1 refuses the offered request for.
   pub fn handle<'h, 'a>(
     &'h mut self,
     data: &'a [u8],
   ) -> Result<ServerProgress<'h, 'a>, ServerHandshakeError> {
-    let (head, request, leftover) = match self
+    // Read before a byte is consumed: a handshake that has been offered a
+    // request must not read another, whichever entry point was offered the
+    // first.
+    self.unclassified()?;
+    let outcome = self
       .connection
       .handle_request(data)
-      .map_err(|error| from_h1(error, 0))?
-    {
+      .map_err(|error| from_h1(error, 0))?;
+    // The two outcomes that consumed NO request. The offer is still open after
+    // either, and it has to be: a driver re-offers a growing buffer until a
+    // head terminates, so arming on `NeedMore` would break the one sequence
+    // every h1 driver runs, and a peer that closed without sending a request
+    // never made one.
+    //
+    // Everything else IS a request the connection has taken — an upgrade, RFC
+    // 9110 §9.3.6's CONNECT, or whatever variant this `#[non_exhaustive]` enum
+    // gains next — and the connection is armed with it whatever this layer goes
+    // on to decide. Taken HERE, ahead of RFC 6455 §4.2.1, because a request this
+    // layer refuses has armed the connection just as firmly as one it accepts.
+    if !matches!(
+      outcome,
+      ServerTunnelRequest::NeedMore | ServerTunnelRequest::Closed
+    ) {
+      self.take_request();
+    }
+    let (head, request, leftover) = match outcome {
       ServerTunnelRequest::Upgrade {
         head,
         request,
@@ -693,137 +840,285 @@ impl ServerHandshake {
       _ => return Err(ServerHandshakeError::NotAnUpgrade),
     };
 
-    // §4.2.1 item 1. http1-proto scopes the offer to the FIELDS, as RFC 9110
-    // §7.8 does ("an OPTIONS request can be honored by any protocol"), so the
-    // method rule is this layer's.
-    if request.method != "GET" {
-      return Err(ServerHandshakeError::NotAGet);
+    let view = websocket_request(head, &request)?;
+    self.record(&view);
+    Ok(ServerProgress::Upgrade(PendingUpgrade {
+      handshake: self,
+      view,
+      leftover,
+    }))
+  }
+
+  /// Adopts a connection the caller classified as an upgrade and transitioned
+  /// with [`Connection::into_tunnel`].
+  ///
+  /// The request has already been READ, through the General connection whose
+  /// pump has the body machinery a tunnel does not, so [`handle`](Self::handle)
+  /// is not the entry point on this path: the head is the caller's, and
+  /// [`classify`](Self::classify) is what validates it.
+  ///
+  /// Adopting an UNtransitioned connection is safe, and no gate is possible
+  /// here in any case: a tunnel's phase is `http1-proto`'s own and not nameable
+  /// from this crate. Two things make it safe, and BOTH are load-bearing. The
+  /// mistake surfaces at encode time, where `http1-proto` refuses a 101 on a
+  /// connection carrying no classified handshake. And the latch spends this
+  /// handshake's one offer on the first request either entry point is given, so
+  /// [`handle`](Self::handle) cannot arm that still-idle connection with a
+  /// SECOND request afterwards — which is the one way a 101 could escape here,
+  /// since `handle` does leave the connection classified and `encode_response`
+  /// would then write the second request's accept value beside whatever the
+  /// first had already settled.
+  ///
+  /// # Pre-validating without spending the connection
+  ///
+  /// [`Connection::into_tunnel`] is one-way, so a request that is a valid RFC
+  /// 9110 §7.8 upgrade but an invalid RFC 6455 §4.2.1 handshake — a bad key, a
+  /// version this crate does not speak, a resource name §4.2.1.1 refuses —
+  /// leaves a caller that transitioned FIRST holding a tunnel it must reject,
+  /// with no keep-alive HTTP connection left to serve.
+  ///
+  /// Adopting a FRESH connection is the way round it, and it is the whole
+  /// recipe: `ServerHandshake::adopt(Connection::new())` plus
+  /// [`classify`](Self::classify) runs every §4.2.1 check against the head the
+  /// General pump produced, touching neither that pump's connection nor the
+  /// throwaway one — `classify` advances nothing. A rejection costs a discarded
+  /// `ServerHandshake` and leaves the real connection General and answerable; an
+  /// acceptance is the go-ahead to transition and adopt for real.
+  ///
+  /// The head-to-connection binding `classify` checks does not stand in the way
+  /// of this, by design: a fresh connection classified nothing, so it answers
+  /// [`HeadBinding::NoHandshake`] for every head and there is no armed request to
+  /// contradict. What makes that safe is the backstop this recipe already leans
+  /// on — [`encode_response`](Self::encode_response) writes the 101 through the
+  /// connection, which refuses one it never classified a request on, so a
+  /// throwaway validates and never answers.
+  ///
+  /// Discarding it is REQUIRED rather than merely tidy: a handshake is offered
+  /// one request whatever the outcome, so a refused head spends this one. That
+  /// is what makes the recipe a per-head loop — cheap, since a `ServerHandshake`
+  /// is a `Connection` and four small fields, and none of it allocates.
+  ///
+  /// [`Connection::into_tunnel`]: http1_proto::Connection::into_tunnel
+  pub const fn adopt(connection: Connection<Server, Tunnel>) -> Self {
+    Self {
+      connection,
+      request_offered: false,
+      key: None,
+      continue_owed: false,
+      answer: None,
+    }
+  }
+
+  /// Validates the request an [adopted](Self::adopt) connection carries
+  /// (RFC 6455 §4.2.1), against a head the CALLER read.
+  ///
+  /// [`handle`](Self::handle) advances the connection, so the head it validates
+  /// is the one that connection classified. This does not: the head and the
+  /// bytes behind it come from the General pump the caller drove before the
+  /// transition, and no signature can state that they belong to the connection
+  /// beside them. [`Connection::head_binding`] states it at runtime instead —
+  /// the connection kept a digest of the head that armed it, and a
+  /// [`Mismatch`](http1_proto::HeadBinding::Mismatch) is refused with
+  /// [`HeadMismatch`](ServerHandshakeError::HeadMismatch). That refusal covers
+  /// a head from another connection and a connection armed by RFC 9110 §9.3.6's
+  /// CONNECT alike — the latter offered no §7.8 upgrade for any head to be, and
+  /// left unrefused it produced a 101 from here while the connection's own
+  /// `accept` wrote `200 Connection Established`.
+  ///
+  /// [`NoHandshake`](http1_proto::HeadBinding::NoHandshake) PROCEEDS rather than
+  /// refusing, and that is what keeps the pre-validation recipe above working: a
+  /// throwaway connection classified nothing, so there is no armed request the
+  /// head could contradict, and `accept` refuses a 101 on such a connection
+  /// anyway.
+  ///
+  /// # What the binding does not reach
+  ///
+  /// Digest equality is not byte equality, and against adversarially shaped
+  /// traffic it is not a boundary at all — see [`Connection::head_binding`]. So
+  /// three content checks stay, and on the throwaway path, where no identity
+  /// check runs, the first two are the WHOLE of the protection: item 1's
+  /// "HTTP/1.1 or higher" floor, which RFC 9110 §7.8 makes a MUST by making an
+  /// HTTP/1.0 `Upgrade` field a MUST-ignore, and item 4's `Connection` naming
+  /// `upgrade`, which is the half of §7.8's offer the §4.2.1 walk shared with
+  /// `handle` does not state (item 3's `Upgrade` naming `websocket` is stated
+  /// there, on both paths).
+  ///
+  /// The third is RFC 9110 §7.8's outstanding `100 (Continue)`, and it is
+  /// ONE-DIRECTIONAL for a reason of its own, which is about STATE rather than
+  /// content: a connection that owes one against a head stating no such
+  /// expectation is a mismatched pair, while a head that states one against a
+  /// connection owing none is LEGAL — a `100 (Continue)` sent on the General
+  /// connection before the transition discharges the obligation while leaving
+  /// the answer owed, so refusing that head would refuse a conforming sequence.
+  ///
+  /// # The request-line is derived, not passed
+  ///
+  /// [`HeadView::request_line`] reads it out of the block this call was handed,
+  /// so there is no second argument to mispair. A caller-supplied line the
+  /// digest says nothing about would carry exactly the class of mistake this
+  /// call exists to refuse: RFC 9112 §3.2.2's absolute-form target overrides
+  /// `Host`, so a foreign line grants the right request's key against a
+  /// different request's resource name and authority. A head whose start line is
+  /// a §4 status-line answers
+  /// [`NotARequestHead`](ServerHandshakeError::NotARequestHead).
+  ///
+  /// ONE request per handshake, across both entry points and WHATEVER THE
+  /// OUTCOME. This call spends the handshake's offer before it validates
+  /// anything, and so does [`handle`](Self::handle) the moment its connection
+  /// takes a request; a second request offered to either answers
+  /// [`AlreadyClassified`](ServerHandshakeError::AlreadyClassified). Why the
+  /// offer is spent on the ATTEMPT rather than on success is on
+  /// [`ServerHandshake`] itself.
+  ///
+  /// # Errors
+  ///
+  /// [`HeadMismatch`](ServerHandshakeError::HeadMismatch) when the head is not
+  /// the one this connection read;
+  /// [`NotARequestHead`](ServerHandshakeError::NotARequestHead) when it holds no
+  /// request-line;
+  /// [`UnsupportedHttpVersion`](ServerHandshakeError::UnsupportedHttpVersion),
+  /// [`NotAnUpgrade`](ServerHandshakeError::NotAnUpgrade) or
+  /// [`ExpectationMismatch`](ServerHandshakeError::ExpectationMismatch) from the
+  /// three content checks above, and everything [`handle`](Self::handle) answers
+  /// a non-conforming §4.2.1 request with otherwise. On error the handshake
+  /// survives and stays reject-only, so §4.2.1's "return an HTTP response with
+  /// an appropriate error code" is still writable — but the offer is SPENT: a
+  /// corrected pairing needs a fresh handshake, not a second call on this one.
+  pub fn classify<'h, 'a>(
+    &'h mut self,
+    head: &HeadView<'a>,
+    leftover: &'a [u8],
+  ) -> Result<ServerProgress<'h, 'a>, ServerHandshakeError> {
+    // The same latch `handle` reads, through the same place: a handshake that
+    // has been offered a request has nothing to learn from a second one, and
+    // two copies of that rule are what later come to disagree.
+    self.unclassified()?;
+    // Taken before anything is validated, the binding and the three tripwires
+    // included. The connection was armed with its one request before this
+    // handshake existed, so a head that fails a check is definitively not that
+    // request — and nothing here can show that the NEXT head is it either. A
+    // retry that might be legitimate is indistinguishable from an attempt to
+    // answer a different request on this connection.
+    //
+    // This is also why the binding is checked BELOW the latch rather than
+    // before it: a second `classify` is `AlreadyClassified` whatever head it
+    // carries, and reporting a binding failure there would say the offer is
+    // still open.
+    self.take_request();
+
+    // RFC 9112 §3, out of the block itself — see "The request-line is derived,
+    // not passed" above for why it is not a parameter.
+    let Some(line) = head.request_line() else {
+      return Err(ServerHandshakeError::NotARequestHead);
+    };
+
+    // The identity `handle` gets from having read the head itself. RFC 9110
+    // §7.8: "A server MUST NOT switch to a protocol that was not indicated by
+    // the client in the corresponding request's Upgrade header field" — the
+    // CORRESPONDING request, which is a question about which request this
+    // connection is holding rather than about what this head says.
+    //
+    // `NoHandshake` proceeds: a connection carrying no classified request is
+    // the throwaway `adopt(Connection::new())` the recipe above prescribes, and
+    // it has no armed request for this head to contradict.
+    if matches!(self.connection.head_binding(head), HeadBinding::Mismatch) {
+      return Err(ServerHandshakeError::HeadMismatch);
     }
 
-    // Every field below is read through THIS, and so is the `RequestView` the
-    // caller gets: the gate and the reader cannot disagree about a field's
-    // occurrences or its presence when neither of them looks the field up.
-    let fields = RequestFields::new(head);
+    // RFC 9110 §7.8: "A server that receives an Upgrade header field in an
+    // HTTP/1.0 request MUST ignore that Upgrade field", so a pre-1.1 head
+    // states no offer this handshake could answer, whatever its fields say.
+    if !matches!(line.version, Version::Http11) {
+      return Err(ServerHandshakeError::UnsupportedHttpVersion);
+    }
 
-    // §4.2.1 item 3: an `Upgrade` field "containing the value 'websocket'".
-    // Classification proved BOTH halves of RFC 9110 §7.8 are present and that
-    // the field names some protocol; WHICH protocol is a WebSocket rule.
-    // RFC 9110 §5.3: repeated field lines are one comma-joined list, so the
-    // token may arrive in ANY occurrence (proxies split lists across lines).
+    let fields = RequestFields::new(*head);
+
+    // §7.8's other half — "A sender of Upgrade MUST also send an `Upgrade`
+    // connection option in the Connection header field". `websocket_request`
+    // states the `Upgrade: websocket` half below, on both paths; this one has
+    // no gate behind it here, because the connection's own gate read a head
+    // this call was not handed.
     if !fields
-      .upgrade()
+      .connection()
       .into_iter()
-      .any(|value| token_list_contains(value, "websocket"))
+      .any(|value| token_list_contains(value, "upgrade"))
     {
       return Err(ServerHandshakeError::NotAnUpgrade);
     }
 
-    // §4.2.1 item 1 / §3: the resource name. http1-proto validated the target's
-    // GRAMMAR and classified its form; the split into path and query, and the
-    // http/https scheme policy, are RFC 6455's.
-    let Some(target) = resource_name(&request.target) else {
-      return Err(ServerHandshakeError::InvalidTarget);
-    };
-
-    // §4.2.1 item 2: a `Host` field "containing the server's authority". RFC
-    // 9112 §3.2 already required exactly one field line whose value is an
-    // authority or EMPTY — the empty spelling is what a target with no
-    // authority component sends, and it names no server, so it fails here.
-    // Present-and-empty is therefore NOT absent: both fail, and they fail for
-    // different reasons the singleton read keeps apart.
-    let Ok(Some(host)) = fields.host().single().map(|v| v.filter(|h| !h.is_empty())) else {
-      return Err(ServerHandshakeError::MissingHost);
-    };
-    // Unreachable: §3.2 held the value to the authority grammar, and every
-    // byte of that grammar is ASCII. Answered rather than unwrapped.
-    let Ok(host) = core::str::from_utf8(host) else {
-      return Err(ServerHandshakeError::InvalidHost);
-    };
-    // RFC 9112 §3.2.2: with an absolute-form target, an origin server MUST
-    // ignore the Host field and use the target's authority — otherwise a
-    // proxy-form request could be routed/authorized as one host while its
-    // target names another.
-    let host = target.authority.unwrap_or(host);
-
-    // §4.2.1 item 5: present exactly once, and 24 base64 bytes.
-    let key = match fields.websocket_key().single() {
-      Ok(Some(key)) => key,
-      Ok(None) => return Err(ServerHandshakeError::InvalidKey),
-      Err(_) => return Err(ServerHandshakeError::DuplicateHeader),
-    };
-    if !crate::base64::is_valid_key(key) {
-      return Err(ServerHandshakeError::InvalidKey);
+    if !expectation_matches(self.connection.owes_continue(), &fields) {
+      return Err(ServerHandshakeError::ExpectationMismatch);
     }
 
-    // §4.2.1 item 6: present exactly once, and 13.
-    let version = match fields.websocket_version().single() {
-      Ok(Some(version)) => version,
-      Ok(None) => return Err(ServerHandshakeError::UnsupportedVersion),
-      Err(_) => return Err(ServerHandshakeError::DuplicateHeader),
-    };
-    if version != constants::WEBSOCKET_VERSION.as_bytes() {
-      return Err(ServerHandshakeError::UnsupportedVersion);
-    }
+    let view = websocket_request(*head, &line)?;
+    self.record(&view);
+    Ok(ServerProgress::Upgrade(PendingUpgrade {
+      handshake: self,
+      view,
+      leftover,
+    }))
+  }
 
-    // §4.2.1 item 7's optional `Origin`, which RFC 6454 §7 defines as ONE
-    // `origin-list-or-null` and RFC 9110 §5.3 therefore forbids repeating.
-    // Refused rather than RESOLVED, because neither answer an `Option` can
-    // carry is safe: the FIRST of two contradicting values authorizes against a
-    // value the peer also denied, and `None` reads to the obvious call shape —
-    // `if let Some(origin) = view.origin()` — as a client that sent no origin
-    // at all, which skips the policy entirely. A field this crate cannot
-    // resolve is one it ANSWERS, exactly as it answers a duplicated key or
-    // version, and the handshake stays reject-only so the driver still writes
-    // §4.2.1's "HTTP response with an appropriate error code".
-    if fields.origin().single().is_err() {
-      return Err(ServerHandshakeError::DuplicateHeader);
+  /// Checks that this handshake has not been offered a request yet — the state
+  /// BOTH entry points need before either looks at one.
+  ///
+  /// The read side of the latch, and the only one: `handle` and `classify` call
+  /// this rather than each testing the fact for itself, because RFC 6455
+  /// §4.2.2's binding of an answer to a request is one rule and a second copy of
+  /// it is free to drift. What it reads is
+  /// [`request_offered`](Self::request_offered), which is the reason it works in
+  /// every direction — a guard on `classify` alone leaves `classify` → `handle`
+  /// open, and a guard derived from a SUCCESSFUL classification's artifacts is
+  /// open on every connection a request armed and this layer then refused.
+  ///
+  /// The connection's own `handle_request` has a second, narrower guard of its
+  /// own — it refuses a request on a connection that is no longer idle — which
+  /// covers `handle` after `handle` on a connection that advanced, and covers
+  /// neither the path where `classify` left the connection untouched nor the one
+  /// where this layer refused what the connection had already taken.
+  fn unclassified(&self) -> Result<(), ServerHandshakeError> {
+    if self.request_offered {
+      return Err(ServerHandshakeError::AlreadyClassified);
     }
+    Ok(())
+  }
 
-    // §11.3.4 with §4.1 item 10: `1#token`, elements the client MUST keep
-    // unique. The rule lives in the grammar layer that knows the ABNF and is
-    // asked over the field's COMPLETE value — every line, empty elements
-    // ignored (RFC 2616 §2.1), a present field naming nothing refused. The
-    // `RequestView::subprotocols` the caller reads is the same walk, so what
-    // passes here is exactly what the application sees.
-    if !crate::negotiation::subprotocol_list_conforms(fields.subprotocol_offers()) {
-      return Err(ServerHandshakeError::MalformedSubprotocols);
-    }
+  /// Spends the one request this handshake is ever offered.
+  ///
+  /// The write side of the latch, and the only one. Called at the point the
+  /// offer becomes IRREVOCABLE — the connection has taken a request, or a head
+  /// has been handed to [`classify`](Self::classify) — never at the point
+  /// validation succeeds. Everything between those two points is a way for this
+  /// layer to refuse a request the connection is nonetheless committed to, and a
+  /// latch that waited for success would be open on exactly those connections.
+  fn take_request(&mut self) {
+    self.request_offered = true;
+  }
 
-    // §9.1: "If a value is received by either the client or the server during
-    // negotiation that does not conform to the ABNF below, the recipient of
-    // such malformed data MUST immediately _Fail the WebSocket Connection_."
-    // Independent of which extensions this build supports, and of whether the
-    // server would have granted any: §9.1's freedom to DECLINE is about
-    // extensions a server does not want, not about data it cannot read. The
-    // handshake is left reject-only, so the fault is answered with §4.2.1's
-    // "HTTP response with an appropriate error code" rather than dropped.
-    if !crate::negotiation::extension_list_conforms(fields.extension_offers()) {
-      return Err(ServerHandshakeError::MalformedExtensions);
-    }
-
+  /// Stores what the answer still needs once the head's borrow has ended: the
+  /// key RFC 6455 §4.2.2 derives the `Sec-WebSocket-Accept` from, and RFC 9110
+  /// §7.8's outstanding ordering MUST as the connection reports it.
+  ///
+  /// The two are written together, on BOTH classification paths, because
+  /// dropping either one dead-ends the same 101: without the key there is no
+  /// accept value to write, and without the mirrored obligation
+  /// [`encode_response`](Self::encode_response) skips the 100 and the
+  /// connection refuses the switch it was ordered before.
+  ///
+  /// Neither is the latch: the offer was spent by
+  /// [`take_request`](Self::take_request) before this ran, so what is stored
+  /// here is only what the ANSWER needs.
+  fn record(&mut self, view: &RequestView<'_>) {
     let mut stored = [0u8; constants::SEC_WEBSOCKET_KEY_LEN];
-    for (slot, byte) in stored.iter_mut().zip(key) {
+    for (slot, byte) in stored.iter_mut().zip(view.key) {
       *slot = *byte;
     }
     self.key = Some(stored);
-    // Asked of the tunnel, which read `Expect` when it classified the request;
-    // a second reading here would be a second implementation of RFC 9110
-    // §7.8's rule, free to disagree with the gate that enforces it.
+    // Asked of the connection, which read `Expect` when the request was
+    // classified; a second reading here would be a second implementation of RFC
+    // 9110 §7.8's rule, free to disagree with the gate that enforces it.
     self.continue_owed = self.connection.owes_continue();
-
-    Ok(ServerProgress::Upgrade(PendingUpgrade {
-      handshake: self,
-      view: RequestView {
-        fields,
-        method: request.method,
-        target: target.target,
-        path: target.path,
-        query: target.query,
-        host,
-        key,
-      },
-      leftover,
-    }))
   }
 
   /// Reports that the transport's read side has ended.
@@ -999,6 +1294,180 @@ impl ServerHandshake {
       .reject(rejection.status, rejection.reason.as_bytes(), &headers, out)
       .map_err(|error| from_h1(error, 0))
   }
+}
+
+/// RFC 9110 §7.8's ordering MUST as a tripwire over a caller-supplied head:
+/// `false` when the connection still owes a `100 (Continue)` and `fields` state
+/// no such expectation, so the two describe different requests.
+///
+/// ONE-DIRECTIONAL. A head that states the expectation against a connection
+/// owing none is LEGAL, not a mismatch: a `100 (Continue)` sent on the General
+/// connection before the transition discharges the obligation while leaving the
+/// answer owed (RFC 9110 §15.2 makes the 1xx not the answer), so refusing it
+/// would refuse a conforming sequence.
+///
+/// The head is read coarsely, as a `#expectation` list naming the bare token,
+/// rather than through §10.1.1's full `expectation = token [ "=" ( token /
+/// quoted-string ) parameters ]`: that grammar is `http1-proto`'s, and the
+/// obligation this compares against is what ITS reading produced. A coarse read
+/// can only widen what counts as stating the expectation, which lets a
+/// mismatched pair through rather than refusing a conforming one — the only
+/// direction a tripwire may err in.
+///
+/// A FUNCTION rather than two lines inside
+/// [`classify`](ServerHandshake::classify), and the reason is testability. The
+/// head-to-connection binding runs ahead of this and refuses a head the
+/// connection did not read, so the only heads that reach here are heads whose
+/// own bytes armed the connection — and identical bytes state an identical
+/// expectation. The `false` direction is therefore unreachable end-to-end
+/// without a digest collision, and this is the seam its four input combinations
+/// are pinned through instead.
+fn expectation_matches(owed: bool, fields: &RequestFields<'_>) -> bool {
+  !owed
+    || fields
+      .expect()
+      .into_iter()
+      .any(|value| token_list_contains(value, "100-continue"))
+}
+
+/// RFC 6455 §4.2.1's rules over a request head `http1-proto` has already framed
+/// and whose target grammar it has already validated, yielding the view an
+/// answer is checked against.
+///
+/// The ONE implementation of §4.2.1, shared by the two ways a request reaches a
+/// handshake — [`handle`](ServerHandshake::handle), which reads it through the
+/// tunnel, and [`classify`](ServerHandshake::classify), which adopts one the
+/// caller read — so the two cannot come to enforce the section differently.
+/// What is deliberately NOT here is what the two paths know differently: the
+/// tunnel proved RFC 9110 §7.8's `Connection: upgrade` half and the HTTP/1.1
+/// floor as it classified the head, and a caller-supplied head has had neither
+/// proved, so `classify` states both itself before calling this.
+fn websocket_request<'a>(
+  head: HeadView<'a>,
+  request: &RequestLine<'a>,
+) -> Result<RequestView<'a>, ServerHandshakeError> {
+  // §4.2.1 item 1. http1-proto scopes the offer to the FIELDS, as RFC 9110
+  // §7.8 does ("an OPTIONS request can be honored by any protocol"), so the
+  // method rule is this layer's.
+  if request.method != "GET" {
+    return Err(ServerHandshakeError::NotAGet);
+  }
+
+  // Every field below is read through THIS, and so is the `RequestView` the
+  // caller gets: the gate and the reader cannot disagree about a field's
+  // occurrences or its presence when neither of them looks the field up.
+  let fields = RequestFields::new(head);
+
+  // §4.2.1 item 3: an `Upgrade` field "containing the value 'websocket'".
+  // WHICH protocol is a WebSocket rule, and what the caller proved before
+  // getting here differs by path: `handle`'s connection proved BOTH halves of
+  // RFC 9110 §7.8 as it classified the head, so the field is known present and
+  // known to name some protocol; `classify`'s tripwire proved only the
+  // `Connection: upgrade` half, so on that path this line is the first and only
+  // check that the `Upgrade` field is there at all. Neither premise is relied
+  // on — the walk below answers a missing field and a wrong one alike.
+  // RFC 9110 §5.3: repeated field lines are one comma-joined list, so the
+  // token may arrive in ANY occurrence (proxies split lists across lines).
+  if !fields
+    .upgrade()
+    .into_iter()
+    .any(|value| token_list_contains(value, "websocket"))
+  {
+    return Err(ServerHandshakeError::NotAnUpgrade);
+  }
+
+  // §4.2.1 item 1 / §3: the resource name. http1-proto validated the target's
+  // GRAMMAR and classified its form; the split into path and query, and the
+  // http/https scheme policy, are RFC 6455's.
+  let Some(target) = resource_name(&request.target) else {
+    return Err(ServerHandshakeError::InvalidTarget);
+  };
+
+  // §4.2.1 item 2: a `Host` field "containing the server's authority". RFC
+  // 9112 §3.2 already required exactly one field line whose value is an
+  // authority or EMPTY — the empty spelling is what a target with no
+  // authority component sends, and it names no server, so it fails here.
+  // Present-and-empty is therefore NOT absent: both fail, and they fail for
+  // different reasons the singleton read keeps apart.
+  let Ok(Some(host)) = fields.host().single().map(|v| v.filter(|h| !h.is_empty())) else {
+    return Err(ServerHandshakeError::MissingHost);
+  };
+  // Unreachable: §3.2 held the value to the authority grammar, and every
+  // byte of that grammar is ASCII. Answered rather than unwrapped.
+  let Ok(host) = core::str::from_utf8(host) else {
+    return Err(ServerHandshakeError::InvalidHost);
+  };
+  // RFC 9112 §3.2.2: with an absolute-form target, an origin server MUST
+  // ignore the Host field and use the target's authority — otherwise a
+  // proxy-form request could be routed/authorized as one host while its
+  // target names another.
+  let host = target.authority.unwrap_or(host);
+
+  // §4.2.1 item 5: present exactly once, and 24 base64 bytes.
+  let key = match fields.websocket_key().single() {
+    Ok(Some(key)) => key,
+    Ok(None) => return Err(ServerHandshakeError::InvalidKey),
+    Err(_) => return Err(ServerHandshakeError::DuplicateHeader),
+  };
+  if !crate::base64::is_valid_key(key) {
+    return Err(ServerHandshakeError::InvalidKey);
+  }
+
+  // §4.2.1 item 6: present exactly once, and 13.
+  let version = match fields.websocket_version().single() {
+    Ok(Some(version)) => version,
+    Ok(None) => return Err(ServerHandshakeError::UnsupportedVersion),
+    Err(_) => return Err(ServerHandshakeError::DuplicateHeader),
+  };
+  if version != constants::WEBSOCKET_VERSION.as_bytes() {
+    return Err(ServerHandshakeError::UnsupportedVersion);
+  }
+
+  // §4.2.1 item 7's optional `Origin`, which RFC 6454 §7 defines as ONE
+  // `origin-list-or-null` and RFC 9110 §5.3 therefore forbids repeating.
+  // Refused rather than RESOLVED, because neither answer an `Option` can
+  // carry is safe: the FIRST of two contradicting values authorizes against a
+  // value the peer also denied, and `None` reads to the obvious call shape —
+  // `if let Some(origin) = view.origin()` — as a client that sent no origin
+  // at all, which skips the policy entirely. A field this crate cannot
+  // resolve is one it ANSWERS, exactly as it answers a duplicated key or
+  // version, and the handshake stays reject-only so the driver still writes
+  // §4.2.1's "HTTP response with an appropriate error code".
+  if fields.origin().single().is_err() {
+    return Err(ServerHandshakeError::DuplicateHeader);
+  }
+
+  // §11.3.4 with §4.1 item 10: `1#token`, elements the client MUST keep
+  // unique. The rule lives in the grammar layer that knows the ABNF and is
+  // asked over the field's COMPLETE value — every line, empty elements
+  // ignored (RFC 2616 §2.1), a present field naming nothing refused. The
+  // `RequestView::subprotocols` the caller reads is the same walk, so what
+  // passes here is exactly what the application sees.
+  if !crate::negotiation::subprotocol_list_conforms(fields.subprotocol_offers()) {
+    return Err(ServerHandshakeError::MalformedSubprotocols);
+  }
+
+  // §9.1: "If a value is received by either the client or the server during
+  // negotiation that does not conform to the ABNF below, the recipient of
+  // such malformed data MUST immediately _Fail the WebSocket Connection_."
+  // Independent of which extensions this build supports, and of whether the
+  // server would have granted any: §9.1's freedom to DECLINE is about
+  // extensions a server does not want, not about data it cannot read. The
+  // handshake is left reject-only, so the fault is answered with §4.2.1's
+  // "HTTP response with an appropriate error code" rather than dropped.
+  if !crate::negotiation::extension_list_conforms(fields.extension_offers()) {
+    return Err(ServerHandshakeError::MalformedExtensions);
+  }
+
+  Ok(RequestView {
+    fields,
+    method: request.method,
+    target: target.target,
+    path: target.path,
+    query: target.query,
+    host,
+    key,
+  })
 }
 
 /// The 101's field section (RFC 6455 §4.2.2), supplied to `http1-proto`'s
@@ -1667,9 +2136,17 @@ Sec-WebSocket-Version: 13\r\n\
       hs.handle(GOOD).unwrap(),
       ServerProgress::Upgrade(_)
     ));
-    // …and classification happens ONCE: the connection advanced, so the same
-    // bytes are no longer a request waiting to be read.
-    assert!(hs.handle(GOOD).is_err(), "handle is not replayable");
+    // …and classification happens ONCE: the pairing latch refuses the second
+    // request before the connection is consulted at all, so the answer is the
+    // same one `classify` gives and does not depend on what the connection did
+    // with the bytes.
+    assert!(
+      matches!(
+        hs.handle(GOOD),
+        Err(ServerHandshakeError::AlreadyClassified)
+      ),
+      "handle is not replayable"
+    );
   }
 
   /// `Closed` is "closed without sending a request". A peer that closed
@@ -2045,7 +2522,7 @@ Sec-WebSocket-Version: 13\r\n\
     ));
   }
 
-  /// RFC 9110 §7.8: "if a server receives both an Upgrade and an Expect header
+  /// RFC 9110 §7.8: "If a server receives both an Upgrade and an Expect header
   /// field with the 100-continue expectation, the server MUST send a 100
   /// (Continue) response before sending a 101 (Switching Protocols) response."
   /// Two heads, one buffer, in that order.
@@ -2626,5 +3103,718 @@ Sec-WebSocket-Version: 13\r\n\
         .contains("Sec-WebSocket-Extensions")
     );
     assert!(negotiated.deflate().is_none());
+  }
+
+  /// The consumer side of the mode EDGE: a request read through a
+  /// `Connection<Server, General>` and carried into the
+  /// `Connection<Server, Tunnel>` that answers it.
+  ///
+  /// Its own module because every fixture here is a request driven through the
+  /// General pump rather than fed to [`ServerHandshake::handle`], and because
+  /// the argument the tests make is one argument: what
+  /// [`ServerHandshake::classify`] cannot be told by the type system — that the
+  /// head it is handed is the head the connection read — it states as a rule.
+  mod adopted {
+    use super::*;
+    use http1_proto::{General, Item, StartLine};
+
+    /// A conforming RFC 6455 §4.2.1 upgrade request, on the HTTP/1.1 RFC 9110
+    /// §7.8 requires.
+    const UPGRADE: &[u8] = b"GET /chat HTTP/1.1\r\n\
+Host: server.example.com\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n";
+
+    /// The same, stating RFC 9110 §10.1.1's expectation — so §7.8 orders a
+    /// `100 (Continue)` before the 101 and the connection carries the
+    /// obligation across the transition.
+    const UPGRADE_WITH_EXPECT: &[u8] = b"GET /chat HTTP/1.1\r\n\
+Host: server.example.com\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Expect: 100-continue\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n";
+
+    /// Two conforming requests whose keys differ, so a `Sec-WebSocket-Accept`
+    /// written for one is visibly not the other's.
+    const UPGRADE_A: &[u8] = UPGRADE;
+    const UPGRADE_B: &[u8] = b"GET /chat HTTP/1.1\r\n\
+Host: server.example.com\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n";
+
+    /// RFC 6455 §4.2.1 item 6 wants 13; this states 8, which §4.2.2 answers
+    /// with the 426.
+    const BAD_VERSION: &[u8] = b"GET /chat HTTP/1.1\r\n\
+Host: server.example.com\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Version: 8\r\n\
+\r\n";
+
+    /// `UPGRADE` with only the HTTP version changed, so a refusal pins the
+    /// version and nothing else. RFC 9110 §7.8: "A server that receives an
+    /// Upgrade header field in an HTTP/1.0 request MUST ignore that Upgrade
+    /// field."
+    const UPGRADE_HTTP_10: &[u8] = b"GET /chat HTTP/1.0\r\n\
+Host: server.example.com\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n";
+
+    /// `UPGRADE` with only §7.8's `Connection` half removed: the `Upgrade`
+    /// field still names websocket, so the offer is half-stated.
+    const UPGRADE_WITHOUT_CONNECTION_TOKEN: &[u8] = b"GET /chat HTTP/1.1\r\n\
+Host: server.example.com\r\n\
+Upgrade: websocket\r\n\
+Connection: keep-alive\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n";
+
+    /// Pulls one request to exhaustion through the General pump, keeping the
+    /// head the driver was handed and reporting what the pump consumed.
+    ///
+    /// No request-line comes back beside it: `classify` derives that from the
+    /// head, so a test that carried one would be carrying a value the API no
+    /// longer has a place for.
+    fn read_request<'a>(
+      general: &mut Connection<Server, General>,
+      req: &'a [u8],
+    ) -> (HeadView<'a>, usize) {
+      let mut items = general.handle(req);
+      let mut head = None;
+      while let Some(item) = items.next().expect("the fixture is a conforming request") {
+        if let Item::Head {
+          view,
+          line: StartLine::Request(_),
+          ..
+        } = item
+        {
+          head = Some(view);
+        }
+      }
+      (head.expect("one complete request head"), items.consumed())
+    }
+
+    /// Drives a General server over `req`, keeps what the pump handed out, and
+    /// takes the mode edge — so what comes back is what a caller of
+    /// `into_tunnel` holds when it reaches this handshake.
+    ///
+    /// `discharge` sends RFC 9110 §7.8's `100 (Continue)` before the
+    /// transition. §15.2 makes a 1xx not the answer, so the obligation is spent
+    /// while the answer stays owed and the edge still switches.
+    ///
+    /// The lifetimes are the CALLER's `req`, not an internal buffer: a function
+    /// cannot return a view borrowing its own local, so the caller's slice is
+    /// fed straight in.
+    fn edged(req: &[u8], discharge: bool) -> (Connection<Server, Tunnel>, HeadView<'_>, &[u8]) {
+      let mut general = Connection::<Server, General>::new();
+      let (head, consumed) = read_request(&mut general, req);
+      if discharge {
+        let mut out = [0u8; 64];
+        general
+          .send_interim(CONTINUE, NO_HEADERS, &mut out)
+          .expect("RFC 9110 §7.8's 100 goes out before the 101");
+      }
+      let tunnel = general
+        .into_tunnel()
+        .expect("a completely read request that offered a switch");
+      (tunnel, head, req.get(consumed..).unwrap_or_default())
+    }
+
+    fn server_edged(req: &[u8]) -> (Connection<Server, Tunnel>, HeadView<'_>, &[u8]) {
+      edged(req, false)
+    }
+
+    fn server_edged_with_continue_already_sent(
+      req: &[u8],
+    ) -> (Connection<Server, Tunnel>, HeadView<'_>, &[u8]) {
+      edged(req, true)
+    }
+
+    /// A head parsed WITHOUT transitioning anything: what a test hands
+    /// `classify` when the head is meant to be one the connection never read.
+    fn head_of(bytes: &[u8]) -> HeadView<'_> {
+      let mut general = Connection::<Server, General>::new();
+      read_request(&mut general, bytes).0
+    }
+
+    #[test]
+    fn an_adopted_connection_classifies_the_request_it_carries() {
+      let (conn, head, leftover) = server_edged(UPGRADE);
+      let mut hs = ServerHandshake::adopt(conn);
+      let ServerProgress::Upgrade(pending) = hs.classify(&head, leftover).unwrap() else {
+        panic!("a conforming §4.1 request")
+      };
+      assert_eq!(pending.request().key(), b"dGhlIHNhbXBsZSBub25jZQ==");
+    }
+
+    /// The obligation the mode edge carries across the seam must survive the
+    /// consumer: without the mirror, `encode_response` skips the 100 and the
+    /// connection refuses the 101 it was ordered before.
+    #[test]
+    fn an_adopted_expect_carrying_upgrade_writes_the_100_before_the_101() {
+      let (conn, head, leftover) = server_edged(UPGRADE_WITH_EXPECT);
+      let mut hs = ServerHandshake::adopt(conn);
+      let mut out = [0u8; 512];
+      let n = {
+        let ServerProgress::Upgrade(mut pending) = hs.classify(&head, leftover).unwrap() else {
+          panic!("a conforming §4.1 request")
+        };
+        pending.validate_accept(&Accept::new()).unwrap();
+        hs.encode_response(&ExtraHeaders::new(), &mut out)
+          .unwrap()
+          .0
+      };
+      let written = core::str::from_utf8(&out[..n]).unwrap();
+      assert!(
+        written.starts_with("HTTP/1.1 100 "),
+        "RFC 9110 §7.8 orders the 100 first: {written}"
+      );
+      assert!(
+        written.contains("HTTP/1.1 101 "),
+        "and the 101 follows it: {written}"
+      );
+    }
+
+    /// RFC 6455 §4.2.2's cross-pairing, reached without crossing two
+    /// handshakes and without leaving one entry point.
+    ///
+    /// It also pins the ORDER the two refusals stand in. B's head would fail the
+    /// head-to-connection binding as surely as it fails the latch, and the latch
+    /// is what must answer: the offer is spent, and a binding failure reported
+    /// here would say it is still open and a corrected pairing still possible.
+    #[test]
+    fn a_second_classify_is_refused_so_an_answer_cannot_cross_requests() {
+      let (conn, head_a, left_a) = server_edged(UPGRADE_A);
+      let mut hs = ServerHandshake::adopt(conn);
+      hs.classify(&head_a, left_a).unwrap();
+      let (_, head_b, left_b) = server_edged(UPGRADE_B);
+      assert!(matches!(
+        hs.classify(&head_b, left_b),
+        Err(ServerHandshakeError::AlreadyClassified)
+      ));
+    }
+
+    /// A refused pairing still owes its peer RFC 6455 §4.2.1's "HTTP response
+    /// with an appropriate error code", so the handshake survives reject-only.
+    /// What it does NOT leave is a second attempt on the same handshake — that
+    /// offer is spent — so a caller that wants to pre-validate several heads
+    /// spends a `ServerHandshake` per head, which costs nothing and is the
+    /// recipe [`adopt`](ServerHandshake::adopt) documents.
+    #[test]
+    fn a_failed_classify_leaves_the_handshake_answerable() {
+      let (conn, bad_head, bad_left) = server_edged(BAD_VERSION);
+      let mut hs = ServerHandshake::adopt(conn);
+      assert!(matches!(
+        hs.classify(&bad_head, bad_left),
+        Err(ServerHandshakeError::UnsupportedVersion)
+      ));
+
+      let mut out = [0u8; 256];
+      let n = hs
+        .encode_rejection(&Rejection::unsupported_version(), &mut out)
+        .unwrap();
+      assert!(out[..n].starts_with(b"HTTP/1.1 426 "));
+
+      // A corrected pairing is classified by a FRESH handshake; the one above
+      // has spent its offer, which `a_failed_classify_spends_the_offer_too`
+      // pins.
+      let (conn2, head, leftover) = server_edged(UPGRADE);
+      let mut hs2 = ServerHandshake::adopt(conn2);
+      assert!(hs2.classify(&head, leftover).is_ok());
+    }
+
+    /// The version tripwire, on the path where it is the whole of the
+    /// protection rather than residue: a THROWAWAY connection classified
+    /// nothing, so `head_binding` answers `NoHandshake` and no identity check
+    /// runs ahead of it.
+    ///
+    /// Pairing this head with an ARMED connection would be refused by the
+    /// binding first — correctly, since a 1.0 head is definitively not the 1.1
+    /// request such a connection read — which is why the tripwire is pinned
+    /// here.
+    #[test]
+    fn the_version_tripwire_catches_a_ten_head() {
+      let mut hs = ServerHandshake::adopt(Connection::<Server, Tunnel>::new());
+      assert!(matches!(
+        hs.classify(&head_of(UPGRADE_HTTP_10), &[]),
+        Err(ServerHandshakeError::UnsupportedHttpVersion)
+      ));
+    }
+
+    /// The `Connection: upgrade` tripwire, on the same path and for the same
+    /// reason: `http1-proto` never read this head, so nothing but this check
+    /// states RFC 9110 §7.8's other half.
+    #[test]
+    fn the_offer_tripwire_catches_a_head_missing_a_seven_eight_half() {
+      let mut hs = ServerHandshake::adopt(Connection::<Server, Tunnel>::new());
+      // `Upgrade: websocket` present, `Connection` does not contain `upgrade`.
+      assert!(matches!(
+        hs.classify(&head_of(UPGRADE_WITHOUT_CONNECTION_TOKEN), &[]),
+        Err(ServerHandshakeError::NotAnUpgrade)
+      ));
+    }
+
+    /// The `Expect` tripwire, at its own seam rather than through `classify`.
+    ///
+    /// Its refusing direction is UNREACHABLE end-to-end, and that is a property
+    /// of the binding rather than a gap: the only heads that reach the check are
+    /// heads whose own bytes armed the connection, and identical bytes state an
+    /// identical expectation. A `classify`-level test of it would need a digest
+    /// collision. All four combinations are pinned on the function instead —
+    /// including the LEGAL converse, which `a_discharged_expectation_is_not_a_
+    /// tripwire` also drives end-to-end.
+    #[test]
+    fn the_expect_tripwire_is_one_directional() {
+      let states = RequestFields::new(head_of(UPGRADE_WITH_EXPECT));
+      let silent = RequestFields::new(head_of(UPGRADE));
+
+      // Owed and stated: the pair agrees.
+      assert!(expectation_matches(true, &states));
+      // Owed and NOT stated: the head describes some other request.
+      assert!(!expectation_matches(true, &silent));
+      // Not owed, whatever the head says. RFC 9110 §15.2 makes the 1xx not the
+      // answer, so a 100 already sent leaves a stating head conforming.
+      assert!(expectation_matches(false, &states));
+      assert!(expectation_matches(false, &silent));
+    }
+
+    /// `UPGRADE` offering a subprotocol, so a 101 answering a DIFFERENT request
+    /// out of this one's grants is visibly the §4.2.2 violation rather than a
+    /// difference only the key shows.
+    const UPGRADE_WITH_OFFER: &[u8] = b"GET /chat HTTP/1.1\r\n\
+Host: server.example.com\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Protocol: superchat\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n";
+
+    /// The crossing the latch has to be SHARED to refuse, and the reason a
+    /// guard on `classify` alone is not the rule it looks like.
+    ///
+    /// `classify` never advances the connection, so on a handshake whose
+    /// connection is still idle — what [`ServerHandshake::adopt`] takes when the
+    /// caller has not transitioned, and what `new` starts at — `handle`'s own
+    /// idle gate is still open after a `classify` succeeded. Left open, the
+    /// sequence below arms the connection with B's request behind A's validated
+    /// answer and RFC 6455 §4.2.2's "The value chosen MUST be derived from the
+    /// client's handshake" is broken by a 101 that every call returned `Ok` for.
+    #[test]
+    fn a_handle_after_a_classify_cannot_cross_an_answer_onto_a_second_request() {
+      let mut hs = ServerHandshake::adopt(Connection::<Server, Tunnel>::new());
+      let head = head_of(UPGRADE_WITH_OFFER);
+      let ServerProgress::Upgrade(mut pending) = hs.classify(&head, &[]).unwrap() else {
+        panic!("a conforming §4.1 request")
+      };
+      pending
+        .validate_accept(&Accept::new().with_subprotocol(Some("superchat")))
+        .unwrap();
+
+      // B carries a different key and offers no subprotocol at all.
+      assert!(matches!(
+        hs.handle(UPGRADE_B),
+        Err(ServerHandshakeError::AlreadyClassified)
+      ));
+
+      // The refusal is what leaves the connection unarmed, so there is no 101
+      // for the crossing to ride out on.
+      let mut out = [0u8; 512];
+      assert!(hs.encode_response(&ExtraHeaders::new(), &mut out).is_err());
+    }
+
+    /// The mirror image. `classify` never ADVANCES the connection, so the idle
+    /// gate that stopped a second `handle` reaches nothing on this side, and the
+    /// latch is what answers. The head-to-connection binding would refuse THIS
+    /// pair as well — A armed the connection and B's head is not A's — but it
+    /// refuses nothing on the unarmed connection the test above uses, so the
+    /// latch is the only guard covering both directions. Removing either entry
+    /// point's read of it fails that direction and leaves the other green, which
+    /// is why both are pinned.
+    #[test]
+    fn a_classify_after_a_handle_cannot_cross_an_answer_onto_a_second_request() {
+      let mut hs = ServerHandshake::new();
+      let ServerProgress::Upgrade(mut pending) = hs.handle(UPGRADE_WITH_OFFER).unwrap() else {
+        panic!("a conforming §4.1 request")
+      };
+      pending
+        .validate_accept(&Accept::new().with_subprotocol(Some("superchat")))
+        .unwrap();
+
+      assert!(matches!(
+        hs.classify(&head_of(UPGRADE_B), &[]),
+        Err(ServerHandshakeError::AlreadyClassified)
+      ));
+
+      // And the answer that survives is A's, paired with A's own key: the 101
+      // states the subprotocol A offered and the accept value A's key derives.
+      let mut out = [0u8; 512];
+      let (n, negotiated) = hs.encode_response(&ExtraHeaders::new(), &mut out).unwrap();
+      let written = core::str::from_utf8(&out[..n]).unwrap();
+      assert_eq!(negotiated.subprotocol(), Some("superchat"));
+      assert!(
+        written.contains("\r\nSec-WebSocket-Protocol: superchat\r\n"),
+        "{written}"
+      );
+      let expected = accept_value(b"dGhlIHNhbXBsZSBub25jZQ==");
+      assert!(
+        written.contains(core::str::from_utf8(&expected).unwrap()),
+        "{written}"
+      );
+    }
+
+    /// One-directional: this head is legal, not a mismatch. RFC 9110 §15.2
+    /// makes the 1xx not the answer, so a 100 sent before the transition
+    /// discharges §7.8's ordering MUST while leaving the answer owed.
+    #[test]
+    fn a_discharged_expectation_is_not_a_tripwire() {
+      let (conn, head, leftover) = server_edged_with_continue_already_sent(UPGRADE_WITH_EXPECT);
+      let mut hs = ServerHandshake::adopt(conn);
+      assert!(hs.classify(&head, leftover).is_ok());
+    }
+
+    /// A conforming RFC 9110 §7.8 upgrade offering a protocol this crate does
+    /// not speak. `http1-proto` classifies it and arms the connection with it —
+    /// §7.8's rule is that both halves are present and that SOME protocol is
+    /// named, not which one — so the connection is committed before RFC 6455
+    /// §4.2.1 gets a say.
+    const H2C_UPGRADE: &[u8] = b"GET /chat HTTP/1.1\r\n\
+Host: server.example.com\r\n\
+Upgrade: h2c\r\n\
+Connection: Upgrade\r\n\
+\r\n";
+
+    /// A websocket upgrade `http1-proto` arms the connection with and RFC 6455
+    /// §4.2.1 item 5 then refuses.
+    const UPGRADE_BAD_KEY: &[u8] = b"GET /chat HTTP/1.1\r\n\
+Host: server.example.com\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: not-a-key\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n";
+
+    /// RFC 9110 §9.3.6's other takeover, which arms the connection as a CONNECT
+    /// tunnel rather than an upgrade.
+    const CONNECT_REQUEST: &[u8] = b"CONNECT server.example.com:443 HTTP/1.1\r\n\
+Host: server.example.com:443\r\n\
+\r\n";
+
+    /// The class, at its sharpest: A is not a websocket request at all, so this
+    /// layer refuses it — but `http1-proto` has already armed the connection
+    /// with it, so the offer is spent and B cannot be answered on a connection
+    /// whose client asked for `h2c`. RFC 9110 §7.8: a server must not switch to
+    /// a protocol the client did not indicate IN THAT REQUEST.
+    ///
+    /// The head-to-connection binding refuses this pair too. What the latch
+    /// adds is that it refuses BEFORE the connection is consulted, and on the
+    /// unarmed connections the binding cannot speak for.
+    #[test]
+    fn a_generic_upgrade_this_layer_refuses_still_spends_the_offer() {
+      let mut hs = ServerHandshake::new();
+      assert!(matches!(
+        hs.handle(H2C_UPGRADE),
+        Err(ServerHandshakeError::NotAnUpgrade)
+      ));
+      assert!(matches!(
+        hs.classify(&head_of(UPGRADE_B), &[]),
+        Err(ServerHandshakeError::AlreadyClassified)
+      ));
+      // …and with nothing classified there is no answer, so no 101 either.
+      let mut out = [0u8; 512];
+      assert!(hs.encode_response(&ExtraHeaders::new(), &mut out).is_err());
+    }
+
+    /// The same shape reached through a WebSocket request that arms the
+    /// connection and then fails a §4.2.1 gate: the offer is spent by the
+    /// arming, not by the validation that follows it.
+    #[test]
+    fn a_websocket_upgrade_that_fails_a_later_gate_still_spends_the_offer() {
+      let mut hs = ServerHandshake::new();
+      assert!(matches!(
+        hs.handle(UPGRADE_BAD_KEY),
+        Err(ServerHandshakeError::InvalidKey)
+      ));
+      assert!(matches!(
+        hs.classify(&head_of(UPGRADE_B), &[]),
+        Err(ServerHandshakeError::AlreadyClassified)
+      ));
+    }
+
+    /// A CONNECT arms the connection as RFC 9110 §9.3.6's tunnel, and that
+    /// spends the offer as any other request the connection takes does.
+    ///
+    /// The disagreement it forecloses — a `classify` reporting a websocket
+    /// handshake this layer would answer while `accept` wrote the CONNECT 2xx —
+    /// is also foreclosed by the binding, which refuses EVERY head on a
+    /// CONNECT-armed connection
+    /// (`a_connect_armed_connection_matches_no_head_at_all`). What this pins is
+    /// that the latch answers first, so the rule does not turn on which head
+    /// the caller happened to pass.
+    #[test]
+    fn a_connect_still_spends_the_offer() {
+      let mut hs = ServerHandshake::new();
+      assert!(matches!(
+        hs.handle(CONNECT_REQUEST),
+        Err(ServerHandshakeError::NotAGet)
+      ));
+      assert!(matches!(
+        hs.classify(&head_of(UPGRADE_B), &[]),
+        Err(ServerHandshakeError::AlreadyClassified)
+      ));
+    }
+
+    /// A failed `classify` spends the offer as surely as a successful one, and
+    /// no `handle` is involved: the connection was armed by A before `adopt`
+    /// was called at all.
+    ///
+    /// There is exactly ONE armed request on the connection, so there is exactly
+    /// one correct head — and nothing here can show that a second head is it. A
+    /// retry that might be legitimate is indistinguishable from an attempt to
+    /// answer a different request on this connection, so the retry is refused
+    /// and the driver rejects instead.
+    #[test]
+    fn a_failed_classify_spends_the_offer_too() {
+      let (conn, _, leftover) = server_edged(UPGRADE);
+      let mut hs = ServerHandshake::adopt(conn);
+      // The 1.0 head is not the request this connection read, and the binding
+      // is what says so — the version tripwire behind it would say the same.
+      assert!(matches!(
+        hs.classify(&head_of(UPGRADE_HTTP_10), leftover),
+        Err(ServerHandshakeError::HeadMismatch)
+      ));
+      // Even the RIGHT head is refused now: the offer went with the attempt.
+      assert!(matches!(
+        hs.classify(&head_of(UPGRADE), leftover),
+        Err(ServerHandshakeError::AlreadyClassified)
+      ));
+    }
+
+    /// The control the arming point exists to keep working: `NeedMore` consumed
+    /// no request, so the offer is still open and the driver's
+    /// accumulate-and-re-offer loop still reaches a classification. Arming there
+    /// would break the one sequence every h1 driver runs.
+    #[test]
+    fn need_more_does_not_spend_the_offer() {
+      let mut hs = ServerHandshake::new();
+      for cut in [1usize, 10, UPGRADE.len() - 1] {
+        assert!(
+          matches!(
+            hs.handle(&UPGRADE[..cut]).unwrap(),
+            ServerProgress::NeedMore
+          ),
+          "cut {cut}"
+        );
+      }
+      assert!(matches!(
+        hs.handle(UPGRADE).unwrap(),
+        ServerProgress::Upgrade(_)
+      ));
+    }
+
+    /// The other control: a peer that closed WITHOUT sending a request consumed
+    /// none either, so `handle_eof` and the [`ServerProgress::Closed`] it
+    /// resolves to leave the offer open.
+    #[test]
+    fn an_eof_with_no_request_does_not_spend_the_offer() {
+      let mut hs = ServerHandshake::new();
+      hs.handle_eof().unwrap();
+      assert!(matches!(hs.handle(b"").unwrap(), ServerProgress::Closed));
+      assert!(hs.classify(&head_of(UPGRADE), &[]).is_ok());
+    }
+
+    /// Spending the offer must not cost the driver the answer it owes: RFC 6455
+    /// §4.2.1 wants "an HTTP response with an appropriate error code" for a
+    /// request this layer refuses, from EITHER entry point.
+    #[test]
+    fn a_spent_offer_still_writes_the_rejection_it_owes() {
+      let mut out = [0u8; 256];
+
+      // Refused by `handle`, on a connection its own request armed.
+      let mut hs = ServerHandshake::new();
+      assert!(hs.handle(UPGRADE_BAD_KEY).is_err());
+      let n = hs
+        .encode_rejection(&Rejection::new(400, "Bad Request"), &mut out)
+        .unwrap();
+      assert!(out[..n].starts_with(b"HTTP/1.1 400 "));
+
+      // Refused by `classify`, on a connection the caller transitioned: the
+      // head is this connection's own, and RFC 6455 §4.2.1 item 6 turns it down.
+      let (conn, bad_head, leftover) = server_edged(BAD_VERSION);
+      let mut hs = ServerHandshake::adopt(conn);
+      assert!(hs.classify(&bad_head, leftover).is_err());
+      let n = hs
+        .encode_rejection(&Rejection::unsupported_version(), &mut out)
+        .unwrap();
+      assert!(out[..n].starts_with(b"HTTP/1.1 426 "));
+    }
+
+    /// The head-to-connection binding, and the three silent misuses it closes.
+    ///
+    /// Without it every one of them returns `Ok` from every call. None is
+    /// reachable by a PEER through the protocol — each needs the caller to hand
+    /// over material that did not come from its own connection — but "the
+    /// application must not make this mistake" is the obligation
+    /// `PendingUpgrade` exists so as not to hand out, and this is the same rule
+    /// for the half no signature can state.
+    mod binding {
+      use super::*;
+      use http1_proto::{Client, ClientTunnelOutcome};
+
+      /// Outcome 1, WRONG PROTOCOL. The connection was armed by a request
+      /// offering only `h2c` — `http1-proto` is protocol-agnostic, so RFC 9110
+      /// §7.8's "some protocol is named" is all it asks — and the head is a
+      /// conforming WebSocket request the client never sent. Answered, it is a
+      /// 101 for a protocol the client did not indicate: §7.8's MUST, broken.
+      #[test]
+      fn a_head_naming_websocket_cannot_answer_an_h2c_armed_connection() {
+        let (conn, _, leftover) = server_edged(H2C_UPGRADE);
+        let mut hs = ServerHandshake::adopt(conn);
+        assert!(matches!(
+          hs.classify(&head_of(UPGRADE), leftover),
+          Err(ServerHandshakeError::HeadMismatch)
+        ));
+      }
+
+      /// Outcome 2, WRONG REQUEST AND RIGHT PROTOCOL — the case the content
+      /// tripwires cannot see, since both heads state every §7.8 and §4.2.1 fact
+      /// identically and differ only in WHICH request they are.
+      ///
+      /// The server-side damage is the worse half: an answer written here
+      /// derives its `Sec-WebSocket-Accept` from B's key and configures a
+      /// `Negotiated` out of B's offers, on a connection whose wire peer sent A
+      /// — a frame-layer desync, of which an honest client's own §4.1 accept
+      /// check catches only the visible part.
+      #[test]
+      fn a_head_from_another_websocket_request_is_refused() {
+        let (conn, _, leftover) = server_edged(UPGRADE_A);
+        let mut hs = ServerHandshake::adopt(conn);
+        // A fresh handshake, so the latch is open and this refusal is the
+        // binding's own rather than `AlreadyClassified` standing in for it.
+        assert!(matches!(
+          hs.classify(&head_of(UPGRADE_B), leftover),
+          Err(ServerHandshakeError::HeadMismatch)
+        ));
+      }
+
+      /// Outcome 3, WRONG TAKEOVER ENTIRELY. `handle_request` is public, so a
+      /// caller can classify a CONNECT on the very connection it then adopts;
+      /// the handshake is fresh, the latch is open, and the tripwires all pass
+      /// on a synthetic WebSocket head.
+      ///
+      /// Unrefused, this layer answers `Ok(Negotiated)` while `encode_response`
+      /// reaches `Connection::accept`, which for a CONNECT writes `200
+      /// Connection Established` — the two ends disagreeing about what the
+      /// connection became. A CONNECT made no §7.8 offer, so EVERY head
+      /// mismatches it, its own included.
+      #[test]
+      fn a_connect_armed_connection_matches_no_head_at_all() {
+        let mut conn = Connection::<Server, Tunnel>::new();
+        let ServerTunnelRequest::Connect { .. } = conn
+          .handle_request(CONNECT_REQUEST)
+          .expect("a well-formed CONNECT with a port")
+        else {
+          panic!("a CONNECT classifies as RFC 9110 §9.3.6's takeover")
+        };
+        let mut hs = ServerHandshake::adopt(conn);
+        assert!(matches!(
+          hs.classify(&head_of(UPGRADE), &[]),
+          Err(ServerHandshakeError::HeadMismatch)
+        ));
+      }
+
+      /// …and the CONNECT connection refuses its OWN head too, which is what
+      /// makes the answer a statement about the offer rather than about the
+      /// bytes: a CONNECT made no upgrade offer for any head to be.
+      #[test]
+      fn a_connect_armed_connection_refuses_even_its_own_head() {
+        let mut conn = Connection::<Server, Tunnel>::new();
+        // Read off the tunnel rather than through `head_of`: a General server
+        // refuses a CONNECT where it arrives, so this head has only one source.
+        let ServerTunnelRequest::Connect { head, .. } = conn
+          .handle_request(CONNECT_REQUEST)
+          .expect("a well-formed CONNECT with a port")
+        else {
+          panic!("a CONNECT classifies as RFC 9110 §9.3.6's takeover")
+        };
+        assert_eq!(conn.head_binding(&head), HeadBinding::Mismatch);
+      }
+
+      /// The recipe `adopt` documents, unbroken: a throwaway connection
+      /// classified nothing, so there is no armed request the head could
+      /// contradict and every §4.2.1 check still runs.
+      ///
+      /// The property this pins is that `NoHandshake` PROCEEDS. A binding that
+      /// refused it would refuse the only way to validate a head before
+      /// spending a one-way transition, which is what makes the question
+      /// three-valued rather than a `bool`.
+      #[test]
+      fn the_throwaway_pre_validation_recipe_still_classifies() {
+        let conn = Connection::<Server, Tunnel>::new();
+        assert_eq!(
+          conn.head_binding(&head_of(UPGRADE)),
+          HeadBinding::NoHandshake
+        );
+        let mut hs = ServerHandshake::adopt(conn);
+        let ServerProgress::Upgrade(pending) = hs
+          .classify(&head_of(UPGRADE), &[])
+          .expect("a fresh connection contradicts no head")
+        else {
+          panic!("a conforming §4.1 request")
+        };
+        assert_eq!(pending.request().key(), b"dGhlIHNhbXBsZSBub25jZQ==");
+      }
+
+      /// A head with no RFC 9112 §3 request-line in it — a RESPONSE head, which
+      /// the client tunnel hands back on a refusal — is diagnosed as that and
+      /// not as a binding failure: an idle connection raises no binding question
+      /// for it to have failed.
+      #[test]
+      fn a_response_head_is_not_a_request_head() {
+        let mut client = Connection::<Client, Tunnel>::new();
+        let mut out = [0u8; 256];
+        let headers: &[(&str, &[u8])] = &[
+          ("Host", b"example.com"),
+          ("Upgrade", b"websocket"),
+          ("Connection", b"upgrade"),
+        ];
+        client
+          .open_upgrade(
+            &Target::Origin {
+              path_and_query: "/chat",
+            },
+            headers,
+            &mut out,
+          )
+          .expect("a well-formed upgrade request");
+        let ClientTunnelOutcome::Refused { head, .. } = client
+          .handle_response(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+          .expect("a well-formed response head")
+        else {
+          panic!("a 400 refuses the switch")
+        };
+        assert!(head.request_line().is_none());
+
+        let mut hs = ServerHandshake::adopt(Connection::<Server, Tunnel>::new());
+        assert!(matches!(
+          hs.classify(&head, &[]),
+          Err(ServerHandshakeError::NotARequestHead)
+        ));
+      }
+    }
   }
 }
