@@ -22,3 +22,7 @@ rustc-ice-*.txt
 Cargo.lock
 
 **docs/
+
+# The RFC text `cargo run -p xtask -- quote-check` reads. Fetched on demand,
+# never committed: it is three quarters of a megabyte of other people's bytes.
+.rfc-cache/
