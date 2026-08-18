@@ -431,6 +431,45 @@ impl<'a> ClientHandshake<'a> {
     options: ClientOptions<'a>,
     rng: &mut R,
   ) -> Result<Self, ClientHandshakeError> {
+    Self::validated(options, rng, Connection::new())
+  }
+
+  /// Opens a handshake on a connection the caller already holds — one
+  /// transitioned out of `General` with [`Connection::into_tunnel`] — so a
+  /// handshake can ride a connection kept warm by ordinary keep-alive
+  /// exchanges instead of opening a new one.
+  ///
+  /// Validates `options` exactly as [`new`](Self::new) does: same path, no
+  /// divergence. It performs NO check on `connection` itself. None is
+  /// possible from here — `TunnelPhase` is crate-private to `http1-proto`, so
+  /// this crate cannot read whether a handshake is already outstanding on the
+  /// connection it was handed — and none is needed: a connection that already
+  /// carries a handshake, or whose read side has ended, is refused by
+  /// `open_upgrade` when [`encode_request`](Self::encode_request) reaches it.
+  /// The misuse surfaces where the bytes would have been written, which is
+  /// where the caller can act on it.
+  ///
+  /// [`Connection::into_tunnel`]: http1_proto::Connection::into_tunnel
+  pub fn with_connection<R: RngCore>(
+    options: ClientOptions<'a>,
+    rng: &mut R,
+    connection: Connection<Client, Tunnel>,
+  ) -> Result<Self, ClientHandshakeError> {
+    Self::validated(options, rng, connection)
+  }
+
+  /// The one validation path [`new`](Self::new) and
+  /// [`with_connection`](Self::with_connection) both run: the host and path
+  /// grammar gates, the subprotocol uniqueness/length/count walk that builds
+  /// the joined value, extra-header validation, the deflate offer validation,
+  /// and the nonce draw plus base64 encode. `connection` is placed on the
+  /// result unchanged — the two public entry points differ only in what they
+  /// pass here, so neither can drift a gate the other lacks.
+  fn validated<R: RngCore>(
+    options: ClientOptions<'a>,
+    rng: &mut R,
+    connection: Connection<Client, Tunnel>,
+  ) -> Result<Self, ClientHandshakeError> {
     let invalid =
       |what: &'static str| ClientHandshakeError::InvalidOptions(InvalidOptionsDetail::new(what));
     // A `Host:` value is an RFC 3986 authority (RFC 9110 §7.2), not a free
@@ -503,7 +542,7 @@ impl<'a> ClientHandshake<'a> {
       let _ = written;
     }
     Ok(Self {
-      connection: Connection::new(),
+      connection,
       options,
       key,
       subprotocols,
@@ -773,6 +812,7 @@ impl Headers for RequestHeaders<'_> {
 mod tests {
   use super::*;
   use crate::handshake::accept_value;
+  use http1_proto::General;
 
   /// Deterministic Rng: fills with 0,1,2,3,…
   struct CountingRng(u8);
@@ -826,6 +866,32 @@ mod tests {
     s.push_str(extra);
     s.push_str("\r\n");
     s.into_bytes()
+  }
+
+  /// A tunnel connection whose one handshake has already been opened, so
+  /// `open_upgrade` refuses a second.
+  fn spent_client_tunnel() -> Connection<Client, Tunnel> {
+    let mut conn = Connection::<Client, General>::new()
+      .into_tunnel()
+      .expect("a fresh client connection has nothing outstanding");
+    let headers = RequestHeaders {
+      host: "server.example.com",
+      key: b"dGhlIHNhbXBsZSBub25jZQ==",
+      subprotocols: None,
+      extensions: None,
+      extras: ExtraHeaders::new(),
+    };
+    let mut out = [0u8; 1024];
+    conn
+      .open_upgrade(
+        &Target::Origin {
+          path_and_query: "/chat",
+        },
+        &headers,
+        &mut out,
+      )
+      .expect("the first handshake opens");
+    conn
   }
 
   #[test]
@@ -1101,9 +1167,9 @@ mod tests {
     ));
   }
 
-  /// RFC 6455 §9.1's MUST names BOTH roles — "if a value is received by either
+  /// RFC 6455 §9.1's MUST names BOTH roles: "If a value is received by either
   /// the client or the server during negotiation that does not conform to the
-  /// ABNF below" — so a malformed `Sec-WebSocket-Extensions` in the 101 fails
+  /// ABNF below". So a malformed `Sec-WebSocket-Extensions` in the 101 fails
   /// this side exactly as it fails the server, and before the value is read
   /// against what this client offered.
   #[test]
@@ -1782,6 +1848,62 @@ mod tests {
         .unwrap()
         .contains("\r\nSec-WebSocket-Protocol: chat, superchat, v2\r\n")
     );
+  }
+
+  /// Adopting changes nothing observable on the wire: a handshake built on a
+  /// connection this crate minted and one built on a connection the caller
+  /// transitioned out of `General` must write byte-identical requests when
+  /// seeded with the same key.
+  #[test]
+  fn a_handshake_on_an_adopted_connection_writes_the_same_request() {
+    let options = ClientOptions::new("server.example.com", "/chat")
+      .with_subprotocols(&["chat", "superchat"])
+      .with_extra_headers(&[("Origin", "http://example.com")]);
+    let mut via_new = ClientHandshake::new(options, &mut CountingRng(0)).unwrap();
+    let tunnel = Connection::<Client, General>::new()
+      .into_tunnel()
+      .expect("a fresh client connection has nothing outstanding");
+    let mut via_adopted =
+      ClientHandshake::with_connection(options, &mut CountingRng(0), tunnel).unwrap();
+
+    let mut a = [0u8; 1024];
+    let mut b = [0u8; 1024];
+    let n = via_new.encode_request(&mut a).unwrap();
+    let m = via_adopted.encode_request(&mut b).unwrap();
+    assert_eq!(a.get(..n), b.get(..m));
+  }
+
+  /// [`ClientHandshake::with_connection`] has no gate of its own on the
+  /// connection it is handed, so a connection whose one handshake is already
+  /// spent is still accepted here — and the refusal instead lands where the
+  /// bytes would be written, exactly as it would on a connection this crate
+  /// misused itself.
+  #[test]
+  fn adopting_a_spent_connection_is_refused_where_the_bytes_would_be_written() {
+    let options = ClientOptions::new("server.example.com", "/chat");
+    let mut hs =
+      ClientHandshake::with_connection(options, &mut CountingRng(0), spent_client_tunnel())
+        .expect("the constructor performs no check on the connection");
+    let mut out = [0u8; 1024];
+    assert!(matches!(
+      hs.encode_request(&mut out).unwrap_err(),
+      ClientHandshakeError::Http(_)
+    ));
+  }
+
+  /// [`ClientHandshake::with_connection`] validates `options` on the same path
+  /// as [`ClientHandshake::new`]: a refactor that leaves it on a shortcut would
+  /// let a bad host through.
+  #[test]
+  fn with_connection_validates_options_exactly_as_new_does() {
+    let options = ClientOptions::new("not a valid authority!", "/");
+    let tunnel = Connection::<Client, General>::new()
+      .into_tunnel()
+      .expect("a fresh client connection has nothing outstanding");
+    assert!(matches!(
+      ClientHandshake::with_connection(options, &mut CountingRng(0), tunnel).unwrap_err(),
+      ClientHandshakeError::InvalidOptions(_)
+    ));
   }
 
   /// RFC 6455 §9.1 states its ABNF "including the 'implied *LWS rule'", so a
