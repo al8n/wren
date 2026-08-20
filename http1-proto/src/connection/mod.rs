@@ -359,6 +359,82 @@ impl Limits {
   }
 }
 
+/// Where the body being received stands.
+///
+/// The observing half of [`Limits`]: that type is what a ceiling is STATED
+/// with, and this is what a message measured against one reports back. Read
+/// through [`Connection::body_progress`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BodyProgress {
+  /// The exchange this body belongs to.
+  pub exchange: ExchangeId,
+  /// Payload octets already delivered as [`Item::BodyChunk`] for this message.
+  ///
+  /// The SAMPLE PRIMITIVE for a driver's own liveness policy. This core is
+  /// Sans-I/O and holds no clock, so it can bound what a peer sends and not how
+  /// long the peer takes over it; a driver that samples this against its own
+  /// wall clock has what a minimum-throughput or deadline rule needs, and the
+  /// socket read deadline is where such a rule belongs.
+  pub received: u64,
+  /// The ceiling in force for this message: the operator's, as narrowed by
+  /// [`Items::limit_body`].
+  pub limit: u64,
+  /// Octets the framing has COMMITTED to and has not yet handed over — and what
+  /// that covers depends on the framing, which is the whole point of reading it:
+  ///
+  /// - `Some(n)` for a `Content-Length` body (RFC 9112 §6.3 item 6): the whole
+  ///   remainder of the BODY, known from the moment its head was read.
+  /// - `Some(n)` inside a chunk (§7.1): the remainder of THAT CHUNK only. §7.1
+  ///   never declares a body's total, and this value must not be read as one.
+  /// - `None` between chunks, for a close-delimited body (§6.3 item 8), and once
+  ///   the body is over.
+  ///
+  /// Read immediately after [`Item::Head`] the three cases separate cleanly:
+  /// `Some(total)` is a counted body, `None` is chunked or close-delimited.
+  ///
+  /// # The contiguous handover
+  ///
+  /// This is what makes ZERO-COPY contiguous handover possible for a counted
+  /// body with no new API and no copy path: wait until the driver's own buffer
+  /// holds `announced` more octets, and the next `handle` yields the whole body
+  /// as ONE [`Item::BodyChunk`] borrowed from that buffer, because the counted
+  /// framing claims `min(remaining, input.len())` in one go.
+  ///
+  /// The recipe has two steps its signature does not reveal, and both are
+  /// required:
+  ///
+  /// 1. **Stop pulling at [`Item::Head`] and DROP the iterator.** One more
+  ///    [`Items::next`] may hand back a partial chunk of whatever happened to be
+  ///    buffered, and [`Connection::body_progress`] is unreachable while
+  ///    [`Items`] borrows the connection. The order is: pull to the head, drop,
+  ///    read the progress, then `handle` again.
+  /// 2. **Answer any pending expectation BEFORE waiting.**
+  ///    [`Item::ExpectContinue`] is yielded by the BODY pump, so a driver that
+  ///    stopped at the head has never seen it — the ask has to be re-derived
+  ///    from the `Expect` field of the head just read. RFC 9110 §10.1.1
+  ///    provides for a client that waits for its `100 (Continue)` before sending
+  ///    content, so against one that does both ends wait: the server for octets,
+  ///    the client for permission to send them.
+  ///
+  /// # The wait is bounded in magnitude and UNBOUNDED IN TIME
+  ///
+  /// A declaration above the ceiling was already refused, so the wait can never
+  /// ask for more than `limit` octets of driver buffer. It can ask for them for
+  /// as long as the peer likes: a peer that declares exactly the ceiling and
+  /// then dribbles pins that buffer for the whole dribble, which is the
+  /// consumer-side accumulation the ceiling exists to close, reintroduced at
+  /// `limit`. On a server that is the server ceiling per connection; on a CLIENT
+  /// it is 64 MiB per connection by default, and a contiguous-handover driver at
+  /// ten thousand connections is holding roughly 640 GB against a streaming
+  /// driver's few hundred bytes each.
+  ///
+  /// **Liveness is the DRIVER's**, and this core cannot take it: it owns no
+  /// clock. [`received`](Self::received) is the quantity to sample and the
+  /// socket read deadline is the real control.
+  pub announced: Option<u64>,
+}
+
 /// Whether this connection carries ordinary messages ([`General`]) or has been
 /// taken over as a tunnel ([`Tunnel`]). Sealed: only those two implement it.
 ///
@@ -674,8 +750,9 @@ pub(crate) struct Exchange {
   /// it, because a refusal is not undone.
   ///
   /// The SECOND of the two windows that hold this fact, and never read on its
-  /// own: [`body_refused`] is what the gates call, because before the pump
-  /// resolves a head refusal the fact lives in the decoder instead.
+  /// own: [`body_refused`] is what the gates call, because until the refusal is
+  /// resolved the fact lives in the decoder instead — which for a head's
+  /// declaration gate is every pull until the pump reaches it.
   pub(crate) body_refused: bool,
 }
 
@@ -824,6 +901,41 @@ pub(crate) enum Lifecycle {
 /// A protocol violation was surfaced already; the connection has nothing else to
 /// say about the wire.
 pub(crate) const FAILED: &str = "connection failed on a protocol violation";
+
+/// The connection has drained (RFC 9112 §9.6): keep-alive is over and the
+/// exchange that was in flight, if any, is through.
+pub(crate) const DRAINED: &str = "connection is draining";
+
+/// Whether the connection is in a state that can still ACT on a caller's call at
+/// all — the lifecycle gate, stated ONCE.
+///
+/// Two callers in opposite directions: [`Connection::sendable`], which every
+/// send call opens with, and [`Items::limit_body`], which narrows the ceiling on
+/// the body being received. The rule is the same for both because it is about
+/// the CONNECTION rather than about either direction — a failed connection has
+/// handed its one violation back, a drained one is past RFC 9112 §9.6's point of
+/// no return — and two statements of it would be free to drift apart while
+/// nothing made them. That is the failure this crate's own
+/// [`peer_close_effects`] records twice.
+///
+/// POLICY decides it and the transport fact deliberately does not appear: the
+/// peer shutting its WRITE side says nothing about whether it is still reading
+/// the response it asked for (RFC 9112 §9.5), so a closed read side must not
+/// refuse an owed answer to a request that arrived in full.
+///
+/// BY VALUE, so it can read the lifecycle and cannot write it — the same
+/// argument [`signal_close`] and [`latch`] are already written to. Exhaustive,
+/// so a [`Lifecycle`] variant added later is a compile error here rather than a
+/// silent default at either caller.
+///
+/// [`Items::limit_body`]: crate::Items::limit_body
+pub(crate) const fn writable(lifecycle: Lifecycle) -> Result<(), Error> {
+  match lifecycle {
+    Lifecycle::Failed => Err(Error::InvalidState(FAILED)),
+    Lifecycle::Draining => Err(Error::InvalidState(DRAINED)),
+    Lifecycle::Open | Lifecycle::Closing => Ok(()),
+  }
+}
 
 /// The HTTP/1.1 connection state machine.
 ///
@@ -1073,9 +1185,13 @@ impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
   /// The limits are read here and nowhere else: the connection copies the two
   /// resolved numbers and keeps no path back to the type they came from.
   ///
-  /// The ceiling a driver states here is the connection's MAXIMUM. A per-route
-  /// narrowing may only lower it, so the value to construct with is the maximum
-  /// over every route this connection may serve.
+  /// The ceiling a driver states here is the connection's MAXIMUM, and the
+  /// value to construct with is therefore the maximum over every route this
+  /// connection may serve. [`Items::limit_body`] can only narrow it, and it
+  /// narrows by `min` and does not report having done so: a route asking for 8
+  /// MiB on a connection built with 1 MiB answers `Ok` and is granted 1 MiB. A
+  /// ceiling constructed from any one route's limit therefore silently caps
+  /// every route above it.
   #[must_use]
   #[inline]
   pub const fn with_limits(limits: Limits) -> Self {
@@ -1387,6 +1503,41 @@ impl<Ro: Role> Connection<Ro, General> {
 // offers — they turn on `lifecycle`, `recv` and `send` alone, which every
 // `Connection<Ro, General>` carries whatever `Ro` is filled with.
 impl<Ro> Connection<Ro, General> {
+  /// Where the body being received stands, or `None` between messages.
+  ///
+  /// On the CONNECTION rather than on [`Items`] because the iterator borrows the
+  /// connection for as long as it lives: a driver reads this after dropping the
+  /// iterator, which is exactly the point in the contiguous-handover recipe
+  /// where it is wanted (see [`BodyProgress::announced`]). Narrowing is the
+  /// other way round and is on [`Items`] for the reason stated there.
+  ///
+  /// `None` is "no body is being received" — between messages, and on a
+  /// connection holding a complete message until its own send side catches up.
+  /// It is NOT "this message has no body": RFC 9112 §6.3 items 1 and 7 frame a
+  /// bodiless message as a body of no octets, which is reported as a body
+  /// already through rather than as no body at all.
+  ///
+  /// Exhaustive over the receive states, so a state added later has to say
+  /// whether a body is being received in it.
+  #[must_use]
+  #[inline]
+  pub fn body_progress(&self) -> Option<BodyProgress> {
+    let decoder = match &self.recv {
+      RecvState::Body { decoder, .. } => decoder,
+      RecvState::Idle | RecvState::AwaitingRearm => return None,
+    };
+    // A receive state holding a decoder was written beside a minted exchange, so
+    // the `else` is defensive: progress nothing can be named against is not
+    // progress a driver can act on.
+    let exchange = self.exchange?.id;
+    Some(BodyProgress {
+      exchange,
+      received: decoder.received(),
+      limit: decoder.limit(),
+      announced: decoder.announced(),
+    })
+  }
+
   /// Whether progress is blocked on the LOCAL send side.
   ///
   /// The write half of the readiness split, and the one a driver must not
@@ -1653,17 +1804,25 @@ pub(crate) fn latch(
 /// TWO storage locations covering two contiguous windows:
 ///
 /// - **Window one — [`State::Refused`] inside the decoder**, from the instant
-///   `commit_head` writes [`RecvState::Body`] until the pump step that resolves
-///   it. One writer: `BodyDecoder::new`, for a `Content-Length` the head
-///   already declared past the ceiling.
-/// - **Window two — [`Exchange::body_refused`]**, from that pump step onward,
+///   `commit_head` writes [`RecvState::Body`] until the step that resolves it.
+///   Its writers are enumerated on the VARIANT itself, which is the one
+///   authoritative list and is deliberately not repeated here — this reader does
+///   not need them, because it keys on the STATE and every writer of that state
+///   leaves the identical one.
+/// - **Window two — [`Exchange::body_refused`]**, from that step onward,
 ///   because the receive state that held the decoder is gone by then. One
 ///   writer: [`refuse`]. Monotone, and it dies with the exchange.
 ///
-/// The windows are contiguous with no gap: [`refuse`] sets the flag and
-/// replaces the receive state in the same step, and before window one there is
-/// no connection state a driver could act on, since the exchange is minted and
-/// the head committed inside a single pump step that has not yielded.
+/// The windows are contiguous with no gap, and each way INTO window one closes
+/// it the same way. A refusal the pump finds: [`refuse`] sets the flag and
+/// replaces the receive state in the same step. A refusal a ROUTE causes, by
+/// narrowing the ceiling through [`Items::limit_body`]: the narrowing and
+/// [`refuse`] run inside that one call, so window one is never observable for it
+/// at all. And before window one there is no connection state a driver could act
+/// on, since the exchange is minted and the head committed inside a single pump
+/// step that has not yielded. The only window-one occupant a driver can OBSERVE
+/// is therefore the head's declaration gate — which is exactly the one the pump
+/// shape below sits in.
 ///
 /// A send gate reading only ONE of them would be right about one window and
 /// wrong about the other — and the window it would miss is the one the
@@ -1679,6 +1838,7 @@ pub(crate) fn latch(
 /// whether it can hold a refused body rather than defaulting to "no".
 ///
 /// [`State::Refused`]: crate::body::BodyDecoder::is_refused
+/// [`Items::limit_body`]: crate::Items::limit_body
 pub(crate) const fn body_refused(recv: &RecvState, exchange: &Option<Exchange>) -> bool {
   let in_flight = match recv {
     RecvState::Body { decoder, .. } => decoder.is_refused(),

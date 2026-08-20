@@ -20,7 +20,7 @@ use super::{
 use crate::{
   body::encode::FORBIDDEN_TRAILER,
   error::{Error, H1Error, Refusal, SuggestedStatus},
-  event::{Item, StartLine},
+  event::{Item, NO_BODY_BEING_RECEIVED, StartLine},
   head::{Target, scan::MAX_LEADING_EMPTY_LINES},
 };
 
@@ -5552,6 +5552,252 @@ fn a_syntactically_malformed_chunk_still_latches_rather_than_refusing() {
   );
   assert!(matches!(c.lifecycle, Lifecycle::Failed));
   assert_eq!(error.suggested_status(), Some(SuggestedStatus::BadRequest));
+}
+
+/// Fields a response to a refused body has to carry: RFC 9112 §9.3's close
+/// branch has been taken, so the one answer left has to say so on the wire.
+const CLOSING_413: &[(&str, &[u8])] = &[("Content-Length", b"0"), ("Connection", b"close")];
+
+// THE RATCHET, through the public surface, and the property that makes the
+// connection ceiling a MAXIMUM rather than a default: narrowing is `min` and
+// reports nothing, so a route asking for more than the connection allows is
+// capped silently. Per EXCHANGE, not per connection — the next message on the
+// same keep-alive connection starts from the operator's ceiling again, because
+// what a narrowing writes is the decoder built for one message.
+#[test]
+fn limit_body_narrows_one_exchange_and_caps_a_route_that_asks_for_more() {
+  let mut c = bounded_server(1 << 20);
+  {
+    let mut it = c.handle(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    // Above the ceiling: `Ok`, and 1 MiB is what the route actually gets.
+    assert_eq!(it.limit_body(8 << 20), Ok(()));
+    assert_eq!(it.limit_body(16), Ok(()));
+    // Idempotent and order-free: a widen after a narrow is a no-op.
+    assert_eq!(it.limit_body(64), Ok(()));
+  }
+  let progress = c.body_progress().expect("a body is being received");
+  assert_eq!(
+    progress.limit, 16,
+    "min only, in any order, any number of times"
+  );
+  assert_eq!(progress.announced, Some(5));
+  assert_eq!(progress.received, 0);
+  assert_eq!(progress.exchange.get(), 1);
+  // The OPERATOR's ceiling is untouched: a route narrows a message, not a
+  // connection, and there is no path from a live connection back to `Limits`.
+  assert_eq!(c.max_body_bytes(), 1 << 20);
+
+  // Finish the exchange and take the next one on the same connection.
+  drain(&mut c, b"hello");
+  send_bodiless_response(&mut c);
+  {
+    let mut it = c.handle(b"POST /y HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+  }
+  let next = c.body_progress().expect("the second body");
+  assert_eq!(next.exchange.get(), 2);
+  assert_eq!(
+    next.limit,
+    1 << 20,
+    "the narrowing died with the message it was made for"
+  );
+}
+
+// RFC 9112 §6.3 item 6 states the whole body in the head, so a route ceiling
+// below what that number already declared is unsatisfiable at once — and the
+// limit the refusal carries is the ROUTE's own maximum, because the narrowing
+// is COMMITTED before satisfiability is checked. A driver logging the refusal
+// otherwise reads back the ceiling the route replaced.
+//
+// Everything a wire-side refusal leaves behind holds here too: policy, not a
+// violation, one notice, one answer still owed, and that answer must state
+// `close`.
+#[test]
+fn an_unsatisfiable_route_limit_refuses_and_names_the_routes_own_maximum() {
+  let mut c = bounded_server(1 << 20);
+  let error = {
+    let mut it = c.handle(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5000\r\n\r\n");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    it.limit_body(4096).unwrap_err()
+  };
+  let Error::Refused(Refusal::BodyTooLarge { exchange, limit }) = error else {
+    panic!("expected a policy refusal, got {error:?}")
+  };
+  assert_eq!(limit, 4096, "the route's max, not the ceiling it replaced");
+  assert_eq!(exchange.get(), 1);
+  assert_eq!(
+    error.suggested_status(),
+    Some(SuggestedStatus::ContentTooLarge)
+  );
+  assert!(!matches!(c.lifecycle, Lifecycle::Failed));
+  assert!(!c.wants_read());
+  assert!(c.is_awaiting_send());
+  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.poll_event(), None);
+  // The body is gone, so there is no progress left to report.
+  assert_eq!(c.body_progress(), None);
+
+  let mut out = [0u8; 128];
+  let without_close = c
+    .send_response(
+      413,
+      b"Content Too Large",
+      LENGTH_0,
+      BodyPlan::None,
+      &mut out,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(without_close, Error::InvalidState(m) if m == REFUSED_BODY_NEEDS_CLOSE),
+    "{without_close:?}"
+  );
+  assert!(
+    c.send_response(
+      413,
+      b"Content Too Large",
+      CLOSING_413,
+      BodyPlan::None,
+      &mut out
+    )
+    .is_ok()
+  );
+}
+
+// THE THREE ANSWERS `limit_body` OWES, kept apart. RFC 9112 §6.3 item 7 gives a
+// GET no body at all, which is a body of no octets rather than no body — so a
+// driver that narrows after EVERY head must be answered `Ok`, or the uniform
+// shape is the one shape that cannot be written. `InvalidState` is reserved for
+// a connection that cannot act on the call, and its two causes are told apart
+// by text alone, which is why the benign case must not join them.
+#[test]
+fn limit_body_is_vacuous_on_a_bodiless_message_and_invalid_between_them() {
+  let mut c = bounded_server(1 << 20);
+  {
+    let mut it = c.handle(BODILESS);
+    // Between messages: nothing is being received yet.
+    let idle = it.limit_body(1).unwrap_err();
+    assert!(
+      matches!(idle, Error::InvalidState(m) if m == NO_BODY_BEING_RECEIVED),
+      "{idle:?}"
+    );
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    assert_eq!(
+      it.limit_body(1),
+      Ok(()),
+      "a narrow-after-every-head driver must not error on a GET"
+    );
+    // The body is over, and the exchange with it: still vacuous, never an error.
+    while it.next().unwrap().is_some() {}
+    assert_eq!(
+      it.limit_body(1),
+      Err(Error::InvalidState(NO_BODY_BEING_RECEIVED))
+    );
+  }
+
+  // A connection that has FAILED answers the lifecycle's own way, and the text
+  // is what distinguishes it from the benign case above.
+  let mut failed = bounded_server(1 << 20);
+  let violation = drain_until_error(
+    &mut failed,
+    b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+  );
+  assert!(matches!(violation, Error::Protocol(_)), "{violation:?}");
+  let mut it = failed.handle(b"");
+  assert!(matches!(it.limit_body(1), Err(Error::InvalidState(m)) if m == FAILED));
+}
+
+// THE CONTIGUOUS HANDOVER, and the pump shape it forces. RFC 9112 §6.3 item 6
+// states the whole body's length in the head, and the counted framing claims
+// `min(remaining, input.len())` in one go — so a driver that waits until its
+// own buffer holds `announced` more octets takes the whole body as ONE borrowed
+// chunk, with no copy anywhere in this core.
+//
+// Two steps of the recipe are not discoverable from the signatures, and this is
+// written in the order that makes both load-bearing:
+//
+//  1. STOP at `Item::Head` and DROP the iterator. One more `next()` would hand
+//     back a partial chunk of whatever happened to be buffered, and
+//     `body_progress` is unreachable while `Items` borrows the connection.
+//  2. ANSWER THE PENDING EXPECTATION BEFORE WAITING. `Item::ExpectContinue` is
+//     yielded by the BODY pump, so a driver that stopped at the head has never
+//     seen it and re-derives the ask from the head's own `Expect` field. RFC
+//     9110 §10.1.1 provides for a client that waits for its `100 (Continue)`
+//     before sending content, so without this both ends wait.
+#[test]
+fn a_counted_body_arrives_as_one_borrowed_chunk_when_the_driver_waits() {
+  const HEAD: &[u8] =
+    b"POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 11\r\n\r\n";
+  const BODY: &[u8] = b"hello world";
+
+  let mut c = Connection::<Server, General>::new();
+  let mut out = [0u8; 64];
+
+  // 1. Pull to the head and STOP.
+  let expects_continue = {
+    let mut it = c.handle(HEAD);
+    let Some(Item::Head { view, .. }) = it.next().unwrap() else {
+      panic!("expected the head")
+    };
+    assert_eq!(it.consumed(), HEAD.len());
+    // The ask is re-derived from the head the driver is holding, because the
+    // item that would have stated it comes out of the body pump.
+    view.header("expect") == Some(b"100-continue".as_slice())
+  };
+  // The iterator is dropped here: `body_progress` borrows the connection.
+
+  let progress = c.body_progress().expect("a body is being received");
+  assert_eq!(
+    progress.announced,
+    Some(11),
+    "item 6 states the whole body in the head"
+  );
+  assert_eq!(progress.received, 0);
+
+  // 2. Answer the expectation BEFORE waiting for the octets it invites.
+  assert!(expects_continue);
+  let n = c.send_interim(100, NO_FIELDS, &mut out).unwrap();
+  assert_eq!(&out[..n], b"HTTP/1.1 100 \r\n\r\n");
+
+  // 3. WAIT until the driver's buffer holds `announced` more octets. The head
+  //    was consumed in full, so the next offer begins at the body's first byte.
+  let wanted = usize::try_from(progress.announced.unwrap()).unwrap();
+  let buffered = BODY.get(..wanted).unwrap();
+  assert_eq!(buffered, BODY, "the wait is over when the count is met");
+
+  // 4. One offer, ONE chunk, borrowed straight out of that buffer — no copy
+  //    anywhere in this core, and no second `handle`.
+  {
+    let mut it = c.handle(buffered);
+    let Some(Item::BodyChunk { data, .. }) = it.next().unwrap() else {
+      panic!("expected the whole body in one chunk")
+    };
+    assert_eq!(data, BODY);
+    assert!(matches!(
+      it.next().unwrap(),
+      Some(Item::ExchangeComplete { .. })
+    ));
+    assert!(it.next().unwrap().is_none());
+    assert_eq!(it.consumed(), BODY.len());
+  }
+  assert_eq!(c.body_progress(), None, "the body is over");
+}
+
+// The negative control for the recipe above, and what the wait BUYS: a driver
+// that pulls again over a buffer holding less than `announced` is handed the
+// partial chunk the counted framing can serve from what is there. Nothing is
+// wrong with that — it is the streaming shape, and it is why the recipe says to
+// stop at the head — but it is not one contiguous body, so a consumer that
+// wanted one would have to copy the pieces together itself.
+#[test]
+fn pulling_before_the_announced_count_has_arrived_hands_back_a_partial_chunk() {
+  let mut c = Connection::<Server, General>::new();
+  let mut it = c.handle(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n\r\nhello");
+  assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+  let Some(Item::BodyChunk { data, .. }) = it.next().unwrap() else {
+    panic!("expected a chunk")
+  };
+  assert_eq!(data, b"hello", "only what the buffer held");
 }
 
 // The size budget is a module-level `const _` (below the type, in `mod.rs`), so

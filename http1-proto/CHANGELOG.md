@@ -136,6 +136,39 @@ its own.
     LATCHES: only a message that parsed can be refused by policy.
   - **BREAKING at the next publish (0.2.0).** A `Connection::new()` that used to
     accept any body now refuses one past its role's default.
+  - **The ceiling NARROWS per exchange**, through `Items::limit_body(max)`.
+    `min` only, so it is idempotent, order-free and safe to forget — forgetting
+    it leaves the operator's ceiling in force, and no routing bug can lift one.
+    A route asking for more than the connection allows is capped silently, so
+    the ceiling a connection is CONSTRUCTED with has to be the maximum over
+    every route it may serve. An unsatisfiable narrowing refuses through the
+    same path a wire-side breach takes, and the `limit` it reports is the
+    ROUTE's `max`: the narrowing is committed before satisfiability is checked.
+    A message with no body answers `Ok` — RFC 9112 §6.3 items 1 and 7 make it a
+    body of no octets — so a driver that narrows after every head is not
+    punished for a conformant GET, HEAD response or 304; `Error::InvalidState`
+    is reserved for a connection that cannot act on the call at all.
+  - **`BodyProgress` and `Connection::body_progress()`**: the exchange, the
+    octets delivered, the ceiling in force, and what the framing has COMMITTED
+    to and not yet handed over. Read right after the head, the last one
+    separates the three RFC 9112 §6.3 framings — `Some(total)` is counted,
+    `None` is chunked or close-delimited — and inside a chunk it is the
+    remainder of THAT CHUNK, since §7.1 never declares a body total.
+  - **A counted body can be taken as ONE borrowed chunk**, with no copy path:
+    wait until the driver's buffer holds `announced` more octets and the next
+    `handle` yields the whole body at once. Stop pulling at `Item::Head` and
+    DROP the iterator first — one more `next()` may hand back a partial chunk,
+    and `body_progress` is unreachable while `Items` borrows the connection —
+    and answer any pending expectation BEFORE waiting, because
+    `Item::ExpectContinue` comes out of the body pump and a client that RFC
+    9110 §10.1.1 provides for — one that waits for its `100 (Continue)` before
+    sending content — will otherwise wait as long as the server does. The wait is bounded in MAGNITUDE by the
+    ceiling and unbounded in TIME: a peer declaring exactly the ceiling and then
+    dribbling pins up to `limit` of driver buffer for the whole dribble — about
+    10 GB at ten thousand connections on the server default, 640 GB on the
+    client's. Liveness is the DRIVER's; this core owns no clock.
+    `body_progress().received` is the quantity to sample and the socket read
+    deadline is the real control.
 - **`body`**: counted, read-to-close, and none, plus a strict **chunked**
   decoder (RFC 9112 §7.1) — `1*HEXDIG` chunk-size with an overflow guard, no
   whitespace after the size, `1*("0")` last-chunk, grammar-checked `chunk-ext`

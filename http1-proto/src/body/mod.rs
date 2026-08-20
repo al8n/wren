@@ -115,13 +115,10 @@ pub(crate) fn widen(n: usize) -> u64 {
 /// against the headroom rather than against the ceiling, so a body part-way
 /// through is measured on what remains of its allowance. `received <= limit`
 /// holds by [`charge`], so the saturation is defensive.
-// No product caller yet — the sites that measure a declaration against a
-// PARTLY-consumed allowance are the narrowing call and the chunk-framing gate,
-// and each lands with the task that adds it. Written here because the four
-// leaves are one set: they are the only spellings of this arithmetic in the
-// crate, and the link proof covers them together. Same shape `is_finished`
-// below already carries.
-#[cfg_attr(not(any(test, feature = "test-no-panic")), allow(dead_code))]
+// Called by `BodyDecoder::narrow`, which is the site that measures a
+// declaration against a PARTLY-consumed allowance. The four leaves are one set:
+// they are the only spellings of this arithmetic in the crate, and the link
+// proof covers them together.
 pub(crate) const fn headroom(received: u64, limit: u64) -> u64 {
   limit.saturating_sub(received)
 }
@@ -227,10 +224,8 @@ impl BodyDecoder {
   }
 
   /// Payload octets this body has handed over.
-  // Read by the driver-facing progress accessor, which lands with the task that
-  // adds one; the decoder's own tests read it to pin that a refusal charges
-  // nothing.
-  #[cfg_attr(not(test), allow(dead_code))]
+  // Read by `Connection::body_progress`, which is what carries it to a driver;
+  // the decoder's own tests read it to pin that a refusal charges nothing.
   pub(crate) const fn received(&self) -> u64 {
     self.received
   }
@@ -243,13 +238,103 @@ impl BodyDecoder {
     self.limit
   }
 
-  /// Whether this body has already been refused.
+  /// Whether this body has already been refused, by whichever writer of
+  /// `State::Refused` got there — the state is the fact, and the variant's own
+  /// doc is where those writers are enumerated.
   ///
-  /// True from construction for a declaration past the ceiling, which is what
+  /// True from CONSTRUCTION for a declaration past the ceiling, which is what
   /// lets the head that framed it decline to surface RFC 9110 §10.1.1's
   /// expectation: content this end has already refused must not be invited.
+  /// True from [`narrow`](Self::narrow) for a per-exchange ceiling the message
+  /// cannot meet, which the same call resolves.
   pub(crate) const fn is_refused(&self) -> bool {
     matches!(self.state, State::Refused)
+  }
+
+  /// Payload octets the framing has COMMITTED to and not yet handed over, or
+  /// `None` where it has committed to nothing.
+  ///
+  /// What "committed" covers depends on the framing, and reading it is how the
+  /// RFC 9112 §6.3 framings are told apart from the outside:
+  ///
+  /// - item 6's `Content-Length` states the whole body in the head, so this is
+  ///   the remainder of the BODY from the moment that head was read;
+  /// - §7.1's chunked coding states one chunk at a time, so this is the
+  ///   remainder of THAT CHUNK and must never be read as a body total;
+  /// - item 8's close-delimited framing states nothing, ever, and a body already
+  ///   through — `Complete`, `Done` — or refused has nothing outstanding.
+  ///
+  /// ONE exhaustive match over the states, delegating to ONE exhaustive match
+  /// over the chunked stages, so a framing or a stage added later is a compile
+  /// error here rather than a case that silently answers "nothing declared".
+  pub(crate) const fn announced(&self) -> Option<u64> {
+    match self.state {
+      State::Counting(remaining) => Some(remaining),
+      State::Chunked(decoder) => decoder.announced(),
+      State::Complete | State::ReadToClose | State::Refused | State::Done => None,
+    }
+  }
+
+  /// Narrows this body's ceiling to `max` payload octets, answering whether the
+  /// ceiling now in force can still be met.
+  ///
+  /// NARROWING ONLY: the ceiling becomes `min(limit, max)`, so a `max` above the
+  /// one in force is a no-op. `min` is idempotent and commutative, so the answer
+  /// does not depend on how often this is called or in what order — the
+  /// operation has no increasing direction to be pointed in, which is what makes
+  /// a ceiling impossible to LIFT rather than merely refused a lift.
+  ///
+  /// COMMITTED BEFORE THE CHECK, and that order is observable: the routine that
+  /// builds the refusal reads [`limit`](Self::limit) off this decoder, so a
+  /// check run first would report the ceiling this call replaced rather than the
+  /// one that refused.
+  ///
+  /// `false` is unsatisfiable. RFC 9110 §15.5.14 refuses content "larger than
+  /// the server is willing or able to process", and two counts of that are
+  /// decidable before the rest of the body has arrived:
+  ///
+  /// - more octets have ALREADY been handed over than the new ceiling allows —
+  ///   the bound is on the message's TOTAL, not on what is left; or
+  /// - the framing has DECLARED more than the headroom left: a `Content-Length`
+  ///   remainder (RFC 9112 §6.3 item 6) or the remainder of the chunk in flight
+  ///   (§7.1), each read through [`announced`](Self::announced).
+  ///
+  /// Both counts are spelled with the leaves the cumulative charge itself uses,
+  /// so a narrowing can only ever reach a conclusion [`feed`](Self::feed) would
+  /// reach later: it is a strictly earlier evaluation of the same comparison and
+  /// never a second rule.
+  ///
+  /// EVERY state answers, and three answer VACUOUSLY `true`. `Complete` and
+  /// `Done` have no octet left to bound — RFC 9112 §6.3 items 1 and 7 put a
+  /// message with no content in `Complete` before a byte is read, so a caller
+  /// that narrows after every head must not be told that a conformant GET, HEAD
+  /// response or 304 was an error — and `Refused` is already refused, since a
+  /// refusal is not undone.
+  ///
+  /// THE SECOND WRITER of `State::Refused`, the first being
+  /// [`new`](Self::new)'s declaration gate. Both write it for one fact — this
+  /// end's own ceiling cannot be met by the message being received — and both
+  /// leave the identical state, so [`is_refused`](Self::is_refused) stays one
+  /// question with one answer whichever of them wrote it.
+  pub(crate) fn narrow(&mut self, max: u64) -> bool {
+    if max < self.limit {
+      self.limit = max;
+    }
+    match self.state {
+      State::Complete | State::Done | State::Refused => true,
+      State::Counting(_) | State::Chunked(_) | State::ReadToClose => {
+        // Nothing declared is nothing to measure: only the already-delivered
+        // count can refuse a framing that has committed to no octets.
+        let declared = self.announced().unwrap_or(0);
+        if overruns(self.received, self.limit)
+          || overruns(declared, headroom(self.received, self.limit))
+        {
+          self.state = State::Refused;
+          return false;
+        }
+        true
+      }
+    }
   }
 
   /// Feeds the next slice of received bytes, returning how many of its leading
@@ -439,7 +524,9 @@ impl BodyDecoder {
   // `Finished` comes out, by which point a finished body has left this state).
   // What is left wanting the BYTES half is a driver-facing accessor — "do more
   // transport bytes belong to THIS message?" — which lands with the task that
-  // needs one.
+  // needs one. `Connection::body_progress` is NOT it: it reports where a body
+  // stands, and `announced` is `None` both once a body is through and between
+  // two chunks of one that is not, so nothing there answers this question.
   #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) const fn is_finished(&self) -> bool {
     matches!(self.state, State::Complete | State::Done)
@@ -510,10 +597,15 @@ enum State {
   /// the connection is closed rather than failed (RFC 9110 §15.5.14's second
   /// MAY — "otherwise, the server MAY close the connection").
   ///
-  /// ONE writer: [`BodyDecoder::new`], for a `Content-Length` the head already
-  /// declared past the ceiling. A breach found MID-body does not land here —
-  /// the charge restores the state it rolled back and the pump replaces the
-  /// whole receive state in the same step, so there is no decoder left to mark.
+  /// TWO writers, and they are the whole list. [`BodyDecoder::new`], for a
+  /// `Content-Length` the head already declared past the ceiling; and
+  /// [`BodyDecoder::narrow`], for a per-exchange ceiling the message in flight
+  /// cannot meet. Both write it for the same fact and leave the identical state,
+  /// so [`BodyDecoder::is_refused`] reads one answer whichever wrote it.
+  ///
+  /// A breach found MID-body does not land here — the charge restores the state
+  /// it rolled back and the pump replaces the whole receive state in the same
+  /// step, so there is no decoder left to mark.
   Refused,
   /// `Finished` has been emitted. The decoder is idle: it claims nothing
   /// further and produces no second item.
