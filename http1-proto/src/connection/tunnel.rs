@@ -1649,6 +1649,14 @@ fn take_over<Ro>(
     tunnel,
     pending_cr: false,
     idle_crlfs: 0,
+    // CARRIED, and the decision is recorded here because this build is what
+    // forces it: the ceilings are properties of the CONNECTION, not of the
+    // message framing that stops applying at the switch. Nothing reads them in
+    // Tunnel mode — RFC 9110 §9.3.6 gives CONNECT no content and this core
+    // refuses content on a handshake — so they are inert here, and what bounds
+    // the protocol on the far side of the switch is that protocol's own limits.
+    max_body: from.max_body,
+    max_chunk_framing: from.max_chunk_framing,
     shape: PhantomData,
   })
 }

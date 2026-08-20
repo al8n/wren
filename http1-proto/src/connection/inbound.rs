@@ -32,13 +32,13 @@
 //! keep-alive gate — and differ only where the RFCs differ.
 
 use crate::{
-  body::{BodyDecoder, BodyItem},
+  body::{BodyDecoder, BodyFault, BodyItem},
   connection::{
     CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Exchange, FAILED, Lifecycle, RecvState,
-    SWITCHING_PROTOCOLS, SendState, abandon_send, head_digest, latch, mint, settle, signal_close,
-    tunnel::names_a_protocol,
+    SWITCHING_PROTOCOLS, SendState, abandon_send, head_digest, latch, mint, refuse, settle,
+    signal_close, tunnel::names_a_protocol,
   },
-  error::{Error, H1Error},
+  error::{Error, H1Error, Refusal},
   event::{ExchangeId, Item, Items, StartLine},
   head::{
     HeadView, Version, find_head_end, malformed, parse_request_line, parse_status_line,
@@ -190,7 +190,21 @@ fn no_more_input<'a>(it: &mut Items<'a, '_>) -> Result<Option<Item<'a>>, Error> 
     RecvState::Idle | RecvState::AwaitingRearm => Ok(None),
   };
   match ended {
-    Err(error) => return Err(truncated(it, error)),
+    Err(BodyFault::Violation(error)) => return Err(truncated(it, error)),
+    // Compiler-forced by the fault split, and DEFENSIVE: `handle_eof` never
+    // touches the decoder, and the pump feeds a `RecvState::Body` decoder
+    // unconditionally — empty offer included — so a refused decoder answers in
+    // `feed` before any stop can route here. Written because the alternative is
+    // a `_` arm that would swallow a refusal if that ever stopped being true.
+    Err(BodyFault::TooLarge) => {
+      // Defensive twice over: a refusal names the exchange it refused, and a
+      // receive state holding a decoder always has one. With no id there is
+      // nothing to report, so the offer simply yields no further item.
+      let Some(exchange) = *it.exchange else {
+        return Ok(None);
+      };
+      return Err(Error::Refused(refused(it, exchange.id)));
+    }
     // RFC 9112 §6.3 item 8: the close IS the delimiter, so a body read to it is
     // COMPLETE here — and here is the only place that can be said. "This body is
     // all the octets that came" is a conclusion about the absence of further
@@ -355,6 +369,9 @@ fn server_head<'a>(
     } else {
       0
     },
+    // Nothing has been read of this message's body yet, so nothing can have
+    // been refused. Set by `connection::refuse` and never cleared.
+    body_refused: false,
   });
   *it.send = SendState::Owed;
   Ok(Step::Yield(commit_head(
@@ -600,11 +617,21 @@ fn commit_head<'a>(
     peer_close_effects(it, parsed.interim);
   }
   if !parsed.interim {
+    // RFC 9112 §6.3's framing decision and the ceiling in force, in one
+    // expression: a `Content-Length` past the ceiling produces a decoder that
+    // is already refused, before the receive state below is written.
+    let decoder = BodyDecoder::new(parsed.framing, it.max_body);
     *it.recv = RecvState::Body {
-      decoder: BodyDecoder::new(parsed.framing),
-      // RFC 9110 §10.1.1 makes `Expect` a request field, and validation already
-      // dropped an expectation an HTTP/1.0 request was not allowed to state.
-      expect_owed: parsed.directives.expect_continue,
+      // RFC 9110 §10.1.1: the expectation asks "shall I send the content?", and
+      // this end has already answered no. Not surfacing the ask is what makes
+      // it impossible to invite a `100 (Continue)` for content that is refused,
+      // and it discharges §10.1.1's first MUST-alternative — "an immediate
+      // response with a final status code, if that status can be determined by
+      // examining just the method, target URI, and header fields" — with no
+      // special case anywhere. `Expect` is a request field, and validation
+      // already dropped an expectation an HTTP/1.0 request could not state.
+      expect_owed: parsed.directives.expect_continue && !decoder.is_refused(),
+      decoder,
     };
   }
   Item::Head {
@@ -724,7 +751,11 @@ fn body<'a>(it: &mut Items<'a, '_>) -> Result<Step<'a>, Error> {
   };
   let (claimed, produced) = match fed {
     Ok(fed) => fed,
-    Err(error) => return Err(fail(it, error)),
+    Err(BodyFault::Violation(error)) => return Err(fail(it, error)),
+    // `*it.consumed` is deliberately untouched: a refusal consumes zero, and
+    // the decoder — restored by the charge that refused — stays in step with
+    // the driver's cursor.
+    Err(BodyFault::TooLarge) => return Err(Error::Refused(refused(it, exchange.id))),
   };
 
   // The decoder claims a byte only when the framing says the body owns it, and
@@ -769,6 +800,26 @@ fn body<'a>(it: &mut Items<'a, '_>) -> Result<Step<'a>, Error> {
     None if claimed > 0 => Step::Again,
     None => Step::Stop,
   })
+}
+
+/// Takes the connection through a body refusal and returns the refusal to hand
+/// back.
+///
+/// The pump's half of `connection::refuse`: it holds the borrows disjointly, so
+/// the argument list is assembled here rather than at each site.
+fn refused(it: &mut Items<'_, '_>, exchange: ExchangeId) -> Refusal {
+  refuse(
+    it.recv,
+    it.exchange,
+    it.watermark,
+    it.send,
+    it.lifecycle,
+    it.event,
+    it.pending_cr,
+    *it.read_closed,
+    it.is_client,
+    exchange,
+  )
 }
 
 /// Latches the connection and turns a wire violation into the error handed back.

@@ -71,6 +71,86 @@ rather than instead of it.
   answer under a version it can no longer see, could not tell that a switch was
   offered at all, and could not tell the request it is holding from any other.
 
+## `http1-proto` — cycle 6 (the inbound body gets a ceiling)
+
+PR2 of the cycle. The message body was the only unbounded quantity this core
+handled: it streamed borrowed chunks and never accumulated, but a consumer that
+needed a whole body accumulated them itself and nothing bounded that, so the
+crate handed its consumers a denial-of-service surface. A body now has a
+per-message ceiling, and exceeding it is a POLICY REFUSAL that leaves the
+connection answerable rather than failed — which is the whole point, since a 413
+carrying an explanation has to stay representable.
+
+### Breaking (0.2.0 at the next publish; the crate is unpublished today)
+
+- `Connection::new()` applies its role's default ceiling. A driver that
+  previously accepted any body now refuses one past 1 MiB at a server, 64 MiB at
+  a client, with `Error::Refused` rather than an item stream that never ends.
+  `Connection::with_limits` is how a driver states its own.
+- `Error` gains a `Refused` variant and `SuggestedStatus` a `ContentTooLarge`
+  one; both enums are already `#[non_exhaustive]`, so a `_` arm keeps compiling
+  and a driver that wants the 413 matches for it.
+
+### Added
+
+- **`Limits`**, and the constructors that read it —
+  `Connection::<Ro, Mo>::default_limits()`, `with_max_body_bytes`,
+  `with_max_chunk_framing_bytes`, `max_body_bytes`, `max_chunk_framing_bytes`,
+  and `Connection::with_limits`. The seed hangs off the CONNECTION type rather
+  than off `Limits`, so the wrong role's seed has no shorter spelling than the
+  right one. Read once, at construction: a live connection has no path back to
+  it, so the ceiling has one writer and the only direction a route can move it
+  is down.
+- **Role-dependent defaults** on the sealed `Role` trait — a server's 1 MiB is
+  nginx's `client_max_body_size 1m` and exactly `MAX_HEAD_BYTES × MAX_HEADERS`;
+  a client's 64 MiB is where RFC 9112 §6.3 item 8's undeclared, close-delimited
+  framing lives and matches `websocket-proto`'s own `max_message_size`.
+- **A chunk-framing budget resolved from the payload ceiling in force** — a
+  sixteenth of it, with the role default as a floor. Derived from the ceiling
+  rather than fixed because a fixed one reproduces, one knob up, the failure it
+  exists to prevent: 100 MiB at the commonest 4 KiB chunk granularity spends
+  153,600 octets of RFC 9112 §7.1 size lines, so a budget frozen at 64 KiB would
+  refuse ordinary traffic about 42.7 MiB into a body the payload ceiling allows.
+  `u64::MAX >> 4` is 2⁶⁰, so "unbounded" stays one knob.
+- **`Error::Refused(Refusal::BodyTooLarge { exchange, limit })`** — deliberately
+  not an `H1Error`. RFC 9110 §15.5.14 names this as a double MAY ("The server
+  MAY terminate the request, if the protocol version in use allows it;
+  otherwise, the server MAY close the connection") and HTTP/1.1 has no way to
+  end one request without the connection, so this core takes the second branch:
+  keep-alive ends, `Event::CloseSignaled` is queued once, and a server's one
+  response is still owed and still sendable.
+- **`SuggestedStatus::ContentTooLarge`** (413) and **`SuggestedStatus::reason()`**,
+  which retires a defect class rather than adding a convenience: both wren
+  drivers mapped a suggested status through `match code { Some(414) => …, _ =>
+  (400, …) }`, so every variant added later degraded silently at two
+  byte-identical sites. Both now map `(s.code(), s.reason())`.
+
+### Changed
+
+- **A refused body constrains what may still be written.** The final response
+  must state the `close` connection option — RFC 9112 §9.3 makes reading the
+  whole body or closing a MUST, this core has taken the close branch on the
+  driver's behalf, and RFC 9110 §10.1.1 makes stating it a SHOULD — and
+  `send_interim` is refused outright, because a refused exchange owes exactly
+  one final answer. Both gates are keyed on a refused body, so nothing that
+  works today changes.
+- **An oversized `Content-Length` never yields `Item::ExpectContinue`.** The
+  expectation asks "shall I send the content?" and this end has already answered
+  no, so the ask is not surfaced and no `100 (Continue)` can be written for it.
+- **Closing after a 413 is a STAGED close, and a driver must do it that way.**
+  The peer is mid-transmission of the refused body by construction, so RFC 9112
+  §9.6's reset case is guaranteed rather than incidental and an immediate full
+  close can erase the very response this path exists to deliver. Half-close the
+  write side, keep draining the socket at the transport level until the peer
+  closes or a deadline expires, then close. `wants_read() == false` means the
+  CORE needs no more octets, not that the socket should stop being drained;
+  nothing discarded that way is parsed, so §9.6's "MUST NOT process any further
+  requests" is untouched.
+- **What the ceiling does NOT bound: time.** A peer declaring exactly the
+  ceiling and then dribbling one octet per read is not refused, and pins a
+  connection for as long as the driver lets it. The core is Sans-I/O and has no
+  clock; the socket read deadline is the driver's, and it is the real control.
+
 ## `websocket-proto` — cycle 6 (handshakes on a connection the caller holds)
 
 PR1 of the cycle. Both h1 handshakes can now be driven on a connection the caller

@@ -61,8 +61,8 @@ use crate::{
   body::encode::{CHUNK_TERMINATOR, encode_chunk_header, encode_last_chunk_and_trailers},
   connection::{
     CONNECT, Client, Connection, Exchange, FAILED, General, Lifecycle, RecvState,
-    SWITCHING_PROTOCOLS, SendBody, SendState, Server, discharge_expect, mint, signal_close,
-    tunnel::CONTINUE,
+    SWITCHING_PROTOCOLS, SendBody, SendState, Server, body_refused, discharge_expect, mint,
+    signal_close, tunnel::CONTINUE,
   },
   error::Error,
   event::Event,
@@ -474,6 +474,36 @@ const NOT_INTERIM: &str = "only a 1xx response is interim";
 /// words — its `send_interim` is the same call for the same reason.
 pub(super) const INTERIM_STATES_NO_CLOSE: &str = "an interim response states no Connection: close";
 
+/// RFC 9112 §9.3: "A server MUST read the entire request message body or close
+/// the connection after sending its response; otherwise, the remaining data on
+/// a persistent connection would be misinterpreted as the next request." The
+/// core has taken the close branch on the driver's behalf — that is what a
+/// limit MEANS — and RFC 9110 §10.1.1 makes stating it a SHOULD: "A server that
+/// responds with a final status code before reading the entire request content
+/// SHOULD indicate whether it intends to close the connection … or continue
+/// reading the request content." So the response has to say so on the wire, or
+/// the peer is told this connection is persistent when it is not.
+///
+/// Either spelling satisfies it: the `close` connection option, or RFC 9112
+/// §6.3 item 8's close-delimited framing, which says the same thing without a
+/// field. The implicit form is accepted deliberately, though the explicit one
+/// is better — §9.6's "A sender SHOULD send a Connection header field …
+/// containing the "close" connection option when it intends to close a
+/// connection" — because a mid-send peer learns the implicit form only at EOF.
+pub(super) const REFUSED_BODY_NEEDS_CLOSE: &str =
+  "a response to a refused body must state the `close` connection option";
+
+/// A refused exchange owes exactly ONE final answer, on a connection that is
+/// closing behind it, so there is nothing an interim response can be
+/// informational ABOUT.
+///
+/// Scoped to `100 (Continue)` for the reason it exists: RFC 9110 §10.1.1 makes
+/// a 100 an invitation to send content, and this end has already declined to
+/// read this message's. That argument does NOT cover `103 (Early Hints)` (RFC
+/// 8297), which invites nothing — what refuses a 103 here is the one-answer
+/// rule above rather than the invitation.
+pub(super) const REFUSED_BODY_TAKES_NO_INTERIM: &str = "no interim response after a refused body";
+
 /// The send state a head with this plan leaves behind.
 ///
 /// [`BodyPlan::None`] completes the send side at the head — the message IS the
@@ -640,6 +670,9 @@ impl Connection<Client, General> {
       // read only behind an offer, and this end records none. See
       // `Exchange::head_digest` for why the field has no absent spelling.
       head_digest: 0,
+      // The RESPONSE this request will draw has not been read, let alone
+      // refused. Set by `connection::refuse` and never cleared.
+      body_refused: false,
     });
     self.send = started(body);
     Ok(written)
@@ -692,6 +725,12 @@ impl Connection<Server, General> {
     let (Some(exchange), SendState::Owed) = (self.exchange, self.send) else {
       return Err(Error::InvalidState(NO_RESPONSE_OWED));
     };
+    // BOTH windows, through the one reader: a driver that stopped at
+    // `Item::Head` and dropped the iterator has not run the pump step that
+    // resolves a head refusal, and this is the call it would make next.
+    if body_refused(&self.recv, &self.exchange) {
+      return Err(Error::InvalidState(REFUSED_BODY_TAKES_NO_INTERIM));
+    }
     if code == SWITCHING_PROTOCOLS {
       return Err(Error::InvalidState(SWITCHING_NEEDS_TUNNEL));
     }
@@ -786,7 +825,16 @@ impl Connection<Server, General> {
       return Err(Error::InvalidState(INTERIM_NOT_FINAL));
     }
     let declared = declared(headers)?;
-    check_response_framing(code, body, &exchange, &declared)?;
+    check_response_framing(
+      code,
+      body,
+      &exchange,
+      &declared,
+      // Both windows, for the reason `send_interim`'s own gate reads both: this
+      // is the call the recommended pump shape makes while the refusal still
+      // lives in the decoder, and it is the one that SPENDS the single answer.
+      body_refused(&self.recv, &self.exchange),
+    )?;
 
     let written = encode_status_head(code, reason, headers, declared.digest, out)?;
     // Committed: the head is written, so the message it framed is under way.
@@ -813,7 +861,7 @@ impl Connection<Server, General> {
     // self-defined length). Announced HERE rather than at
     // [`finish_body`](Self::finish_body) so that a driver knows the connection
     // is ending before it writes the first body octet.
-    if declared.close || matches!(body, BodyPlan::CloseDelimited) {
+    if states_close(&declared, body) {
       signal_close(&mut self.lifecycle, &mut self.event, self.read_closed);
     }
     self.send = started(body);
@@ -1426,14 +1474,37 @@ pub(super) fn announces_octets(declared: &Declared) -> bool {
   !matches!(declared.length, None | Some(0))
 }
 
+/// Whether a response head and its body plan state that the connection ends.
+///
+/// TWO spellings of one fact, and this is the only place they are read as one:
+/// RFC 9112 §9.6's `close` connection option, and §6.3 item 8's close-delimited
+/// framing, which §9.3 makes non-persistent by construction ("all messages on a
+/// connection need to have a self-defined message length"). Factored out so the
+/// gate that REQUIRES the statement and the call that acts on it cannot come to
+/// disagree about what counts as making it.
+fn states_close(declared: &Declared, plan: BodyPlan) -> bool {
+  declared.close || matches!(plan, BodyPlan::CloseDelimited)
+}
+
 /// Checks that a RESPONSE head and the body plan under it frame the same
-/// message, in RFC 9112 §6.3's order of precedence.
+/// message, in RFC 9112 §6.3's order of precedence — and, before any of that,
+/// that a response to a body this end REFUSED states the close it implies.
 fn check_response_framing(
   code: u16,
   plan: BodyPlan,
   exchange: &Exchange,
   declared: &Declared,
+  refused: bool,
 ) -> Result<(), Error> {
+  // Ahead of every framing rule, because it is not one: a body this end refused
+  // to read leaves the connection non-persistent whatever the status, so the
+  // response has to say so. See `REFUSED_BODY_NEEDS_CLOSE`. The parameter is
+  // what makes the arity force any future final-response encoder to supply it,
+  // and `states_close` is the ONE reader of what "states close" means, shared
+  // with the call that actually signals it.
+  if refused && !states_close(declared, plan) {
+    return Err(Error::InvalidState(REFUSED_BODY_NEEDS_CLOSE));
+  }
   // RFC 9112 §6.1, ahead of §6.3's list because it is not a question about where
   // this body ends: "A server MUST NOT send a response containing
   // Transfer-Encoding unless the corresponding request indicates HTTP/1.1 (or

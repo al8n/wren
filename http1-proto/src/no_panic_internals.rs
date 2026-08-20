@@ -3,7 +3,8 @@
 //! Gated behind `test-no-panic`, doc-hidden, and exempt from semver: these
 //! `pub` forwarders expose the crate's leaf entry points so the test can wrap
 //! them in `#[no_panic]` shims — `find_head_end`, `parse_status_line`,
-//! `parse_chunk_size` and `head_digest` — or run them as plain smoke tests,
+//! `parse_chunk_size`, `head_digest` and the body budget's four leaves
+//! (`overruns`, `charge`, `widen`, `headroom`) — or run them as plain smoke tests,
 //! which is what `parse_request_line`, `encode_request_head` and `scan_head`
 //! get. The test file records why each of those three cannot be link-checked;
 //! the reasons are properties of `no-panic` and of the call trees, not of the
@@ -83,6 +84,35 @@ pub fn encode_request_head(
 #[inline]
 pub fn scan_head(head: &[u8]) -> Result<HeadView<'_>, H1Error> {
   crate::head::scan_head(head)
+}
+
+/// Forwards to `crate::body::overruns` — the one spelling of the early-exit
+/// test a count the peer DECLARED is measured against.
+#[inline]
+pub fn overruns(declared: u64, headroom: u64) -> bool {
+  crate::body::overruns(declared, headroom)
+}
+
+/// Forwards to `crate::body::charge` — the checked accumulation that IS the
+/// body bound: every payload octet the crate hands over passes through it, so a
+/// panic edge here would be one on the path of every message with content.
+#[inline]
+pub fn charge(received: u64, n: u64, limit: u64) -> Option<u64> {
+  crate::body::charge(received, n, limit)
+}
+
+/// Forwards to `crate::body::widen` — the saturating conversion that puts a
+/// slice length into the budget's unit.
+#[inline]
+pub fn widen(n: usize) -> u64 {
+  crate::body::widen(n)
+}
+
+/// Forwards to `crate::body::headroom` — what is left of a limit after what has
+/// already been received.
+#[inline]
+pub fn headroom(received: u64, limit: u64) -> u64 {
+  crate::body::headroom(received, limit)
 }
 
 /// Forwards to `crate::connection::head_digest` — the FNV-1a fold a connection

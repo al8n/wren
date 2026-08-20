@@ -82,6 +82,60 @@ its own.
 
 ### Bodies
 
+- **The inbound body is BOUNDED**, per message and in payload octets, and a
+  breach is a POLICY REFUSAL rather than a protocol failure. It was the only
+  unbounded quantity this core handled: a consumer that needed a whole body
+  accumulated the chunks itself and nothing bounded that accumulation, so the
+  crate handed its consumers a denial-of-service surface. No RFC supplies a
+  number — RFC 9110 §8.6: "there is no predefined limit to the length of
+  content" — and §17.5 sanctions the rejection while declining the value, so the
+  ceiling is configurable and its defaults are named `DEFAULT_`.
+  - **`Limits`**, seeded from the connection type being built:
+    `Connection::<Ro, Mo>::default_limits()`, narrowed with
+    `with_max_body_bytes` / `with_max_chunk_framing_bytes`, read back with
+    `max_body_bytes()` / `max_chunk_framing_bytes()`, and applied with
+    `Connection::with_limits`. `Connection::new()` is
+    `with_limits(default_limits())`. The ceiling is written once, at
+    construction: there is no setter and no `&mut` path, and it reaches the
+    receive pump by value.
+  - **Role-dependent defaults** on the sealed `Role` trait.
+    `Server::DEFAULT_MAX_BODY_BYTES` is 1 MiB — nginx's own
+    `client_max_body_size 1m`, and exactly `MAX_HEAD_BYTES × MAX_HEADERS`.
+    `Client::DEFAULT_MAX_BODY_BYTES` is 64 MiB, because RFC 9112 §6.3 item 8's
+    undeclared close-delimited framing is response-only and is where a real
+    ceiling has to exist; it matches `websocket-proto`'s `max_message_size`
+    default. `DEFAULT_MAX_CHUNK_FRAMING_BYTES` is a sixteenth of each (64 KiB,
+    4 MiB) and acts as the FLOOR under a budget resolved from the payload
+    ceiling in force — so raising the payload ceiling carries the framing budget
+    with it rather than leaving a ceiling that ordinary chunked traffic cannot
+    reach.
+  - **`Error::Refused(Refusal::BodyTooLarge { exchange, limit })`**: not an
+    `H1Error`, because nothing on the wire broke a rule. The connection does NOT
+    fail, `poll_event` queues `Event::CloseSignaled` exactly once, `wants_read`
+    goes false, and a server's `is_awaiting_send` stays true until it has
+    written its one answer. `SuggestedStatus::ContentTooLarge` (413, RFC 9110
+    §15.5.14) is what it advises. The payload names the LIMIT, not the observed
+    size, which the peer chooses and may never end.
+  - **`SuggestedStatus::reason()`**: the RFC 9110 §15 reason phrase, so a driver
+    maps a suggested status as `(s.code(), s.reason())` and no variant added
+    later silently degrades to a 400.
+  - **Two new refusals on the send side**, both keyed on a refused body so
+    nothing that works today breaks. A final response to a refused body must
+    state the `close` connection option — RFC 9112 §9.3 makes reading the whole
+    body or closing a MUST and this core has taken the close branch, which RFC
+    9110 §10.1.1 makes a SHOULD to state — and `send_interim` is refused
+    entirely, since a refused exchange owes exactly one final answer.
+  - **An oversized `Content-Length` never invites content**: the head that
+    declares it does not surface `Item::ExpectContinue`, which discharges RFC
+    9110 §10.1.1's first MUST-alternative with no special case.
+  - **Where a breach is found.** A `Content-Length` past the ceiling is refused
+    in the same call that yields `Item::Head`, before an octet is read; a
+    chunked or close-delimited body is refused by a cumulative charge on the one
+    line every payload item leaves through, so the whole offer is refused rather
+    than a legal prefix delivered first. A syntactically malformed element still
+    LATCHES: only a message that parsed can be refused by policy.
+  - **BREAKING at the next publish (0.2.0).** A `Connection::new()` that used to
+    accept any body now refuses one past its role's default.
 - **`body`**: counted, read-to-close, and none, plus a strict **chunked**
   decoder (RFC 9112 §7.1) — `1*HEXDIG` chunk-size with an overflow guard, no
   whitespace after the size, `1*("0")` last-chunk, grammar-checked `chunk-ext`

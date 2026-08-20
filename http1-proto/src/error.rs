@@ -4,6 +4,8 @@
 
 use derive_more::Display;
 
+use crate::event::ExchangeId;
+
 /// Detail payload: where and why a protocol element failed grammar.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Display)]
 #[display("malformed head at byte {at}: {what}")]
@@ -53,6 +55,9 @@ pub enum SuggestedStatus {
   NotImplemented,
   /// `505 HTTP Version Not Supported` (RFC 9110 §15.6.6).
   VersionNotSupported,
+  /// `413 Content Too Large` (RFC 9110 §15.5.14): the content is larger than
+  /// this end is willing to process.
+  ContentTooLarge,
 }
 
 impl SuggestedStatus {
@@ -61,10 +66,75 @@ impl SuggestedStatus {
   pub const fn code(self) -> u16 {
     match self {
       Self::BadRequest => 400,
+      Self::ContentTooLarge => 413,
       Self::UriTooLong => 414,
       Self::FieldsTooLarge => 431,
       Self::NotImplemented => 501,
       Self::VersionNotSupported => 505,
+    }
+  }
+
+  /// The RFC 9110 §15 reason phrase for this status (RFC 6585 §5 for 431).
+  ///
+  /// Exists to retire a defect class rather than for convenience. A driver that
+  /// maps a suggested status through `match code { Some(414) => …, _ => … }`
+  /// silently degrades every variant added afterwards; with this the mapping is
+  /// `(s.code(), s.reason())` and no variant can degrade. The phrase is
+  /// advisory either way — RFC 9112 §4 makes `reason-phrase` optional and
+  /// unexamined by the client.
+  #[inline(always)]
+  pub const fn reason(self) -> &'static str {
+    match self {
+      Self::BadRequest => "Bad Request",
+      Self::ContentTooLarge => "Content Too Large",
+      Self::UriTooLong => "URI Too Long",
+      Self::FieldsTooLarge => "Request Header Fields Too Large",
+      Self::NotImplemented => "Not Implemented",
+      Self::VersionNotSupported => "HTTP Version Not Supported",
+    }
+  }
+}
+
+/// A LOCAL policy limit refused a message the peer framed correctly.
+///
+/// Deliberately NOT an [`H1Error`]: nothing on the wire broke a rule, so this
+/// is not a violation, the connection does NOT enter its failed state, and
+/// [`send_error_response`](crate::Connection::send_error_response) stays
+/// unreachable. RFC 9110 §15.5.14 names this as a double MAY — "The server MAY
+/// terminate the request, if the protocol version in use allows it; otherwise,
+/// the server MAY close the connection" — and this core takes the second
+/// branch, because HTTP/1.1 has no way to terminate one request without the
+/// connection.
+///
+/// What a refused connection still owes: on a SERVER, exactly one final
+/// response, and it must state the `close` connection option (RFC 9110 §10.1.1
+/// makes stating it a SHOULD, and RFC 9112 §9.3 makes closing the branch this
+/// end has taken). On a CLIENT there is nothing to write; the prefix of the
+/// body already handed over is not the representation, since RFC 9112 §8
+/// requires an incomplete response to be recorded as incomplete, and this one
+/// ends in an error rather than in a completion.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Refusal {
+  /// The message's content exceeded the limit in force for it.
+  #[error("inbound body exceeds the {limit}-octet limit in force for this message")]
+  BodyTooLarge {
+    /// The exchange whose body was refused.
+    exchange: ExchangeId,
+    /// The LIMIT that refused it, not the observed size — the observed size is
+    /// unbounded and unknowable, since the peer may never stop. The same choice
+    /// [`H1Error::HeadTooLarge`] already makes.
+    limit: u64,
+  },
+}
+
+impl Refusal {
+  /// The response status a server driver is advised to answer this refusal
+  /// with.
+  #[inline(always)]
+  pub const fn suggested_status(self) -> SuggestedStatus {
+    match self {
+      Self::BodyTooLarge { .. } => SuggestedStatus::ContentTooLarge,
     }
   }
 }
@@ -149,6 +219,13 @@ pub enum Error {
   /// A protocol violation on the wire.
   #[error(transparent)]
   Protocol(#[from] H1Error),
+  /// This end's own POLICY refused a well-formed message.
+  ///
+  /// NOT terminal, and that is the difference from
+  /// [`Protocol`](Self::Protocol): the connection has not failed, a server
+  /// still owes exactly one response, and that response must state `close`.
+  #[error(transparent)]
+  Refused(#[from] Refusal),
 }
 
 impl Error {
@@ -168,6 +245,7 @@ impl Error {
   pub const fn suggested_status(&self) -> Option<SuggestedStatus> {
     match self {
       Self::Protocol(e) => Some(e.suggested_status()),
+      Self::Refused(r) => Some(r.suggested_status()),
       Self::BufferTooSmall { .. } | Self::InvalidState(_) => None,
     }
   }

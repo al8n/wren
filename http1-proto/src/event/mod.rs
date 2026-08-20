@@ -298,6 +298,13 @@ pub struct Items<'a, 'c> {
   /// Whether the connection is a client, off the type-state: the pump is one
   /// non-generic function, so the role reaches it as a value.
   pub(crate) is_client: bool,
+  /// The operator's ceiling on the payload octets one inbound body may deliver.
+  ///
+  /// BY VALUE, and that is the property rather than an economy: the pump is
+  /// handed a copy of the connection's field, so no step of it can raise the
+  /// ceiling even by accident. It is read once, where a head's framing decision
+  /// builds the decoder that will enforce it.
+  pub(crate) max_body: u64,
   /// A disjoint borrow of the connection's consumed counter. It stays a
   /// connection field rather than a tally kept here, because drop-safety depends
   /// on it: see the paragraph above.
@@ -354,6 +361,7 @@ impl<'a, 'c> Items<'a, 'c> {
   pub(crate) fn new(input: &'a [u8], borrows: Borrows<'c>) -> Self {
     let Borrows {
       is_client,
+      max_body,
       consumed,
       watermark,
       next_exchange,
@@ -372,6 +380,7 @@ impl<'a, 'c> Items<'a, 'c> {
     Self {
       input,
       is_client,
+      max_body,
       consumed,
       watermark,
       next_exchange,
@@ -398,9 +407,23 @@ impl<'a, 'c> Items<'a, 'c> {
   /// and [`consumed`](Self::consumed) is what says how much of the input to drop
   /// before offering the rest.
   ///
-  /// `Err` is a protocol violation, and it is terminal for the connection rather
-  /// than for this call: the connection latches into its failed state and no
-  /// further item can surface after it.
+  /// `Err` is TWO different answers, and a driver that treats them alike loses
+  /// the response it is still allowed to send:
+  ///
+  /// - [`Error::Protocol`] is a wire violation, and it is terminal for the
+  ///   connection rather than for this call: the connection latches into its
+  ///   failed state and no further item can surface after it.
+  /// - [`Error::Refused`] is this end's own POLICY refusing a message the peer
+  ///   framed correctly. The connection has NOT failed. `poll_event` has queued
+  ///   [`Event::CloseSignaled`], [`wants_read`] is false, and a server's
+  ///   [`is_awaiting_send`] is TRUE until it has written its one answer — which
+  ///   must state the `close` connection option (RFC 9112 §9.3). Treating this
+  ///   as terminal drops a `413` the peer is entitled to.
+  ///
+  /// [`Error::Protocol`]: crate::Error::Protocol
+  /// [`Error::Refused`]: crate::Error::Refused
+  /// [`wants_read`]: crate::Connection::wants_read
+  /// [`is_awaiting_send`]: crate::Connection::is_awaiting_send
   // Not `Iterator`: that trait's `next` cannot be fallible, and `Ok(None)` here
   // means "feed me more", which is not iterator exhaustion either — collapsing
   // the two would let a `for` loop silently treat a partial head as the end of

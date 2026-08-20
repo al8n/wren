@@ -322,20 +322,19 @@ async fn refuse<S: Duplex>(
   let (status, rejection) = if error.is_unsupported_version() {
     (426, Rejection::unsupported_version())
   } else {
-    // What the fault deserves is `http1-proto`'s reading of it; the reason
-    // phrase is this layer's, and RFC 9112 §4 leaves it advisory. A code with
-    // no phrase here is answered with §4.2.1's own example rather than with a
-    // phrase that names a different status.
+    // What the fault deserves is `http1-proto`'s reading of it, and so is the
+    // phrase now: taking BOTH off the same value is what stops a status added
+    // there later from silently degrading to a 400 here. RFC 9112 §4 leaves the
+    // phrase advisory either way. A fault that suggests nothing — a caller-side
+    // error, or a handshake fault that is not `http1-proto`'s — is answered
+    // with §4.2.1's own example.
     let suggested = match &error {
-      ServerHandshakeError::Http(fault) => fault.suggested_status().map(|status| status.code()),
+      ServerHandshakeError::Http(fault) => fault.suggested_status(),
       _ => None,
     };
     let (status, reason) = match suggested {
-      Some(414) => (414, "URI Too Long"),
-      Some(431) => (431, "Request Header Fields Too Large"),
-      Some(501) => (501, "Not Implemented"),
-      Some(505) => (505, "HTTP Version Not Supported"),
-      _ => (400, "Bad Request"),
+      Some(status) => (status.code(), status.reason()),
+      None => (400, "Bad Request"),
     };
     (status, Rejection::new(status, reason))
   };

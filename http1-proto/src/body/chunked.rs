@@ -521,7 +521,7 @@ mod tests {
   #[test]
   fn a_partial_chunk_line_asks_for_more_and_consumes_nothing() {
     for n in 0..TWO_CHUNKS.len() {
-      let mut d = BodyDecoder::new(BodyFraming::Chunked);
+      let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
       let mut at = 0usize;
       // Pump the prefix dry; whatever it could not decide must end in
       // need-more-input, never in a violation.
@@ -539,9 +539,9 @@ mod tests {
       assert!(!d.is_finished(), "prefix {n} finished early");
     }
     // The lone-CR cases spelled out, one per line the body has.
-    let mut size = BodyDecoder::new(BodyFraming::Chunked);
+    let mut size = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(size.feed(b"4\r").unwrap(), (0, None));
-    let mut data = BodyDecoder::new(BodyFraming::Chunked);
+    let mut data = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(data.feed(b"4\r\n").unwrap(), (3, None));
     assert_eq!(
       data.feed(b"wiki").unwrap(),
@@ -558,7 +558,7 @@ mod tests {
   // arrives on the following call and nothing is claimed after it.
   #[test]
   fn emits_data_then_trailers_then_finished() {
-    let mut d = BodyDecoder::new(BodyFraming::Chunked);
+    let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(d.feed(b"2;a=b\r\n").unwrap(), (7, None));
     assert_eq!(d.feed(b"hi").unwrap(), (2, Some(BodyItem::Data(b"hi"))));
     assert_eq!(d.feed(b"\r\n").unwrap(), (2, None));
@@ -591,10 +591,10 @@ mod tests {
   // CRLF, and a bare LF standing in for a line terminator.
   #[test]
   fn rejects_chunk_framing_violations_without_a_heap() {
-    let mut hex = BodyDecoder::new(BodyFraming::Chunked);
+    let mut hex = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert!(hex.feed(b"zz\r\nhello\r\n").is_err());
 
-    let mut crlf = BodyDecoder::new(BodyFraming::Chunked);
+    let mut crlf = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(crlf.feed(b"5\r\n").unwrap(), (3, None));
     assert_eq!(
       crlf.feed(b"helloXX").unwrap(),
@@ -602,12 +602,12 @@ mod tests {
     );
     assert!(crlf.feed(b"XX").is_err());
 
-    let mut lf = BodyDecoder::new(BodyFraming::Chunked);
+    let mut lf = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert!(lf.feed(b"5\nhello\r\n").is_err());
 
     // RFC 9112 §6.3: a close before the chunked body's last chunk is a
     // truncated message, not a body that merely ended.
-    let mut cut = BodyDecoder::new(BodyFraming::Chunked);
+    let mut cut = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(cut.feed(b"5\r\n").unwrap(), (3, None));
     assert!(cut.eof().is_err());
   }
@@ -619,7 +619,7 @@ mod tests {
   // on and not the first one seen.
   #[test]
   fn chunk_data_is_counted_not_line_delimited() {
-    let mut d = BodyDecoder::new(BodyFraming::Chunked);
+    let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(d.feed(b"6\r\n").unwrap(), (3, None));
     assert_eq!(
       d.feed(b"a\r\n\r\nb\r\n0\r\n\r\n").unwrap(),
@@ -640,21 +640,21 @@ mod tests {
   // legal, in the trailer section exactly as in a head.
   #[test]
   fn hex_case_and_empty_trailer_values() {
-    let mut lower = BodyDecoder::new(BodyFraming::Chunked);
+    let mut lower = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(lower.feed(b"a\r\n").unwrap(), (3, None));
     assert_eq!(
       lower.feed(b"0123456789\r\n").unwrap(),
       (10, Some(BodyItem::Data(b"0123456789")))
     );
 
-    let mut upper = BodyDecoder::new(BodyFraming::Chunked);
+    let mut upper = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(upper.feed(b"A\r\n").unwrap(), (3, None));
     assert_eq!(
       upper.feed(b"0123456789\r\n").unwrap(),
       (10, Some(BodyItem::Data(b"0123456789")))
     );
 
-    let mut empty = BodyDecoder::new(BodyFraming::Chunked);
+    let mut empty = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     assert_eq!(
       empty.feed(b"0\r\n").unwrap(),
       (3, Some(BodyItem::TrailersStart))
@@ -677,7 +677,10 @@ mod tests {
 #[cfg(all(test, any(feature = "std", feature = "alloc", feature = "no-atomic")))]
 mod heap_tests {
   use super::*;
-  use crate::{body::BodyDecoder, validate::BodyFraming};
+  use crate::{
+    body::{BodyDecoder, BodyFault},
+    validate::BodyFraming,
+  };
 
   /// Everything one decode of a chunked body produced, in wire order.
   #[derive(Debug, Default)]
@@ -696,8 +699,12 @@ mod heap_tests {
   /// connection's receive path would: bytes accumulate in the CALLER's buffer,
   /// `feed` is pumped until it reports no progress, and whatever it did not
   /// consume stays buffered for the next read — this decoder never buffers.
-  fn decode(chunks: &[&[u8]]) -> Result<Decoded, H1Error> {
-    let mut decoder = BodyDecoder::new(BodyFraming::Chunked);
+  // `BodyFault` rather than `H1Error`: the shell's `feed` reports both a wire
+  // violation and a policy refusal now, and these fixtures drive the shell.
+  // Every stream here runs against an unbounded ceiling, so a `TooLarge` from
+  // one would itself be a finding.
+  fn decode(chunks: &[&[u8]]) -> Result<Decoded, BodyFault> {
+    let mut decoder = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
     let mut out = Decoded::default();
     let mut buf = std::vec::Vec::new();
     for chunk in chunks {
@@ -738,7 +745,7 @@ mod heap_tests {
 
   /// Test driver: the decoded octets and whether the trailer section was
   /// announced.
-  fn run(chunks: &[&[u8]]) -> Result<(std::vec::Vec<u8>, bool), H1Error> {
+  fn run(chunks: &[&[u8]]) -> Result<(std::vec::Vec<u8>, bool), BodyFault> {
     let decoded = decode(chunks)?;
     Ok((decoded.data, decoded.trailers_start))
   }
@@ -1019,7 +1026,7 @@ mod heap_tests {
     too_many.extend_from_slice(b"\r\n");
     assert!(matches!(
       run(&[too_many.as_slice()]),
-      Err(H1Error::TooManyHeaders(_))
+      Err(BodyFault::Violation(H1Error::TooManyHeaders(_)))
     ));
 
     // Under the line cap but over the byte cap: the two bounds are independent.
@@ -1031,7 +1038,7 @@ mod heap_tests {
     assert!(too_big.len() > MAX_HEAD_BYTES);
     assert!(matches!(
       run(&[too_big.as_slice()]),
-      Err(H1Error::HeadTooLarge(_))
+      Err(BodyFault::Violation(H1Error::HeadTooLarge(_)))
     ));
   }
 
@@ -1050,7 +1057,7 @@ mod heap_tests {
       b"5\r\nhello\r\n0\r\n",
       b"5\r\nhello\r\n0\r\nX-Sum: ok\r\n",
     ] {
-      let mut decoder = BodyDecoder::new(BodyFraming::Chunked);
+      let mut decoder = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
       let mut at = 0usize;
       loop {
         let (consumed, item) = decoder.feed(prefix.get(at..).unwrap_or_default()).unwrap();
