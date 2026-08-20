@@ -109,14 +109,14 @@ pub(crate) fn pump<'a>(it: &mut Items<'a, '_>) -> Result<Option<Item<'a>>, Error
       Lifecycle::Open | Lifecycle::Closing => {}
     }
 
-    // Matched through `matches!` rather than by holding the borrow across the
-    // call: each step takes `&mut Items` of its own.
-    let step = if matches!(*it.recv, RecvState::AwaitingRearm) {
-      rearm(it)
-    } else if matches!(*it.recv, RecvState::Body { .. }) {
-      body(it)?
-    } else {
-      head(it)?
+    // Exhaustive so a variant added to `RecvState` is named here rather than
+    // falling into a catch-all: no arm binds a field, so this reads the
+    // discriminant of `*it.recv` without holding a borrow across the call —
+    // each step still takes `&mut Items` of its own.
+    let step = match *it.recv {
+      RecvState::AwaitingRearm => rearm(it),
+      RecvState::Body { .. } => body(it)?,
+      RecvState::Idle => head(it)?,
     };
 
     match step {
