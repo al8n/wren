@@ -131,6 +131,51 @@ fn an_empty_parameter_is_skipped_not_a_violation() {
   assert!(member.params().next().is_none());
 }
 
+#[test]
+fn a_supplied_predicate_admits_a_name_is_token_refuses() {
+  fn solidus_ok(name: &[u8]) -> bool {
+    match name.iter().position(|b| *b == b'/') {
+      Some(at) => match (name.get(..at), name.get(at.saturating_add(1)..)) {
+        (Some(ty), Some(sub)) => is_token(ty) && is_token(sub),
+        _ => false,
+      },
+      None => false,
+    }
+  }
+
+  // `is_token` refuses this today, which is the whole of issue #42.
+  assert!(!is_token(b"application/json"));
+
+  let mut walk =
+    parameterised_list_with([b"application/json;charset=utf-8".as_slice()], solidus_ok);
+  let member = walk
+    .next()
+    .expect("one member")
+    .expect("the predicate admits it");
+  assert_eq!(member.name(), b"application/json");
+  let mut params = member.params();
+  assert_eq!(
+    params.next().expect("one parameter").expect("well formed"),
+    (b"charset".as_slice(), ParamValue::Token(b"utf-8"))
+  );
+  assert!(params.next().is_none());
+  assert!(walk.next().is_none());
+}
+
+#[test]
+fn parameterised_list_still_refuses_a_non_token_name() {
+  let mut walk = parameterised_list([b"application/json".as_slice()]);
+  assert_eq!(walk.next(), Some(Err(ListError::NotAToken)));
+}
+
+#[test]
+fn has_bare_comma_ignores_a_comma_inside_a_quoted_string() {
+  assert!(!has_bare_comma(b"text/plain;boundary=\"a,b\""));
+  assert!(has_bare_comma(b"text/plain, text/html"));
+  assert!(has_bare_comma(b"text/plain,"));
+  assert!(!has_bare_comma(b"text/plain"));
+}
+
 /// Tests that collect into a `Vec`: gated to the tiers that have a heap, since
 /// the bare `no_std` tier has neither an allocator nor the `alloc as std` alias.
 #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
