@@ -40,7 +40,14 @@ weight applies and nothing about what to serve.
   contain. Three parts of it are readings rather than answers §12.5.1 gives and
   ship as implementation-defined determinism; they are named in the function's
   own doc. `Weight::ZERO` both for a matching range that says `q=0` and for a
-  candidate nothing matched (§12.4.3).
+  candidate nothing matched (§12.4.3). A range's parameter matches a
+  candidate's when the NAMES agree ASCII-case-insensitively (§5.6.6) and the
+  values agree byte-exact after unescaping — except `charset`, which folds ASCII
+  case because §8.3.2 says "In both cases, charset names are matched
+  case-insensitively". That exception is load-bearing rather than cosmetic:
+  without it `text/plain;charset=UTF-8;q=0` would not match a candidate spelling
+  its charset `utf-8`, and the field's own refusal would be answered with the
+  weight of whatever coarser range sat behind it.
 - **`Weight`**: a §12.4.2 `qvalue` in thousandths, `0..=1000`. Fixed point rather
   than a float, because the grammar is already fixed point and this core compares
   weights exactly, on tiers with no FPU and under a link-time no-panic proof.
@@ -75,11 +82,14 @@ weight applies and nothing about what to serve.
   `range_from` uses it to unescape a `q` parameter's digits before
   `parse_qvalue` reads them. `eq_unescaped_ignore_ascii_case` has no internal
   caller yet — it answers the common question ("is this charset utf-8?")
-  without a buffer, for whoever asks it next. None of the three fold case:
-  §8.3.1 says parameter values "might or might not be case-sensitive,
-  depending on the semantics of the parameter name", which is each
-  registration's business rather than this crate's. Parameter NAMES compare
-  ASCII-case-insensitively regardless (§5.6.6).
+  without a buffer, for whoever asks it next. Neither `unescaped` nor
+  `unescape_into` folds case, and the folding one says so in its name: §8.3.1
+  says parameter values "might or might not be case-sensitive, depending on the
+  semantics of the parameter name", so which of them fold belongs to the field
+  asking rather than to these three. `same_value` is where the media surface
+  answers it, and RFC 9110 answers it for exactly one parameter — see
+  `weight_for` above. Parameter NAMES compare ASCII-case-insensitively
+  regardless (§5.6.6).
 - **`ListMember` now derives `Eq` and `PartialEq`**, comparing a member's bytes
   as written; `MediaType` and `MediaRange` reuse it through their own derives.
 

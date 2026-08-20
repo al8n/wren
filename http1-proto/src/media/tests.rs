@@ -470,11 +470,130 @@ fn parameter_values_compare_after_unescaping_and_byte_exact() {
     ),
     Ok(Weight(600))
   );
-  // Case is NOT folded: which parameters fold is each registration's business,
-  // so a value-case-different range falls through to the coarser match.
+  // Byte-exact is the DEFAULT, not the whole rule: §8.3.1 leaves which
+  // parameters fold to each registration, so a parameter RFC 9110 says nothing
+  // about compares as written and a case-different range falls through to the
+  // coarser match. `charset`, which RFC 9110 DOES settle, is the one exception
+  // and has its own tests below.
+  let boundary = media_type(b"multipart/form-data;boundary=abc").expect("valid");
   assert_eq!(
-    weight_for(&m, [b"text/html;charset=UTF-8;q=0.6, */*;q=0.1".as_slice()]),
+    weight_for(
+      &boundary,
+      [b"multipart/form-data;boundary=ABC;q=0.6, */*;q=0.1".as_slice()]
+    ),
     Ok(Weight(100))
+  );
+}
+
+#[test]
+fn a_charset_value_folds_case_so_a_q_zero_range_is_not_escaped() {
+  // §8.3.2: "In the fields defined by this document, charset names appear
+  // either in parameters (Content-Type), or, for Accept-Encoding, in the form
+  // of a plain token. In both cases, charset names are matched
+  // case-insensitively."
+  //
+  // The sharp case, and why this is not cosmetic: a field that refuses this
+  // representation OUTRIGHT must not be answered with the full weight of the
+  // range behind it. Comparing `charset` byte-exact makes the `q=0` range miss
+  // and the bare `text/plain` range win, which tells a server to serve, at
+  // weight 1, what the client just refused.
+  let m = media_type(b"text/plain;charset=utf-8").expect("valid");
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"text/plain;charset=UTF-8;q=0, text/plain;q=1".as_slice()]
+    ),
+    Ok(Weight::ZERO)
+  );
+  // The same fold the other way round — the candidate is the upper-case one —
+  // and through a quoted-string, since §5.6.6 makes the two forms one value.
+  let upper = media_type(b"text/plain;charset=UTF-8").expect("valid");
+  assert_eq!(
+    weight_for(
+      &upper,
+      [b"text/plain;charset=\"utf-8\";q=0, text/plain;q=1".as_slice()]
+    ),
+    Ok(Weight::ZERO)
+  );
+  // And it is a MATCH, not merely a refusal: the folded range wins its own
+  // weight where the coarser one would otherwise have given `0.1`.
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"text/plain;charset=UTF-8;q=0.6, */*;q=0.1".as_slice()]
+    ),
+    Ok(Weight(600))
+  );
+  // §5.6.6 makes the parameter NAME case-insensitive, so the exception is
+  // selected by which parameter this is rather than by how it is spelled.
+  let named = media_type(b"text/plain;Charset=utf-8").expect("valid");
+  assert_eq!(
+    weight_for(
+      &named,
+      [b"text/plain;CHARSET=UTF-8;q=0, text/plain;q=1".as_slice()]
+    ),
+    Ok(Weight::ZERO)
+  );
+}
+
+#[test]
+fn a_charset_differing_in_value_still_does_not_match() {
+  // The mirror of the test above, and what keeps it from being "charset always
+  // matches": folding CASE is not folding the value. Two different charset
+  // names are two different values, so the `q=0` range does not apply and the
+  // wildcard behind it does.
+  let m = media_type(b"text/plain;charset=utf-8").expect("valid");
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"text/plain;charset=ISO-8859-1;q=0, */*;q=0.1".as_slice()]
+    ),
+    Ok(Weight(100))
+  );
+  // Nor is it a prefix match, in either direction.
+  assert_eq!(
+    weight_for(&m, [b"text/plain;charset=UTF-88;q=0, */*;q=0.1".as_slice()]),
+    Ok(Weight(100))
+  );
+  assert_eq!(
+    weight_for(&m, [b"text/plain;charset=UTF;q=0, */*;q=0.1".as_slice()]),
+    Ok(Weight(100))
+  );
+}
+
+#[test]
+fn a_non_charset_parameter_value_still_compares_byte_exact() {
+  // The exception stays an exception. RFC 9110 gives `boundary` no case rule
+  // at all, so a range whose `boundary` differs only in case does not match
+  // and a `q=0` on it does not reach this candidate.
+  let m = media_type(b"multipart/form-data;boundary=AbC").expect("valid");
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"multipart/form-data;boundary=abc;q=0, */*;q=0.1".as_slice()]
+    ),
+    Ok(Weight(100))
+  );
+  // The same for a parameter that merely LOOKS like the exception: the rule is
+  // on the name `charset`, not on anything that contains it.
+  let near = media_type(b"text/html;charsets=UTF-8").expect("valid");
+  assert_eq!(
+    weight_for(
+      &near,
+      [b"text/html;charsets=utf-8;q=0, */*;q=0.1".as_slice()]
+    ),
+    Ok(Weight(100))
+  );
+  let level = media_type(b"text/html;level=A").expect("valid");
+  assert_eq!(
+    weight_for(&level, [b"text/html;level=a;q=0, */*;q=0.1".as_slice()]),
+    Ok(Weight(100))
+  );
+  // …and byte-exact still ADMITS the identical value, so those three are
+  // matching failures rather than a parameter that can never match at all.
+  assert_eq!(
+    weight_for(&m, [b"multipart/form-data;boundary=AbC;q=0".as_slice()]),
+    Ok(Weight::ZERO)
   );
 }
 
