@@ -952,7 +952,7 @@ pub enum ListError {
 pub enum ParamValue<'a> {
   /// The parameter carried no `=`. RFC 9110 §5.6.6's `parameter` requires one;
   /// the fields whose parameters are optional-valued write that themselves, as
-  /// RFC 6455 §9.1's `extension-param = token [ "=" ( token / quoted-string ) ]`
+  /// RFC 6455 §9.1's `extension-param = token [ "=" (token | quoted-string) ]`
   /// does.
   None,
   /// A bare token (RFC 9110 §5.6.2).
