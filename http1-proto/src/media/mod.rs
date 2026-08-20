@@ -40,10 +40,9 @@ pub enum MediaError {
   ValuelessParameter,
   /// A parameter named `q` whose value is not RFC 9110 §12.4.2's `qvalue`.
   ///
-  /// `accept` and `weight_for` only (plain code spans, not links, because
-  /// neither exists yet; Task 7 restores both once they do): `Content-Type`
-  /// has no weight grammar, so [`media_type`] yields a parameter named `q`
-  /// like any other and never produces this.
+  /// [`accept`] and [`weight_for`] only: `Content-Type` has no weight grammar,
+  /// so [`media_type`] yields a parameter named `q` like any other and never
+  /// produces this.
   #[error("the q parameter's value is not a qvalue")]
   BadWeight,
   /// A quoted value crosses an RFC 9110 §5.2 field-line join, so it is well
@@ -57,6 +56,18 @@ pub enum MediaError {
   /// than a value to recover from.
   #[error("Content-Type is a singleton field and this value is a list")]
   NotASingleton,
+  /// [`weight_for`] only: the candidate carries more parameter instances than
+  /// [`MAX_TRACKED_PARAMS`], and the match would have had to look past the last
+  /// one it can record.
+  ///
+  /// Nothing here is malformed — RFC 9110 §5.6.6 bounds `parameters` nowhere —
+  /// so this names a limit of a no-alloc match rather than a fault the sender
+  /// committed, which is why it is its own variant rather than a
+  /// [`Parameters`](Self::Parameters) detail. One condition, one
+  /// representation, the same rule that lifts
+  /// [`ValueSpansFieldLines`](Self::ValueSpansFieldLines) out of that variant.
+  #[error("candidate carries more parameters than the match can track")]
+  TooManyParameters,
 }
 
 impl From<ListError> for MediaError {
@@ -425,6 +436,197 @@ where
     Err(ListError::NotAToken) => Err(MediaError::NotAMediaType),
     Err(other) => Err(MediaError::from(other)),
   })
+}
+
+/// The most parameter instances a candidate may carry while a range's own
+/// parameters are matched against it.
+///
+/// RFC 9110 bounds `parameters` nowhere, so this is a bound of the WALK rather
+/// than of the grammar. [`weight_for`] matches a range's parameters against a
+/// candidate's per INSTANCE, which means remembering which of the candidate's
+/// instances it has already spent; a no-alloc core cannot grow that memory, so
+/// the record is a fixed array of this many slots. A match that would have to
+/// look past the last slot yields [`MediaError::TooManyParameters`] rather than
+/// a weight read off the parameters it could see.
+///
+/// Two things this deliberately does NOT bound. It does not bound a range's own
+/// parameters, which are walked without a record. And it does not reach a
+/// candidate at all unless the range carries a parameter: `*/*`, `text/*` and
+/// `text/plain` spend no slot, so they keep matching a candidate with any
+/// number of parameters.
+///
+/// A parse-constant like [`MAX_HEADERS`](crate::MAX_HEADERS), not a
+/// [`Limits`](crate::Limits) knob: the storage is in the binary, so a caller
+/// cannot raise it.
+pub const MAX_TRACKED_PARAMS: usize = 16;
+
+/// Whether two parameter values are the same value.
+///
+/// RFC 9110 §5.6.6: "A parameter value that matches the token production can be
+/// transmitted either as a token or within a quoted-string." and "The quoted
+/// and unquoted values are equivalent." §5.6.4 adds the recipient MUST that
+/// removes `quoted-pair` escapes. Byte-exact after both, and NOT case-folded:
+/// §8.3.1 says "Parameter values might or might not be case-sensitive,
+/// depending on the semantics of the parameter name", which is each
+/// registration's business rather than this crate's.
+fn same_value(a: ParamValue<'_>, b: ParamValue<'_>) -> bool {
+  a.unescaped().eq(b.unescaped())
+}
+
+/// How specific a shape is: smaller wins. `type/subtype` 0, `type/*` 1,
+/// `*/*` 2 — items 2, 3 and 4 of §12.5.1's printed precedence list.
+const fn shape_rank(range: &MediaRange<'_>) -> u8 {
+  match (range.ty, range.subtype) {
+    (Some(_), Some(_)) => 0,
+    (Some(_), None) => 1,
+    (None, _) => 2,
+  }
+}
+
+/// Whether `range` matches `candidate`, and with how many parameter instances.
+///
+/// `None` for no match. `Some(n)` where `n` counts the range's own parameter
+/// instances other than `q`, all of which found their own counterpart.
+///
+/// # Errors
+///
+/// A [`MediaError`] the candidate's own parameter walk produced, or
+/// [`MediaError::TooManyParameters`] when the match would have to look past
+/// [`MAX_TRACKED_PARAMS`] candidate instances.
+fn matched_instances(
+  range: &MediaRange<'_>,
+  candidate: &MediaType<'_>,
+) -> Result<Option<usize>, MediaError> {
+  // Shape decides the type/subtype test, per §12.5.1's two named wildcards.
+  // `MediaType` stores the two tokens as bytes; `ty()`/`subtype()` are the
+  // `&str` VIEW of them, so compare the fields, not the accessors.
+  match (range.ty, range.subtype) {
+    (None, _) => {}
+    (Some(ty), None) => {
+      if !ty.eq_ignore_ascii_case(candidate.ty) {
+        return Ok(None);
+      }
+    }
+    (Some(ty), Some(subtype)) => {
+      if !ty.eq_ignore_ascii_case(candidate.ty) || !subtype.eq_ignore_ascii_case(candidate.subtype)
+      {
+        return Ok(None);
+      }
+    }
+  }
+
+  // Per INSTANCE: each parameter the range carries must find its own
+  // counterpart, so a doubled range parameter needs a doubled candidate one.
+  // `taken` marks the candidate instances already spent, by position.
+  let mut taken = [false; MAX_TRACKED_PARAMS];
+  let mut count = 0usize;
+  for param in range.params() {
+    let (name, value) = param.map_err(MediaError::from)?;
+    let mut found = false;
+    // First fit, and that is a MAXIMUM matching only because the predicate
+    // below is a conjunction of two equivalence relations — name equality
+    // ASCII-case-insensitively, value equality after unescaping. Those make the
+    // range-to-candidate graph a disjoint union of complete blocks, in which no
+    // choice can strand an augmenting path. Fold case for some registered
+    // parameter, or admit a prefix or subset match, and the blocks stop being
+    // complete: first fit then silently stops being maximum and undercounts.
+    for (at, candidate_param) in candidate.params().enumerate() {
+      let (candidate_name, candidate_value) = candidate_param.map_err(MediaError::from)?;
+      let Some(slot) = taken.get_mut(at) else {
+        // Past what this walk can track: refuse rather than answer wrongly.
+        return Err(MediaError::TooManyParameters);
+      };
+      // §5.6.6: "Parameter names are case-insensitive".
+      if !*slot && candidate_name.eq_ignore_ascii_case(name) && same_value(value, candidate_value) {
+        *slot = true;
+        found = true;
+        break;
+      }
+    }
+    if !found {
+      return Ok(None);
+    }
+    count = count.saturating_add(1);
+  }
+  Ok(Some(count))
+}
+
+/// The weight an `Accept` field gives `candidate` (RFC 9110 §12.5.1).
+///
+/// §12.5.1: "The media type quality factor associated with a given type is
+/// determined by finding the media range with the highest precedence that
+/// matches the type."
+///
+/// Precedence is a lexicographic key over the ranges that matched: shape
+/// (`type/subtype`, then `type/*`, then `*/*`), then matched parameter
+/// instances (more first), then field order (first first). The key GENERATES
+/// §12.5.1's printed four-item list rather than transcribing it, which is what
+/// ranks a parameterised wildcard above its bare form — a pair that list does
+/// not contain.
+///
+/// Three parts of that are READINGS rather than answers §12.5.1 gives, and they
+/// ship as implementation-defined determinism — stable, not uniquely
+/// conforming. Shape dominating matched-parameter count is one: `text/plain`
+/// outranks `text/*;format=flowed`, and §12.5.1 orders that pair nowhere. Field
+/// order settling every residual tie is the second. Matching a duplicated
+/// parameter name per INSTANCE rather than by set membership is the third — a
+/// range naming `a` twice matches only a candidate offering two, so repeating a
+/// parameter cannot buy precedence.
+///
+/// Parameter names compare ASCII-case-insensitively and values compare
+/// byte-exact after unescaping. Values are NOT case-folded: §8.3.1 says
+/// "Parameter values might or might not be case-sensitive, depending on the
+/// semantics of the parameter name", so which of them fold is each
+/// registration's business rather than this crate's. The consequence is worth
+/// stating rather than leaving to be discovered — a field saying
+/// `text/html;charset=UTF-8;q=0.6, */*;q=0.1` gives the candidate
+/// `text/html;charset=utf-8` a weight of `0.1`, because the specific range does
+/// not match and the walk falls through. A candidate carrying parameters the
+/// range does not name DOES still match, which is how `text/*` matches
+/// `text/html;level=3`.
+///
+/// [`Weight::ZERO`] is the answer both for a matching range that says `q=0` and
+/// for a candidate nothing matched. §12.4.3: "If no wildcard is present, values
+/// that are not explicitly mentioned in the field are considered unacceptable."
+///
+/// This answers what weight applies to ONE candidate; ranking a caller's
+/// candidates is the caller's own loop over this.
+///
+/// # Errors
+///
+/// Any [`MediaError`] the walk produces. A malformed field yields `Err` rather
+/// than a weight, because a walker that cannot tell a separator from data
+/// cannot say which ranges the field named. Also
+/// [`MediaError::TooManyParameters`], which is about the CANDIDATE rather than
+/// the field: see [`MAX_TRACKED_PARAMS`].
+pub fn weight_for<'a, I>(candidate: &MediaType<'_>, accept_lines: I) -> Result<Weight, MediaError>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  let mut best: Option<((u8, usize, usize), Weight)> = None;
+  for (at, range) in accept(accept_lines).enumerate() {
+    let range = range?;
+    let Some(matched) = matched_instances(&range, candidate)? else {
+      continue;
+    };
+    // `usize::MAX - matched` inverts "more is better" into "smaller wins"
+    // without a signed key; `saturating_sub` keeps it off the lint wall.
+    // `core::cmp::Reverse(matched)` is NOT the simplification it looks like:
+    // it makes `best`'s annotation `Option<((u8, Reverse<usize>, usize),
+    // Weight)>`, which `clippy::type_complexity` rejects under `-D warnings`.
+    // Checked, not assumed.
+    //
+    // `at` and the strict `<` below are redundant with each other, and both
+    // stay. `at` is what makes the key TOTAL — no two ranges can tie — and the
+    // strict `<` is what keeps the first of any tie. Dropping either one alone
+    // still answers first-in-field-order; dropping both answers LAST, which is
+    // a different contract. Neither is dead code because of the other.
+    let key = (shape_rank(&range), usize::MAX.saturating_sub(matched), at);
+    if best.is_none_or(|(best_key, _)| key < best_key) {
+      best = Some((key, range.weight()));
+    }
+  }
+  Ok(best.map_or(Weight::ZERO, |(_, weight)| weight))
 }
 
 #[cfg(test)]

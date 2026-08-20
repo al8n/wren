@@ -243,6 +243,388 @@ fn a_valueless_q_is_a_grammar_fault_not_a_bad_weight() {
   );
 }
 
+/// RFC 9110 §12.5.1's worked example.
+const TABLE_5_FIELD: &[u8] = b"text/*;q=0.3, text/plain;q=0.7, text/plain;format=flowed, \
+    text/plain;format=fixed;q=0.4, */*;q=0.5";
+
+#[test]
+fn rfc_9110_table_5() {
+  // The last row is `0.3`, NOT the `0.7` §12.5.1 prints: verified erratum 7138
+  // corrects it, a leftover from RFC 7231's version of the example. The
+  // section's own rules give the same answer independently —
+  // `text/html;level=3` matches only `text/*;q=0.3` and `*/*;q=0.5`, and
+  // `text/*` is the more specific shape.
+  for (candidate, expected) in [
+    (b"text/plain;format=flowed".as_slice(), 1000),
+    (b"text/plain", 700),
+    (b"text/html", 300),
+    (b"image/jpeg", 500),
+    (b"text/plain;format=fixed", 400),
+    (b"text/html;level=3", 300),
+  ] {
+    let m = media_type(candidate).expect("valid candidate");
+    assert_eq!(
+      weight_for(&m, [TABLE_5_FIELD]),
+      Ok(Weight(expected)),
+      "{:?}",
+      candidate
+    );
+  }
+}
+
+#[test]
+fn rfc_7231_table_is_reproduced_too() {
+  // A second worked example, richer in parameterised ranges than RFC 9110's.
+  // `text/html;level=3` is 0.7 HERE and 0.3 in RFC 9110's, because the fields
+  // differ — this is the row erratum 7138 traces.
+  const FIELD: &[u8] = b"text/*;q=0.3, text/html;q=0.7, text/html;level=1, \
+                         text/html;level=2;q=0.4, */*;q=0.5";
+  for (candidate, expected) in [
+    (b"text/html;level=1".as_slice(), 1000),
+    (b"text/html", 700),
+    (b"text/plain", 300),
+    (b"image/jpeg", 500),
+    (b"text/html;level=2", 400),
+    (b"text/html;level=3", 700),
+  ] {
+    let m = media_type(candidate).expect("valid candidate");
+    assert_eq!(
+      weight_for(&m, [FIELD]),
+      Ok(Weight(expected)),
+      "{:?}",
+      candidate
+    );
+  }
+}
+
+#[test]
+fn a_parameterised_wildcard_outranks_its_bare_form() {
+  // §12.5.1: "The media-range can include media type parameters that are
+  // applicable to that range." — of ANY shape. A precedence rule transcribed
+  // from the section's four-item printed list gives 0.1 here; the sentence
+  // that generates the list gives 0.9.
+  let m = media_type(b"text/plain;format=flowed").expect("valid");
+  assert_eq!(
+    weight_for(&m, [b"text/*;q=0.1, text/*;format=flowed;q=0.9".as_slice()]),
+    Ok(Weight(900))
+  );
+}
+
+#[test]
+fn a_literal_asterisk_type_is_not_a_wildcard() {
+  let m = media_type(b"application/json").expect("valid");
+  assert_eq!(
+    weight_for(&m, [b"*/json;q=0.9, */*;q=0.1".as_slice()]),
+    Ok(Weight(100)),
+    "*/json is type/subtype with the literal type `*`, and matches nothing real"
+  );
+}
+
+#[test]
+fn shape_beats_parameter_count() {
+  // A recorded READING, not an RFC answer: §12.5.1 orders this pair nowhere.
+  let m = media_type(b"text/plain;format=flowed").expect("valid");
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"text/*;format=flowed;q=0.9, text/plain;q=0.2".as_slice()]
+    ),
+    Ok(Weight(200))
+  );
+}
+
+#[test]
+fn the_three_shapes_compete_at_once_and_the_narrowest_wins() {
+  // Every shape carrying the SAME parameter, so only shape separates them.
+  // Not a row of either RFC's table: both tables' parameterised ranges are
+  // `type/subtype`, so neither exercises a parameterised wildcard losing to a
+  // parameterised exact type.
+  let m = media_type(b"text/plain;format=flowed").expect("valid");
+  for field in [
+    b"*/*;format=flowed;q=0.2, text/*;format=flowed;q=0.5, text/plain;format=flowed;q=0.8"
+      .as_slice(),
+    // Reversed, because a key that depended on field order here would be
+    // reading precedence off the wrong component.
+    b"text/plain;format=flowed;q=0.8, text/*;format=flowed;q=0.5, */*;format=flowed;q=0.2",
+  ] {
+    assert_eq!(weight_for(&m, [field]), Ok(Weight(800)), "{:?}", field);
+  }
+  // And the bare forms of all three lose to the parameterised exact type,
+  // wherever they sit.
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"text/plain;format=flowed;q=0.9, */*;q=0.1, text/*;q=0.3, text/plain;q=0.6".as_slice()]
+    ),
+    Ok(Weight(900))
+  );
+}
+
+#[test]
+fn matched_count_outranks_field_order() {
+  // Two ranges of the SAME shape differing only in how many of the candidate's
+  // parameters they matched. Neither RFC table has this pair either.
+  let m = media_type(b"text/html;a=1;b=2").expect("valid");
+  for field in [
+    b"text/html;a=1;q=0.4, text/html;a=1;b=2;q=0.7".as_slice(),
+    b"text/html;a=1;b=2;q=0.7, text/html;a=1;q=0.4",
+  ] {
+    assert_eq!(weight_for(&m, [field]), Ok(Weight(700)), "{:?}", field);
+  }
+}
+
+#[test]
+fn a_residual_tie_takes_the_first_in_field_order() {
+  // Also a recorded reading. The contract is that the choice is STABLE.
+  let m = media_type(b"text/plain").expect("valid");
+  assert_eq!(
+    weight_for(&m, [b"text/plain;q=0.3, text/plain;q=0.9".as_slice()]),
+    Ok(Weight(300))
+  );
+}
+
+#[test]
+fn duplicate_range_parameters_match_per_instance() {
+  let one = media_type(b"text/html;a=1").expect("valid");
+  let two = media_type(b"text/html;a=1;a=1").expect("valid");
+  let field = [b"text/html;a=1;a=1;q=0.8, text/html;a=1;q=0.3".as_slice()];
+  // The doubled range needs TWO instances and the first candidate has one.
+  assert_eq!(weight_for(&one, field), Ok(Weight(300)));
+  // The second candidate has both, so the doubled range earns its count.
+  assert_eq!(weight_for(&two, field), Ok(Weight(800)));
+}
+
+#[test]
+fn duplicate_instances_pair_up_in_any_order_and_never_inflate_precedence() {
+  // Per instance means PAIRING, not positional equality: `a=2;a=1` against a
+  // candidate's `a=1;a=2` spends both instances and counts two.
+  let both = media_type(b"text/html;a=1;a=2").expect("valid");
+  assert_eq!(
+    weight_for(
+      &both,
+      [b"text/html;a=2;a=1;q=0.8, text/html;a=1;q=0.3".as_slice()]
+    ),
+    Ok(Weight(800))
+  );
+  // A doubled range whose second instance has no unspent counterpart matches
+  // nothing, even though the NAME appears twice on both sides.
+  let twice_the_same = media_type(b"text/html;a=1;a=1").expect("valid");
+  assert_eq!(
+    weight_for(
+      &twice_the_same,
+      [b"text/html;a=1;a=2;q=0.8, text/html;a=1;q=0.3".as_slice()]
+    ),
+    Ok(Weight(300))
+  );
+  // The reading's whole point: repetition may not buy precedence. Under set
+  // membership the tripled range would win with 0.9, and a range that says
+  // strictly less about the candidate would outrank the one that describes it
+  // exactly.
+  let described = media_type(b"text/html;a=1;b=2").expect("valid");
+  assert_eq!(
+    weight_for(
+      &described,
+      [b"text/html;a=1;a=1;a=1;q=0.9, text/html;a=1;b=2;q=0.2".as_slice()]
+    ),
+    Ok(Weight(200))
+  );
+}
+
+#[test]
+fn a_range_parameter_the_candidate_lacks_does_not_match() {
+  let m = media_type(b"text/plain").expect("valid");
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"text/plain;format=flowed;q=0.9, */*;q=0.1".as_slice()]
+    ),
+    Ok(Weight(100))
+  );
+}
+
+#[test]
+fn a_candidate_parameter_the_range_lacks_still_matches() {
+  let m = media_type(b"text/html;level=3").expect("valid");
+  assert_eq!(
+    weight_for(&m, [b"text/*;q=0.3".as_slice()]),
+    Ok(Weight(300))
+  );
+}
+
+#[test]
+fn parameter_values_compare_after_unescaping_and_byte_exact() {
+  let m = media_type(b"text/html;charset=utf-8").expect("valid");
+  // Quoted and unquoted are the same value (§5.6.6).
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"text/html;charset=\"utf-8\";q=0.6, */*;q=0.1".as_slice()]
+    ),
+    Ok(Weight(600))
+  );
+  // Escapes are removed before comparing (§5.6.4's recipient MUST).
+  assert_eq!(
+    weight_for(
+      &m,
+      [b"text/html;charset=\"utf\\-8\";q=0.6, */*;q=0.1".as_slice()]
+    ),
+    Ok(Weight(600))
+  );
+  // Case is NOT folded: which parameters fold is each registration's business,
+  // so a value-case-different range falls through to the coarser match.
+  assert_eq!(
+    weight_for(&m, [b"text/html;charset=UTF-8;q=0.6, */*;q=0.1".as_slice()]),
+    Ok(Weight(100))
+  );
+}
+
+#[test]
+fn parameter_names_compare_case_insensitively() {
+  let m = media_type(b"text/html;Charset=utf-8").expect("valid");
+  assert_eq!(
+    weight_for(&m, [b"text/html;charset=utf-8;q=0.6, */*;q=0.1".as_slice()]),
+    Ok(Weight(600))
+  );
+}
+
+#[test]
+fn an_unmatched_candidate_weighs_zero() {
+  // §12.4.3: "If no wildcard is present, values that are not explicitly
+  // mentioned in the field are considered unacceptable."
+  let m = media_type(b"image/png").expect("valid");
+  assert_eq!(weight_for(&m, [b"text/html".as_slice()]), Ok(Weight::ZERO));
+  assert_eq!(weight_for(&m, [b"".as_slice()]), Ok(Weight::ZERO));
+  // An explicit q=0 is the same answer, and the RFC draws no distinction.
+  assert_eq!(weight_for(&m, [b"*/*;q=0".as_slice()]), Ok(Weight::ZERO));
+}
+
+#[test]
+fn a_malformed_accept_yields_err_not_a_weight() {
+  let m = media_type(b"text/html").expect("valid");
+  assert_eq!(
+    weight_for(&m, [b"text/html;q=blah".as_slice()]),
+    Err(MediaError::BadWeight)
+  );
+}
+
+#[test]
+fn a_candidate_past_the_tracking_bound_is_refused_not_mis_ranked() {
+  // The two fixtures are sized off the published constant.
+  assert_eq!(MAX_TRACKED_PARAMS, 16);
+  const SIXTEEN: &[u8] = b"text/plain;p1=1;p2=2;p3=3;p4=4;p5=5;p6=6;p7=7;p8=8;\
+                           p9=9;p10=10;p11=11;p12=12;p13=13;p14=14;p15=15;p16=16";
+  const SEVENTEEN: &[u8] = b"text/plain;p1=1;p2=2;p3=3;p4=4;p5=5;p6=6;p7=7;p8=8;\
+                             p9=9;p10=10;p11=11;p12=12;p13=13;p14=14;p15=15;p16=16;\
+                             p17=17";
+  let sixteen = media_type(SIXTEEN).expect("valid candidate");
+  let seventeen = media_type(SEVENTEEN).expect("valid candidate");
+  assert_eq!(sixteen.params().count(), MAX_TRACKED_PARAMS);
+  assert_eq!(seventeen.params().count(), MAX_TRACKED_PARAMS + 1);
+  // Every slot reachable: the range's parameter matches none of the sixteen,
+  // so the walk sees all of them and still answers.
+  let field = [b"text/plain;zz=1;q=0.9, */*;q=0.1".as_slice()];
+  assert_eq!(weight_for(&sixteen, field), Ok(Weight(100)));
+  // One instance more than the walk can record: a refusal, never a weight that
+  // silently ignored the parameters it could not see.
+  assert_eq!(
+    weight_for(&seventeen, field),
+    Err(MediaError::TooManyParameters)
+  );
+  // A PARAMETERLESS range spends no slot, so the bound never reaches it and the
+  // same 17-parameter candidate still matches at every shape.
+  for line in [
+    b"*/*;q=0.4".as_slice(),
+    b"text/*;q=0.4",
+    b"text/plain;q=0.4",
+  ] {
+    assert_eq!(
+      weight_for(&seventeen, [line]),
+      Ok(Weight(400)),
+      "{:?}",
+      line
+    );
+  }
+  // Nor is the refusal categorical: a range parameter answered before the
+  // bound never needs a slot past it.
+  assert_eq!(
+    weight_for(&seventeen, [b"text/plain;p1=1;q=0.7".as_slice()]),
+    Ok(Weight(700))
+  );
+}
+
+#[test]
+fn type_and_subtype_compare_case_insensitively() {
+  // RFC 9110 §8.3.1: "The type and subtype tokens are case-insensitive." An RFC
+  // rule rather than one of the readings §5.3's key records, and the only test
+  // in this file that fails if either half of the comparison becomes `!=`.
+  let upper = media_type(b"TEXT/Plain").expect("valid");
+  // `text/*` exercises the type half alone — a `type/*` range never reads a
+  // subtype — and `text/plain` exercises both and outranks it, so the answer
+  // moves whichever half stops folding case: 0.3 if only the subtype does,
+  // 0 if the type does.
+  assert_eq!(
+    weight_for(&upper, [b"text/*;q=0.3, text/plain;q=0.7".as_slice()]),
+    Ok(Weight(700))
+  );
+  // The fold is symmetric, so it also holds with the cases swapped between the
+  // field and the candidate.
+  let lower = media_type(b"text/plain").expect("valid");
+  assert_eq!(
+    weight_for(&lower, [b"TEXT/*;q=0.3, TEXT/PLAIN;q=0.7".as_slice()]),
+    Ok(Weight(700))
+  );
+  // Folding case is not folding tokens together: `html` is still not `plain`,
+  // in any case.
+  assert_eq!(
+    weight_for(&upper, [b"TEXT/HTML;q=0.9, */*;q=0.1".as_slice()]),
+    Ok(Weight(100))
+  );
+}
+
+#[test]
+fn a_field_split_across_lines_is_one_list_with_one_running_order() {
+  // RFC 9110 §5.2 makes a repeated field one comma-joined value, and `accept`
+  // walks the lines as that one list. Two consequences live only here.
+  let m = media_type(b"text/plain").expect("valid");
+  // First: a later line's range is reachable at all, and wins on merit.
+  assert_eq!(
+    weight_for(&m, [b"text/*;q=0.3".as_slice(), b"text/plain;q=0.8"]),
+    Ok(Weight(800))
+  );
+  // Second: the index §5.3's key breaks residual ties on keeps COUNTING across
+  // the join rather than restarting per line. Restarting would give the second
+  // line's range index 0 against the first line's 1, inverting this to 0.9.
+  assert_eq!(
+    weight_for(
+      &m,
+      [
+        b"text/html;q=0.1, text/plain;q=0.3".as_slice(),
+        b"text/plain;q=0.9"
+      ]
+    ),
+    Ok(Weight(300))
+  );
+}
+
+#[test]
+fn a_value_spanning_the_join_surfaces_through_weight_for() {
+  // The design's one partiality: a quoted value opened on one line and closed
+  // on the next is well formed and not one contiguous slice, so it is an error
+  // rather than a weight — and the error has to travel out of `weight_for`,
+  // not be skipped as an unmatched range.
+  let m = media_type(b"text/plain").expect("valid");
+  assert_eq!(
+    weight_for(
+      &m,
+      [
+        b"text/plain;boundary=\"a".as_slice(),
+        b"b\";q=0.5, */*;q=0.1"
+      ]
+    ),
+    Err(MediaError::ValueSpansFieldLines)
+  );
+}
+
 /// Tests that collect into a `Vec`: gated to the tiers that have a heap, since
 /// the bare `no_std` tier has neither an allocator nor the `alloc as std` alias.
 #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
