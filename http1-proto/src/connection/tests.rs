@@ -5282,9 +5282,16 @@ fn a_counted_body_over_the_limit_refuses_without_failing_the_connection() {
 }
 
 // RFC 9112 §7.1 declares no total, ever — a size line announces one chunk — so
-// nothing about eleven one-octet chunks is refusable in advance and only the
-// cumulative charge can bound them. Every octet the ceiling allowed is
-// delivered first, and the refusal falls on the chunk that would pass it.
+// nothing about eleven one-octet chunks is refusable from the head and the
+// bound has to be cumulative. Every octet the ceiling allowed is delivered
+// first, and the eleventh chunk is refused with the ceiling named as the limit.
+//
+// WHERE inside that chunk the refusal falls is not decidable from here, and this
+// test does not claim it: the whole body rides in ONE offer, so a gate at the
+// size line and the shell's charge on the data one call later reach a driver as
+// the same error after the same ten octets. That the size LINE is what answers
+// is `body::tests::a_later_chunk_overrunning_the_remainder_is_refused_at_its_size_line`,
+// which feeds a line whose data has not arrived.
 #[test]
 fn a_chunked_body_over_the_limit_refuses_cumulatively() {
   const HEAD: &[u8] = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -5552,6 +5559,142 @@ fn a_syntactically_malformed_chunk_still_latches_rather_than_refusing() {
   );
   assert!(matches!(c.lifecycle, Lifecycle::Failed));
   assert_eq!(error.suggested_status(), Some(SuggestedStatus::BadRequest));
+}
+
+/// A server whose inbound bodies are bounded at `framing` chunk-framing octets
+/// each, with the payload ceiling left where the role puts it.
+///
+/// The twin of `bounded_server`, and it has to be a separate helper: the two
+/// knobs are not independent, so a test that means to exercise the framing
+/// budget must STATE it rather than reach it by lowering the payload ceiling.
+fn framing_bounded_server(framing: u64) -> Connection<Server, General> {
+  Connection::<Server, General>::with_limits(
+    Connection::<Server, General>::default_limits().with_max_chunk_framing_bytes(framing),
+  )
+}
+
+// PER BODY, like the payload ceiling beside it and for the same reason: RFC 9112
+// §9.3 carries many messages on one connection, and a budget that accumulated
+// across them would refuse a conformant peer for the sins of its earlier
+// requests. Each body here spends the WHOLE budget — nine octets of chunk-size
+// line against nine — so a tally that survived the first would refuse the
+// second's opening line, while one that never started at zero would refuse the
+// first's last.
+#[test]
+fn the_framing_budget_resets_per_body() {
+  const REQUEST: &[u8] = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n\
+1\r\na\r\n1\r\na\r\n0\r\n\r\n";
+  let mut c = framing_bounded_server(9);
+  assert_eq!(drain(&mut c, REQUEST), REQUEST.len(), "the first body");
+  send_bodiless_response(&mut c);
+  assert_eq!(drain(&mut c, REQUEST), REQUEST.len(), "the second body");
+  send_bodiless_response(&mut c);
+  // Two exchanges, both through, and no failure or close along the way.
+  assert_eq!(c.next_exchange, 3);
+  assert!(!matches!(c.lifecycle, Lifecycle::Failed));
+  assert_eq!(c.poll_event(), None);
+}
+
+// THE FRAMING REFUSAL AS A DRIVER SEES IT. RFC 9112 §7.1.1 asks a server to
+// limit "the total length of chunk extensions received in a request" and to
+// "generate an appropriate 4xx (Client Error) response if that amount is
+// exceeded". This core charges the whole size LINE instead, which is stricter
+// and is local policy under RFC 9110 §15.5's 4xx class, so the status it
+// advises is read off that same class — a 4xx, and not the 413 the payload
+// ceiling advises, whose name is about content this message is well inside.
+// Everything else is the refusal disposition its sibling already has: not a
+// failure, one answer still owed, and that answer has to state `close`.
+#[test]
+fn a_chunk_framing_refusal_advises_a_4xx_and_still_owes_one_answer() {
+  const CLOSING_400: &[(&str, &[u8])] = &[("Content-Length", b"0"), ("Connection", b"close")];
+  let mut c = framing_bounded_server(3);
+  let mut delivered = 0usize;
+  let error = {
+    let mut it = c.handle(
+      b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n1\r\na\r\n",
+    );
+    loop {
+      match it.next() {
+        Ok(Some(Item::BodyChunk { data, .. })) => delivered = delivered.saturating_add(data.len()),
+        Ok(Some(_)) => {}
+        Ok(None) => panic!("the offer was exhausted without a refusal"),
+        Err(error) => break error,
+      }
+    }
+  };
+  // One three-octet size line fits the budget, so its chunk is delivered; the
+  // second line is what the budget refuses.
+  assert_eq!(delivered, 1);
+  let Error::Refused(Refusal::ChunkFramingTooLarge { exchange, limit }) = error else {
+    panic!("expected a framing refusal, got {error:?}")
+  };
+  assert_eq!(limit, 3, "the BUDGET that refused, in framing octets");
+  assert_eq!(exchange.get(), 1);
+  assert_eq!(error.suggested_status(), Some(SuggestedStatus::BadRequest));
+  assert_eq!(SuggestedStatus::BadRequest.code(), 400);
+  assert_eq!(SuggestedStatus::BadRequest.reason(), "Bad Request");
+  // NOT a violation: nothing on the wire broke a rule, so the connection is
+  // answerable and RFC 9112 §9.6's notice is given once.
+  assert!(!matches!(c.lifecycle, Lifecycle::Failed));
+  assert!(!c.wants_read());
+  assert!(c.is_awaiting_send());
+  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+
+  let mut out = [0u8; 128];
+  let without_close = c
+    .send_response(400, b"Bad Request", LENGTH_0, BodyPlan::None, &mut out)
+    .unwrap_err();
+  assert!(
+    matches!(without_close, Error::InvalidState(m) if m == REFUSED_BODY_NEEDS_CLOSE),
+    "{without_close:?}"
+  );
+  assert_eq!(out, [0u8; 128], "the one answer was not spent");
+  let n = c
+    .send_response(400, b"Bad Request", CLOSING_400, BodyPlan::None, &mut out)
+    .unwrap();
+  assert_eq!(
+    out.get(..n),
+    Some(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice())
+  );
+}
+
+// THE GRANULARITY THE BUDGET IMPLIES, and the property worth writing down about
+// it: because the budget is a sixteenth of the payload ceiling, the smallest
+// chunk size a FULL body can be sent in does not move with the role. 64-octet
+// chunks spend the budget exactly and die at the last-chunk line at either
+// role; 65-octet chunks fit at either, with room over. Both numbers are read
+// off the resolved limits rather than restated, so a change to the resolution
+// rule moves this test with it.
+#[test]
+fn the_sustainable_chunk_granularity_does_not_move_with_the_role() {
+  // What a whole body of `payload` costs in RFC 9112 §7.1 chunk-size lines at
+  // `chunk` octets per chunk: four octets for every chunk's line — two hex
+  // digits and the CRLF, since 64 and 65 are both `4x` — and three for the
+  // last chunk's `0\r\n`.
+  fn framing_cost(payload: u64, chunk: u64) -> u64 {
+    payload.div_ceil(chunk) * 4 + 3
+  }
+  let server = Connection::<Server, General>::default_limits();
+  let client = Connection::<Client, General>::default_limits();
+  for limits in [server, client] {
+    let payload = limits.max_body_bytes();
+    let budget = limits.max_chunk_framing_bytes();
+    assert!(
+      framing_cost(payload, 64) > budget,
+      "64-octet chunks spend more than the budget"
+    );
+    assert!(
+      framing_cost(payload, 65) <= budget,
+      "65 is the sustainable granularity"
+    );
+  }
+  // And it is the SIXTEENTH that makes the boundary role-independent: the two
+  // roles' ceilings differ by 64, their budgets by the same factor.
+  assert_eq!(client.max_body_bytes() / server.max_body_bytes(), 64);
+  assert_eq!(
+    client.max_chunk_framing_bytes() / server.max_chunk_framing_bytes(),
+    64
+  );
 }
 
 /// Fields a response to a refused body has to carry: RFC 9112 §9.3's close

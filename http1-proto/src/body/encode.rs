@@ -397,7 +397,7 @@ mod tests {
     at += encode_last_chunk_and_trailers(trailers, &mut wire[at..]).unwrap();
     assert_eq!(&wire[..at], b"5\r\nhello\r\n0\r\nX-Sum: ok\r\n\r\n");
 
-    let mut decoder = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut decoder = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     let mut rest: &[u8] = &wire[..at];
     let mut payload = [0u8; 8];
     let mut payload_len = 0usize;

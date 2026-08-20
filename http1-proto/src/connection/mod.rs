@@ -85,7 +85,7 @@ use core::marker::PhantomData;
 use derive_more::Display;
 
 use crate::{
-  body::BodyDecoder,
+  body::{BodyDecoder, Budget},
   error::{Error, H1Error, Refusal},
   event::{Event, ExchangeId, Item, Items},
   head::Version,
@@ -312,6 +312,16 @@ impl Limits {
   ///
   /// Stating it pins it: the budget then no longer moves when the payload
   /// ceiling does.
+  ///
+  /// A body that spends more is refused with
+  /// [`Refusal::ChunkFramingTooLarge`] — policy rather than a protocol failure,
+  /// since every line of such a body was well-formed. The budget bounds a quantity the payload ceiling cannot see:
+  /// `chunk-size = 1*HEXDIG` admits unlimited leading zeros, so a size line may
+  /// announce one octet and cost hundreds.
+  ///
+  /// `0` refuses every chunked body, the empty one included: RFC 9112 §7.1's
+  /// `last-chunk` is itself a size line and is charged like any other. A
+  /// message framed some other way is untouched.
   #[must_use]
   pub const fn with_max_chunk_framing_bytes(self, n: u64) -> Self {
     Self {
@@ -341,6 +351,15 @@ impl Limits {
   /// A consequence worth stating rather than discovering: `u64::MAX >> 4` is
   /// 2⁶⁰, so an unbounded payload ceiling unbounds this too — "unbounded" stays
   /// one knob.
+  ///
+  /// WHAT IS CHARGED against it: the whole chunk-size line — digits,
+  /// `chunk-ext` and the CRLF that ends it — for every chunk of one body, the
+  /// terminating `0\r\n` included. So the budget also fixes the smallest chunk
+  /// a whole body can be sent in, and because it scales with the payload
+  /// ceiling that boundary does not move with the role: 65 octets at either.
+  /// Ordinary traffic is nowhere near the boundary — 1 MiB in 4 KiB chunks, the
+  /// commonest reverse-proxy granularity, writes 256 six-octet size lines and
+  /// spends 1,539 octets of the server's 65,536.
   #[must_use]
   pub const fn max_chunk_framing_bytes(&self) -> u64 {
     match self.framing {
@@ -391,7 +410,12 @@ pub struct BodyProgress {
   ///   the body is over.
   ///
   /// Read immediately after [`Item::Head`] the three cases separate cleanly:
-  /// `Some(total)` is a counted body, `None` is chunked or close-delimited.
+  /// `Some(total)` is a counted body, `None` is chunked or close-delimited —
+  /// with ONE exception, and it falls at exactly this read point. A counted body
+  /// whose declaration was already refused against the ceiling reads `None` too,
+  /// because a refused body has committed to nothing; a driver that takes that
+  /// for chunked streams instead of waiting and meets [`Refusal::BodyTooLarge`]
+  /// on its next pull.
   ///
   /// # The contiguous handover
   ///
@@ -1239,7 +1263,12 @@ impl<Ro, Mo> Connection<Ro, Mo> {
   ///
   /// Observable because a budget that refuses traffic must be readable by the
   /// operator who set the payload ceiling it was resolved from — see
-  /// [`Limits::max_chunk_framing_bytes`].
+  /// [`Limits::max_chunk_framing_bytes`], which also states what is charged
+  /// against it. A body that spends more is refused with
+  /// [`Refusal::ChunkFramingTooLarge`].
+  ///
+  /// PER MESSAGE, like the payload ceiling: every body on a keep-alive
+  /// connection starts with the whole budget.
   #[must_use]
   #[inline]
   pub const fn max_chunk_framing_bytes(&self) -> u64 {
@@ -1319,6 +1348,7 @@ impl<Ro: Role> Connection<Ro, General> {
       pending_cr,
       idle_crlfs,
       max_body,
+      max_chunk_framing,
       ..
     } = self;
     Items::new(
@@ -1328,6 +1358,7 @@ impl<Ro: Role> Connection<Ro, General> {
         // BY VALUE, which is the whole of the "cannot be raised" argument: the
         // pump is handed a copy, so no step of it can write the field back.
         max_body: *max_body,
+        max_chunk_framing: *max_chunk_framing,
         consumed,
         watermark,
         next_exchange,
@@ -1618,6 +1649,9 @@ pub(crate) struct Borrows<'c> {
   /// The operator's ceiling on one inbound body's payload octets. Copied rather
   /// than borrowed, so the pump can read it and cannot write it.
   pub(crate) max_body: u64,
+  /// The budget for one inbound body's RFC 9112 §7.1 chunk-size lines. Copied
+  /// for the same reason, and read at the same one site.
+  pub(crate) max_chunk_framing: u64,
   /// Bytes of the current offer consumed so far.
   pub(crate) consumed: &'c mut usize,
   /// How far into the head being accumulated the scan has looked.
@@ -1922,12 +1956,18 @@ pub(crate) fn refuse(
   read_closed: bool,
   is_client: bool,
   id: ExchangeId,
+  budget: Budget,
 ) -> Refusal {
   // 1. Read the limit off the decoder still sitting in the receive state,
   //    BEFORE step 5 replaces the state that holds it — so a caller cannot get
-  //    the refusal's payload wrong by forgetting to read it first.
+  //    the refusal's payload wrong by forgetting to read it first. WHICH limit
+  //    is the fault's own discriminant: two budgets refuse through this one
+  //    routine and only the comparison that failed knows which it was.
   let limit = match recv {
-    RecvState::Body { decoder, .. } => decoder.limit(),
+    RecvState::Body { decoder, .. } => match budget {
+      Budget::Payload => decoder.limit(),
+      Budget::ChunkFraming => decoder.framing_limit(),
+    },
     // Defensive, and unreachable from either caller: both reach here from a
     // decoder that answered, which only `RecvState::Body` holds one of.
     RecvState::Idle | RecvState::AwaitingRearm => 0,
@@ -1954,10 +1994,18 @@ pub(crate) fn refuse(
   //    server that had already answered, has nothing left and drains.
   settle(recv, exchange, watermark, send, lifecycle, pending_cr);
   // 7. The limit that refused it, not the observed size: the observed size is
-  //    unbounded and unknowable, since the peer may never stop.
-  Refusal::BodyTooLarge {
-    exchange: id,
-    limit,
+  //    unbounded and unknowable, since the peer may never stop. One arm per
+  //    budget, off the same discriminant step 1 read, so the number and the
+  //    variant that names it cannot come apart.
+  match budget {
+    Budget::Payload => Refusal::BodyTooLarge {
+      exchange: id,
+      limit,
+    },
+    Budget::ChunkFraming => Refusal::ChunkFramingTooLarge {
+      exchange: id,
+      limit,
+    },
   }
 }
 

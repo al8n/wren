@@ -248,6 +248,85 @@ borrowed chunk with no copy path anywhere in this core.
   owns no clock. `body_progress().received` is the quantity to sample against
   the driver's own clock, and the socket read deadline is the real control.
 
+## `http1-proto` — cycle 6 (the chunk framing gets a budget of its own)
+
+PR4 of the cycle, and the last of it. A payload ceiling bounds content, and RFC
+9112 §7.1's chunk-size lines are not content: `chunk-size = 1*HEXDIG` admits
+unlimited leading zeros, so 271 of them and a `1` is a 272-octet line that
+parses cleanly, announces ONE payload octet and costs 277 octets of wire. A body
+comfortably inside its ceiling could therefore make this end parse about 277
+wire octets per payload octet, for as long as it liked, because nothing counted
+them. The framing a chunked body may spend is now bounded per message, at the
+one place it is parsed.
+
+### Added
+
+- **A cumulative chunk-framing budget**, charged over the whole chunk-size LINE
+  — digits, `chunk-ext` and the CRLF that ends it — and reset per body. The
+  budget is `Limits::max_chunk_framing_bytes()`, which PR2 already resolved from
+  the payload ceiling in force (a sixteenth of it, floored at the role default);
+  this is the PR that makes it bind. The last chunk's `0\r\n` is charged like
+  every other line, since it comes through the same parse and exempting it would
+  be a second rule.
+
+  **The LINE and not the extension**, which is the whole of why it catches
+  anything: RFC 9112 §7.1.1 asks a server to "limit the total length of chunk
+  extensions received in a request to an amount reasonable for the services
+  provided", and the zero-padding attack above spends 274 framing octets with no
+  extension in it at all. An extension-only budget never sees it.
+
+- **`Refusal::ChunkFramingTooLarge { exchange, limit }`**, whose `limit` is the
+  budget in framing octets. Its advised status is `SuggestedStatus::BadRequest`
+  and not the 413 its sibling advises: RFC 9112 §7.1.1 asks for "an appropriate
+  4xx (Client Error) response if that amount is exceeded", and 413's name — RFC
+  9110 §15.5.14, "Content Too Large" — is about content this message may be well
+  inside. `Refusal` is `#[non_exhaustive]`, so a `_` arm keeps compiling and a
+  driver mapping `(s.code(), s.reason())` answers `400 Bad Request` without
+  changing. Everything else is the refusal disposition PR2 built: not a protocol
+  failure, `Event::CloseSignaled` once, and a server still owing exactly one
+  answer that has to state `close`.
+
+- **The granularity the budget implies, and it does not move with the role.** At
+  a full payload ceiling the smallest chunk size a whole body can be sent in is
+  **65 octets** at either role, because the budget scales with the ceiling: 1 MiB
+  in exactly-64-octet chunks writes 16,384 `40\r\n` lines, spends 65,536 to the
+  byte, and is refused at the terminating `0\r\n` with every payload octet
+  already delivered. 128-octet chunks have 2× margin, and 1 MiB in 4 KiB chunks
+  — the commonest reverse-proxy granularity — writes 256 six-octet size lines
+  and spends 1,539 octets of the 65,536.
+
+### Changed
+
+- **A chunked body over the payload ceiling is now refused at the size LINE**
+  that announces the octets, one chunk ahead of the data, rather than by the
+  cumulative charge as the octets arrive. RFC 9112 §7.1 declares one chunk at a
+  time, so the announcement is measured against what is left of the allowance:
+  the same `Refusal::BodyTooLarge` with the same `limit`, reached sooner, with
+  every octet the ceiling allowed still delivered first.
+- **Syntax still runs before policy**, on both budgets. A line that is not
+  `1*HEXDIG`, or whose extensions break the §7.1.1 grammar, is diagnosed as
+  malformed however far past a budget it also was — only a message that PARSED
+  can be refused by policy — and a line breaching both budgets is refused as
+  framing, deterministically.
+
+### The exposure numbers this changes
+
+- **Per message**: `payload + (5/3) × framing_budget`, plus a trailer section
+  (already capped at 16,384 octets by `MAX_HEAD_BYTES`, with `MAX_HEADERS` over
+  its line count) and one unterminated line. Each chunk spends at least three
+  charged octets, so the budget admits at most `F/3` chunks and the `2F/3`
+  octets of chunk-data CRLF that go with them. At the server defaults that is
+  1 MiB of content plus **109,227 octets** — 106.7 KiB — of framing and
+  chunk-data CRLF.
+- **Per narrowed route**: `Items::limit_body` narrows the PAYLOAD ceiling only —
+  the framing budget belongs to the connection — so a route narrowed to 4 KiB on
+  a connection with a 64 KiB framing budget still admits `4096 + (5/3) × 65,536`
+  ≈ **113,300 octets** (110.7 KiB) of wire. Construct the connection's budget
+  accordingly; there is deliberately no per-route knob for it.
+- **The instantaneous 277:1 ratio is unchanged.** What this bounds is the
+  absolute amount, not the ratio: an attacker still gets 277 wire octets per
+  payload octet, and now runs out.
+
 ## `websocket-proto` — cycle 6 (handshakes on a connection the caller holds)
 
 PR1 of the cycle. Both h1 handshakes can now be driven on a connection the caller

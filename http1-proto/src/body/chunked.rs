@@ -20,6 +20,40 @@
 //! and the trailer section is a field section (RFC 9110 §6.5), so it carries
 //! the head's own caps.
 //!
+//! # Two bounds on chunk framing, and which of them latches
+//!
+//! This module now carries a per-LINE cap and a per-BODY budget, and they end
+//! the connection differently on purpose. The rule they follow, which is the
+//! crate's and not this module's:
+//!
+//! > On an in-flight message whose framing is already decided, a cumulative cap
+//! > on its successfully parsed elements REFUSES, because the connection can
+//! > still answer. A bound that fires BEFORE framing is decided, and a bound
+//! > that caps a SINGLE element's size so that need-more-input stays bounded,
+//! > LATCHES.
+//!
+//! So `MAX_CHUNK_LINE_BYTES` and `MAX_CHUNK_EXT_BYTES` latch — each caps one
+//! element, and the first of them is what keeps a partial line from being an
+//! allocation the peer sizes — while the cumulative chunk-framing budget
+//! refuses, since a message that spent it was well-formed in every line and
+//! this end still owes an answer. Both are local policy and neither number is a
+//! rule of the grammar. What RFC 9112 §7.1.1 asks a server to limit is narrower
+//! than either of them — "the total length of chunk extensions received in a
+//! request", "in the same way that it applies length limitations and timeouts
+//! for other parts of a message" — while what this module caps is the whole
+//! size LINE, a stricter generalization of that ask: the zero-padding line
+//! `read_size_line` documents carries no extension octet at all, so an
+//! extension-only limit never sees it.
+//!
+//! THE GRANDFATHER CLAUSE. The §7.1.2 trailer section's two caps —
+//! `MAX_HEAD_BYTES` over its octets and `MAX_HEADERS` over its lines — are
+//! cumulative over successfully parsed elements of a message whose framing is
+//! decided, so the rule above puts them on the refusing side. They LATCH, and
+//! they stay latching deliberately: they predate the rule, and reclassifying
+//! them is a behavioural change to the trailer path rather than a tidy-up of
+//! this one. Recorded here so the inconsistency is a decision rather than an
+//! accident.
+//!
 //! OFFSETS. Every `MalformedDetail` this module reports is relative to the
 //! slice the current `feed` was handed. A body decoder sees a moving window of
 //! a stream it has no absolute position in — the head that framed the body may
@@ -27,7 +61,7 @@
 //! reference at this layer. The connection state machine, which knows where the
 //! window sat, is what turns such an offset into a position in the stream.
 
-use super::{BodyItem, MAX_CHUNK_EXT_BYTES, claim};
+use super::{BodyFault, BodyItem, Budget, MAX_CHUNK_EXT_BYTES, charge, claim, overruns, widen};
 use crate::{
   error::H1Error,
   grammar::{is_field_vchar, is_token_byte},
@@ -76,19 +110,33 @@ const CHUNK_DATA_CRLF: &str = "chunk-data is not followed by CRLF";
 /// [`is_complete`](Self::is_complete) rather than by emitting `Finished`, so
 /// every framing this core decodes finishes through the same shell.
 ///
-/// An `H1Error` from [`feed`](Self::feed) is terminal for the connection, and
-/// the decoder does not latch it: every rule here is a function of the state
-/// and the bytes offered, so a caller that feeds the same bytes again is
-/// answered the same way rather than being told something new.
+/// A `Violation` from [`feed`](Self::feed) is terminal for the connection and a
+/// `TooLarge` is this end's own budget declining a well-formed one; the decoder
+/// latches neither. Every rule here is a function of the stage, the tally and
+/// the bytes offered, so a caller that feeds the same bytes again is answered
+/// the same way rather than being told something new.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(super) struct Decoder {
   stage: Stage,
+  /// Octets of RFC 9112 §7.1 chunk-size lines this body has spent — digits,
+  /// extension and the CRLF that ends the line.
+  ///
+  /// ONE writer, the commit step of `read_size_line`, which is also the only
+  /// place a size-line octet is consumed. It lives HERE, beside the stage,
+  /// rather than in the shell: a tally born and buried with the sub-machine
+  /// resets per body by construction, with no rule for anyone to remember, and
+  /// it rides inside the same `Copy` the shell's rollback already stores.
+  framing_spent: u64,
 }
 
 impl Decoder {
-  /// Builds a decoder positioned at the first chunk-size line.
+  /// Builds a decoder positioned at the first chunk-size line, with its framing
+  /// budget unspent.
   pub(super) const fn new() -> Self {
-    Self { stage: Stage::Size }
+    Self {
+      stage: Stage::Size,
+      framing_spent: 0,
+    }
   }
 
   /// Whether the trailer section's final CRLF has been consumed — the body's
@@ -124,15 +172,26 @@ impl Decoder {
   /// is needed; a positive count with no item is progress the caller should
   /// keep pumping on (a chunk-size line consumed, a chunk's trailing CRLF), and
   /// is not an end of anything.
+  ///
+  /// `headroom` is what is LEFT of the body's payload allowance and
+  /// `framing_limit` is the whole of its chunk-framing budget, both by value:
+  /// the coding reads them and cannot write them, so neither can be raised by
+  /// anything below this call. Only the chunk-size line is measured against
+  /// either, which is why every other stage answers with an `H1Error` that a
+  /// refusal could not be confused with.
   pub(super) fn feed<'a>(
     &mut self,
+    headroom: u64,
+    framing_limit: u64,
     input: &'a [u8],
-  ) -> Result<(usize, Option<BodyItem<'a>>), H1Error> {
+  ) -> Result<(usize, Option<BodyItem<'a>>), BodyFault> {
     match self.stage {
-      Stage::Size => self.read_size_line(input),
+      Stage::Size => self.read_size_line(headroom, framing_limit, input),
       Stage::Data(remaining) => Ok(self.read_data(remaining, input)),
-      Stage::DataCrlf => self.read_data_crlf(input),
-      Stage::Trailers { bytes, lines } => self.read_trailer_line(bytes, lines, input),
+      Stage::DataCrlf => self.read_data_crlf(input).map_err(BodyFault::Violation),
+      Stage::Trailers { bytes, lines } => self
+        .read_trailer_line(bytes, lines, input)
+        .map_err(BodyFault::Violation),
       // The shell turns a complete sub-machine into `State::Complete` on the
       // same call, so this arm is only reached by a caller pumping a decoder it
       // already owns no bytes of.
@@ -140,16 +199,58 @@ impl Decoder {
     }
   }
 
-  /// Reads `chunk-size [ chunk-ext ] CRLF` (RFC 9112 §7.1).
+  /// Reads `chunk-size [ chunk-ext ] CRLF` (RFC 9112 §7.1), and the only place
+  /// either of a body's two budgets can refuse a chunked message.
   ///
   /// The whole line is decided at once or not at all: a size without the CRLF
   /// that ends its line is a length the next read could still change, and
   /// acting on it is how two recipients end up disagreeing about where the
   /// chunk-data begins (§11.2).
+  ///
+  /// # Four steps, in this order, and the order is the specification
+  ///
+  /// **(a) Delimit.** A partial line proves nothing, so it charges nothing and
+  /// consumes nothing; an over-long unterminated line is the pre-framing bound
+  /// and latches.
+  ///
+  /// **(b) Syntax.** The line-length cap, `chunk-size = 1*HEXDIG`, the
+  /// extension cap and the extension grammar, all latching. Policy may only
+  /// refuse an element that PARSED: a malformed line is diagnosed as malformed
+  /// however far past a budget it also was.
+  ///
+  /// **(c1) The framing budget**, then **(c2) the payload announcement**. Both
+  /// answer BEFORE the tally and the stage are written, so a refusal of either
+  /// kind consumes nothing and leaves the sub-machine exactly where the call
+  /// found it. The order between them decides one thing and decides it
+  /// deterministically: a line that breaches both is refused as framing.
+  ///
+  /// **(d) Commit.** The tally, then the stage.
+  ///
+  /// # Why the LINE is charged rather than the extension
+  ///
+  /// RFC 9112 §7.1.1 asks a server to "limit the total length of chunk
+  /// extensions received in a request to an amount reasonable for the services
+  /// provided", and an extension-only budget is exactly what an attacker
+  /// walks around: `1*HEXDIG` admits unlimited leading zeros, so 271 of them
+  /// and a `1` is a 272-octet size line that parses cleanly, delivers ONE
+  /// payload octet and spends 274 framing octets with no extension at all.
+  /// Every octet of the line is framing the peer chose the length of, so every
+  /// octet of the line is charged — the last chunk's line included, since it
+  /// comes through here and exempting it would be a second rule.
+  ///
+  /// What the budget does NOT capture is the re-SCAN: a line arriving a byte at
+  /// a time is delimited from offset zero on every call, so its scanning cost is
+  /// O(L²) while only its L consumed octets are charged. Pre-existing and
+  /// bounded — by `MAX_CHUNK_LINE_BYTES` per line, and by this budget on the
+  /// number of lines — and stated here because a budget sitting over exactly
+  /// this parser invites the assumption that it covers the parser's work.
   fn read_size_line<'a>(
     &mut self,
+    headroom: u64,
+    framing_limit: u64,
     input: &'a [u8],
-  ) -> Result<(usize, Option<BodyItem<'a>>), H1Error> {
+  ) -> Result<(usize, Option<BodyItem<'a>>), BodyFault> {
+    // (a) Delimit.
     let (line, end) = match delimit_line(input) {
       LineEnd::Crlf { body, end } => (body, end),
       // Nothing is proven yet — unless what has arrived is already longer than
@@ -157,13 +258,14 @@ impl Decoder {
       // can rescue it and waiting would be an unbounded buffer the peer
       // controls.
       LineEnd::Partial if unterminated_len(input) > MAX_CHUNK_LINE_BYTES => {
-        return Err(malformed(MAX_CHUNK_LINE_BYTES, CHUNK_LINE_TOO_LONG));
+        return Err(malformed(MAX_CHUNK_LINE_BYTES, CHUNK_LINE_TOO_LONG).into());
       }
       LineEnd::Partial => return Ok((0, None)),
-      LineEnd::Bare(at) => return Err(malformed(at, BARE_CR_OR_LF)),
+      LineEnd::Bare(at) => return Err(malformed(at, BARE_CR_OR_LF).into()),
     };
+    // (b) Syntax, in full, before either budget is consulted.
     if line.len() > MAX_CHUNK_LINE_BYTES {
-      return Err(malformed(MAX_CHUNK_LINE_BYTES, CHUNK_LINE_TOO_LONG));
+      return Err(malformed(MAX_CHUNK_LINE_BYTES, CHUNK_LINE_TOO_LONG).into());
     }
 
     let (size, digits) = parse_chunk_size(line)?;
@@ -172,13 +274,34 @@ impl Decoder {
     // is already an offset within the fed slice.
     let ext = line.get(digits..).unwrap_or_default();
     if ext.len() > MAX_CHUNK_EXT_BYTES {
-      return Err(malformed(
-        digits.saturating_add(MAX_CHUNK_EXT_BYTES),
-        CHUNK_EXT_TOO_LONG,
-      ));
+      return Err(
+        malformed(
+          digits.saturating_add(MAX_CHUNK_EXT_BYTES),
+          CHUNK_EXT_TOO_LONG,
+        )
+        .into(),
+      );
     }
     validate_chunk_ext(ext, digits)?;
 
+    // (c1) The framing budget. Spelled with the leaves the link proof covers —
+    // `framing_spent + end as u64` would pass the lint wall and the link proof
+    // alike, since a release profile has overflow checks off, and would admit a
+    // wrapped total the comparison then found small.
+    let Some(spent) = charge(self.framing_spent, widen(end), framing_limit) else {
+      return Err(BodyFault::TooLarge(Budget::ChunkFraming));
+    };
+    // (c2) The payload the line ANNOUNCES, measured against what is left of the
+    // allowance. RFC 9112 §7.1 declares one chunk at a time, so this is the
+    // whole of what the peer has committed to, and refusing it here is a
+    // strictly earlier evaluation of what the shell's charge would conclude one
+    // chunk later. The last chunk announces zero and is never refused by it.
+    if overruns(size, headroom) {
+      return Err(BodyFault::TooLarge(Budget::Payload));
+    }
+
+    // (d) Commit.
+    self.framing_spent = spent;
     // RFC 9112 §7.1: `last-chunk = 1*("0") [ chunk-ext ] CRLF` — a chunk-size
     // of zero IS the last chunk however many digits spelled it, and what
     // follows is the trailer section rather than chunk-data.
@@ -541,7 +664,7 @@ mod tests {
   #[test]
   fn a_partial_chunk_line_asks_for_more_and_consumes_nothing() {
     for n in 0..TWO_CHUNKS.len() {
-      let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+      let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
       let mut at = 0usize;
       // Pump the prefix dry; whatever it could not decide must end in
       // need-more-input, never in a violation.
@@ -559,9 +682,9 @@ mod tests {
       assert!(!d.is_finished(), "prefix {n} finished early");
     }
     // The lone-CR cases spelled out, one per line the body has.
-    let mut size = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut size = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(size.feed(b"4\r").unwrap(), (0, None));
-    let mut data = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut data = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(data.feed(b"4\r\n").unwrap(), (3, None));
     assert_eq!(
       data.feed(b"wiki").unwrap(),
@@ -578,7 +701,7 @@ mod tests {
   // arrives on the following call and nothing is claimed after it.
   #[test]
   fn emits_data_then_trailers_then_finished() {
-    let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(d.feed(b"2;a=b\r\n").unwrap(), (7, None));
     assert_eq!(d.feed(b"hi").unwrap(), (2, Some(BodyItem::Data(b"hi"))));
     assert_eq!(d.feed(b"\r\n").unwrap(), (2, None));
@@ -611,10 +734,10 @@ mod tests {
   // CRLF, and a bare LF standing in for a line terminator.
   #[test]
   fn rejects_chunk_framing_violations_without_a_heap() {
-    let mut hex = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut hex = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert!(hex.feed(b"zz\r\nhello\r\n").is_err());
 
-    let mut crlf = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut crlf = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(crlf.feed(b"5\r\n").unwrap(), (3, None));
     assert_eq!(
       crlf.feed(b"helloXX").unwrap(),
@@ -622,12 +745,12 @@ mod tests {
     );
     assert!(crlf.feed(b"XX").is_err());
 
-    let mut lf = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut lf = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert!(lf.feed(b"5\nhello\r\n").is_err());
 
     // RFC 9112 §6.3: a close before the chunked body's last chunk is a
     // truncated message, not a body that merely ended.
-    let mut cut = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut cut = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(cut.feed(b"5\r\n").unwrap(), (3, None));
     assert!(cut.eof().is_err());
   }
@@ -639,7 +762,7 @@ mod tests {
   // on and not the first one seen.
   #[test]
   fn chunk_data_is_counted_not_line_delimited() {
-    let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(d.feed(b"6\r\n").unwrap(), (3, None));
     assert_eq!(
       d.feed(b"a\r\n\r\nb\r\n0\r\n\r\n").unwrap(),
@@ -660,21 +783,21 @@ mod tests {
   // legal, in the trailer section exactly as in a head.
   #[test]
   fn hex_case_and_empty_trailer_values() {
-    let mut lower = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut lower = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(lower.feed(b"a\r\n").unwrap(), (3, None));
     assert_eq!(
       lower.feed(b"0123456789\r\n").unwrap(),
       (10, Some(BodyItem::Data(b"0123456789")))
     );
 
-    let mut upper = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut upper = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(upper.feed(b"A\r\n").unwrap(), (3, None));
     assert_eq!(
       upper.feed(b"0123456789\r\n").unwrap(),
       (10, Some(BodyItem::Data(b"0123456789")))
     );
 
-    let mut empty = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut empty = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     assert_eq!(
       empty.feed(b"0\r\n").unwrap(),
       (3, Some(BodyItem::TrailersStart))
@@ -724,7 +847,7 @@ mod heap_tests {
   // Every stream here runs against an unbounded ceiling, so a `TooLarge` from
   // one would itself be a finding.
   fn decode(chunks: &[&[u8]]) -> Result<Decoded, BodyFault> {
-    let mut decoder = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+    let mut decoder = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
     let mut out = Decoded::default();
     let mut buf = std::vec::Vec::new();
     for chunk in chunks {
@@ -1077,7 +1200,7 @@ mod heap_tests {
       b"5\r\nhello\r\n0\r\n",
       b"5\r\nhello\r\n0\r\nX-Sum: ok\r\n",
     ] {
-      let mut decoder = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+      let mut decoder = BodyDecoder::new(BodyFraming::Chunked, u64::MAX, u64::MAX);
       let mut at = 0usize;
       loop {
         let (consumed, item) = decoder.feed(prefix.get(at..).unwrap_or_default()).unwrap();

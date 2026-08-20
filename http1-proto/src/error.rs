@@ -126,6 +126,30 @@ pub enum Refusal {
     /// [`H1Error::HeadTooLarge`] already makes.
     limit: u64,
   },
+  /// The message spent more on RFC 9112 §7.1 chunk-size lines than the budget
+  /// in force for it.
+  ///
+  /// FRAMING, not content, and the two are bounded separately because a payload
+  /// ceiling cannot see this one: a chunk-size line may announce a single octet
+  /// and spend hundreds, so a body inside its content limit can still make this
+  /// end parse an unbounded number of framing octets. What RFC 9112 §7.1.1 asks
+  /// a server to limit is ONE part of that line — "the total length of chunk
+  /// extensions received in a request", "in the same way that it applies length
+  /// limitations and timeouts for other parts of a message" — and this budget
+  /// charges the WHOLE line, a stricter generalization of that ask, because the
+  /// padding line it exists to catch spends its octets on digits and leaves
+  /// §7.1.1 nothing to govern. Local policy either way, under RFC 9110 §15.5's
+  /// 4xx class; nothing on the wire broke a rule, so this is a refusal like its
+  /// sibling and not a violation.
+  #[error("inbound body exceeds the {limit}-octet chunk-framing budget in force for this message")]
+  ChunkFramingTooLarge {
+    /// The exchange whose body was refused.
+    exchange: ExchangeId,
+    /// The BUDGET that refused it, in chunk-size-line octets — digits,
+    /// extension and the CRLF that ends the line. Not the observed total, for
+    /// the reason its sibling gives.
+    limit: u64,
+  },
 }
 
 impl Refusal {
@@ -135,6 +159,12 @@ impl Refusal {
   pub const fn suggested_status(self) -> SuggestedStatus {
     match self {
       Self::BodyTooLarge { .. } => SuggestedStatus::ContentTooLarge,
+      // RFC 9112 §7.1.1 asks the server to "generate an appropriate 4xx (Client
+      // Error) response if that amount is exceeded" — a 4xx, and not 413, whose
+      // name (RFC 9110 §15.5.14, "Content Too Large") is about content this
+      // message may be well inside. The generic 400 is the appropriate one: no
+      // status names over-large framing.
+      Self::ChunkFramingTooLarge { .. } => SuggestedStatus::BadRequest,
     }
   }
 }

@@ -134,6 +134,34 @@ its own.
     line every payload item leaves through, so the whole offer is refused rather
     than a legal prefix delivered first. A syntactically malformed element still
     LATCHES: only a message that parsed can be refused by policy.
+  - **The chunk FRAMING is bounded too, and separately**, because a payload
+    ceiling cannot see it: RFC 9112 §7.1's `chunk-size = 1*HEXDIG` admits
+    unlimited leading zeros, so a 272-octet size line can announce one payload
+    octet and cost 277 octets of wire. The whole size LINE — digits, `chunk-ext`
+    and the CRLF — is charged cumulatively per body against
+    `Limits::max_chunk_framing_bytes()`, the last chunk's `0\r\n` included. An
+    extension-only budget, which is what RFC 9112 §7.1.1 names, is walked around
+    by the padding attack with zero extension octets.
+  - **`Error::Refused(Refusal::ChunkFramingTooLarge { exchange, limit })`**: the
+    same refusal disposition as its sibling — not a protocol failure, one close
+    notice, one answer still owed and stating `close` — but advising
+    `SuggestedStatus::BadRequest`. RFC 9112 §7.1.1 asks for "an appropriate 4xx
+    (Client Error) response if that amount is exceeded"; 413's name is about
+    content, which such a message may be well inside.
+  - **Granularity, and it is role-independent** because the budget scales with
+    the payload ceiling: 65 octets is the smallest chunk a whole body can be
+    sent in at either role. 1 MiB in exactly-64-octet chunks spends the server's
+    65,536 to the byte and is refused at the terminating `0\r\n`, every payload
+    octet already delivered.
+  - **A chunked body over the PAYLOAD ceiling is refused at the size line** that
+    announces the octets — §7.1 declares one chunk at a time, so the
+    announcement is measured against what is left — one chunk ahead of the data
+    and with the same `BodyTooLarge` limit. A line breaching both budgets is
+    refused as framing.
+  - **Per-message wire exposure**: `payload + (5/3) × framing_budget`, plus the
+    trailer section's own caps and one unterminated line. `Items::limit_body`
+    narrows payload only, so a route's exposure is
+    `route_payload + (5/3) × connection_framing`.
   - **BREAKING at the next publish (0.2.0).** A `Connection::new()` that used to
     accept any body now refuses one past its role's default.
   - **The ceiling NARROWS per exchange**, through `Items::limit_body(max)`.
