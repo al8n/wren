@@ -176,6 +176,42 @@ fn has_bare_comma_ignores_a_comma_inside_a_quoted_string() {
   assert!(!has_bare_comma(b"text/plain"));
 }
 
+#[test]
+fn a_token_and_a_missing_value_unescape_to_themselves() {
+  assert!(
+    ParamValue::Token(b"utf-8")
+      .unescaped()
+      .eq(b"utf-8".iter().copied())
+  );
+  assert_eq!(ParamValue::None.unescaped().count(), 0);
+}
+
+#[test]
+fn unescape_into_writes_nothing_when_the_slice_is_short() {
+  let v = ParamValue::Quoted(br#"a\"b"#);
+  let mut out = [0xAAu8; 2];
+  assert_eq!(
+    v.unescape_into(&mut out),
+    Err(crate::Error::BufferTooSmall { need: 3, have: 2 })
+  );
+  assert_eq!(out, [0xAA, 0xAA], "a failed call must not have written");
+
+  let mut out = [0u8; 8];
+  assert_eq!(v.unescape_into(&mut out), Ok(3));
+  assert_eq!(out.get(..3), Some(br#"a"b"#.as_slice()));
+}
+
+#[test]
+fn eq_unescaped_answers_the_charset_question_without_a_buffer() {
+  assert!(ParamValue::Quoted(b"UTF-8").eq_unescaped_ignore_ascii_case("utf-8"));
+  assert!(ParamValue::Quoted(br#"utf\-8"#).eq_unescaped_ignore_ascii_case("utf-8"));
+  assert!(ParamValue::Token(b"utf-8").eq_unescaped_ignore_ascii_case("utf-8"));
+  assert!(!ParamValue::Quoted(b"utf-8").eq_unescaped_ignore_ascii_case("utf-88"));
+  assert!(!ParamValue::Quoted(b"utf-88").eq_unescaped_ignore_ascii_case("utf-8"));
+  assert!(ParamValue::None.eq_unescaped_ignore_ascii_case(""));
+  assert!(!ParamValue::None.eq_unescaped_ignore_ascii_case("x"));
+}
+
 /// Tests that collect into a `Vec`: gated to the tiers that have a heap, since
 /// the bare `no_std` tier has neither an allocator nor the `alloc as std` alias.
 #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
@@ -268,5 +304,12 @@ mod heap {
     assert_eq!(members[1].as_ref().unwrap().name(), b"other");
     let p = members[0].unwrap().params().next().unwrap();
     assert_eq!(p, Err(ListError::ValueSpansFieldLines));
+  }
+
+  #[test]
+  fn unescaping_removes_the_backslash_and_keeps_the_octet() {
+    let v = ParamValue::Quoted(br#"a\"b\\c"#);
+    let got: Vec<u8> = v.unescaped().collect();
+    assert_eq!(got.as_slice(), br#"a"b\c"#);
   }
 }

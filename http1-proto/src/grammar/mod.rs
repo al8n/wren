@@ -961,6 +961,101 @@ pub enum ParamValue<'a> {
   Quoted(&'a [u8]),
 }
 
+/// Walks a parameter value with its RFC 9110 §5.6.4 `quoted-pair` escapes
+/// removed. Total over any value the walker produced: a `quoted-pair`'s
+/// backslash is only accepted with an octet behind it, so the lookahead below
+/// can only run off the end of a value this crate did not validate.
+struct Unescaped<'a> {
+  bytes: &'a [u8],
+  at: usize,
+  quoted: bool,
+}
+
+impl Iterator for Unescaped<'_> {
+  type Item = u8;
+
+  fn next(&mut self) -> Option<u8> {
+    let byte = *self.bytes.get(self.at)?;
+    if self.quoted && byte == b'\\' {
+      let escaped = *self.bytes.get(self.at.saturating_add(1))?;
+      self.at = self.at.saturating_add(2);
+      return Some(escaped);
+    }
+    self.at = self.at.saturating_add(1);
+    Some(byte)
+  }
+}
+
+impl<'a> ParamValue<'a> {
+  /// The bytes as the walker found them: a token's own, a quoted-string's
+  /// interior with escapes intact, or none at all.
+  const fn raw(self) -> &'a [u8] {
+    match self {
+      Self::None => &[],
+      Self::Token(bytes) | Self::Quoted(bytes) => bytes,
+    }
+  }
+
+  /// The value with its `quoted-pair` escapes removed.
+  ///
+  /// RFC 9110 §5.6.4: "Recipients that process the value of a quoted-string
+  /// MUST handle a quoted-pair as if it were replaced by the octet following
+  /// the backslash." Removing them leaves a value that is not one contiguous
+  /// slice, which is why this yields bytes rather than returning `&[u8]`.
+  ///
+  /// [`Token`](Self::Token) yields its bytes unchanged — a `token` carries no
+  /// backslash — and [`None`](Self::None) yields nothing.
+  #[inline]
+  pub fn unescaped(self) -> impl Iterator<Item = u8> + 'a {
+    Unescaped {
+      bytes: self.raw(),
+      at: 0,
+      quoted: matches!(self, Self::Quoted(_)),
+    }
+  }
+
+  /// [`unescaped`](Self::unescaped) written into a caller-supplied slice,
+  /// returning the number of bytes written.
+  ///
+  /// Two passes: the length is counted before anything is written, so a call
+  /// that does not fit writes NOTHING and leaves `out` as it found it.
+  ///
+  /// # Errors
+  ///
+  /// [`crate::Error::BufferTooSmall`] when `out` is shorter than the
+  /// unescaped value.
+  pub fn unescape_into(self, out: &mut [u8]) -> Result<usize, crate::Error> {
+    let need = self.unescaped().count();
+    if need > out.len() {
+      return Err(crate::Error::BufferTooSmall {
+        need,
+        have: out.len(),
+      });
+    }
+    for (slot, byte) in out.iter_mut().zip(self.unescaped()) {
+      *slot = byte;
+    }
+    Ok(need)
+  }
+
+  /// Whether the unescaped value equals `s`, ASCII-case-insensitively — the
+  /// common question ("is this charset utf-8?") answered without a buffer.
+  ///
+  /// Case folding here is the CALLER's assertion about this parameter, not
+  /// this crate's: RFC 9110 §5.6.6 says "Parameter values might or might not
+  /// be case-sensitive, depending on the semantics of the parameter name."
+  pub fn eq_unescaped_ignore_ascii_case(self, s: &str) -> bool {
+    let mut want = s.as_bytes().iter();
+    for got in self.unescaped() {
+      match want.next() {
+        Some(byte) if got.eq_ignore_ascii_case(byte) => {}
+        _ => return false,
+      }
+    }
+    want.next().is_none()
+  }
+}
+
 /// One member of a parameterised `#`-list: a name and its parameters, with
 /// quoted-string values kept intact.
 ///
