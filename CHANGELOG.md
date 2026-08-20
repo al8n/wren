@@ -31,7 +31,13 @@ weight applies and nothing about what to serve.
   `type "/" subtype` alternative (`*/json`) stays an ordinary token and matches
   nothing real. `params()` never yields `q`, wherever it appeared: §12.5.1 says
   recipients "SHOULD process any parameter named "q" as weight, regardless of
-  parameter ordering", so none of them is a range parameter.
+  parameter ordering", so none of them is a range parameter. The walk STOPS at
+  the first faulting member and every `next` after that `Err` is `None` —
+  whether the fault is the list walk's own (a member whose boundaries it cannot
+  resolve) or one found here while reading an already-delimited member as a
+  range (a `q` that is not a `qvalue`, a parameter with no value, a quoted value
+  spanning the §5.2 join). A caller handed the suffix of a malformed `Accept`
+  would be the second of two recipients disagreeing about a hostile field.
 - **`weight_for`**: the §12.5.1 selection — the weight an `Accept` field gives
   one candidate. Precedence is a lexicographic key over the ranges that matched
   (shape, then matched parameter instances, then field order) which GENERATES
