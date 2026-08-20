@@ -201,6 +201,74 @@ fn the_walk_stops_at_the_first_faulting_member() {
 }
 
 #[test]
+fn a_fault_found_reading_the_member_stops_the_walk_too() {
+  // The OTHER half of the rule above, and the half that has to be latched
+  // here. The list walk stops itself only when a member's own boundaries are
+  // unresolved; every fault below is found AFTER it handed over a delimited
+  // member, so it is ready with the next one and would go on yielding.
+  //
+  // Each fixture pairs a faulting first member with a perfectly good second,
+  // so a walk that failed to latch would answer `Some(Ok(text/html))` where
+  // this asserts `None`.
+  for (field, want) in [
+    (
+      b"text/plain;q=bogus, text/html".as_slice(),
+      MediaError::BadWeight,
+    ),
+    // The `q` that decides is the LAST one (§12.5.1), so the fault can be
+    // behind a `q` that already parsed.
+    (
+      b"text/plain;q=1;q=nope, text/html".as_slice(),
+      MediaError::BadWeight,
+    ),
+    (
+      b"text/plain;charset, text/html".as_slice(),
+      MediaError::ValuelessParameter,
+    ),
+    // `NotAMediaType` is the one kind with no unlatched route: `accept` hands
+    // the walker `is_media_name`, which already requires the solidus, so the
+    // name check inside `range_from` cannot fail on a member the walker
+    // admitted. It reaches a caller only as the walker's own `NotAToken`,
+    // latched there — asserted here so the contract is pinned for every
+    // variant `accept` documents, whichever latch answers for it.
+    (
+      b"text/plain;q=0.5, not-a-media-type, text/html".as_slice(),
+      MediaError::NotAMediaType,
+    ),
+  ] {
+    let mut it = accept([field]);
+    let mut item = it.next();
+    // Walk to the fault: the `NotAMediaType` fixture opens with a good member.
+    while matches!(item, Some(Ok(_))) {
+      item = it.next();
+    }
+    assert_eq!(item, Some(Err(want)), "{field:?}");
+    assert!(
+      it.next().is_none(),
+      "{field:?}: later members are unreachable"
+    );
+    // Latched, not merely exhausted — an `Iterator` that answered `None` is
+    // free to answer `Some` again, and this one must not.
+    assert!(it.next().is_none(), "{field:?}: the stop is latched");
+  }
+}
+
+#[test]
+fn a_value_spanning_the_join_stops_the_walk_too() {
+  // The fourth kind, which needs two field lines to reach. §5.2 joins them
+  // with a comma that falls INSIDE the quoted-string, so the value is well
+  // formed, is not one contiguous slice, and is reported by the parameter walk
+  // inside `range_from` — with the list walk none the wiser.
+  let mut it = accept([
+    b"text/html;boundary=\"a".as_slice(),
+    b"b\", text/plain".as_slice(),
+  ]);
+  assert_eq!(it.next(), Some(Err(MediaError::ValueSpansFieldLines)));
+  assert!(it.next().is_none(), "later members are unreachable");
+  assert!(it.next().is_none(), "the stop is latched");
+}
+
+#[test]
 fn an_empty_accept_value_yields_no_ranges() {
   assert!(accept([b"".as_slice()]).next().is_none());
 }

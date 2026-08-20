@@ -411,9 +411,20 @@ fn range_from(member: ListMember<'_>) -> Result<MediaRange<'_>, MediaError> {
 /// span the join.
 ///
 /// The walk STOPS at the first faulting member — later well-formed ranges are
-/// unreachable. A walker that cannot tell a separator from data cannot say
-/// which ranges the field named, and a member that is not a media range cannot
-/// be yielded by this entry point at all.
+/// unreachable, and every `next` after the `Err` is `None`. A walker that
+/// cannot tell a separator from data cannot say which ranges the field named,
+/// and a member that is not a media range cannot be yielded by this entry point
+/// at all. A caller that processed the suffix of a malformed `Accept` would be
+/// the second of two recipients disagreeing about a hostile field.
+///
+/// EVERY fault stops it, wherever it was found. Some are the list walk's own —
+/// a member whose boundaries it cannot resolve, or a name that is not
+/// `type "/" subtype` — and it cannot go on past either, so it latches itself.
+/// The rest are this entry point's, found while reading an already-delimited
+/// member as a range: a `q` that is not a `qvalue`, a parameter with no value, a
+/// quoted value that spans the §5.2 join. Those leave the list walk perfectly
+/// able to continue, and stopping there is a decision made here rather than one
+/// inherited.
 ///
 /// # Errors
 ///
@@ -426,11 +437,48 @@ pub fn accept<'a, I>(lines: I) -> impl Iterator<Item = Result<MediaRange<'a>, Me
 where
   I: IntoIterator<Item = &'a [u8]>,
 {
-  parameterised_list_with(lines, is_media_name).map(|member| match member {
-    Ok(member) => range_from(member),
-    Err(ListError::NotAToken) => Err(MediaError::NotAMediaType),
-    Err(other) => Err(MediaError::from(other)),
-  })
+  Accept {
+    members: parameterised_list_with(lines, is_media_name),
+    done: false,
+  }
+}
+
+/// The walk [`accept`] hands out: the delimited members still to come, and
+/// whether one of them has already faulted.
+///
+/// A stateless `map` over the member walk would latch only HALF the faults.
+/// The list walk stops itself when a member's own boundaries are unresolved,
+/// but a fault [`range_from`] finds is invisible to it — it handed over an
+/// `Ok(member)` and is ready with the next one. The `done` flag below is what
+/// makes the two kinds stop alike, which is the contract [`accept`] documents.
+struct Accept<I> {
+  members: I,
+  /// An `Err` has been yielded, from either source. Latched, never cleared: an
+  /// `Iterator` that has answered `None` may answer `Some` again, and this one
+  /// must not.
+  done: bool,
+}
+
+impl<'a, I> Iterator for Accept<I>
+where
+  I: Iterator<Item = Result<ListMember<'a>, ListError>>,
+{
+  type Item = Result<MediaRange<'a>, MediaError>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.done {
+      return None;
+    }
+    let range = match self.members.next()? {
+      Ok(member) => range_from(member),
+      Err(ListError::NotAToken) => Err(MediaError::NotAMediaType),
+      Err(other) => Err(MediaError::from(other)),
+    };
+    if range.is_err() {
+      self.done = true;
+    }
+    Some(range)
+  }
 }
 
 /// The most parameter instances a candidate may carry while a range's own
