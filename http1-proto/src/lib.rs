@@ -59,6 +59,9 @@ pub mod grammar;
 /// bounded scanner over the field lines that follow, and the lazy view of a
 /// scanned head.
 pub mod head;
+/// The RFC 9110 §8.3.1 media type and §12.5.1 `Accept` range: `Content-Type`
+/// parsing, range walking with q-values, and the §12.5.1 weight selection.
+pub mod media;
 /// Role-aware semantics over a scanned head: the RFC 9112 §3.2 `Host` and
 /// target rules, the §6.3 body-framing decision, and the connection directives
 /// a head carries.
