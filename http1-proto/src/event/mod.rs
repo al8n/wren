@@ -26,10 +26,23 @@
 //! `Items`. Read it before writing anything that produces items.
 
 use crate::{
-  connection::{Borrows, Exchange, Lifecycle, RecvState, SendState, inbound},
+  connection::{Borrows, Exchange, Lifecycle, RecvState, SendState, inbound, writable},
   error::Error,
   head::{HeadView, RequestLine, StatusLine},
 };
+
+/// No message body is being received, so there is no ceiling to narrow.
+///
+/// The RECEIVE side's, and named apart from `outbound::NO_BODY_IN_FLIGHT` — the
+/// send side's answer to "write these body octets" — because the two describe
+/// opposite directions and nothing but the name would say so at a call site.
+///
+/// Distinct from the lifecycle's own answers by its TEXT alone, which is why the
+/// benign case — a message RFC 9112 §6.3 items 1 and 7 frame with no content at
+/// all — is deliberately NOT reported here: a caller cannot branch on a
+/// `&'static str`, so folding "this message has no body" in would make it
+/// indistinguishable from "this connection is dead".
+pub(crate) const NO_BODY_BEING_RECEIVED: &str = "no message body is being received";
 
 /// The number that names one request/response exchange on a connection.
 ///
@@ -444,6 +457,102 @@ impl<'a, 'c> Items<'a, 'c> {
   #[inline]
   pub fn consumed(&self) -> usize {
     *self.consumed
+  }
+
+  /// Narrows the ceiling on the body in flight to `max` payload octets.
+  ///
+  /// NARROWING ONLY: the effective ceiling becomes `min(current, max)`. `min` is
+  /// idempotent and commutative, so this may be called any number of times, in
+  /// any order, right after [`Item::Head`] or mid-body, and the answer is the
+  /// same. There is no "exactly once, before X" rule to get wrong, which is the
+  /// whole reason the call is safe to FORGET: forgetting it leaves the
+  /// operator's ceiling in force. A routing bug cannot LIFT that ceiling,
+  /// because this operation has no increasing direction to be pointed in — not
+  /// because a check refuses one.
+  ///
+  /// # The connection ceiling must be the maximum over all routes
+  ///
+  /// A route limit ABOVE the connection's ceiling is silently capped, since
+  /// narrowing is `min`: `limit_body(8 << 20)` on a connection built with a
+  /// 1 MiB ceiling answers `Ok` and grants 1 MiB. Construct the ceiling
+  /// ([`Connection::with_limits`]) as the maximum over every route this
+  /// connection may serve; a ceiling taken from one route's limit caps every
+  /// route above it and reports nothing.
+  ///
+  /// It narrows the PAYLOAD ceiling and nothing else. The connection's
+  /// chunk-framing budget ([`Connection::max_chunk_framing_bytes`]) belongs to
+  /// the connection, so a route narrowed to a few kilobytes still carries the
+  /// whole of it.
+  ///
+  /// # What it refuses, and when
+  ///
+  /// The bound is on the message's TOTAL, not on what is left: `limit_body(4096)`
+  /// after 6000 octets have already been handed over refuses immediately.
+  ///
+  /// `Err(Error::Refused(Refusal::BodyTooLarge { .. }))`, with the connection
+  /// moved to the refused disposition (see [`Refusal`]), when `max` cannot be
+  /// satisfied — either more than `max` octets have already been delivered, or
+  /// the framing has already DECLARED more than fits: a `Content-Length`
+  /// remainder (RFC 9112 §6.3 item 6), or the remainder of the chunk in flight
+  /// (§7.1). That is the case the call exists for. The `limit` the refusal
+  /// carries is the ROUTE's `max`, not the ceiling it replaced: the narrowing is
+  /// committed before satisfiability is checked.
+  ///
+  /// `Ok(())` on a message with no body — RFC 9112 §6.3 items 1 and 7 make a
+  /// bodiless message a body of no octets, so there is nothing a ceiling could
+  /// be about and a driver that narrows after every head is not punished for a
+  /// conformant GET, HEAD response or 304 — and on a body already through or
+  /// already refused, since neither has an octet left to bound.
+  ///
+  /// `Err(Error::InvalidState(_))` is reserved for a connection that cannot act
+  /// on the call at all: no message is being received, or the connection has
+  /// failed or drained. The distinction matters because
+  /// [`Error::InvalidState`] carries a `&'static str` a caller cannot branch on
+  /// — folding "this message has no body" into it would make it
+  /// indistinguishable from "this connection is dead".
+  ///
+  /// # On `Items` rather than on `Connection`, and only there
+  ///
+  /// [`Item`] borrows the INPUT rather than the iterator, so a driver narrows
+  /// while still holding the [`Item::Head`] it just pulled — before the pump has
+  /// decoded one octet of that body, even when head and body arrived in the same
+  /// offer. A `Connection`-level twin could not promise that, and two surfaces
+  /// with one signature and different timing guarantees is a trap dressed as
+  /// symmetry. Observing goes the other way: [`Connection::body_progress`] is
+  /// read once this iterator has been dropped.
+  ///
+  /// [`Refusal`]: crate::Refusal
+  /// [`Error::InvalidState`]: crate::Error::InvalidState
+  /// [`Connection::with_limits`]: crate::Connection::with_limits
+  /// [`Connection::max_chunk_framing_bytes`]: crate::Connection::max_chunk_framing_bytes
+  /// [`Connection::body_progress`]: crate::Connection::body_progress
+  pub fn limit_body(&mut self, max: u64) -> Result<(), Error> {
+    // The lifecycle gate, which is `Connection::sendable`'s own — one statement
+    // of it, two callers, so the receive side cannot come to answer a failed or
+    // drained connection differently from the send side.
+    writable(*self.lifecycle)?;
+    // Read BEFORE the decoder is touched: a refusal names the exchange it
+    // refused, and a narrowing that could not name one must change nothing. A
+    // receive state holding a decoder was written beside a minted exchange, so
+    // this is defensive rather than reachable.
+    let Some(exchange) = *self.exchange else {
+      return Err(Error::InvalidState(NO_BODY_BEING_RECEIVED));
+    };
+    // Exhaustive over the receive states, so a state added later has to say
+    // whether a body can be narrowed in it.
+    let satisfiable = match &mut *self.recv {
+      RecvState::Body { decoder, .. } => decoder.narrow(max),
+      RecvState::Idle | RecvState::AwaitingRearm => {
+        return Err(Error::InvalidState(NO_BODY_BEING_RECEIVED));
+      }
+    };
+    if satisfiable {
+      return Ok(());
+    }
+    // The decoder is refused, and this resolves it in the same call: the
+    // refusal's two storage windows stay contiguous, so no send gate can see a
+    // connection that is neither refusable nor refused.
+    Err(Error::Refused(inbound::refused(self, exchange.id)))
   }
 
   /// The fed input slice, at the INPUT lifetime.

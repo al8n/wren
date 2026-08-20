@@ -62,7 +62,7 @@ use crate::{
   connection::{
     CONNECT, Client, Connection, Exchange, FAILED, General, Lifecycle, RecvState,
     SWITCHING_PROTOCOLS, SendBody, SendState, Server, body_refused, discharge_expect, mint,
-    signal_close, tunnel::CONTINUE,
+    signal_close, tunnel::CONTINUE, writable,
   },
   error::Error,
   event::Event,
@@ -188,10 +188,6 @@ const CONTENT_LENGTH: &str = "content-length";
 
 /// RFC 9112 §6.1.
 const TRANSFER_ENCODING: &str = "transfer-encoding";
-
-/// The connection has drained (RFC 9112 §9.6): keep-alive is over and the
-/// exchange that was in flight, if any, is through.
-const DRAINED: &str = "connection is draining";
 
 /// A client holds ONE exchange of its own in flight (RFC 9112 §9.3.2 — this end
 /// does not pipeline its requests), so a second open before the first is
@@ -984,10 +980,10 @@ impl<Ro> Connection<Ro, General> {
   ///
   /// An abandoned body (RFC 9112 §9.6 — the peer ended the exchange and released
   /// this end from "sending") also drove the connection to draining, so the
-  /// generic gate would answer `DRAINED`. That is true and useless: it describes
-  /// the connection rather than what happened to THIS message, and a caller
-  /// holding half an upload wants the second. So the specific reason is checked
-  /// ahead of it.
+  /// generic gate ([`writable`]) would answer "draining". That is true and
+  /// useless: it describes the connection rather than what happened to THIS
+  /// message, and a caller holding half an upload wants the second. So the
+  /// specific reason is checked ahead of it.
   ///
   /// A latched violation still outranks both: the connection has already handed
   /// its one error back, and nothing after it is anything else.
@@ -1175,16 +1171,14 @@ impl<Ro, Mo> Connection<Ro, Mo> {
   /// The lifecycle gate every send call opens with, so a failed or drained
   /// connection answers the same way whatever was asked of it. The single error
   /// response is the one exception and checks the latch itself.
+  ///
+  /// The rule itself is [`writable`]'s, not this method's: the receive side's
+  /// [`Items::limit_body`] gates on the identical fact, and one implementation
+  /// with two callers is what keeps the two answers in lock-step.
+  ///
+  /// [`Items::limit_body`]: crate::Items::limit_body
   fn sendable(&self) -> Result<(), Error> {
-    match self.lifecycle {
-      Lifecycle::Failed => Err(Error::InvalidState(FAILED)),
-      Lifecycle::Draining => Err(Error::InvalidState(DRAINED)),
-      // POLICY decides this and the transport fact deliberately does not appear:
-      // the peer shutting its WRITE side says nothing about whether it is still
-      // reading the response it asked for (RFC 9112 §9.5), so a closed read side
-      // must not refuse an owed answer to a request that arrived in full.
-      Lifecycle::Open | Lifecycle::Closing => Ok(()),
-    }
+    writable(self.lifecycle)
   }
 }
 

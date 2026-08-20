@@ -97,6 +97,26 @@ impl Decoder {
     matches!(self.stage, Stage::Complete)
   }
 
+  /// Payload octets this coding has COMMITTED to and not yet handed over — the
+  /// remainder of the chunk in flight, and never a body total.
+  ///
+  /// RFC 9112 §7.1 declares one chunk at a time: a `chunk-size` states the
+  /// length of the `chunk-data` that follows it and says nothing whatever about
+  /// how many chunks are still to come, so this is `Some` only while a chunk's
+  /// own octets are outstanding. Every other stage is framing the peer has not
+  /// backed with a count — before the first size line, between a chunk's last
+  /// octet and the CRLF that ends it, and through the §7.1.2 trailer section —
+  /// and answers `None`.
+  ///
+  /// ONE exhaustive match over the stages, so a stage added later has to state
+  /// whether it carries a commitment rather than defaulting to "none".
+  pub(super) const fn announced(&self) -> Option<u64> {
+    match self.stage {
+      Stage::Data(remaining) => Some(remaining),
+      Stage::Size | Stage::DataCrlf | Stage::Trailers { .. } | Stage::Complete => None,
+    }
+  }
+
   /// Decodes what it can from `input`, returning how many leading octets the
   /// body claimed and at most one item.
   ///

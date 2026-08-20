@@ -295,3 +295,100 @@ fn a_chunked_refusal_restores_the_stage_it_had_before_the_charge() {
     "an unrestored decoder would answer these bytes with a framing violation"
   );
 }
+
+// THE RATCHET. `min` is idempotent and commutative, so the narrowed ceiling
+// does not depend on how often the call is made or in what order: a `max` above
+// the ceiling in force is a no-op, which is what makes a routing bug unable to
+// LIFT a ceiling — the operation has no increasing direction to be pointed in.
+#[test]
+fn narrowing_only_tightens_and_is_idempotent() {
+  let mut d = BodyDecoder::new(BodyFraming::ContentLength(100), 1000);
+  assert!(d.narrow(500));
+  assert_eq!(d.limit(), 500);
+  assert!(d.narrow(800));
+  assert_eq!(d.limit(), 500, "min only — a widen is a no-op");
+  assert!(d.narrow(500));
+  assert_eq!(d.limit(), 500);
+}
+
+// RFC 9112 §6.3 item 6 states the whole body's length in the head, so a ceiling
+// narrowed below what that number already declared is decidable at once and
+// without reading an octet — the same early exit the declaration gate makes at
+// construction, applied to the ceiling a route replaced it with.
+#[test]
+fn narrowing_below_what_the_framing_declared_refuses_in_place() {
+  let mut d = BodyDecoder::new(BodyFraming::ContentLength(100), 1000);
+  assert!(!d.narrow(50));
+  assert!(d.is_refused());
+}
+
+// RFC 9112 §6.3 items 1 and 7: a message with no content at all is COMPLETE
+// before a byte is read, so there is nothing a ceiling could be about and the
+// answer is vacuously yes. A driver that narrows after every head is the
+// natural shape, and it must not be told that every conformant GET, HEAD
+// response or 304 was an error.
+#[test]
+fn narrowing_on_a_bodiless_message_succeeds_vacuously() {
+  let mut d = BodyDecoder::new(BodyFraming::None, 1000);
+  assert!(
+    d.narrow(1),
+    "a uniform narrow-after-every-head driver must not error on a GET"
+  );
+}
+
+// The OTHER count a narrowing can be unsatisfiable on, and the only framing
+// that isolates it: RFC 9112 §6.3 item 8 declares nothing, ever, so no
+// declaration can be over the headroom and what refuses here is purely that
+// more octets have already been handed over than the new ceiling allows. The
+// bound is on the message's TOTAL, not on what is left.
+#[test]
+fn narrowing_below_what_has_already_been_delivered_refuses() {
+  let mut d = BodyDecoder::new(BodyFraming::ReadToClose, 1000);
+  assert_eq!(
+    d.feed(b"abcdef").unwrap(),
+    (6, Some(BodyItem::Data(b"abcdef")))
+  );
+  assert!(!d.narrow(4));
+  assert!(d.is_refused());
+  assert_eq!(
+    d.limit(),
+    4,
+    "committed before the check, so the refusal names the ceiling that refused"
+  );
+}
+
+// What each RFC 9112 §6.3 framing has COMMITTED to at the moment its head has
+// been read, which is the one moment the three separate cleanly: item 6 states
+// the whole body, §7.1 states nothing until a size line has been read, and item
+// 8 can state nothing at all.
+#[test]
+fn announced_separates_the_three_framings_right_after_the_head() {
+  assert_eq!(
+    BodyDecoder::new(BodyFraming::ContentLength(42), 1 << 20).announced(),
+    Some(42)
+  );
+  assert_eq!(
+    BodyDecoder::new(BodyFraming::Chunked, 1 << 20).announced(),
+    None
+  );
+  assert_eq!(
+    BodyDecoder::new(BodyFraming::ReadToClose, 1 << 20).announced(),
+    None
+  );
+}
+
+// RFC 9112 §7.1 announces ONE chunk at a time and never a body total, so this
+// tracks the chunk in flight and falls back to `None` the moment that chunk's
+// octets are through. A reader that took it for a body length would be reading
+// a number §7.1 never states.
+#[test]
+fn announced_follows_the_chunk_in_flight_rather_than_the_body() {
+  let mut d = BodyDecoder::new(BodyFraming::Chunked, u64::MAX);
+  assert_eq!(d.announced(), None, "no size line has been read yet");
+  assert_eq!(d.feed(b"5\r\n").unwrap(), (3, None));
+  assert_eq!(d.announced(), Some(5), "the remainder of THIS chunk");
+  assert_eq!(d.feed(b"he").unwrap(), (2, Some(BodyItem::Data(b"he"))));
+  assert_eq!(d.announced(), Some(3));
+  assert_eq!(d.feed(b"llo").unwrap(), (3, Some(BodyItem::Data(b"llo"))));
+  assert_eq!(d.announced(), None, "between chunks nothing is declared");
+}

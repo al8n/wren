@@ -151,6 +151,103 @@ carrying an explanation has to stay representable.
   connection for as long as the driver lets it. The core is Sans-I/O and has no
   clock; the socket read deadline is the driver's, and it is the real control.
 
+## `http1-proto` — cycle 6 (the ceiling narrows per exchange, and reports)
+
+PR3 of the cycle. The ceiling PR2 gave the inbound body is the connection's, and
+a connection serves many routes: the one that accepts uploads and the one that
+takes a 4 KiB JSON document had to share a number chosen for the larger. A route
+can now tighten that ceiling once its own head has been read, a driver can ask
+where the body it is receiving stands, and a counted body can be taken as one
+borrowed chunk with no copy path anywhere in this core.
+
+### Added
+
+- **`Items::limit_body(max)`** — narrows the ceiling on the body in flight to
+  `max` payload octets. NARROWING ONLY: the effective ceiling is
+  `min(current, max)`, and `min` is idempotent and commutative, so it may be
+  called any number of times, in any order, right after `Item::Head` or
+  mid-body, and the answer is the same. There is no "exactly once, before X"
+  rule to get wrong, which is why the call is safe to FORGET — forgetting it
+  leaves the operator's ceiling in force. A routing bug cannot LIFT that ceiling
+  because the operation has no increasing direction to be pointed in, not
+  because a check refuses one.
+
+  On `Items` rather than on `Connection`, and only there: `Item<'a>` borrows the
+  INPUT rather than the iterator, so a driver narrows while still holding the
+  head it just pulled — before the pump has decoded one octet of that body, even
+  when head and body arrived in the same offer. A `Connection`-level twin could
+  not promise that, and two surfaces with one signature and different timing
+  guarantees is a trap dressed as symmetry.
+
+  **The connection ceiling must be the maximum over all route limits.** A route
+  asking for more than the connection allows is capped silently, since narrowing
+  is `min`: `limit_body(8 << 20)` under a 1 MiB ceiling answers `Ok` and grants
+  1 MiB. A ceiling taken from any one route's limit caps every route above it
+  and reports nothing.
+
+  It refuses — `Err(Error::Refused(Refusal::BodyTooLarge { .. }))`, with the
+  connection moved to the same refused disposition a wire-side breach produces —
+  when `max` cannot be satisfied: more octets have already been delivered than it
+  allows, or the framing has already DECLARED more than fits (a `Content-Length`
+  remainder, RFC 9112 §6.3 item 6, or the remainder of the chunk in flight,
+  §7.1). The `limit` such a refusal carries is the ROUTE's `max` and not the
+  ceiling it replaced, because the narrowing is committed before satisfiability
+  is checked; a driver logging one otherwise reads back a number that never
+  refused anything.
+
+  It answers `Ok(())` on a message with no body. RFC 9112 §6.3 items 1 and 7
+  frame a bodiless message as a body of no octets, so there is nothing a ceiling
+  could be about, and a uniform narrow-after-every-head driver — the natural
+  shape — must not be told that every conformant GET, HEAD response or 304 was an
+  error. `Error::InvalidState` is reserved for a connection that cannot act on
+  the call at all: no message being received, or a failed or drained connection.
+  That reservation is deliberate, because `InvalidState` carries a `&'static str`
+  a caller cannot branch on — folding "this message has no body" into it would
+  make it indistinguishable from "this connection is dead".
+
+- **`BodyProgress` and `Connection::body_progress()`** — where the body being
+  received stands: its exchange, the payload octets already delivered, the
+  ceiling now in force, and what the framing has COMMITTED to and not yet handed
+  over. That last one separates the three RFC 9112 §6.3 framings cleanly when
+  read right after the head: `Some(total)` is a counted body, `None` is chunked
+  or close-delimited. Inside a chunk it is the remainder of THAT CHUNK — §7.1
+  never declares a body total, and it must not be read as one.
+
+  On the CONNECTION rather than on `Items`, which is the opposite side from
+  `limit_body` and for the same reason: the iterator borrows the connection for
+  as long as it lives, so this is read once it has been dropped — which is
+  exactly where the recipe below wants it.
+
+- **The zero-copy contiguous handover**, which needs no new API beyond the
+  above and adds no copy path. Wait until the driver's own buffer holds
+  `announced` more octets and the next `handle` yields the whole body as ONE
+  borrowed `Item::BodyChunk`, because the counted framing claims
+  `min(remaining, input.len())` in one go. Two steps of that are not
+  discoverable from the signatures and both are required:
+
+  1. **Stop pulling at `Item::Head` and DROP the iterator.** One more `next()`
+     may hand back a partial chunk of whatever happened to be buffered, and
+     `body_progress` is unreachable while `Items` borrows the connection.
+  2. **Answer any pending expectation BEFORE waiting.** `Item::ExpectContinue`
+     is yielded by the BODY pump, so a driver that stopped at the head has never
+     seen it and must re-derive the ask from the head's own `Expect` field. RFC
+     9110 §10.1.1 provides for a client that waits for its `100 (Continue)`
+     before sending content, so against one that does both ends wait — the server
+     for octets, the client for permission to send them.
+
+  **The wait is bounded in MAGNITUDE and unbounded in TIME, and that is not a
+  footnote.** A declaration above the ceiling was already refused, so the wait
+  can never ask for more than `limit` octets of driver buffer — but it can ask
+  for them for as long as the peer likes, and a peer that declares exactly the
+  ceiling and then dribbles pins that buffer for the whole dribble. That is the
+  consumer-side accumulation the ceiling exists to close, reintroduced at
+  `limit`. Per process: a streaming driver costs about 200 core bytes per
+  connection, a contiguous-handover driver up to `limit` — roughly 10 GB at ten
+  thousand connections on the server default, and **640 GB on the client's 64
+  MiB default**. **Liveness is the DRIVER's**, and this core cannot take it: it
+  owns no clock. `body_progress().received` is the quantity to sample against
+  the driver's own clock, and the socket read deadline is the real control.
+
 ## `websocket-proto` — cycle 6 (handshakes on a connection the caller holds)
 
 PR1 of the cycle. Both h1 handshakes can now be driven on a connection the caller

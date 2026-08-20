@@ -64,8 +64,8 @@ pub mod head;
 /// a head carries.
 pub mod validate;
 pub use connection::{
-  BodyPlan, Client, ClientTunnelOutcome, Connection, General, HeadBinding, Limits, Mode,
-  NO_TRAILERS, Role, Server, ServerTunnelRequest, TransitionRefused, Tunnel,
+  BodyPlan, BodyProgress, Client, ClientTunnelOutcome, Connection, General, HeadBinding, Limits,
+  Mode, NO_TRAILERS, Role, Server, ServerTunnelRequest, TransitionRefused, Tunnel,
 };
 pub use error::{Error, H1Error, MalformedDetail, Refusal, SuggestedStatus};
 pub use event::{Event, ExchangeId, Item, Items, StartLine};

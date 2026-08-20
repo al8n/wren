@@ -805,9 +805,11 @@ fn body<'a>(it: &mut Items<'a, '_>) -> Result<Step<'a>, Error> {
 /// Takes the connection through a body refusal and returns the refusal to hand
 /// back.
 ///
-/// The pump's half of `connection::refuse`: it holds the borrows disjointly, so
-/// the argument list is assembled here rather than at each site.
-fn refused(it: &mut Items<'_, '_>, exchange: ExchangeId) -> Refusal {
+/// The `Items` half of `connection::refuse`: it holds the borrows disjointly, so
+/// the argument list is assembled here rather than at each of the three sites
+/// that refuse — the body pump, the EOF path, and `Items::limit_body`, which is
+/// the one a ROUTE reaches rather than the wire.
+pub(crate) fn refused(it: &mut Items<'_, '_>, exchange: ExchangeId) -> Refusal {
   refuse(
     it.recv,
     it.exchange,
