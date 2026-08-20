@@ -238,10 +238,6 @@ impl Weight {
 /// `None` for anything else, INCLUDING a value that is a perfectly good
 /// `parameter` value — `q=blah`, `q=1.5`, `q=0.5000`. Note that `0.` and `1.`
 /// ARE valid: `[ "." 0*3DIGIT ]` admits zero digits after the dot.
-// No non-test caller yet: `#[cfg(test)]` is the only reachable call site
-// until Task 5's `range_from` becomes the first one. Task 5 MUST remove this
-// attribute and this comment when it adds that call.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_qvalue(v: &[u8]) -> Option<Weight> {
   let (first, rest) = v.split_first()?;
   let one = match *first {
@@ -278,6 +274,157 @@ pub(crate) fn parse_qvalue(v: &[u8]) -> Option<Weight> {
     thousandths = thousandths.checked_add(value.checked_mul(scale)?)?;
   }
   Some(Weight(thousandths))
+}
+
+/// One member of an `Accept` list: RFC 9110 §12.5.1's
+/// `media-range = ( "*/*" / ( type "/" "*" ) / ( type "/" subtype ) ) parameters`.
+///
+/// Borrows the field lines it was parsed from.
+///
+/// `Eq`/`PartialEq` compare the SAME bytes [`ListMember`]'s own `PartialEq`
+/// does — as written, not as parsed — the same rule [`MediaType`]'s derive
+/// documents and for the same reason: it lets a test assert
+/// `accept(..).next() == Some(Err(MediaError::..))` without a `MediaRange`
+/// value on the other side. It does NOT honour §8.3.1's case-insensitive
+/// `type`/`subtype` (the same tokens a `media-range` reuses): a caller wanting
+/// that compares [`ty`](Self::ty) and [`subtype`](Self::subtype) with
+/// `str::eq_ignore_ascii_case`, not `==` on the whole value.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct MediaRange<'a> {
+  ty: Option<&'a [u8]>,
+  subtype: Option<&'a [u8]>,
+  member: ListMember<'a>,
+  weight: Weight,
+}
+
+impl<'a> MediaRange<'a> {
+  /// The `type` token, or `None` for `*/*`.
+  ///
+  /// RFC 9110 §12.5.1: "The asterisk "*" character is used to group media types
+  /// into ranges, with "*/*" indicating all media types and "type/*" indicating
+  /// all subtypes of that type." Those two SHAPES are the wildcards; a literal
+  /// `*` reached through the `type "/" subtype` alternative — `*/json` — is an
+  /// ordinary token and reports `Some("*")`.
+  #[inline]
+  pub const fn ty(&self) -> Option<&'a str> {
+    match self.ty {
+      Some(bytes) => Some(ascii(bytes)),
+      None => None,
+    }
+  }
+
+  /// The `subtype` token, or `None` for `*/*` and for `type/*`.
+  #[inline]
+  pub const fn subtype(&self) -> Option<&'a str> {
+    match self.subtype {
+      Some(bytes) => Some(ascii(bytes)),
+      None => None,
+    }
+  }
+
+  /// The weight, defaulting to [`Weight::ONE`].
+  ///
+  /// RFC 9110 §12.4.2: "If no "q" parameter is present, the default weight is
+  /// 1."
+  #[inline]
+  pub const fn weight(&self) -> Weight {
+    self.weight
+  }
+
+  /// Every parameter EXCEPT `q`, wherever `q` appeared.
+  ///
+  /// RFC 9110 §12.5.1: "Recipients SHOULD process any parameter named "q" as
+  /// weight, regardless of parameter ordering." *Any* means none of them is a
+  /// range parameter, so none reaches this iterator.
+  #[inline]
+  pub fn params(&self) -> impl Iterator<Item = Result<(&'a [u8], ParamValue<'a>), ListError>> {
+    self.member.params().filter(|p| match p {
+      Ok((name, _)) => !name.eq_ignore_ascii_case(b"q"),
+      Err(_) => true,
+    })
+  }
+}
+
+/// Reads a range out of one already-walked member.
+fn range_from(member: ListMember<'_>) -> Result<MediaRange<'_>, MediaError> {
+  let (ty, subtype) = split_solidus(member.name()).ok_or(MediaError::NotAMediaType)?;
+  // Shape, per §12.5.1's two named wildcards. Anything else — `*/json` — is
+  // the literal `type "/" subtype` alternative.
+  let star = b"*".as_slice();
+  let (ty, subtype) = match (ty == star, subtype == star) {
+    (true, true) => (None, None),
+    (false, true) => (Some(ty), None),
+    // `(true, false)` is `*/json`: the literal `type "/" subtype`
+    // alternative, whose type happens to be the one-character token `*`.
+    // `(false, false)` is the ordinary case. Either way, `subtype` can never
+    // surface as `Some("*")` from this function: the two arms above already
+    // catch every case where the raw subtype bytes equal the one-character
+    // token `*`, regardless of `ty`, so a literal single-asterisk subtype
+    // always reads back as the `type/*` wildcard's `None`, never as a token.
+    _ => (Some(ty), Some(subtype)),
+  };
+  // §5.6.6's `parameter` requires the `=`; a media range defines no grammar of
+  // its own that admits a bare name (contrast RFC 6455 §9.1's
+  // `extension-param`), so a valueless parameter is refused here exactly as
+  // `media_type` refuses one. Every parameter named `q` that DOES carry a
+  // value is weight, in wire order, last one wins.
+  let mut weight = Weight::ONE;
+  for param in member.params() {
+    let (name, value) = param.map_err(MediaError::from)?;
+    // Checked BEFORE the `q`-name check below, deliberately: a bare name
+    // fails §5.6.6's `parameter` grammar outright, whatever it is called, and
+    // that fault is more fundamental than §12.5.1's weight question — a bare
+    // `q` is a missing value, not a bad `qvalue`.
+    if matches!(value, ParamValue::None) {
+      return Err(MediaError::ValuelessParameter);
+    }
+    if name.eq_ignore_ascii_case(b"q") {
+      // A quoted qvalue is the same value as a bare one (§5.6.6: "The quoted
+      // and unquoted values are equivalent."), so unquote before parsing.
+      let mut buf = [0u8; 8];
+      let written = value
+        .unescape_into(&mut buf)
+        .map_err(|_| MediaError::BadWeight)?;
+      let digits = buf.get(..written).ok_or(MediaError::BadWeight)?;
+      weight = parse_qvalue(digits).ok_or(MediaError::BadWeight)?;
+    }
+  }
+  Ok(MediaRange {
+    ty,
+    subtype,
+    member,
+    weight,
+  })
+}
+
+/// Walks an `Accept` field's ranges (RFC 9110 §12.5.1).
+///
+/// Takes the field's LINES rather than one value, for the reason
+/// [`grammar::parameterised_list`](crate::grammar::parameterised_list) does:
+/// §5.2 makes a repeated field one comma-joined value and a quoted-string may
+/// span the join.
+///
+/// The walk STOPS at the first faulting member — later well-formed ranges are
+/// unreachable. A walker that cannot tell a separator from data cannot say
+/// which ranges the field named, and a member that is not a media range cannot
+/// be yielded by this entry point at all.
+///
+/// # Errors
+///
+/// Each item is [`MediaError`]: [`NotAMediaType`](MediaError::NotAMediaType),
+/// [`ValuelessParameter`](MediaError::ValuelessParameter),
+/// [`BadWeight`](MediaError::BadWeight),
+/// [`Parameters`](MediaError::Parameters) or
+/// [`ValueSpansFieldLines`](MediaError::ValueSpansFieldLines).
+pub fn accept<'a, I>(lines: I) -> impl Iterator<Item = Result<MediaRange<'a>, MediaError>>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  parameterised_list_with(lines, is_media_name).map(|member| match member {
+    Ok(member) => range_from(member),
+    Err(ListError::NotAToken) => Err(MediaError::NotAMediaType),
+    Err(other) => Err(MediaError::from(other)),
+  })
 }
 
 #[cfg(test)]
