@@ -455,16 +455,49 @@ where
 /// cannot raise it.
 pub const MAX_TRACKED_PARAMS: usize = 16;
 
-/// Whether two parameter values are the same value.
+/// Whether two parameter values are the same value, under `name`'s own case
+/// rule.
 ///
 /// RFC 9110 §5.6.6: "A parameter value that matches the token production can be
 /// transmitted either as a token or within a quoted-string." and "The quoted
 /// and unquoted values are equivalent." §5.6.4 adds the recipient MUST that
-/// removes `quoted-pair` escapes. Byte-exact after both, and NOT case-folded:
-/// §8.3.1 says "Parameter values might or might not be case-sensitive,
-/// depending on the semantics of the parameter name", which is each
-/// registration's business rather than this crate's.
-fn same_value(a: ParamValue<'_>, b: ParamValue<'_>) -> bool {
+/// removes `quoted-pair` escapes. Byte-exact after both — except for `charset`,
+/// which folds ASCII case.
+///
+/// The DEFAULT is byte-exact because §8.3.1 leaves it so: "Parameter values
+/// might or might not be case-sensitive, depending on the semantics of the
+/// parameter name", which is each registration's business rather than this
+/// crate's. That is the general clause, and it is not the last word: RFC 9110
+/// settles one parameter itself, two sections later. §8.3.2: "In the fields
+/// defined by this document, charset names appear either in parameters
+/// (Content-Type), or, for Accept-Encoding, in the form of a plain token. In
+/// both cases, charset names are matched case-insensitively." §8.3.1's own next
+/// sentence points the same way, calling four spellings of one media type
+/// equivalent because "the `charset` parameter value is defined as being
+/// case-insensitive in [RFC2046], Section 4.1.2".
+///
+/// So `charset` folds and NOTHING else does. Every other case rule RFC 9110
+/// states is about a NAME — field names, parameter names, connection options,
+/// content codings, range units, auth schemes, protocol names — or about `q`,
+/// which §12.5.1 takes as weight before a value ever reaches here. `boundary`
+/// in particular is given no case rule by RFC 9110 at all — RFC 2046 §4.1.2
+/// grants that exemption to `charset` alone, and a `boundary` is matched
+/// against the literal octets of a delimiter line (RFC 2046 §5.1.1) — so it
+/// keeps comparing byte-exact. This is ONE stated exception
+/// rather than a per-parameter policy hook: a hook would be somewhere for a
+/// caller to disagree with the RFC, and there is nothing here to disagree
+/// about.
+///
+/// `name` is the parameter's name, which the caller has already matched
+/// ASCII-case-insensitively (§5.6.6: "Parameter names are case-insensitive"),
+/// so `Charset` selects the exception exactly as `charset` does.
+fn same_value(name: &[u8], a: ParamValue<'_>, b: ParamValue<'_>) -> bool {
+  if name.eq_ignore_ascii_case(b"charset") {
+    return a
+      .unescaped()
+      .map(|byte| byte.to_ascii_lowercase())
+      .eq(b.unescaped().map(|byte| byte.to_ascii_lowercase()));
+  }
   a.unescaped().eq(b.unescaped())
 }
 
@@ -526,11 +559,11 @@ fn matched_instances(
     // and the blocks stop being complete, because neither of those is
     // symmetric: first fit then silently stops being maximum and undercounts.
     //
-    // Case-FOLDING some registered parameter's value is NOT in that class and
-    // is not what this rules out. Name equality is already a precondition of
-    // the comparison, so a per-name folding rule is still an equivalence on
-    // the pairs and the blocks stay complete. What breaks it is a predicate
-    // that is not an equivalence at all.
+    // `same_value`'s `charset` folding is NOT in that class and is not what
+    // this rules out. Name equality is already a precondition of the
+    // comparison, so a per-name folding rule is still an equivalence on the
+    // pairs and the blocks stay complete. What breaks it is a predicate that
+    // is not an equivalence at all.
     for (at, candidate_param) in candidate.params().enumerate() {
       let (candidate_name, candidate_value) = candidate_param.map_err(MediaError::from)?;
       let Some(slot) = taken.get_mut(at) else {
@@ -538,7 +571,10 @@ fn matched_instances(
         return Err(MediaError::TooManyParameters);
       };
       // §5.6.6: "Parameter names are case-insensitive".
-      if !*slot && candidate_name.eq_ignore_ascii_case(name) && same_value(value, candidate_value) {
+      if !*slot
+        && candidate_name.eq_ignore_ascii_case(name)
+        && same_value(name, value, candidate_value)
+      {
         *slot = true;
         found = true;
         break;
@@ -574,16 +610,19 @@ fn matched_instances(
 /// range naming `a` twice matches only a candidate offering two, so repeating a
 /// parameter cannot buy precedence.
 ///
-/// Parameter names compare ASCII-case-insensitively and values compare
-/// byte-exact after unescaping. Values are NOT case-folded: §8.3.1 says
-/// "Parameter values might or might not be case-sensitive, depending on the
-/// semantics of the parameter name", so which of them fold is each
-/// registration's business rather than this crate's. The consequence is worth
-/// stating rather than leaving to be discovered — a field saying
-/// `text/html;charset=UTF-8;q=0.6, */*;q=0.1` gives the candidate
-/// `text/html;charset=utf-8` a weight of `0.1`, because the specific range does
-/// not match and the walk falls through. A candidate carrying parameters the
-/// range does not name DOES still match, which is how `text/*` matches
+/// Parameter names compare ASCII-case-insensitively (§5.6.6) and values compare
+/// byte-exact after unescaping, with `charset` the one exception: §8.3.2 says
+/// "In both cases, charset names are matched case-insensitively", so a field
+/// saying `text/html;charset=UTF-8;q=0.6, */*;q=0.1` gives the candidate
+/// `text/html;charset=utf-8` a weight of `0.6` and not the wildcard's `0.1`.
+/// Every OTHER value stays byte-exact, because §8.3.1 leaves it so — a field
+/// saying `text/html;boundary=A;q=0.6, */*;q=0.1` gives
+/// `text/html;boundary=a` the wildcard's `0.1`, since the specific range does
+/// not match and the walk falls through. §8.3.1 says "Parameter values might or
+/// might not be case-sensitive, depending on the semantics of the parameter
+/// name", and `charset` is the one whose semantics RFC 9110 states, so the
+/// split is the RFC's rather than this crate's. A candidate carrying parameters
+/// the range does not name DOES still match, which is how `text/*` matches
 /// `text/html;level=3`.
 ///
 /// [`Weight::ZERO`] is the answer both for a matching range that says `q=0` and
