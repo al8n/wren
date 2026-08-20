@@ -82,6 +82,9 @@ pub use head::{
   FieldsIter, HeadView, Headers, MAX_HEAD_BYTES, MAX_HEADERS, RequestLine, StatusLine, Target,
   Version,
 };
+pub use media::{
+  MAX_TRACKED_PARAMS, MediaError, MediaRange, MediaType, Weight, accept, media_type, weight_for,
+};
 // `validate::BodyFraming` is deliberately NOT re-exported here. It is the
 // receive side's own RFC 9112 §6.3 decision, and no public signature hands one
 // out or takes one: a driver states its outbound framing with `BodyPlan` and

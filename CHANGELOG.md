@@ -1,5 +1,97 @@
 # UNRELEASED
 
+## `http1-proto` — cycle 6 (media types and the `Accept` ranking)
+
+Issue #42. `Content-Type` and `Accept` were the two fields this core scanned but
+would not read: a consumer holding their values had to re-implement RFC 9110
+§5.6.6's parameter grammar to get at a charset, and §12.5.1's precedence to pick
+a representation — the second of which is a ranking the RFC settles and a
+hand-rolled one gets wrong. Both are now parsed here, to the last parameter. The
+PICK stays the caller's: §12.1 says a user agent "cannot rely on proactive
+negotiation preferences being consistently honored", so this crate answers what
+weight applies and nothing about what to serve.
+
+### Added
+
+- **`media_type`, `MediaType`**: reads ONE `Content-Type` value into §8.3.1's
+  `type "/" subtype parameters`, borrowing the value rather than copying it.
+  `ty()` and `subtype()` hand back the tokens as written, since §8.3.1 makes them
+  case-insensitive and the comparison is the caller's; `params()` yields every
+  parameter in wire order. It takes a single VALUE rather than a field's lines
+  because §8.3 makes `Content-Type` a singleton, and a comma outside a
+  quoted-string is refused rather than recovered from: §8.3 records that
+  recipients which take "the last syntactically valid member of the list" cause
+  "potential interoperability and security issues", and refusal is the one
+  behaviour that cannot diverge between two recipients.
+- **`accept`, `MediaRange`**: walks an `Accept` field's §12.5.1 media ranges.
+  Takes the field's LINES, not one value, for the reason `parameterised_list`
+  does — §5.2 makes a repeated field one comma-joined value and a quoted-string
+  may span the join. `ty()`/`subtype()` report `None` for exactly the two
+  wildcard SHAPES §12.5.1 names, so a literal asterisk reached through the
+  `type "/" subtype` alternative (`*/json`) stays an ordinary token and matches
+  nothing real. `params()` never yields `q`, wherever it appeared: §12.5.1 says
+  recipients "SHOULD process any parameter named "q" as weight, regardless of
+  parameter ordering", so none of them is a range parameter.
+- **`weight_for`**: the §12.5.1 selection — the weight an `Accept` field gives
+  one candidate. Precedence is a lexicographic key over the ranges that matched
+  (shape, then matched parameter instances, then field order) which GENERATES
+  §12.5.1's printed four-item list rather than transcribing it, which is what
+  ranks a parameterised wildcard above its bare form — a pair that list does not
+  contain. Three parts of it are readings rather than answers §12.5.1 gives and
+  ship as implementation-defined determinism; they are named in the function's
+  own doc. `Weight::ZERO` both for a matching range that says `q=0` and for a
+  candidate nothing matched (§12.4.3).
+- **`Weight`**: a §12.4.2 `qvalue` in thousandths, `0..=1000`. Fixed point rather
+  than a float, because the grammar is already fixed point and this core compares
+  weights exactly, on tiers with no FPU and under a link-time no-panic proof.
+  `Ord` is PREFERENCE ("0.001 is the least preferred and 1 is the most
+  preferred"), not §12.5.1's separate question of which range applies.
+- **`MediaError`**: why a media-type or `Accept` walk stopped.
+  `ValueSpansFieldLines` and `TooManyParameters` are their own variants rather
+  than `Parameters` details, because one condition gets one representation: the
+  first is well-formed input that is simply not one contiguous slice, and the
+  second names a limit of a no-alloc match rather than a fault the sender
+  committed.
+- **`MAX_TRACKED_PARAMS`**: the most parameter instances a candidate may carry
+  while a range's parameters are matched against it. §12.5.1's match is per
+  INSTANCE — a range naming `a` twice matches only a candidate offering two, so
+  repeating a parameter cannot buy precedence — which means remembering which of
+  the candidate's instances are already spent, and a no-alloc core cannot grow
+  that memory. Exceeding it is `Err`, never a weight read off the parameters the
+  walk could see. A parse-constant like `MAX_HEADERS`, not a `Limits` knob: the
+  storage is in the binary, so a caller cannot raise it. A range carrying no
+  parameters spends no slot and keeps matching a candidate with any number.
+- **`validate::parse_content_length`**: the §8.6 `1*DIGIT` reader, made `pub`.
+  It was already the crate's one spelling of that parse and a consumer had no
+  way to reach it. One element only; a caller holding a comma-bearing value
+  composes it with the existing `grammar::list_elements` and `grammar::trim_ows`.
+  An overflow is a framing error rather than a wrapped length.
+- **`ParamValue::unescaped`, `unescape_into` and `eq_unescaped_ignore_ascii_case`**:
+  new methods, not new consumers of an old one — none of the three existed
+  before this branch. `unescaped` is the no-alloc iterator the other two are
+  built on and the one a no-alloc caller reaches for first: `same_value` (the
+  range-vs-candidate parameter match behind `weight_for`) compares two values
+  with it directly. `unescape_into` writes it into a caller-supplied slice;
+  `range_from` uses it to unescape a `q` parameter's digits before
+  `parse_qvalue` reads them. `eq_unescaped_ignore_ascii_case` has no internal
+  caller yet — it answers the common question ("is this charset utf-8?")
+  without a buffer, for whoever asks it next. None of the three fold case:
+  §8.3.1 says parameter values "might or might not be case-sensitive,
+  depending on the semantics of the parameter name", which is each
+  registration's business rather than this crate's. Parameter NAMES compare
+  ASCII-case-insensitively regardless (§5.6.6).
+- **`ListMember` now derives `Eq` and `PartialEq`**, comparing a member's bytes
+  as written; `MediaType` and `MediaRange` reuse it through their own derives.
+
+### Internals
+
+- **The §12.4.2 `qvalue` reader and the §12.5.1 weight selection join the
+  link-time `no-panic` proof**, bringing it to eleven link-checked leaves. The
+  `qvalue` reader carries the feature's only checked accumulation; the weight
+  shim is driven over a field's LINES rather than one value, so §5.2's join
+  branches stay live rather than being pruned as visibly dead before the guard
+  can act on them.
+
 ## `http1-proto` — cycle 6 (the General ↔ Tunnel mode edges)
 
 PR1 of the cycle. A server could not answer WebSocket upgrades and ordinary HTTP

@@ -1,14 +1,9 @@
-// `media_type`, `accept`, and `weight_for` (here and in `Weight`'s own doc
-// below) are plain code spans, not intra-doc links: their targets don't exist
-// until Tasks 4-6 land, and `-Dwarnings` fails an unresolved link on every
-// commit in between, not only once at the end of the feature. Task 7 turns all
-// four spans back into links once the public surface is complete.
 //! The RFC 9110 §8.3.1 media type and §12.5.1 `Accept` range, over the §5.6.6
 //! parameter grammar the crate already walks.
 //!
-//! Two entry points share one walk: `media_type` reads a single
-//! `Content-Type` value and `accept` walks an `Accept` field's lines.
-//! `weight_for` composes §12.5.1's precedence with §12.4.2's weight, which is
+//! Two entry points share one walk: [`media_type`] reads a single
+//! `Content-Type` value and [`accept`] walks an `Accept` field's lines.
+//! [`weight_for`] composes §12.5.1's precedence with §12.4.2's weight, which is
 //! the one derivation those sections settle; choosing a representation from the
 //! result is the caller's, and §12.1 says a user agent "cannot rely on
 //! proactive negotiation preferences being consistently honored".
@@ -186,7 +181,7 @@ impl<'a> MediaType<'a> {
 /// §5.6.6 parameter fault. Never [`MediaError::BadWeight`]. Never
 /// [`MediaError::ValueSpansFieldLines`] either: that variant needs an
 /// RFC 9110 §5.2 join between field LINES to span, and a value walked as a
-/// single line has no second line to join with — `accept`, which walks a
+/// single line has no second line to join with — [`accept`], which walks a
 /// field's several lines, is where it is reachable.
 pub fn media_type(value: &[u8]) -> Result<MediaType<'_>, MediaError> {
   if has_bare_comma(value) {
@@ -224,7 +219,7 @@ pub fn media_type(value: &[u8]) -> Result<MediaType<'_>, MediaError> {
 ///
 /// The `Ord` derive is PREFERENCE, not precedence: §12.4.2 says "0.001 is the
 /// least preferred and 1 is the most preferred", while which RANGE applies to a
-/// candidate is §12.5.1's separate question. Only `weight_for` composes the
+/// candidate is §12.5.1's separate question. Only [`weight_for`] composes the
 /// two, and it composes them in §12.5.1's order.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Weight(u16);
@@ -527,9 +522,15 @@ fn matched_instances(
     // below is a conjunction of two equivalence relations — name equality
     // ASCII-case-insensitively, value equality after unescaping. Those make the
     // range-to-candidate graph a disjoint union of complete blocks, in which no
-    // choice can strand an augmenting path. Fold case for some registered
-    // parameter, or admit a prefix or subset match, and the blocks stop being
-    // complete: first fit then silently stops being maximum and undercounts.
+    // choice can strand an augmenting path. Admit a prefix or a subset match
+    // and the blocks stop being complete, because neither of those is
+    // symmetric: first fit then silently stops being maximum and undercounts.
+    //
+    // Case-FOLDING some registered parameter's value is NOT in that class and
+    // is not what this rules out. Name equality is already a precondition of
+    // the comparison, so a per-name folding rule is still an equivalence on
+    // the pairs and the blocks stay complete. What breaks it is a predicate
+    // that is not an equivalence at all.
     for (at, candidate_param) in candidate.params().enumerate() {
       let (candidate_name, candidate_value) = candidate_param.map_err(MediaError::from)?;
       let Some(slot) = taken.get_mut(at) else {

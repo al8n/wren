@@ -196,6 +196,12 @@ fn unescape_into_writes_nothing_when_the_slice_is_short() {
   );
   assert_eq!(out, [0xAA, 0xAA], "a failed call must not have written");
 
+  // The EXACT fit, `need == out.len()`: the boundary between the two arms, and
+  // the seat an off-by-one in a two-pass buffer API takes.
+  let mut out = [0xAAu8; 3];
+  assert_eq!(v.unescape_into(&mut out), Ok(3));
+  assert_eq!(out, *br#"a"b"#);
+
   let mut out = [0u8; 8];
   assert_eq!(v.unescape_into(&mut out), Ok(3));
   assert_eq!(out.get(..3), Some(br#"a"b"#.as_slice()));
