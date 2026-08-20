@@ -429,10 +429,13 @@ fn weight_for_is_panic_free() {
     ),
     0
   );
-  // No lines at all, and one empty line: nothing matched, never a panic.
+  // No lines at all is §12.4.1's ABSENCE, which short-circuits before the walk
+  // and answers §12.4.2's default weight; one empty line is a field that WAS
+  // sent, naming an empty list, which walks and matches nothing. Two inputs,
+  // two answers, and the early return is a branch of its own to prove clean.
   assert_eq!(
     shim_weight_for(black_box(b"text/html".as_slice()), black_box(&[])),
-    0
+    1000
   );
   assert_eq!(
     shim_weight_for(

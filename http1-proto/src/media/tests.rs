@@ -678,11 +678,111 @@ fn parameter_names_compare_case_insensitively() {
 fn an_unmatched_candidate_weighs_zero() {
   // §12.4.3: "If no wildcard is present, values that are not explicitly
   // mentioned in the field are considered unacceptable."
+  //
+  // Row 3 of the three-way rule on `weight_for`: the field was SENT and did
+  // not mention this candidate. Row 1 — no field at all — is a different input
+  // with a different answer; see the absence test below before changing any of
+  // these to `ONE`.
   let m = media_type(b"image/png").expect("valid");
   assert_eq!(weight_for(&m, [b"text/html".as_slice()]), Ok(Weight::ZERO));
   assert_eq!(weight_for(&m, [b"".as_slice()]), Ok(Weight::ZERO));
   // An explicit q=0 is the same answer, and the RFC draws no distinction.
   assert_eq!(weight_for(&m, [b"*/*;q=0".as_slice()]), Ok(Weight::ZERO));
+}
+
+/// No field lines at all — the natural spelling of a request that carried no
+/// `Accept` header.
+const NO_ACCEPT: [&[u8]; 0] = [];
+
+#[test]
+fn an_absent_accept_field_is_no_preference_not_a_refusal() {
+  // §12.4.1, titled Absence: "For each of the content negotiation fields, a
+  // request that does not contain the field implies that the sender has no
+  // preference on that dimension of negotiation."
+  //
+  // Row 1 of `weight_for`'s three-way rule. No preference is not a refusal, so
+  // the candidate keeps §12.4.2's default weight and no matching happens at
+  // all — including for a candidate no real field would have named.
+  let m = media_type(b"text/html").expect("valid");
+  assert_eq!(weight_for(&m, NO_ACCEPT), Ok(Weight::ONE));
+  let odd = media_type(b"application/vnd.example+json;v=3").expect("valid");
+  assert_eq!(weight_for(&odd, NO_ACCEPT), Ok(Weight::ONE));
+
+  // The CONTRAST is what this test exists for, so it is asserted here rather
+  // than left to the tests either side: an answer of `ONE` for row 1 is only
+  // right if rows 2 and 3 are still `ZERO`. A rule that returned `ONE`
+  // whenever nothing matched would satisfy the two assertions above and be
+  // wrong about every present field.
+  assert_eq!(
+    weight_for(&m, [b"".as_slice()]),
+    Ok(Weight::ZERO),
+    "row 2: a field that WAS sent, with an empty list"
+  );
+  assert_eq!(
+    weight_for(&m, [b"image/png".as_slice()]),
+    Ok(Weight::ZERO),
+    "row 3: a field that WAS sent, naming something else"
+  );
+}
+
+#[test]
+fn a_present_but_empty_accept_field_is_not_an_absent_one() {
+  // Row 2, on its own. `Accept = #( media-range [ weight ] )`, and §5.6.1.1
+  // expands the construct to `#element => [ 1#element ]`, so an empty list is
+  // a field the sender was entitled to write. It was SENT, it named no range,
+  // and §12.4.3 makes an unmentioned value unacceptable — which is the same
+  // answer as row 3 and NOT the answer to row 1.
+  let m = media_type(b"text/html").expect("valid");
+  for field in [
+    b"".as_slice(),
+    // Whitespace is OWS, not a range (§5.6.3).
+    b" ",
+    // §5.6.1.2: "A recipient MUST parse and ignore a reasonable number of
+    // empty list elements".
+    b",",
+    b" , ,",
+  ] {
+    assert_eq!(weight_for(&m, [field]), Ok(Weight::ZERO), "{field:?}");
+  }
+  // Several lines that are all empty are still a field that was sent: §5.2
+  // joins them into one value, and that value names no range either.
+  assert_eq!(
+    weight_for(&m, [b"".as_slice(), b""]),
+    Ok(Weight::ZERO),
+    "two empty lines are a present field, not an absent one"
+  );
+  // And one empty line is not a shorter way of writing no lines: the two
+  // inputs differ, and so do the answers.
+  assert_ne!(weight_for(&m, [b"".as_slice()]), weight_for(&m, NO_ACCEPT));
+}
+
+#[test]
+fn the_absence_rule_leaves_a_present_field_alone() {
+  // Reading presence off the input costs the walk its first line, which is
+  // handed straight back to it. These pin that nothing was dropped or
+  // reordered on the way.
+  let m = media_type(b"text/html").expect("valid");
+  // A matching range on the ONLY line still wins its own weight.
+  assert_eq!(
+    weight_for(&m, [b"text/html;q=0.4, */*;q=0.1".as_slice()]),
+    Ok(Weight(400))
+  );
+  // A range on the FIRST line is still reachable when later lines follow it.
+  assert_eq!(
+    weight_for(&m, [b"text/html;q=0.4".as_slice(), b"image/png;q=0.9"]),
+    Ok(Weight(400))
+  );
+  // An empty FIRST line is a present field whose later lines still walk: §5.2
+  // joins them with a comma, and §5.6.1.2 ignores the empty element it makes.
+  assert_eq!(
+    weight_for(&m, [b"".as_slice(), b"text/html;q=0.4"]),
+    Ok(Weight(400))
+  );
+  // A fault on the first line is still a fault, rather than an absence.
+  assert_eq!(
+    weight_for(&m, [b"text/html;q=bogus".as_slice()]),
+    Err(MediaError::BadWeight)
+  );
 }
 
 #[test]

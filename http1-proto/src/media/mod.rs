@@ -677,6 +677,38 @@ fn matched_instances(
 /// for a candidate nothing matched. §12.4.3: "If no wildcard is present, values
 /// that are not explicitly mentioned in the field are considered unacceptable."
 ///
+/// An ABSENT field is neither of those, and it answers differently. NO lines at
+/// all is how a caller spells a request that carried no `Accept`, and §12.4.1 —
+/// titled Absence — settles that input on its own: "For each of the content
+/// negotiation fields, a request that does not contain the field implies that
+/// the sender has no preference on that dimension of negotiation." No preference
+/// is not a refusal, so every candidate keeps [`Weight::ONE`], §12.4.2's default
+/// weight, and no matching is done at all. §12.4.1's next sentence confirms the
+/// reading by reserving the 406 for a field that IS present: "If a content
+/// negotiation header field is present in a request and none of the available
+/// representations for the response can be considered acceptable according to
+/// it, the origin server can either honor the header field by sending a 406 (Not
+/// Acceptable) response or disregard the header field by treating the response
+/// as if it is not subject to content negotiation for that request header
+/// field."
+///
+/// ONE line that happens to be empty is a different input and keeps
+/// [`Weight::ZERO`]. `Accept` is `#( media-range [ weight ] )`, and §5.6.1.1
+/// expands that to `#element => [ 1#element ]` — the list may be empty — so such
+/// a field WAS sent and named no range, which is §12.4.3's unmentioned value
+/// once more. Three inputs, two answers:
+///
+/// | lines | the field | answer |
+/// |---|---|---|
+/// | none | never sent | [`Weight::ONE`] |
+/// | one empty line | sent, list empty | [`Weight::ZERO`] |
+/// | ranges, none matching | sent, candidate unmentioned | [`Weight::ZERO`] |
+///
+/// The iterator already carries that distinction — zero items against one empty
+/// item — so this reads presence off the input rather than taking a flag for it.
+/// A caller holding an absent field passes no lines and a caller holding an empty
+/// one passes its empty value, each of which is what they already have.
+///
 /// This answers what weight applies to ONE candidate; ranking a caller's
 /// candidates is the caller's own loop over this.
 ///
@@ -687,12 +719,24 @@ fn matched_instances(
 /// cannot say which ranges the field named. Also
 /// [`MediaError::TooManyParameters`], which is about the CANDIDATE rather than
 /// the field: see [`MAX_TRACKED_PARAMS`].
+///
+/// Never for an ABSENT field: with no lines there is nothing to walk and no
+/// candidate parameter to track, so [`Weight::ONE`] is unconditional there.
 pub fn weight_for<'a, I>(candidate: &MediaType<'_>, accept_lines: I) -> Result<Weight, MediaError>
 where
   I: IntoIterator<Item = &'a [u8]>,
 {
+  let mut lines = accept_lines.into_iter();
+  // §12.4.1's absence, told from §5.6.1.1's empty list by the one thing that
+  // separates them: a field that was never sent has no lines, and a field sent
+  // empty has one line that is empty. Peeling the first line reads that off the
+  // input without a second parameter to say what the input already says, and
+  // the peeled line is handed straight back to the walk below.
+  let Some(first) = lines.next() else {
+    return Ok(Weight::ONE);
+  };
   let mut best: Option<((u8, usize, usize), Weight)> = None;
-  for (at, range) in accept(accept_lines).enumerate() {
+  for (at, range) in accept(core::iter::once(first).chain(lines)).enumerate() {
     let range = range?;
     let Some(matched) = matched_instances(&range, candidate)? else {
       continue;
