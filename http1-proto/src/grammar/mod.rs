@@ -945,8 +945,13 @@ pub enum ListError {
 ///
 /// RFC 9110 §5.6.4 defines the `quoted-pair` escape but leaves what the
 /// unescaped value MEANS to the field that used it — RFC 6455 §9.1, for one,
-/// requires the unescaped form to be a `token` — so unescaping belongs to the
-/// caller and this hands over exactly the bytes between the delimiting DQUOTEs.
+/// requires the unescaped form to be a `token` — so this variant hands over
+/// the bytes as the sender wrote them, escapes intact: what they mean is the
+/// field's business, not this type's. Performing §5.6.4's replacement itself
+/// is NOT the caller's job, though: [`unescaped`](Self::unescaped),
+/// [`unescape_into`](Self::unescape_into) and
+/// [`eq_unescaped_ignore_ascii_case`](Self::eq_unescaped_ignore_ascii_case)
+/// below are how this type discharges it.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ParamValue<'a> {
@@ -964,7 +969,11 @@ pub enum ParamValue<'a> {
 /// Walks a parameter value with its RFC 9110 §5.6.4 `quoted-pair` escapes
 /// removed. Total over any value the walker produced: a `quoted-pair`'s
 /// backslash is only accepted with an octet behind it, so the lookahead below
-/// can only run off the end of a value this crate did not validate.
+/// can only run off the end of a value this crate did not validate — reachable
+/// only by building one directly, since `#[non_exhaustive]` blocks exhaustive
+/// matching, not construction. There, the lone trailing backslash is simply
+/// dropped: not yielded, not reported as an error, the same in all three
+/// methods below.
 struct Unescaped<'a> {
   bytes: &'a [u8],
   at: usize,
@@ -1064,6 +1073,9 @@ impl<'a> ParamValue<'a> {
 /// `ext; q=1` and `ext;  q=1` compare unequal here even though both walk to
 /// the same `(name, ParamValue)` pairs through [`params`](ListMember::params).
 /// A caller wanting that value equality compares `params()`'s output instead.
+/// The derive also compares the private `QuotedTail`, so two members with
+/// identical `name` and `params` bytes can still compare unequal when one was
+/// parsed across an RFC 9110 §5.2 field-line join and the other was not.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct ListMember<'a> {
   name: &'a [u8],

@@ -331,15 +331,22 @@ pub(crate) fn check_response_head(
 /// Checked decimal parse of ONE `Content-Length` value: RFC 9110 §8.6 spells it
 /// `1*DIGIT`, and nothing else is accepted.
 ///
-/// No sign, no whitespace, no other base, and no value past `u64::MAX` — an
-/// overflow is a framing error rather than a wrapped length, since a wrapped
-/// one would frame the body at the wrong offset. Leading zeros are digits like
-/// any other (`007` is 7).
+/// No sign, no whitespace, no other base, and no value past `u64::MAX`, since a
+/// wrapped length would frame the body at the wrong offset. Leading zeros are
+/// digits like any other (`007` is 7).
 ///
 /// The caller splits a comma-separated value into its elements first: this
 /// parses a single value, and item 5's identical-list rule is applied around
-/// it.
-pub(crate) fn parse_content_length(v: &[u8]) -> Result<u64, H1Error> {
+/// it. A [`HeadView`] does exactly that with the public companions
+/// [`grammar::list_elements`](crate::grammar::list_elements) and
+/// [`grammar::trim_ows`](crate::grammar::trim_ows), which a caller composes
+/// the same way.
+///
+/// # Errors
+///
+/// [`H1Error::Framing`] when the value is not `1*DIGIT`, or when it exceeds
+/// `u64::MAX` — an overflow is a framing error rather than a wrapped length.
+pub fn parse_content_length(v: &[u8]) -> Result<u64, H1Error> {
   if v.is_empty() || !v.iter().all(|b| b.is_ascii_digit()) {
     return Err(H1Error::Framing("Content-Length is not 1*DIGIT"));
   }

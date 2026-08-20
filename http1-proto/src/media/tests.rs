@@ -37,7 +37,7 @@ fn qvalue_refuses_what_the_abnf_does_not_spell() {
 
 #[test]
 fn weight_orders_as_the_rfc_says_it_does() {
-  // RFC 9110 section 12.4.2: "0.001 is the least preferred and 1 is the most
+  // RFC 9110 §12.4.2: "0.001 is the least preferred and 1 is the most
   // preferred".
   assert!(Weight::ZERO < Weight(1));
   assert!(Weight(1) < Weight(500));
@@ -61,7 +61,7 @@ fn a_media_type_parses_to_its_two_tokens_and_its_parameters() {
 
 #[test]
 fn content_type_refuses_a_comma_outside_a_quoted_string() {
-  // RFC 9110 section 8.3 warns that recovering from a doubled Content-Type by
+  // RFC 9110 §8.3 warns that recovering from a doubled Content-Type by
   // taking "the last syntactically valid member of the list" causes
   // "potential interoperability and security issues"; refusal cannot diverge.
   assert_eq!(
@@ -69,7 +69,7 @@ fn content_type_refuses_a_comma_outside_a_quoted_string() {
     Err(MediaError::NotASingleton)
   );
   // A trailing comma too: member-counting would call this singular, because
-  // section 5.6.1.2 has the walk skip empty elements.
+  // §5.6.1.2 has the walk skip empty elements.
   assert_eq!(media_type(b"text/plain,"), Err(MediaError::NotASingleton));
   // Inside a quoted-string the comma is data.
   let m = media_type(b"multipart/form-data;boundary=\"a,b\"").expect("valid");
@@ -78,9 +78,9 @@ fn content_type_refuses_a_comma_outside_a_quoted_string() {
 
 #[test]
 fn a_parameter_named_q_is_ordinary_in_a_content_type() {
-  // Content-Type has no weight grammar: section 12.4.2's q is a
-  // content-negotiation feature and section 12.5.1's recipient SHOULD is
-  // Accept's. So this is a valid media type with an oddly named parameter.
+  // Content-Type has no weight grammar: §12.4.2's q is a content-negotiation
+  // feature and §12.5.1's recipient SHOULD is Accept's. So this is a valid
+  // media type with an oddly named parameter.
   let m = media_type(b"text/html;q=blah").expect("valid");
   assert_eq!(m.ty(), "text");
   assert_eq!(
@@ -95,6 +95,7 @@ fn media_type_refuses_what_is_not_type_solidus_subtype() {
     b"application".as_slice(), // no solidus
     b"/json",                  // empty type
     b"application/",           // empty subtype
+    b"/",                      // both halves empty at once
     b"appli cation/json",      // space is not a tchar
     b"application/js/on",      // two solidi: the second is not a tchar
   ] {
@@ -105,8 +106,8 @@ fn media_type_refuses_what_is_not_type_solidus_subtype() {
 #[test]
 fn a_valueless_parameter_is_refused_by_the_media_grammar() {
   // The walker admits `ParamValue::None` for fields like RFC 6455's that
-  // define their own parameter grammar. Section 5.6.6's `parameter` requires
-  // the `=`, so for a media type it is a violation.
+  // define their own parameter grammar. §5.6.6's `parameter` requires the `=`,
+  // so for a media type it is a violation.
   assert_eq!(
     media_type(b"text/html;charset"),
     Err(MediaError::ValuelessParameter)
@@ -142,13 +143,12 @@ fn a_range_yields_its_shape_its_weight_and_its_parameters() {
 
 #[test]
 fn a_literal_asterisk_type_matches_nothing_real_in_a_range_too() {
-  // Section 12.5.1 names exactly two wildcard SHAPES -- "*/*" and "type/*"
+  // §12.5.1 names exactly two wildcard SHAPES — "*/*" and "type/*"
   // (quoted in full on `MediaRange::ty`'s doc). `*` reached through the third
   // alternative, `type "/" subtype`, is an ordinary token, not a wildcard:
   // `*/json` must report `ty() == Some("*")`, never collapse to `None`. An
   // earlier draft of this design conflated the two and let `*/json` match
-  // every candidate; `weight_for` (task 6) is built directly on this staying
-  // false.
+  // every candidate; `weight_for` is built directly on this staying false.
   let r = accept([b"*/json".as_slice()])
     .next()
     .expect("one")
@@ -208,15 +208,15 @@ fn an_empty_accept_value_yields_no_ranges() {
 #[test]
 fn a_value_spanning_the_join_is_lifted_to_its_own_variant() {
   // A quoted-string opened on one field line and closed on the next is well
-  // formed (section 5.2 joins them with a comma, which is data inside the
-  // string) and not one contiguous slice.
+  // formed (§5.2 joins them with a comma, which is data inside the string)
+  // and not one contiguous slice.
   let mut it = accept([b"text/html;boundary=\"a".as_slice(), b"b\"".as_slice()]);
   assert_eq!(it.next(), Some(Err(MediaError::ValueSpansFieldLines)));
 }
 
 #[test]
 fn a_valueless_parameter_is_refused_in_a_range_too() {
-  // The same refusal `media_type` makes, for the same reason: section 5.6.6's
+  // The same refusal `media_type` makes, for the same reason: §5.6.6's
   // `parameter` grammar requires the `=`, and a media range defines no
   // grammar of its own that admits a bare name.
   assert_eq!(
@@ -227,10 +227,10 @@ fn a_valueless_parameter_is_refused_in_a_range_too() {
 
 #[test]
 fn a_valueless_q_is_a_grammar_fault_not_a_bad_weight() {
-  // A bare `q` fails section 5.6.6's `parameter` grammar outright -- there is
-  // no value to be a bad `qvalue`, so the walk never reaches section 12.5.1's
-  // weight question at all. This pins the ordering: the valueless check runs
-  // before the `q`-name check.
+  // A bare `q` fails §5.6.6's `parameter` grammar outright — there is no
+  // value to be a bad `qvalue`, so the walk never reaches §12.5.1's weight
+  // question at all. This pins the ordering: the valueless check runs before
+  // the `q`-name check.
   assert_eq!(
     accept([b"text/html;q".as_slice()]).next(),
     Some(Err(MediaError::ValuelessParameter))
@@ -652,9 +652,9 @@ mod heap {
 
   #[test]
   fn q_is_weight_wherever_it_appears_and_in_whatever_case() {
-    // RFC 9110 section 12.5.1: "Recipients SHOULD process any parameter named
-    // "q" as weight, regardless of parameter ordering." Section 12.4.2 names it
-    // "q" (case-insensitive).
+    // RFC 9110 §12.5.1: "Recipients SHOULD process any parameter named "q" as
+    // weight, regardless of parameter ordering." §12.4.2 names it "q"
+    // (case-insensitive).
     for line in [
       b"text/html;q=0.5;level=3".as_slice(),
       b"text/html;level=3;q=0.5",

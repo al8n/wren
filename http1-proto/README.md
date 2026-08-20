@@ -95,11 +95,10 @@ crate exists; the other three are what that position obligates.
    preferences being consistently honored", so the ranking §12.5.1 settles is
    ours and the pick is yours.
 
-Where a clause names work this crate does not yet do — today, §12.5.1's
-media-range walk and its ranking, §11.3's challenge walk, §8.8.3.2's entity-tag
-comparison, §13.2.2's precondition order, and stripping `quoted-pair` from a
-quoted parameter value — that is a missing feature here, to be filed as one. It
-is not licence to read the wire downstream.
+Where a clause names work this crate does not yet do — today, §11.3's challenge
+walk, §8.8.3.2's entity-tag comparison, and §13.2.2's precondition order — that
+is a missing feature here, to be filed as one. It is not licence to read the
+wire downstream.
 
 So: not a router, not a URI resolver, not a cache, not a content codec. Each of
 those follows from the clauses above rather than standing beside them. This core
@@ -578,17 +577,19 @@ two recipients that resolve it differently.
   values, `chunked` that is not the final coding in a request.
 - Every protocol-violation error carries a byte offset (`MalformedDetail`) and,
   where a server would answer, a `SuggestedStatus` (400 / 414 / 431 / 501 / 505).
-- A [`no-panic`] link-time test (`tests/no_panic.rs`) proves the head-end scanner,
-  the status-line parser and the chunk-size parser compile to panic-free code in
-  release. Every argument at every call site goes through
-  `core::hint::black_box`, which is load-bearing rather than decorative: a shim
-  called with compile-time constants is folded away before the guard can act,
-  so the symbol that would fail the link is never emitted and the shim "passes"
-  with an empty proof. A **lie-check** keeps that honest — the internal
-  `test-no-panic-lie` feature adds one shim with a deliberately reachable panic,
-  and CI asserts that building it **fails**. The rest of the crate is held by
-  the crate-wide clippy panic-freedom lint wall (`unwrap_used` /
-  `indexing_slicing` / `arithmetic_side_effects` / …) and by
+- A [`no-panic`] link-time test (`tests/no_panic.rs`) proves eleven leaf
+  primitives compile to panic-free code in release: the head-end scanner, the
+  status-line and chunk-size parsers, the §5.6.6 parameterised-list walk, the
+  §12.4.2 `qvalue` reader, the §12.5.1 weight selection, the FNV-1a head digest,
+  and the inbound body budget's four leaves. Every argument at every call site
+  goes through `core::hint::black_box`, which is load-bearing rather than
+  decorative: a shim called with compile-time constants is folded away before
+  the guard can act, so the symbol that would fail the link is never emitted and
+  the shim "passes" with an empty proof. A **lie-check** keeps that honest — the
+  internal `test-no-panic-lie` feature adds one shim with a deliberately
+  reachable panic, and CI asserts that building it **fails**. The rest of the
+  crate is held by the crate-wide clippy panic-freedom lint wall
+  (`unwrap_used` / `indexing_slicing` / `arithmetic_side_effects` / …) and by
   `forbid(unsafe_code)`.
 - The parser is checked against `httparse` as a **differential oracle**
   (`tests/differential.rs`): we are never more permissive, and every stricter
