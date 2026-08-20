@@ -12,13 +12,17 @@
 //! `no-panic` error naming the symbol.
 //!
 //! Coverage: `find_head_end`, `parse_status_line`, `parse_chunk_size`,
-//! `parameterised_list` and `head_digest` are each link-checked via
-//! `#[no_panic]` shims — the head-terminator scan, the §4 status-line codec, the
+//! `parameterised_list`, `head_digest` and the inbound body budget's four
+//! leaves — `overruns`, `charge`, `widen` and `headroom` — are each
+//! link-checked via `#[no_panic]` shims: the head-terminator scan, the §4
+//! status-line codec, the
 //! `1*HEXDIG` reader whose checked accumulation is the crate's one arithmetic
 //! overflow risk, the join-aware RFC 9110 §5.6.6 list walk, whose cursors run
 //! over borrowed field lines the caller supplies and whose member boundaries
-//! cross the §5.2 join, and the FNV-1a head fold, whose XOR and wrapping
-//! multiply run once per byte of a block up to `MAX_HEAD_BYTES` long.
+//! cross the §5.2 join, the FNV-1a head fold, whose XOR and wrapping
+//! multiply run once per byte of a block up to `MAX_HEAD_BYTES` long, and the
+//! four pure functions that carry the whole of the body bound's arithmetic —
+//! `charge` in particular runs once per payload item the crate hands over.
 //!
 //! Three paths are exercised as **smoke tests only** (NOT link-checked), each
 //! for a reason recorded at its own section: `parse_request_line` and
@@ -92,8 +96,8 @@ use core::hint::black_box;
 
 use http1_proto::{
   __no_panic_internals::{
-    encode_request_head, find_head_end, head_digest, parse_chunk_size, parse_request_line,
-    parse_status_line, scan_head,
+    charge, encode_request_head, find_head_end, head_digest, headroom, overruns, parse_chunk_size,
+    parse_request_line, parse_status_line, scan_head, widen,
   },
   MAX_HEAD_BYTES, Target,
   grammar::{ParamValue, parameterised_list},
@@ -316,6 +320,108 @@ Connection: Upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n";
     shim_head_digest(black_box([0xffu8; MAX_HEAD_BYTES].as_slice())),
     shim_head_digest(black_box([0x00u8; MAX_HEAD_BYTES].as_slice()))
   );
+}
+
+// ── the inbound body budget's four leaves ─────────────────────────────────────
+//
+// The whole of the bound's arithmetic, and the only spellings of it in the
+// crate. `charge` is the one that matters most: it runs once per payload item
+// the receive pump hands over, so a surviving panic edge would be one on the
+// path of every message that carries content. The other three are the
+// declared-count comparison, the slice-length conversion and the remaining
+// allowance — all pure, all reached from the same path.
+//
+// Each shim returns a value derived from its result, so nothing here can be
+// dropped as dead: a call whose answer is unused takes the shim's body with it
+// and proves nothing.
+//
+// THE HONEST LIMIT of what these four prove, recorded here because this is
+// where the claim is made. `no-panic` proves the absence of PANICS, not the
+// absence of wrong answers, and this workspace has no `[profile]` section — so
+// release builds run with `overflow-checks = false` and a bare `received + n`
+// is a wrapping add with no panic edge at all. Replacing `charge`'s
+// `checked_add` with one therefore LINKS CLEAN; what catches it is the
+// `charge(u64::MAX, 1, u64::MAX)` assertion below (the wrap answers 0, which
+// the comparison then admits) and `clippy::arithmetic_side_effects` at
+// `src/lib.rs`. Both were run. What the link proof adds on top is that no
+// indexing, `unwrap` or checked-arithmetic panic survives into the leaves —
+// injecting `received.checked_add(n).unwrap()` fails the link naming
+// `shim_charge`, which is the check that these shims are not vacuous.
+
+no_panic_shim! {
+  /// Shim over `body::charge` — the checked accumulation that IS the bound.
+  fn shim_charge(received: u64, n: u64, limit: u64) -> u64 {
+    // `u64::MAX` stands for the refusal, so both arms carry the computation out.
+    charge(received, n, limit).unwrap_or(u64::MAX)
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `body::overruns` — the declared-count early-exit test.
+  fn shim_overruns(declared: u64, headroom: u64) -> bool {
+    overruns(declared, headroom)
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `body::widen` — the saturating slice-length conversion.
+  fn shim_widen(n: usize) -> u64 {
+    widen(n)
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `body::headroom` — what is left of a limit.
+  fn shim_headroom(received: u64, limit: u64) -> u64 {
+    headroom(received, limit)
+  }
+}
+
+#[test]
+fn the_body_budget_leaves_are_panic_free() {
+  // `charge`: under, exactly at, and past the ceiling, plus the overflow the
+  // `checked_add` exists for — a bare `+` would wrap `u64::MAX + 1` to 0 and
+  // admit it.
+  assert_eq!(shim_charge(black_box(0), black_box(10), black_box(10)), 10);
+  assert_eq!(shim_charge(black_box(4), black_box(5), black_box(10)), 9);
+  assert_eq!(
+    shim_charge(black_box(10), black_box(1), black_box(10)),
+    u64::MAX
+  );
+  assert_eq!(
+    shim_charge(black_box(u64::MAX), black_box(1), black_box(u64::MAX)),
+    u64::MAX
+  );
+  // A zero ceiling, which is the "refuse every message that carries content"
+  // setting, and a zero-length charge against it, which is not content.
+  assert_eq!(shim_charge(black_box(0), black_box(0), black_box(0)), 0);
+  assert_eq!(
+    shim_charge(black_box(0), black_box(1), black_box(0)),
+    u64::MAX
+  );
+  // An unbounded ceiling, where the sum is the only thing that can go wrong.
+  assert_eq!(
+    shim_charge(black_box(u64::MAX - 1), black_box(1), black_box(u64::MAX)),
+    u64::MAX
+  );
+
+  // `overruns`: strict, at both edges and at the extremes.
+  assert!(!shim_overruns(black_box(10), black_box(10)));
+  assert!(shim_overruns(black_box(11), black_box(10)));
+  assert!(!shim_overruns(black_box(0), black_box(0)));
+  assert!(shim_overruns(black_box(u64::MAX), black_box(0)));
+  assert!(!shim_overruns(black_box(u64::MAX), black_box(u64::MAX)));
+
+  // `widen`: the identity range and the saturating end.
+  assert_eq!(shim_widen(black_box(0)), 0);
+  assert_eq!(shim_widen(black_box(1)), 1);
+  assert_eq!(shim_widen(black_box(usize::MAX)), u64::MAX);
+
+  // `headroom`: the subtraction, its zero, and the underflow it saturates.
+  assert_eq!(shim_headroom(black_box(4), black_box(10)), 6);
+  assert_eq!(shim_headroom(black_box(10), black_box(10)), 0);
+  assert_eq!(shim_headroom(black_box(11), black_box(10)), 0);
+  assert_eq!(shim_headroom(black_box(0), black_box(u64::MAX)), u64::MAX);
 }
 
 // ── request-line codec ────────────────────────────────────────────────────────

@@ -86,7 +86,7 @@ use derive_more::Display;
 
 use crate::{
   body::BodyDecoder,
-  error::{Error, H1Error},
+  error::{Error, H1Error, Refusal},
   event::{Event, ExchangeId, Item, Items},
   head::Version,
 };
@@ -177,6 +177,33 @@ pub trait Role: sealed::Sealed {
   /// it: the inbound pump is a single non-generic function, so the role reaches
   /// it as this `bool` rather than by monomorphising the FSM twice.
   const IS_CLIENT: bool;
+
+  /// The default ceiling on the PAYLOAD octets any one inbound message body may
+  /// deliver — a request at a server, a response at a client.
+  ///
+  /// Role-dependent because the two directions are not the same problem: RFC
+  /// 9112 §6.3 item 8's framing, which declares nothing and is delimited only
+  /// by the connection closing, is RESPONSE-only, so a client is where the
+  /// least-boundable case lives and where a real ceiling has to be larger. No
+  /// RFC supplies either number — RFC 9110 §8.6: "there is no predefined limit
+  /// to the length of content" — and §17.5 sanctions the rejection while
+  /// declining the value, which is why this is named `DEFAULT_` and is
+  /// configurable through [`Limits`].
+  ///
+  /// A limit RESERVES nothing: it is a number compared against, so an embedded
+  /// target meets it immediately rather than paying for it.
+  const DEFAULT_MAX_BODY_BYTES: u64;
+
+  /// The FLOOR under the chunk-framing budget: octets one inbound body may
+  /// spend on RFC 9112 §7.1 chunk-size lines when a sixteenth of the payload
+  /// ceiling would be less than this.
+  ///
+  /// The budget itself is resolved from the payload ceiling in force — see
+  /// [`Limits::max_chunk_framing_bytes`] — so that raising one knob does not
+  /// silently leave the other refusing ordinary traffic. This is the floor
+  /// under that resolution, which is what a caller who narrows the payload
+  /// ceiling to nothing still gets.
+  const DEFAULT_MAX_CHUNK_FRAMING_BYTES: u64;
 }
 
 /// Role marker: this endpoint sends requests and reads responses.
@@ -191,9 +218,145 @@ impl sealed::Sealed for Client {}
 impl sealed::Sealed for Server {}
 impl Role for Client {
   const IS_CLIENT: bool = true;
+  /// 64 MiB. Large enough that being refused is exceptional — ordinary
+  /// documents, API responses and page assets sit orders of magnitude inside
+  /// it — and small enough that a consumer accumulating one survives on an
+  /// ordinary deployment. RFC 9112 §6.3 item 8's undeclared, close-delimited
+  /// framing is response-only, so this is the direction that most needs a
+  /// ceiling of some kind. `websocket-proto`'s own `max_message_size` default
+  /// is the same number, which makes the two crates agree rather than each
+  /// guessing.
+  const DEFAULT_MAX_BODY_BYTES: u64 = 64 << 20;
+  /// 4 MiB — a sixteenth of the payload default above, so the two are one
+  /// progression. 64 MiB delivered in 4 KiB chunks, the commonest CDN
+  /// granularity, spends 96 KiB of chunk-size lines, far inside it.
+  const DEFAULT_MAX_CHUNK_FRAMING_BYTES: u64 = 4 << 20;
 }
 impl Role for Server {
   const IS_CLIENT: bool = false;
+  /// 1 MiB, on two anchors rather than a preference: it is nginx's own
+  /// `client_max_body_size 1m`, and it is exactly
+  /// [`MAX_HEAD_BYTES`](crate::MAX_HEAD_BYTES) × [`MAX_HEADERS`](crate::MAX_HEADERS)
+  /// (16384 × 64), so this crate's declared limits are one progression rather
+  /// than unrelated numbers.
+  const DEFAULT_MAX_BODY_BYTES: u64 = 1 << 20;
+  /// 64 KiB — a sixteenth of the payload default above. A sender chunking 1 MiB
+  /// at 8 KiB writes 128 six-octet size lines, two orders of magnitude inside
+  /// it; a peer spending it on one-octet chunks is refused after about 128 KiB
+  /// of wire.
+  const DEFAULT_MAX_CHUNK_FRAMING_BYTES: u64 = 1 << 16;
+}
+
+/// The deterministic, role-seeded limits a connection is constructed with.
+///
+/// Read ONCE, at construction: a [`Connection`] copies the values it needs, so
+/// there is no path from a live connection back to this type and no way to
+/// raise a ceiling on a connection that is already running. That is what makes
+/// the narrowing direction the only one there is.
+///
+/// Seeded from the connection type being built —
+/// [`Connection::default_limits`] — rather than from a free constructor, so the
+/// wrong role's seed has no shorter spelling than the right one.
+///
+/// # The two knobs are not independent
+///
+/// The chunk-framing budget is resolved FROM the payload ceiling in force,
+/// unless a caller states one explicitly, so raising the payload ceiling
+/// carries the framing budget with it. A budget derived from the DEFAULT
+/// payload would reproduce, one knob up, the failure a budget exists to
+/// prevent: a server that set `with_max_body_bytes(100 << 20)` and kept a 64 KiB
+/// framing budget would refuse ordinary 4 KiB-granularity chunked traffic about
+/// 42.7 MiB in. See [`max_chunk_framing_bytes`](Self::max_chunk_framing_bytes).
+///
+/// # Equality compares what was STATED
+///
+/// Presence is part of the value, so `default_limits()` and
+/// `default_limits().with_max_chunk_framing_bytes(n)` are different limits even
+/// on a role where the two resolve to the same number — the first still tracks
+/// the payload ceiling and the second does not.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct Limits {
+  /// The payload ceiling, in octets.
+  payload: u64,
+  /// The chunk-framing budget a caller STATED, or `None` for "resolve it".
+  /// Presence, not a value — see `max_chunk_framing_bytes`.
+  framing: Option<u64>,
+  /// `Ro::DEFAULT_MAX_CHUNK_FRAMING_BYTES`, captured where the role was in
+  /// scope. Carried so the resolution below has a role-less answer to give.
+  floor: u64,
+}
+
+impl Limits {
+  /// Sets the ceiling on the PAYLOAD octets one inbound message body may
+  /// deliver.
+  ///
+  /// `u64::MAX` disables the bound. `0` refuses every message that carries
+  /// content — and is NOT nginx's spelling of "unlimited", deliberately, since
+  /// a magic zero would invert the narrowing direction. A message with no
+  /// content at all (RFC 9112 §6.3 items 1 and 7, and `Content-Length: 0`) is
+  /// never refused whatever this says.
+  ///
+  /// Raises the resolved chunk-framing budget with it unless one has been
+  /// stated: see [`max_chunk_framing_bytes`](Self::max_chunk_framing_bytes).
+  #[must_use]
+  pub const fn with_max_body_bytes(self, n: u64) -> Self {
+    Self {
+      payload: n,
+      framing: self.framing,
+      floor: self.floor,
+    }
+  }
+
+  /// States the budget for the RFC 9112 §7.1 chunk-size lines one inbound body
+  /// may spend, instead of resolving it from the payload ceiling.
+  ///
+  /// Stating it pins it: the budget then no longer moves when the payload
+  /// ceiling does.
+  #[must_use]
+  pub const fn with_max_chunk_framing_bytes(self, n: u64) -> Self {
+    Self {
+      payload: self.payload,
+      framing: Some(n),
+      floor: self.floor,
+    }
+  }
+
+  /// The ceiling on the payload octets one inbound message body may deliver.
+  #[must_use]
+  pub const fn max_body_bytes(&self) -> u64 {
+    self.payload
+  }
+
+  /// The RESOLVED chunk-framing budget: what was stated, or a sixteenth of the
+  /// payload ceiling, or the role's floor — whichever of the last two is larger.
+  ///
+  /// Resolved from the ceiling IN FORCE rather than from the role's default,
+  /// which is the whole point of the rule: 100 MiB delivered in 4 KiB chunks
+  /// needs 153,600 octets of chunk-size lines, so a budget frozen at the
+  /// server's 64 KiB default would refuse ordinary chunked traffic about 42.7
+  /// MiB into a body its own payload ceiling allows. The role default survives
+  /// as the FLOOR, so narrowing the payload ceiling never leaves a body unable
+  /// to state its own framing.
+  ///
+  /// A consequence worth stating rather than discovering: `u64::MAX >> 4` is
+  /// 2⁶⁰, so an unbounded payload ceiling unbounds this too — "unbounded" stays
+  /// one knob.
+  #[must_use]
+  pub const fn max_chunk_framing_bytes(&self) -> u64 {
+    match self.framing {
+      Some(stated) => stated,
+      // `>> 4`, not `/ 16`: `clippy::integer_division` is denied crate-wide.
+      // Spelled out rather than through `Ord::max`, which is not `const`.
+      None => {
+        let scaled = self.payload >> 4;
+        if scaled > self.floor {
+          scaled
+        } else {
+          self.floor
+        }
+      }
+    }
+  }
 }
 
 /// Whether this connection carries ordinary messages ([`General`]) or has been
@@ -501,6 +664,19 @@ pub(crate) struct Exchange {
   /// on a struct with a const-asserted budget, and what makes a genuine digest
   /// of `0` harmless rather than a sentinel collision.
   pub(crate) head_digest: u64,
+  /// This end's own limit refused this exchange's inbound body.
+  ///
+  /// Kept on the EXCHANGE rather than on the connection because it governs what
+  /// this end may still WRITE for this message: RFC 9112 §9.3 makes reading the
+  /// whole request body or closing the connection a MUST, and a refusal takes
+  /// the second branch — so the one response still owed has to state `close`,
+  /// and no interim may invite content that will not be read. Nothing clears
+  /// it, because a refusal is not undone.
+  ///
+  /// The SECOND of the two windows that hold this fact, and never read on its
+  /// own: [`body_refused`] is what the gates call, because before the pump
+  /// resolves a head refusal the fact lives in the decoder instead.
+  pub(crate) body_refused: bool,
 }
 
 /// Where the inbound side of the connection stands.
@@ -818,6 +994,30 @@ pub struct Connection<Ro, Mo> {
   /// idle period rather than per connection. A `u8` because the bound is a
   /// single digit and the counter saturates.
   idle_crlfs: u8,
+  /// BOTH MODES. The OPERATOR'S CEILING on the payload octets one inbound body
+  /// may deliver, resolved at construction from [`Limits`].
+  ///
+  /// ONE WRITER, and it is the constructor. There is no setter, no `&mut` path
+  /// to this field, and no consuming builder on a live connection; it reaches
+  /// the receive pump BY VALUE (a `u64` copy in [`Items`], beside `is_client`),
+  /// so no step of the pump can raise it even by accident. That is a property
+  /// of the field having one writer, not a convention — the same argument
+  /// [`signal_close`] makes about taking `read_closed` by value.
+  ///
+  /// Mode-generic, and carried across [`into_tunnel`](Connection::into_tunnel):
+  /// the ceiling is a property of the connection. It is inert in Tunnel mode —
+  /// RFC 9110 §9.3.6 gives CONNECT no content and this core refuses content on
+  /// a handshake — and it neither constrains nor seeds whatever bounds the
+  /// protocol on the other side of a switch applies to its own messages.
+  max_body: u64,
+  /// BOTH MODES. The budget for the RFC 9112 §7.1 chunk-size lines one inbound
+  /// body may spend, resolved at construction from [`Limits`].
+  ///
+  /// One writer, by value, for the same reason `max_body` is. Carried and
+  /// readable from the day the type exists so that the resolution rule has one
+  /// spelling — [`Limits::max_chunk_framing_bytes`] — rather than a second one
+  /// re-derived here.
+  max_chunk_framing: u64,
   /// The type-state. Zero-sized, so the markers cost the connection nothing.
   shape: PhantomData<(Ro, Mo)>,
 }
@@ -840,8 +1040,45 @@ impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
   /// makes every OTHER impl's widening free rather than a trade — `Connection`'s
   /// fields are all private, so a `Connection<SomeForeign, SomeOther>` cannot be
   /// built by any route except this one, and this one still refuses it.
+  ///
+  /// `Self::with_limits(Self::default_limits())`, so the defaults are stated in
+  /// one place and this constructor is not a second one.
   #[inline]
   pub const fn new() -> Self {
+    Self::with_limits(Self::default_limits())
+  }
+
+  /// The defaults this connection's ROLE would be constructed with — the seed a
+  /// caller narrows from.
+  ///
+  /// The only place a role is in scope, which is why the role's chunk-framing
+  /// floor is captured here rather than looked up later. The framing budget
+  /// itself is left UNSET, so that a caller who narrows or raises the payload
+  /// ceiling carries the framing budget with it: seeding it with a value would
+  /// make `default_limits().with_max_body_bytes(100 << 20)` keep a 64 KiB
+  /// framing budget and refuse ordinary chunked traffic well inside its own
+  /// payload allowance.
+  #[must_use]
+  #[inline]
+  pub const fn default_limits() -> Limits {
+    Limits {
+      payload: Ro::DEFAULT_MAX_BODY_BYTES,
+      framing: None,
+      floor: Ro::DEFAULT_MAX_CHUNK_FRAMING_BYTES,
+    }
+  }
+
+  /// A connection with nothing in flight, bounded by `limits`.
+  ///
+  /// The limits are read here and nowhere else: the connection copies the two
+  /// resolved numbers and keeps no path back to the type they came from.
+  ///
+  /// The ceiling a driver states here is the connection's MAXIMUM. A per-route
+  /// narrowing may only lower it, so the value to construct with is the maximum
+  /// over every route this connection may serve.
+  #[must_use]
+  #[inline]
+  pub const fn with_limits(limits: Limits) -> Self {
     Self {
       consumed: 0,
       watermark: 0,
@@ -858,12 +1095,41 @@ impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
       tunnel: TunnelPhase::Idle,
       pending_cr: false,
       idle_crlfs: 0,
+      max_body: limits.max_body_bytes(),
+      // Obtained by CALLING the resolution rather than re-deriving it: written
+      // the other way — this connection applying its own `Ro`'s floor to a seed
+      // minted from another role — the two answers to one question would differ
+      // by a factor of 64, and the getter would disagree with the connection.
+      max_chunk_framing: limits.max_chunk_framing_bytes(),
       shape: PhantomData,
     }
   }
 }
 
 impl<Ro, Mo> Connection<Ro, Mo> {
+  /// The operator's ceiling on the payload octets one inbound message body may
+  /// deliver. Constant for the connection's life.
+  ///
+  /// A per-message limit, not a per-connection total: each body starts from
+  /// zero. A breach is [`Error::Refused`], not a protocol failure.
+  #[must_use]
+  #[inline]
+  pub const fn max_body_bytes(&self) -> u64 {
+    self.max_body
+  }
+
+  /// The budget for the RFC 9112 §7.1 chunk-size lines one inbound body may
+  /// spend, as resolved at construction. Constant for the connection's life.
+  ///
+  /// Observable because a budget that refuses traffic must be readable by the
+  /// operator who set the payload ceiling it was resolved from — see
+  /// [`Limits::max_chunk_framing_bytes`].
+  #[must_use]
+  #[inline]
+  pub const fn max_chunk_framing_bytes(&self) -> u64 {
+    self.max_chunk_framing
+  }
+
   /// Takes the next queued connection-scoped notice, or `None`.
   ///
   /// Mode-generic, unlike everything else about the receive side: an [`Event`] is
@@ -936,12 +1202,16 @@ impl<Ro: Role> Connection<Ro, General> {
       aborted,
       pending_cr,
       idle_crlfs,
+      max_body,
       ..
     } = self;
     Items::new(
       input,
       Borrows {
         is_client: Ro::IS_CLIENT,
+        // BY VALUE, which is the whole of the "cannot be raised" argument: the
+        // pump is handed a copy, so no step of it can write the field back.
+        max_body: *max_body,
         consumed,
         watermark,
         next_exchange,
@@ -1194,6 +1464,9 @@ pub(crate) struct Borrows<'c> {
   /// Whether the connection is a client. Copied rather than borrowed: it is
   /// [`Role::IS_CLIENT`], which is a constant of the type-state.
   pub(crate) is_client: bool,
+  /// The operator's ceiling on one inbound body's payload octets. Copied rather
+  /// than borrowed, so the pump can read it and cannot write it.
+  pub(crate) max_body: u64,
   /// Bytes of the current offer consumed so far.
   pub(crate) consumed: &'c mut usize,
   /// How far into the head being accumulated the scan has looked.
@@ -1374,6 +1647,160 @@ pub(crate) fn latch(
   Error::Protocol(error)
 }
 
+/// Whether this end's own limit has refused the body of the message in flight.
+///
+/// THE ONE READER of that fact, and it has to be one, because the fact lives in
+/// TWO storage locations covering two contiguous windows:
+///
+/// - **Window one — [`State::Refused`] inside the decoder**, from the instant
+///   `commit_head` writes [`RecvState::Body`] until the pump step that resolves
+///   it. One writer: `BodyDecoder::new`, for a `Content-Length` the head
+///   already declared past the ceiling.
+/// - **Window two — [`Exchange::body_refused`]**, from that pump step onward,
+///   because the receive state that held the decoder is gone by then. One
+///   writer: [`refuse`]. Monotone, and it dies with the exchange.
+///
+/// The windows are contiguous with no gap: [`refuse`] sets the flag and
+/// replaces the receive state in the same step, and before window one there is
+/// no connection state a driver could act on, since the exchange is minted and
+/// the head committed inside a single pump step that has not yielded.
+///
+/// A send gate reading only ONE of them would be right about one window and
+/// wrong about the other — and the window it would miss is the one the
+/// recommended pump shape sits in, because a driver that stops at
+/// `Item::Head` and drops the iterator has not run the pump step that resolves
+/// the refusal. It would then write a `100 (Continue)` inviting content this
+/// end has already refused, or spend its one answer on a close-less response
+/// and leave the 413 unrepresentable. Reading both is what makes RFC 9112
+/// §9.3's close branch hold from the head onwards rather than from the next
+/// pull onwards.
+///
+/// Exhaustive over [`RecvState`], so a receive state added later has to say
+/// whether it can hold a refused body rather than defaulting to "no".
+///
+/// [`State::Refused`]: crate::body::BodyDecoder::is_refused
+pub(crate) const fn body_refused(recv: &RecvState, exchange: &Option<Exchange>) -> bool {
+  let in_flight = match recv {
+    RecvState::Body { decoder, .. } => decoder.is_refused(),
+    RecvState::Idle | RecvState::AwaitingRearm => false,
+  };
+  let resolved = match exchange {
+    Some(exchange) => exchange.body_refused,
+    None => false,
+  };
+  in_flight || resolved
+}
+
+/// Everything that follows from "this end refused the body it was being sent".
+///
+/// ONE routine, deliberately shaped like [`peer_close_effects`], so a
+/// consequence added later is added once. Every step reuses an existing
+/// single-writer routine rather than re-deriving its rule.
+///
+/// # Not a failure, and that is the load-bearing choice
+///
+/// [`Lifecycle`] does not become [`Failed`](Lifecycle::Failed), [`latch`] is not
+/// called, and no [`H1Error`] is constructed: nothing on the wire broke a rule.
+/// RFC 9110 §15.5.14 names exactly this as a double MAY — "The server MAY
+/// terminate the request, if the protocol version in use allows it; otherwise,
+/// the server MAY close the connection" — and HTTP/1.1 has no way to terminate
+/// one request without the connection, so this core takes the second branch.
+/// The connection stays ANSWERABLE, which is the point: a server still owes
+/// exactly one response, and a 413 carrying an explanation is still
+/// representable.
+///
+/// # Why the connection cannot be kept
+///
+/// RFC 9112 §9.3: "A server MUST read the entire request message body or close
+/// the connection after sending its response; otherwise, the remaining data on
+/// a persistent connection would be misinterpreted as the next request.
+/// Likewise, a client MUST read the entire response message body if it intends
+/// to reuse the same connection for a subsequent request." Reading the whole
+/// body is exactly what the limit refuses, so closing is not the lesser evil —
+/// it is the only coherent branch of a MUST with two.
+///
+/// # The client's own send side
+///
+/// A client that refuses the RESPONSE it is reading has decided not to read the
+/// rest of it, so under §9.3's second sentence this connection cannot be
+/// reused; a request body still going out serves no exchange that can complete,
+/// and §9.5 lets this end "close the connection at any time". `abandon_send` is
+/// therefore right here — but §9.5's other sentence, "If the client sees a
+/// response that indicates the server does not wish to receive the message body
+/// and is closing the connection, the client SHOULD immediately cease
+/// transmitting the body and close its side of the connection", is NOT the
+/// authority for it: that one governs a client reacting to a server's refusal
+/// of the client's REQUEST body, and no such response exists here. The
+/// citation is recorded because `xtask quote-check` proves a quotation
+/// verbatim and says nothing about whether it governs.
+///
+/// # After it
+///
+/// The driver writes its one response and then closes in STAGES: half-close the
+/// write side and keep draining the socket at the transport level until the peer
+/// closes or a deadline expires. The peer is mid-transmission of the refused body
+/// by construction, so an immediate full close is RFC 9112 §9.6's reset case —
+/// "receives additional data from the client on a fully closed connection" — and
+/// the reset can erase the very 413 this path exists to deliver. `wants_read()`
+/// going false means the CORE needs no more octets, not that the socket should
+/// stop being drained. Nothing discarded that way is parsed, so §9.6's "MUST
+/// NOT process any further requests" is untouched.
+// The disjoint borrows the pump holds, passed as themselves. Bundling them into
+// a struct would only re-create `Borrows`, and the two by-VALUE arguments are
+// the point rather than an economy: `read_closed` and `is_client` are facts this
+// routine reads and must not be able to write — the same argument `signal_close`
+// and `latch` are already written to.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refuse(
+  recv: &mut RecvState,
+  exchange: &mut Option<Exchange>,
+  watermark: &mut usize,
+  send: &mut SendState,
+  lifecycle: &mut Lifecycle,
+  event: &mut Option<Event>,
+  pending_cr: &mut bool,
+  read_closed: bool,
+  is_client: bool,
+  id: ExchangeId,
+) -> Refusal {
+  // 1. Read the limit off the decoder still sitting in the receive state,
+  //    BEFORE step 5 replaces the state that holds it — so a caller cannot get
+  //    the refusal's payload wrong by forgetting to read it first.
+  let limit = match recv {
+    RecvState::Body { decoder, .. } => decoder.limit(),
+    // Defensive, and unreachable from either caller: both reach here from a
+    // decoder that answered, which only `RecvState::Body` holds one of.
+    RecvState::Idle | RecvState::AwaitingRearm => 0,
+  };
+  // 2. Before the settle below, which is what may clear the exchange the flag
+  //    lives on.
+  if let Some(exchange) = exchange.as_mut() {
+    exchange.body_refused = true;
+  }
+  // 3. RFC 9112 §9.6: keep-alive is over. `signal_close` stays the single
+  //    writer of that rule and of the once-per-connection notice, so the
+  //    doubled cause — a refusal on a connection whose peer already closed —
+  //    is not re-derived here.
+  signal_close(lifecycle, event, read_closed);
+  // 4. A client's own request body, released for the reason above.
+  if is_client {
+    abandon_send(send);
+  }
+  // 5. The receive side is done with this message: nothing further is decoded,
+  //    and the exchange waits on whatever this end still owes.
+  *recv = RecvState::AwaitingRearm;
+  // 6. RFC 9112 §9.3.2's re-arm gate, asked once: a server that had not yet
+  //    answered keeps its exchange and owes its one response; a client, or a
+  //    server that had already answered, has nothing left and drains.
+  settle(recv, exchange, watermark, send, lifecycle, pending_cr);
+  // 7. The limit that refused it, not the observed size: the observed size is
+  //    unbounded and unknowable, since the peer may never stop.
+  Refusal::BodyTooLarge {
+    exchange: id,
+    limit,
+  }
+}
+
 /// Abandons a client's outstanding request body, if it has one.
 ///
 /// Not §9.6's "cease sending", which governs requests: what releases this end
@@ -1492,6 +1919,8 @@ pub(crate) struct Fingerprint<'a> {
   tunnel: &'a TunnelPhase,
   pending_cr: &'a bool,
   idle_crlfs: &'a u8,
+  max_body: &'a u64,
+  max_chunk_framing: &'a u64,
 }
 
 #[cfg(test)]
@@ -1515,6 +1944,8 @@ impl<Ro, Mo> Connection<Ro, Mo> {
       tunnel,
       pending_cr,
       idle_crlfs,
+      max_body,
+      max_chunk_framing,
       // The type-state, which is zero-sized and is the one thing the two sides
       // of a differential are ALLOWED to differ in until the transition runs.
       shape: _,
@@ -1535,6 +1966,8 @@ impl<Ro, Mo> Connection<Ro, Mo> {
       tunnel,
       pending_cr,
       idle_crlfs,
+      max_body,
+      max_chunk_framing,
     }
   }
 }

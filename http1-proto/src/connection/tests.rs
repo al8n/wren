@@ -10,16 +10,16 @@ use super::{
     BODILESS_STATUS_FRAMING, BODY_INCOMPLETE, BOTH_FRAMINGS, CHUNKED_DECLARATION,
     CHUNKED_UNANNOUNCED, CLOSE_DELIMITED_IS_UNFRAMED, CONTINUE_NEEDS_CONTENT,
     FIELD_STATES_ITS_GRAMMAR, INTERIM_NEEDS_HTTP_11, LENGTH_DISAGREES, LENGTH_IS_ONE_VALUE,
-    NO_BODY_IN_FLIGHT, NO_SUCCESS_TO_STATE, OVER_SEND, READ_SIDE_ENDED,
-    REQUEST_IS_NEVER_CLOSE_DELIMITED, REQUEST_NEEDS_HOST, SENDER_LIST_EMPTY_ELEMENT,
-    TE_NEEDS_HTTP_11, TE_WITHOUT_CHUNKED, UNCHUNKED_HAS_NO_TRAILERS, UNFRAMED_RESPONSE,
-    UPGRADE_NEEDS_TUNNEL,
+    NO_BODY_IN_FLIGHT, NO_SUCCESS_TO_STATE, OVER_SEND, READ_SIDE_ENDED, REFUSED_BODY_NEEDS_CLOSE,
+    REFUSED_BODY_TAKES_NO_INTERIM, REQUEST_IS_NEVER_CLOSE_DELIMITED, REQUEST_NEEDS_HOST,
+    SENDER_LIST_EMPTY_ELEMENT, TE_NEEDS_HTTP_11, TE_WITHOUT_CHUNKED, UNCHUNKED_HAS_NO_TRAILERS,
+    UNFRAMED_RESPONSE, UPGRADE_NEEDS_TUNNEL,
   },
   *,
 };
 use crate::{
   body::encode::FORBIDDEN_TRAILER,
-  error::{Error, SuggestedStatus},
+  error::{Error, H1Error, Refusal, SuggestedStatus},
   event::{Item, StartLine},
   head::{Target, scan::MAX_LEADING_EMPTY_LINES},
 };
@@ -5164,6 +5164,394 @@ fn a_request_is_never_close_delimited() {
     c.open_request("GET", &ORIGIN, HOST, BodyPlan::None, &mut out)
       .is_ok()
   );
+}
+
+/// A server whose inbound bodies are bounded at `max` payload octets each,
+/// built through the real construction path rather than by writing a field.
+fn bounded_server(max: u64) -> Connection<Server, General> {
+  Connection::<Server, General>::with_limits(
+    Connection::<Server, General>::default_limits().with_max_body_bytes(max),
+  )
+}
+
+/// Feeds `input`, pulls items until one of them is an error, and returns it.
+#[track_caller]
+fn drain_until_error(c: &mut Connection<Server, General>, input: &[u8]) -> Error {
+  let mut it = c.handle(input);
+  loop {
+    match it.next() {
+      Ok(Some(_)) => {}
+      Ok(None) => panic!("the offer was exhausted without an error"),
+      Err(error) => return error,
+    }
+  }
+}
+
+// THE RESOLUTION RULE, and the only test that catches the reading it exists to
+// prevent. The chunk-framing budget is resolved from the payload ceiling IN
+// FORCE, so raising only the payload knob carries the framing budget with it. A
+// budget seeded from the ROLE DEFAULT would answer 65,536 here — and 100 MiB
+// delivered at the commonest 4 KiB chunk granularity spends 153,600 octets of
+// RFC 9112 §7.1 chunk-size lines, so ordinary chunked traffic would be refused
+// about 42.7 MiB into a body this ceiling allows.
+#[test]
+fn raising_only_the_payload_ceiling_raises_the_framing_budget_with_it() {
+  let limits = Connection::<Server, General>::default_limits().with_max_body_bytes(100 << 20);
+  assert_eq!(limits.max_chunk_framing_bytes(), (100 << 20) >> 4);
+}
+
+// The other two halves of the same rule. The role default survives as a FLOOR,
+// so narrowing the payload ceiling never leaves a body unable to state its own
+// RFC 9112 §7.1 framing; and a STATED budget pins itself, which is part of the
+// value rather than of its resolution — so equality compares what was stated,
+// not what it resolves to.
+#[test]
+fn the_framing_budget_has_a_floor_and_records_what_was_stated() {
+  let server = Connection::<Server, General>::default_limits();
+  assert_eq!(server.max_body_bytes(), 1 << 20);
+  assert_eq!(server.max_chunk_framing_bytes(), 1 << 16);
+  // A sixteenth of nothing is nothing; the floor is what a body still gets.
+  assert_eq!(
+    server.with_max_body_bytes(0).max_chunk_framing_bytes(),
+    1 << 16
+  );
+  // `u64::MAX >> 4` is 2^60, so "unbounded" stays ONE knob.
+  assert_eq!(
+    server
+      .with_max_body_bytes(u64::MAX)
+      .max_chunk_framing_bytes(),
+    u64::MAX >> 4
+  );
+  // Stated, and therefore no longer tracking the payload ceiling.
+  let stated = server.with_max_chunk_framing_bytes(1 << 16);
+  assert_eq!(
+    stated
+      .with_max_body_bytes(100 << 20)
+      .max_chunk_framing_bytes(),
+    1 << 16
+  );
+  // Presence is part of the value, even where the two resolve identically.
+  assert_ne!(server, stated);
+  // The client's own seed, which is a different progression.
+  let client = Connection::<Client, General>::default_limits();
+  assert_eq!(client.max_body_bytes(), 64 << 20);
+  assert_eq!(client.max_chunk_framing_bytes(), (64 << 20) >> 4);
+  // A connection answers exactly what the limits it was built from resolve to.
+  let c = Connection::<Server, General>::with_limits(stated);
+  assert_eq!(c.max_body_bytes(), stated.max_body_bytes());
+  assert_eq!(
+    c.max_chunk_framing_bytes(),
+    stated.max_chunk_framing_bytes()
+  );
+}
+
+// RFC 9112 §6.3 item 6 with RFC 9110 §15.5.14: a declaration past the ceiling
+// is refused before an octet of content is read, and the refusal is POLICY —
+// nothing on the wire broke a rule, so the connection is not failed and the
+// server still owes its one answer. RFC 9112 §9.6's notice is given once.
+#[test]
+fn a_counted_body_over_the_limit_refuses_without_failing_the_connection() {
+  let mut c = bounded_server(4);
+  let error = drain_until_error(
+    &mut c,
+    b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello",
+  );
+  let Error::Refused(Refusal::BodyTooLarge { exchange, limit }) = error else {
+    panic!("expected a policy refusal, got {error:?}")
+  };
+  // The LIMIT, not the observed size, which the peer chooses and may never end.
+  assert_eq!(limit, 4);
+  assert_eq!(exchange.get(), 1);
+  // RFC 9110 §15.5.14 is what a server driver is advised to answer with.
+  assert_eq!(
+    error.suggested_status(),
+    Some(SuggestedStatus::ContentTooLarge)
+  );
+  assert_eq!(SuggestedStatus::ContentTooLarge.code(), 413);
+  assert_eq!(
+    SuggestedStatus::ContentTooLarge.reason(),
+    "Content Too Large"
+  );
+  // NOT the failed state: no violation was found and none was constructed.
+  assert!(!matches!(c.lifecycle, Lifecycle::Failed));
+  // The readiness split says "write, and only write".
+  assert!(!c.wants_read());
+  assert!(c.is_awaiting_send());
+  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.poll_event(), None);
+}
+
+// RFC 9112 §7.1 declares no total, ever — a size line announces one chunk — so
+// nothing about eleven one-octet chunks is refusable in advance and only the
+// cumulative charge can bound them. Every octet the ceiling allowed is
+// delivered first, and the refusal falls on the chunk that would pass it.
+#[test]
+fn a_chunked_body_over_the_limit_refuses_cumulatively() {
+  const HEAD: &[u8] = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+  // Eleven `1\r\na\r\n` chunks, spelled out so the fixture needs no allocation.
+  const BODY: &[u8] = b"1\r\na\r\n1\r\na\r\n1\r\na\r\n1\r\na\r\n1\r\na\r\n1\r\na\r\n\
+1\r\na\r\n1\r\na\r\n1\r\na\r\n1\r\na\r\n1\r\na\r\n";
+
+  let mut c = bounded_server(10);
+  {
+    let mut it = c.handle(HEAD);
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    assert_eq!(it.consumed(), HEAD.len());
+  }
+  let mut delivered = 0usize;
+  let error = {
+    let mut it = c.handle(BODY);
+    loop {
+      match it.next() {
+        Ok(Some(Item::BodyChunk { data, .. })) => delivered = delivered.saturating_add(data.len()),
+        Ok(Some(_)) => {}
+        Ok(None) => panic!("the offer was exhausted without a refusal"),
+        Err(error) => break error,
+      }
+    }
+  };
+  assert_eq!(
+    delivered, 10,
+    "every octet the ceiling allowed was handed over"
+  );
+  assert!(
+    matches!(
+      error,
+      Error::Refused(Refusal::BodyTooLarge { limit: 10, .. })
+    ),
+    "{error:?}"
+  );
+  assert!(!matches!(c.lifecycle, Lifecycle::Failed));
+}
+
+// RFC 9112 §9.3: "A server MUST read the entire request message body or close
+// the connection after sending its response" — the core has taken the close
+// branch, so the one response still owed has to say so on the wire (RFC 9110
+// §10.1.1's SHOULD). Driven from a CHUNKED body, so the refusal is the
+// cumulative charge's rather than the declaration gate's.
+#[test]
+fn a_refused_server_still_owes_exactly_one_response_and_it_must_state_close() {
+  const CLOSING_413: &[(&str, &[u8])] = &[("Content-Length", b"0"), ("Connection", b"close")];
+  let mut c = bounded_server(4);
+  let error = drain_until_error(
+    &mut c,
+    b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+  );
+  assert!(matches!(error, Error::Refused(_)), "{error:?}");
+  assert!(c.is_awaiting_send());
+
+  let mut out = [0u8; 128];
+  let without_close = c
+    .send_response(
+      413,
+      b"Content Too Large",
+      LENGTH_0,
+      BodyPlan::None,
+      &mut out,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(without_close, Error::InvalidState(m) if m == REFUSED_BODY_NEEDS_CLOSE),
+    "{without_close:?}"
+  );
+  // The refusal writes nothing and does not spend the one answer.
+  assert_eq!(out, [0u8; 128]);
+
+  let n = c
+    .send_response(
+      413,
+      b"Content Too Large",
+      CLOSING_413,
+      BodyPlan::None,
+      &mut out,
+    )
+    .unwrap();
+  assert_eq!(
+    out.get(..n),
+    Some(
+      b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        .as_slice()
+    )
+  );
+  // EXACTLY one: RFC 9112 §9.6 drains the connection behind the response that
+  // stated the option, so a second answer has nowhere to go.
+  assert!(
+    c.send_response(413, b"", CLOSING_413, BodyPlan::None, &mut out)
+      .is_err()
+  );
+  assert!(!c.is_awaiting_send());
+  assert!(!c.wants_read());
+}
+
+// RFC 9110 §10.1.1: the expectation asks "shall I send the content?" and this
+// end has already answered no, so the ask is never surfaced and no `100
+// (Continue)` can be written for it. The gate covers every 1xx, not only the
+// invitation — a refused exchange owes one final answer and nothing else.
+#[test]
+fn a_refused_body_takes_no_interim() {
+  let mut c = bounded_server(4);
+  let error = {
+    let mut it =
+      c.handle(b"POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+    // The expectation is NOT surfaced: the only item this head yields is the
+    // head, and the next pull is the refusal.
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    it.next().unwrap_err()
+  };
+  assert!(matches!(error, Error::Refused(_)), "{error:?}");
+
+  let mut out = [0u8; 64];
+  for code in [100u16, 103] {
+    let refused = c.send_interim(code, NO_FIELDS, &mut out).unwrap_err();
+    assert!(
+      matches!(refused, Error::InvalidState(m) if m == REFUSED_BODY_TAKES_NO_INTERIM),
+      "{code}: {refused:?}"
+    );
+  }
+  assert_eq!(out, [0u8; 64]);
+}
+
+/// A server that has read a head whose `Content-Length` is past its ceiling and
+/// has NOT pumped again — the driver shape the contiguous-handover recipe asks
+/// for, which stops at `Item::Head` and drops the iterator.
+///
+/// The refusal exists here, but only inside the decoder: the pump step that
+/// moves it onto the exchange has not run. Every send gate has to see it
+/// anyway, which is the window a gate reading the exchange alone would miss.
+fn head_refused_before_the_pump(request: &[u8]) -> Connection<Server, General> {
+  let mut c = bounded_server(4);
+  {
+    let mut it = c.handle(request);
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    // Dropped WITHOUT a second pull: the refusal is unresolved by construction.
+  }
+  c
+}
+
+// WINDOW ONE, the interim gate. RFC 9110 §10.1.1 makes a `100 (Continue)` an
+// invitation to send content, and this end has already refused this message's —
+// so the invitation must be impossible from the instant the head is read, not
+// from the next pull onwards.
+#[test]
+fn no_interim_goes_out_while_a_head_refusal_is_still_unresolved() {
+  let mut c = head_refused_before_the_pump(
+    b"POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
+  );
+  let mut out = [0u8; 64];
+  let refused = c.send_interim(100, NO_FIELDS, &mut out).unwrap_err();
+  assert!(
+    matches!(refused, Error::InvalidState(m) if m == REFUSED_BODY_TAKES_NO_INTERIM),
+    "{refused:?}"
+  );
+  assert_eq!(out, [0u8; 64], "nothing was written");
+}
+
+// WINDOW ONE, the final-response gate. This is the call that SPENDS the one
+// answer: a close-less response written here would leave the peer told the
+// connection is persistent (RFC 9112 §9.3) and the 413 with nowhere to go. The
+// gate refuses it before anything is encoded, so the answer is still owed —
+// and it refuses only what it must, since the same response WITH the option
+// goes out of this same window.
+#[test]
+fn a_close_less_answer_is_refused_while_a_head_refusal_is_still_unresolved() {
+  const CLOSING_413: &[(&str, &[u8])] = &[("Content-Length", b"0"), ("Connection", b"close")];
+  let mut c =
+    head_refused_before_the_pump(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n");
+  let mut out = [0u8; 128];
+  let without_close = c
+    .send_response(200, b"OK", LENGTH_0, BodyPlan::None, &mut out)
+    .unwrap_err();
+  assert!(
+    matches!(without_close, Error::InvalidState(m) if m == REFUSED_BODY_NEEDS_CLOSE),
+    "{without_close:?}"
+  );
+  assert_eq!(out, [0u8; 128], "nothing was written");
+
+  // The one answer was not spent, and the 413 is still representable.
+  let n = c
+    .send_response(
+      413,
+      b"Content Too Large",
+      CLOSING_413,
+      BodyPlan::None,
+      &mut out,
+    )
+    .unwrap();
+  assert_eq!(
+    out.get(..n),
+    Some(
+      b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        .as_slice()
+    )
+  );
+}
+
+// RFC 9112 §9.6's notice is once per CONNECTION, whichever cause reaches it
+// first: the refusal signals the close, and the peer's write side ending after
+// it is the same fact arriving twice.
+#[test]
+fn the_close_notice_is_queued_once_under_doubled_causes() {
+  let mut c = bounded_server(4);
+  let error = drain_until_error(
+    &mut c,
+    b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello",
+  );
+  assert!(matches!(error, Error::Refused(_)), "{error:?}");
+  assert!(c.handle_eof().unwrap().is_none());
+  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.poll_event(), None);
+}
+
+// The CLIENT half, on the framing that has no early exit at all: RFC 9112 §6.3
+// item 8 declares nothing and is delimited only by the close, so the cumulative
+// charge is its only gate — and it is response-only, which is why the client's
+// default ceiling is the larger one. A client has no answer to write, so the
+// refusal drains the connection outright, and §9.6's notice is still given once
+// even though the close-delimited head had already signalled it.
+#[test]
+fn a_client_refuses_a_close_delimited_response_and_drains() {
+  let mut c = Connection::<Client, General>::with_limits(
+    Connection::<Client, General>::default_limits().with_max_body_bytes(4),
+  );
+  open_bodiless_request(&mut c, "GET");
+  let error = {
+    let mut it = c.handle(b"HTTP/1.1 200 OK\r\n\r\nhello");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    it.next().unwrap_err()
+  };
+  assert!(
+    matches!(
+      error,
+      Error::Refused(Refusal::BodyTooLarge { limit: 4, .. })
+    ),
+    "{error:?}"
+  );
+  assert!(!matches!(c.lifecycle, Lifecycle::Failed));
+  // Nothing left to read, and nothing this end could answer with.
+  assert!(!c.wants_read());
+  assert!(!c.is_awaiting_send());
+  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.poll_event(), None);
+}
+
+// SYNTAX BEFORE POLICY. A ceiling of zero refuses every message that carries
+// content, so policy has everything to say about this body — but `zz` is not
+// RFC 9112 §7.1's `chunk-size = 1*HEXDIG` at all, and a malformed element is
+// diagnosed as malformed. Only a message that PARSED can be refused by policy,
+// so this latches the connection and hands back a protocol violation.
+#[test]
+fn a_syntactically_malformed_chunk_still_latches_rather_than_refusing() {
+  let mut c = bounded_server(0);
+  let error = drain_until_error(
+    &mut c,
+    b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n",
+  );
+  assert!(
+    matches!(error, Error::Protocol(H1Error::Malformed(_))),
+    "{error:?}"
+  );
+  assert!(matches!(c.lifecycle, Lifecycle::Failed));
+  assert_eq!(error.suggested_status(), Some(SuggestedStatus::BadRequest));
 }
 
 // The size budget is a module-level `const _` (below the type, in `mod.rs`), so
