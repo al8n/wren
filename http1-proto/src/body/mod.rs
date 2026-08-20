@@ -39,7 +39,12 @@ pub(crate) mod encode;
 /// spent on bytes the decoder parses and then discards; it exists to bound that
 /// parse, not to leave room for a feature. It sits beside the framing decision
 /// rather than inside the chunked sub-machine because it is one of this core's
-/// declared limits, next to `MAX_HEAD_BYTES` and `MAX_HEADERS`.
+/// declared limits, where the head's `MAX_HEAD_BYTES` and `MAX_HEADERS` sit.
+///
+/// PLACEMENT ONLY: those two are published and this one is deliberately not,
+/// because it caps a SINGLE element so that need-more-input stays bounded, and
+/// what a reader of a chunked body has to compute with is the cumulative,
+/// per-body budget `Limits::max_chunk_framing_bytes`, which is public.
 pub(crate) const MAX_CHUNK_EXT_BYTES: usize = 256;
 
 /// RFC 9112 §6.3 item 6: when the connection closes before the indicated number
@@ -50,6 +55,25 @@ const CLOSED_MID_BODY: &str = "connection closed before the Content-Length body 
 /// section, so a close before that line leaves framing bytes the sender still
 /// owed — the same incompleteness §6.3 item 6 makes a MUST for a counted body.
 const CLOSED_MID_CHUNKED: &str = "connection closed before the chunked body ended";
+
+/// Which of this end's two per-body budgets refused a message.
+///
+/// THE DISCRIMINANT, and it exists because two budgets share one refusal path:
+/// the routine that takes the connection through a refusal has to read the
+/// limit that refused and name it to the driver, and those are two different
+/// numbers measuring two different things. Carried on the fault rather than
+/// re-derived at the refusal, because only the site that ran the comparison
+/// knows which one it ran.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum Budget {
+  /// The ceiling on the PAYLOAD octets one body may deliver — the content RFC
+  /// 9110 §8.6 declines to bound, bounded here as local policy.
+  Payload,
+  /// The budget for the RFC 9112 §7.1 chunk-size lines one body may spend.
+  /// Framing rather than content, and unbounded by any payload ceiling: a size
+  /// line can announce one octet and spend hundreds.
+  ChunkFraming,
+}
 
 /// What stopped a body decoder.
 ///
@@ -65,8 +89,8 @@ const CLOSED_MID_CHUNKED: &str = "connection closed before the chunked body ende
 pub(crate) enum BodyFault {
   /// The wire broke a rule. Terminal for the connection.
   Violation(H1Error),
-  /// This end's limit refused a conformant message.
-  TooLarge,
+  /// This end's limit refused a conformant message, and WHICH limit it was.
+  TooLarge(Budget),
 }
 
 impl From<H1Error> for BodyFault {
@@ -115,10 +139,11 @@ pub(crate) fn widen(n: usize) -> u64 {
 /// against the headroom rather than against the ceiling, so a body part-way
 /// through is measured on what remains of its allowance. `received <= limit`
 /// holds by [`charge`], so the saturation is defensive.
-// Called by `BodyDecoder::narrow`, which is the site that measures a
-// declaration against a PARTLY-consumed allowance. The four leaves are one set:
-// they are the only spellings of this arithmetic in the crate, and the link
-// proof covers them together.
+// Two callers, both sites that measure a declaration against a PARTLY-consumed
+// allowance: `BodyDecoder::narrow`, and the step that hands the chunked coding
+// what is left before it reads a size line. The four leaves are one set: they
+// are the only spellings of this arithmetic in the crate, and the link proof
+// covers them together.
 pub(crate) const fn headroom(received: u64, limit: u64) -> u64 {
   limit.saturating_sub(received)
 }
@@ -190,11 +215,26 @@ pub(crate) struct BodyDecoder {
   /// §8.6 states there is "no predefined limit to the length of content", so a
   /// ceiling is local policy and never a rule of the protocol.
   limit: u64,
+  /// The budget in force for THIS message, in RFC 9112 §7.1 chunk-size-line
+  /// octets.
+  ///
+  /// Written once, at construction, and never narrowed: [`narrow`](Self::narrow)
+  /// is a payload operation, so this budget belongs to the connection for the
+  /// whole of every body it carries. It reaches the sub-machine that spends it
+  /// BY VALUE on each call, which is what keeps the tally downstream of the
+  /// ceiling rather than beside it.
+  framing_limit: u64,
 }
 
 impl BodyDecoder {
   /// Builds the decoder for a body framed as `framing` says, bounded at `limit`
-  /// payload octets.
+  /// payload octets and `framing_limit` chunk-framing octets.
+  ///
+  /// TWO budgets, because one of them cannot bound the other. `limit` bounds
+  /// the content; `framing_limit` bounds the RFC 9112 §7.1 chunk-size lines,
+  /// which are framing the peer chooses the length of and which a payload
+  /// ceiling never sees — a 272-octet size line may announce a single octet.
+  /// Only the chunked coding can spend the second one.
   ///
   /// A zero `Content-Length` and [`BodyFraming::None`] start in the same place:
   /// a body of no octets is complete before a byte is read, and neither is ever
@@ -208,7 +248,7 @@ impl BodyDecoder {
   /// number, so the declaration is a strictly earlier evaluation of what the
   /// cumulative charge would conclude — it can only make the refusal sooner,
   /// never lift the bound.
-  pub(crate) const fn new(framing: BodyFraming, limit: u64) -> Self {
+  pub(crate) const fn new(framing: BodyFraming, limit: u64, framing_limit: u64) -> Self {
     let state = match framing {
       BodyFraming::None | BodyFraming::ContentLength(0) => State::Complete,
       BodyFraming::ContentLength(expected) if overruns(expected, limit) => State::Refused,
@@ -220,6 +260,7 @@ impl BodyDecoder {
       state,
       received: 0,
       limit,
+      framing_limit,
     }
   }
 
@@ -236,6 +277,16 @@ impl BodyDecoder {
   /// state, so the refusal it builds names the limit that actually refused.
   pub(crate) const fn limit(&self) -> u64 {
     self.limit
+  }
+
+  /// The chunk-framing budget in force for this message.
+  ///
+  /// The twin of [`limit`](Self::limit), read by the same routine on the other
+  /// branch of the same question: a refusal names the budget that refused it,
+  /// and the two are told apart by the fault's own discriminant rather than by
+  /// the reader guessing.
+  pub(crate) const fn framing_limit(&self) -> u64 {
+    self.framing_limit
   }
 
   /// Whether this body has already been refused, by whichever writer of
@@ -376,6 +427,26 @@ impl BodyDecoder {
   /// driver's buffer and any later path built on it would skip octets — RFC
   /// 9112 §11.2, one change removed.
   ///
+  /// WHICH FRAMINGS CAN STILL REACH THE REFUSAL is a shorter list than it was,
+  /// and saying so is part of the invariant rather than a caveat to it. A
+  /// framing that DECLARES before it delivers is refused at the declaration —
+  /// a `Content-Length` at construction, a chunk-size line at the announcement
+  /// gate — and each declaration bounds the very sum this charges, so an
+  /// announced octet can no longer arrive over the ceiling. A ceiling that
+  /// SHRINKS mid-body does not reopen it, and that is the third leg rather than
+  /// a detail: [`narrow`](Self::narrow) re-measures whatever the framing still
+  /// has outstanding — [`announced`](Self::announced), which is a
+  /// `Content-Length` remainder or the chunk in flight — against the headroom
+  /// the new ceiling leaves, and refuses in place, so `received + announced <=
+  /// limit` survives the narrowing instead of being a fact the declaration gate
+  /// established under a ceiling that no longer holds. What is left is RFC
+  /// 9112 §6.3 item 8, which declares nothing ever and whose producer advances
+  /// no state, so the restore it takes writes back what was already there. The
+  /// line stands for the framing added LATER that hands over octets it never
+  /// announced: the charge is the bound, the early exits only make it sooner,
+  /// and this is what keeps the decoder in step on the call where the charge is
+  /// the one that answers.
+  ///
   /// `step`'s existing behaviour of KEEPING the advance on a wire violation is
   /// untouched, and deliberately so: a decoder that rejected a chunk does not
   /// quietly rewind to before it. A violation ends the connection; a refusal
@@ -395,7 +466,7 @@ impl BodyDecoder {
       Some(BodyItem::Data(data)) => {
         let Some(received) = charge(self.received, widen(data.len()), self.limit) else {
           self.state = before;
-          return Err(BodyFault::TooLarge);
+          return Err(BodyFault::TooLarge(Budget::Payload));
         };
         self.received = received;
       }
@@ -431,17 +502,34 @@ impl BodyDecoder {
       // Already refused, and it stays refused: the same answer to the same
       // bytes however often they are offered, consuming nothing. Nothing is
       // parsed past a refusal, so no octet behind it can be mistaken for the
-      // next message (RFC 9112 §11.2).
-      State::Refused => Err(BodyFault::TooLarge),
+      // next message (RFC 9112 §11.2). `Payload` names it because both writers
+      // of this state are payload gates — the variant's own doc is the list.
+      State::Refused => Err(BodyFault::TooLarge(Budget::Payload)),
       // RFC 9112 §7.1: the chunked coding delimits itself, so the sub-machine
       // owns the boundary and this arm only carries its answer out.
+      //
+      // BOTH budgets reach it by value: what is left of the payload allowance,
+      // which a size line's announcement is measured against, and the whole
+      // chunk-framing budget, against which the sub-machine's own tally is. The
+      // ceiling goes down and the tally stays down, so no step of the coding
+      // can write either of this decoder's numbers.
       State::Chunked(mut decoder) => {
-        let decoded = decoder.feed(input).map_err(BodyFault::Violation);
+        let decoded = decoder.feed(
+          headroom(self.received, self.limit),
+          self.framing_limit,
+          input,
+        );
         // A chunked body that reached the end of its trailer section rejoins
         // the shell's two-phase finish, so its `Finished` comes from
         // `State::Complete` like every other framing's. The state is written
         // back even when the sub-machine reported a violation, so a decoder
         // that rejected a chunk does not quietly rewind to before it.
+        //
+        // And a REFUSAL needs no rollback, which is a property of where the
+        // gates sit rather than of this write: both of them answer before the
+        // sub-machine has written a stage or a tally, so the copy stored here
+        // is the one the call was handed. `feed`'s own restore never sees it —
+        // an `Err` leaves `step` before the admission runs.
         self.state = if decoder.is_complete() {
           State::Complete
         } else {
@@ -502,7 +590,7 @@ impl BodyDecoder {
       // A refused body is refused whichever way it is asked. Compiler-forced by
       // the exhaustive match, and DEFENSIVE: the pump feeds a refused decoder
       // before any stop can route an EOF here, so `feed` answers first.
-      State::Refused => Err(BodyFault::TooLarge),
+      State::Refused => Err(BodyFault::TooLarge(Budget::Payload)),
     }
   }
 

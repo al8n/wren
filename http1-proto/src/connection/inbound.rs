@@ -32,7 +32,7 @@
 //! keep-alive gate — and differ only where the RFCs differ.
 
 use crate::{
-  body::{BodyDecoder, BodyFault, BodyItem},
+  body::{BodyDecoder, BodyFault, BodyItem, Budget},
   connection::{
     CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Exchange, FAILED, Lifecycle, RecvState,
     SWITCHING_PROTOCOLS, SendState, abandon_send, head_digest, latch, mint, refuse, settle,
@@ -196,14 +196,14 @@ fn no_more_input<'a>(it: &mut Items<'a, '_>) -> Result<Option<Item<'a>>, Error> 
     // unconditionally — empty offer included — so a refused decoder answers in
     // `feed` before any stop can route here. Written because the alternative is
     // a `_` arm that would swallow a refusal if that ever stopped being true.
-    Err(BodyFault::TooLarge) => {
+    Err(BodyFault::TooLarge(budget)) => {
       // Defensive twice over: a refusal names the exchange it refused, and a
       // receive state holding a decoder always has one. With no id there is
       // nothing to report, so the offer simply yields no further item.
       let Some(exchange) = *it.exchange else {
         return Ok(None);
       };
-      return Err(Error::Refused(refused(it, exchange.id)));
+      return Err(Error::Refused(refused(it, exchange.id, budget)));
     }
     // RFC 9112 §6.3 item 8: the close IS the delimiter, so a body read to it is
     // COMPLETE here — and here is the only place that can be said. "This body is
@@ -620,7 +620,7 @@ fn commit_head<'a>(
     // RFC 9112 §6.3's framing decision and the ceiling in force, in one
     // expression: a `Content-Length` past the ceiling produces a decoder that
     // is already refused, before the receive state below is written.
-    let decoder = BodyDecoder::new(parsed.framing, it.max_body);
+    let decoder = BodyDecoder::new(parsed.framing, it.max_body, it.max_chunk_framing);
     *it.recv = RecvState::Body {
       // RFC 9110 §10.1.1: the expectation asks "shall I send the content?", and
       // this end has already answered no. Not surfacing the ask is what makes
@@ -755,7 +755,9 @@ fn body<'a>(it: &mut Items<'a, '_>) -> Result<Step<'a>, Error> {
     // `*it.consumed` is deliberately untouched: a refusal consumes zero, and
     // the decoder — restored by the charge that refused — stays in step with
     // the driver's cursor.
-    Err(BodyFault::TooLarge) => return Err(Error::Refused(refused(it, exchange.id))),
+    Err(BodyFault::TooLarge(budget)) => {
+      return Err(Error::Refused(refused(it, exchange.id, budget)));
+    }
   };
 
   // The decoder claims a byte only when the framing says the body owns it, and
@@ -809,7 +811,12 @@ fn body<'a>(it: &mut Items<'a, '_>) -> Result<Step<'a>, Error> {
 /// the argument list is assembled here rather than at each of the three sites
 /// that refuse — the body pump, the EOF path, and `Items::limit_body`, which is
 /// the one a ROUTE reaches rather than the wire.
-pub(crate) fn refused(it: &mut Items<'_, '_>, exchange: ExchangeId) -> Refusal {
+///
+/// `budget` travels from the comparison that failed. The two wire sites forward
+/// the decoder's own answer; `limit_body` states [`Budget::Payload`], because
+/// narrowing is a payload operation and the framing budget belongs to the
+/// connection.
+pub(crate) fn refused(it: &mut Items<'_, '_>, exchange: ExchangeId, budget: Budget) -> Refusal {
   refuse(
     it.recv,
     it.exchange,
@@ -821,6 +828,7 @@ pub(crate) fn refused(it: &mut Items<'_, '_>, exchange: ExchangeId) -> Refusal {
     *it.read_closed,
     it.is_client,
     exchange,
+    budget,
   )
 }
 

@@ -26,6 +26,7 @@
 //! `Items`. Read it before writing anything that produces items.
 
 use crate::{
+  body::Budget,
   connection::{Borrows, Exchange, Lifecycle, RecvState, SendState, inbound, writable},
   error::Error,
   head::{HeadView, RequestLine, StatusLine},
@@ -318,6 +319,12 @@ pub struct Items<'a, 'c> {
   /// ceiling even by accident. It is read once, where a head's framing decision
   /// builds the decoder that will enforce it.
   pub(crate) max_body: u64,
+  /// The budget for the RFC 9112 §7.1 chunk-size lines one inbound body may
+  /// spend.
+  ///
+  /// BY VALUE for the same reason, and read at the same one site: framing and
+  /// payload are two ceilings on one body, so they reach its decoder together.
+  pub(crate) max_chunk_framing: u64,
   /// A disjoint borrow of the connection's consumed counter. It stays a
   /// connection field rather than a tally kept here, because drop-safety depends
   /// on it: see the paragraph above.
@@ -375,6 +382,7 @@ impl<'a, 'c> Items<'a, 'c> {
     let Borrows {
       is_client,
       max_body,
+      max_chunk_framing,
       consumed,
       watermark,
       next_exchange,
@@ -394,6 +402,7 @@ impl<'a, 'c> Items<'a, 'c> {
       input,
       is_client,
       max_body,
+      max_chunk_framing,
       consumed,
       watermark,
       next_exchange,
@@ -482,7 +491,17 @@ impl<'a, 'c> Items<'a, 'c> {
   /// It narrows the PAYLOAD ceiling and nothing else. The connection's
   /// chunk-framing budget ([`Connection::max_chunk_framing_bytes`]) belongs to
   /// the connection, so a route narrowed to a few kilobytes still carries the
-  /// whole of it.
+  /// whole of it. A narrowed route's true exposure is therefore
+  /// `route_payload + (5/3) × connection_framing` octets of wire, plus a
+  /// trailer section and one unterminated line: every RFC 9112 §7.1 chunk
+  /// spends at least three charged octets, so the budget admits at most `F/3`
+  /// chunks and the `2F/3` octets of chunk-data CRLF that go with them.
+  /// Narrowing a route to 4 KiB on a connection whose framing budget is 64 KiB
+  /// therefore still admits `4096 + (5/3) × 65_536` ≈ **113,300 octets** —
+  /// 110.7 KiB — of wire for a message whose content is capped at 4 KiB. Construct
+  /// the connection's framing budget accordingly
+  /// ([`Limits::with_max_chunk_framing_bytes`]); there is deliberately no
+  /// per-route knob for it.
   ///
   /// # What it refuses, and when
   ///
@@ -525,6 +544,7 @@ impl<'a, 'c> Items<'a, 'c> {
   /// [`Error::InvalidState`]: crate::Error::InvalidState
   /// [`Connection::with_limits`]: crate::Connection::with_limits
   /// [`Connection::max_chunk_framing_bytes`]: crate::Connection::max_chunk_framing_bytes
+  /// [`Limits::with_max_chunk_framing_bytes`]: crate::Limits::with_max_chunk_framing_bytes
   /// [`Connection::body_progress`]: crate::Connection::body_progress
   pub fn limit_body(&mut self, max: u64) -> Result<(), Error> {
     // The lifecycle gate, which is `Connection::sendable`'s own — one statement
@@ -552,7 +572,13 @@ impl<'a, 'c> Items<'a, 'c> {
     // The decoder is refused, and this resolves it in the same call: the
     // refusal's two storage windows stay contiguous, so no send gate can see a
     // connection that is neither refusable nor refused.
-    Err(Error::Refused(inbound::refused(self, exchange.id)))
+    // PAYLOAD: `narrow` writes the payload ceiling and reads only payload
+    // counts, so the budget that refused is the one it narrowed.
+    Err(Error::Refused(inbound::refused(
+      self,
+      exchange.id,
+      Budget::Payload,
+    )))
   }
 
   /// The fed input slice, at the INPUT lifetime.
