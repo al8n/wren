@@ -1167,10 +1167,6 @@ where
 /// A singleton field cannot answer this by counting members: §5.6.1.2 has the
 /// walk skip empty elements, so `text/plain,` yields one member and looks
 /// singular. The comma itself is the evidence.
-// No non-test caller yet: this exists for the media-type list walk that
-// consumes it, which is not built in this change. `#[cfg(test)]` is the only
-// reachable call site until then.
-#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 pub(crate) fn has_bare_comma(value: &[u8]) -> bool {
   matches!(scan_to_delim(value, 0, b','), Delim::At(at) if at < value.len())

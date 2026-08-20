@@ -44,3 +44,79 @@ fn weight_orders_as_the_rfc_says_it_does() {
   assert_eq!(Weight::ONE.thousandths(), 1000);
   assert_eq!(Weight::ZERO.thousandths(), 0);
 }
+
+#[test]
+fn a_media_type_parses_to_its_two_tokens_and_its_parameters() {
+  let m = media_type(b"application/graphql-response+json;charset=utf-8").expect("valid");
+  assert_eq!(m.ty(), "application");
+  assert_eq!(m.subtype(), "graphql-response+json");
+  let mut params = m.params();
+  assert_eq!(
+    params.next().expect("one").expect("well formed"),
+    (b"charset".as_slice(), ParamValue::Token(b"utf-8"))
+  );
+  assert!(params.next().is_none());
+}
+
+#[test]
+fn content_type_refuses_a_comma_outside_a_quoted_string() {
+  // RFC 9110 section 8.3 warns that recovering from a doubled Content-Type by
+  // taking "the last syntactically valid member of the list" causes
+  // "potential interoperability and security issues"; refusal cannot diverge.
+  assert_eq!(
+    media_type(b"text/plain, text/html"),
+    Err(MediaError::NotASingleton)
+  );
+  // A trailing comma too: member-counting would call this singular, because
+  // section 5.6.1.2 has the walk skip empty elements.
+  assert_eq!(media_type(b"text/plain,"), Err(MediaError::NotASingleton));
+  // Inside a quoted-string the comma is data.
+  let m = media_type(b"multipart/form-data;boundary=\"a,b\"").expect("valid");
+  assert_eq!(m.subtype(), "form-data");
+}
+
+#[test]
+fn a_parameter_named_q_is_ordinary_in_a_content_type() {
+  // Content-Type has no weight grammar: section 12.4.2's q is a
+  // content-negotiation feature and section 12.5.1's recipient SHOULD is
+  // Accept's. So this is a valid media type with an oddly named parameter.
+  let m = media_type(b"text/html;q=blah").expect("valid");
+  assert_eq!(m.ty(), "text");
+  assert_eq!(
+    m.params().next().expect("one").expect("well formed"),
+    (b"q".as_slice(), ParamValue::Token(b"blah"))
+  );
+}
+
+#[test]
+fn media_type_refuses_what_is_not_type_solidus_subtype() {
+  for bad in [
+    b"application".as_slice(), // no solidus
+    b"/json",                  // empty type
+    b"application/",           // empty subtype
+    b"appli cation/json",      // space is not a tchar
+    b"application/js/on",      // two solidi: the second is not a tchar
+  ] {
+    assert_eq!(media_type(bad), Err(MediaError::NotAMediaType), "{:?}", bad);
+  }
+}
+
+#[test]
+fn a_valueless_parameter_is_refused_by_the_media_grammar() {
+  // The walker admits `ParamValue::None` for fields like RFC 6455's that
+  // define their own parameter grammar. Section 5.6.6's `parameter` requires
+  // the `=`, so for a media type it is a violation.
+  assert_eq!(
+    media_type(b"text/html;charset"),
+    Err(MediaError::ValuelessParameter)
+  );
+}
+
+#[test]
+fn a_literal_asterisk_type_parses_and_matches_nothing_real() {
+  // `*` is a tchar, so `*/json` reaches the grammar through the
+  // `type "/" subtype` alternative with the literal type `*`.
+  let m = media_type(b"*/json").expect("valid");
+  assert_eq!(m.ty(), "*");
+  assert_eq!(m.subtype(), "json");
+}
