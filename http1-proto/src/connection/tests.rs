@@ -11,9 +11,10 @@ use super::{
     CHUNKED_UNANNOUNCED, CLOSE_DELIMITED_IS_UNFRAMED, CONTINUE_NEEDS_CONTENT,
     FIELD_STATES_ITS_GRAMMAR, INTERIM_NEEDS_HTTP_11, LENGTH_DISAGREES, LENGTH_IS_ONE_VALUE,
     NO_BODY_IN_FLIGHT, NO_SUCCESS_TO_STATE, OVER_SEND, READ_SIDE_ENDED, REFUSED_BODY_NEEDS_CLOSE,
-    REFUSED_BODY_TAKES_NO_INTERIM, REQUEST_IS_NEVER_CLOSE_DELIMITED, REQUEST_NEEDS_HOST,
-    SENDER_LIST_EMPTY_ELEMENT, TE_NEEDS_HTTP_11, TE_WITHOUT_CHUNKED, UNCHUNKED_HAS_NO_TRAILERS,
-    UNFRAMED_RESPONSE, UPGRADE_NEEDS_TUNNEL,
+    REFUSED_BODY_TAKES_NO_INTERIM, REFUSED_RESPONSE_ENDS_THE_REQUEST,
+    REQUEST_IS_NEVER_CLOSE_DELIMITED, REQUEST_NEEDS_HOST, SENDER_LIST_EMPTY_ELEMENT,
+    TE_NEEDS_HTTP_11, TE_WITHOUT_CHUNKED, UNCHUNKED_HAS_NO_TRAILERS, UNFRAMED_RESPONSE,
+    UPGRADE_NEEDS_TUNNEL,
   },
   *,
 };
@@ -5541,6 +5542,224 @@ fn a_client_refuses_a_close_delimited_response_and_drains() {
   assert_eq!(c.poll_event(), None);
 }
 
+// WINDOW ONE, the REQUEST-BODY side. A client with a chunked request still
+// going out reads a final response head whose `Content-Length` is past its
+// ceiling: the decoder is refused the moment `commit_head` builds it, before
+// the head item is yielded, and the driver here drops the iterator without
+// pulling again — so the pump step that resolves the refusal has not run.
+//
+// Every further request octet is work the peer is made to read for an answer
+// this end has already declined. RFC 9112 §9.3 makes reading the whole response
+// the condition for reusing the connection, and declining it is exactly what
+// this end did, so nothing this request body could still say serves an exchange
+// that can complete.
+#[test]
+fn a_refused_response_stops_the_request_body_before_the_pump_resolves_it() {
+  const CHUNKED_REQUEST: &[(&str, &[u8])] = &[("Host", b"h"), ("Transfer-Encoding", b"chunked")];
+  let mut c = Connection::<Client, General>::with_limits(
+    Connection::<Client, General>::default_limits().with_max_body_bytes(4),
+  );
+  let mut out = [0u8; 128];
+  c.open_request(
+    "POST",
+    &ORIGIN,
+    CHUNKED_REQUEST,
+    BodyPlan::Chunked,
+    &mut out,
+  )
+  .unwrap();
+  // The upload is under way and unrefused: this is what stops.
+  assert!(c.send_body(b"hi", &mut out).unwrap() > 0);
+
+  {
+    let mut it = c.handle(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    // Dropped WITHOUT a second pull: the refusal is unresolved by construction.
+  }
+
+  out = [0u8; 128];
+  // Repeatedly, because the defect was that each call encoded again.
+  for attempt in 0..2u8 {
+    let refused = c.send_body(b"more", &mut out).unwrap_err();
+    assert!(
+      matches!(refused, Error::InvalidState(m) if m == REFUSED_RESPONSE_ENDS_THE_REQUEST),
+      "attempt {attempt}: {refused:?}"
+    );
+  }
+  let finished = c.finish_body(NO_TRAILERS, &mut out).unwrap_err();
+  assert!(
+    matches!(finished, Error::InvalidState(m) if m == REFUSED_RESPONSE_ENDS_THE_REQUEST),
+    "{finished:?}"
+  );
+  assert_eq!(out, [0u8; 128], "nothing was written after the refusal");
+
+  // And the write stays refused once the pump RESOLVES it, which is the half
+  // that already worked: `refuse` settles the connection — clearing the
+  // exchange that held the flag — and releases the send side, so the reason
+  // quoted changes while the answer does not. No octet reaches the wire in
+  // either window.
+  let error = {
+    let mut it = c.handle(b"");
+    it.next().unwrap_err()
+  };
+  assert!(matches!(error, Error::Refused(_)), "{error:?}");
+  assert!(c.send_body(b"more", &mut out).is_err());
+  assert!(c.finish_body(NO_TRAILERS, &mut out).is_err());
+  assert_eq!(out, [0u8; 128], "and still nothing was written");
+}
+
+// THE CONTROL, and the whole risk of the gate above: a SERVER's outbound body
+// is the ANSWER to the refused message, not the message that was refused. A 413
+// carrying its explanation is why this design refuses rather than latching, so
+// a response body already under way must finish — here in window one, where the
+// request's refusal is live in the decoder and the gate is being consulted.
+#[test]
+fn a_refused_request_still_lets_the_server_finish_the_answer_it_started() {
+  const CLOSING_413: &[(&str, &[u8])] = &[("Content-Length", b"7"), ("Connection", b"close")];
+  let mut c =
+    head_refused_before_the_pump(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n");
+  let mut out = [0u8; 128];
+  let n = c
+    .send_response(
+      413,
+      b"Content Too Large",
+      CLOSING_413,
+      BodyPlan::ContentLength(7),
+      &mut out,
+    )
+    .unwrap();
+  assert_eq!(
+    out.get(..n),
+    Some(
+      b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 7\r\nConnection: close\r\n\r\n"
+        .as_slice()
+    )
+  );
+  // The explanation itself, written while the refusal is still in the decoder.
+  let n = c.send_body(b"too big", &mut out).unwrap();
+  assert_eq!(out.get(..n), Some(b"too big".as_slice()));
+  assert_eq!(c.finish_body(NO_TRAILERS, &mut out).unwrap(), 0);
+}
+
+// THE STALL. Readiness is what a driver acts on when it is not pulling items,
+// and both halves of it used to key on the pump step that FORMALISES a
+// refusal — so a server that stopped at `Item::Head` was told "read, do not
+// send" about a message no further octet can change.
+//
+// With RFC 9110 §10.1.1's expectation on the request that is a deadlock rather
+// than a cosmetic wrong answer: the peer is withholding its content until it is
+// answered, this end is waiting for content that will never come, and the
+// refusal was decidable from the head alone. Both ends wait until a timeout.
+#[test]
+fn a_head_refused_body_tells_a_server_to_write_rather_than_to_read() {
+  let mut c = head_refused_before_the_pump(
+    b"POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
+  );
+  assert!(!c.wants_read(), "no octet can change a refusal");
+  assert!(c.is_awaiting_send(), "the one answer is due now");
+
+  // THE PENDING CONCLUSION, and the rule that keeps a refusal deliverable to a
+  // driver that has stopped reading: an EMPTY slice is a sufficient re-offer.
+  let error = {
+    let mut it = c.handle(b"");
+    it.next().unwrap_err()
+  };
+  assert!(
+    matches!(
+      error,
+      Error::Refused(Refusal::BodyTooLarge { limit: 4, .. })
+    ),
+    "{error:?}"
+  );
+  // And the answer does not move when the pump formalises what was already true.
+  assert!(!c.wants_read());
+  assert!(c.is_awaiting_send());
+}
+
+// The CLIENT side of the same window, where the two halves answer differently:
+// a client owes no response and its own request body has already been stopped,
+// so both go quiet together and the pending conclusion is all there is to
+// collect.
+#[test]
+fn a_refused_response_leaves_a_client_no_readiness_and_one_pump_owed() {
+  const CHUNKED_REQUEST: &[(&str, &[u8])] = &[("Host", b"h"), ("Transfer-Encoding", b"chunked")];
+  let mut c = Connection::<Client, General>::with_limits(
+    Connection::<Client, General>::default_limits().with_max_body_bytes(4),
+  );
+  // A request body still in flight, so the send side is NOT idle: without that
+  // this end's answer to "is a write owed?" would be false for a reason that
+  // has nothing to do with the refusal.
+  let mut out = [0u8; 128];
+  c.open_request(
+    "POST",
+    &ORIGIN,
+    CHUNKED_REQUEST,
+    BodyPlan::Chunked,
+    &mut out,
+  )
+  .unwrap();
+  assert!(c.send_body(b"hi", &mut out).unwrap() > 0);
+  {
+    let mut it = c.handle(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+  }
+  assert!(!c.wants_read());
+  // A client owes no response, and the write it DOES have outstanding has
+  // already been stopped — reporting an obligation here would name a call that
+  // every send path refuses.
+  assert!(!c.is_awaiting_send(), "a client owes no response");
+  assert!(c.send_body(b"more", &mut out).is_err());
+  let error = {
+    let mut it = c.handle(b"");
+    it.next().unwrap_err()
+  };
+  assert!(matches!(error, Error::Refused(_)), "{error:?}");
+}
+
+// THE CONTROL, and the whole risk of asking the decoder instead of the state: a
+// body still owed octets must go on advertising read work, or the fix above
+// trades a stall on refused bodies for a stall on every healthy one.
+#[test]
+fn a_body_still_owed_octets_still_advertises_read_work() {
+  let mut c = bounded_server(1 << 20);
+  {
+    let mut it = c.handle(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhe");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    assert!(matches!(it.next().unwrap(), Some(Item::BodyChunk { .. })));
+  }
+  assert!(c.wants_read(), "three octets are still owed");
+  assert!(!c.is_awaiting_send(), "the request is not through");
+}
+
+// The sibling of the refused case, and it is reachable for exactly the reason
+// the refused one is: `Items` lets a driver stop pulling mid-stream, so a body
+// whose octets have ALL arrived can be left mid-`Body` with its item still
+// owed. That item comes from the next call rather than from the wire, so the
+// read half must say so — the same pending conclusion, by the same rule.
+#[test]
+fn a_body_whose_octets_all_arrived_owes_an_item_rather_than_a_read() {
+  let mut c = bounded_server(1 << 20);
+  {
+    let mut it = c.handle(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    let Some(Item::BodyChunk { data, .. }) = it.next().unwrap() else {
+      panic!("expected the body")
+    };
+    assert_eq!(data, b"hello");
+    // Stopped here, which the item stream explicitly permits.
+  }
+  assert!(!c.wants_read(), "every octet of this body has arrived");
+  assert!(
+    !c.is_awaiting_send(),
+    "the completion item has not been taken"
+  );
+  let mut it = c.handle(b"");
+  assert!(matches!(
+    it.next().unwrap(),
+    Some(Item::ExchangeComplete { .. })
+  ));
+}
+
 // SYNTAX BEFORE POLICY. A ceiling of zero refuses every message that carries
 // content, so policy has everything to say about this body — but `zz` is not
 // RFC 9112 §7.1's `chunk-size = 1*HEXDIG` at all, and a malformed element is
@@ -5941,6 +6160,54 @@ fn pulling_before_the_announced_count_has_arrived_hands_back_a_partial_chunk() {
     panic!("expected a chunk")
   };
   assert_eq!(data, b"hello", "only what the buffer held");
+}
+
+// THE WINDOW BETWEEN `BodyChunk` AND `ExchangeComplete`. A counted body whose
+// octets have all arrived leaves the decoder complete while the exchange is
+// not: `ExchangeComplete` has not been pulled, so `Items` is still usable and a
+// route may still narrow. The octets are already out, so a ceiling below that
+// total was not met and saying `Ok` would tell a route its bound was applied to
+// content that had already crossed it.
+#[test]
+fn narrowing_below_a_body_already_delivered_in_full_refuses() {
+  let mut c = bounded_server(1 << 20);
+  let error = {
+    let mut it = c.handle(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n\r\nhello world");
+    assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
+    let Some(Item::BodyChunk { data, .. }) = it.next().unwrap() else {
+      panic!("expected the whole body in one chunk")
+    };
+    assert_eq!(data, b"hello world");
+    it.limit_body(4).unwrap_err()
+  };
+  let Error::Refused(Refusal::BodyTooLarge { exchange, limit }) = error else {
+    panic!("expected a policy refusal, got {error:?}")
+  };
+  assert_eq!(limit, 4, "the route's max, not the ceiling it replaced");
+  assert_eq!(exchange.get(), 1);
+  assert_eq!(
+    error.suggested_status(),
+    Some(SuggestedStatus::ContentTooLarge)
+  );
+  // Policy, not a violation: the connection is answerable and the one answer
+  // owed still has to state `close` (RFC 9112 §9.3).
+  assert!(!matches!(c.lifecycle, Lifecycle::Failed));
+  assert!(c.is_awaiting_send());
+  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  let mut out = [0u8; 128];
+  let without_close = c
+    .send_response(
+      413,
+      b"Content Too Large",
+      LENGTH_0,
+      BodyPlan::None,
+      &mut out,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(without_close, Error::InvalidState(m) if m == REFUSED_BODY_NEEDS_CLOSE),
+    "{without_close:?}"
+  );
 }
 
 // The size budget is a module-level `const _` (below the type, in `mod.rs`), so

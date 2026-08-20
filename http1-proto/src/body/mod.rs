@@ -326,6 +326,35 @@ impl BodyDecoder {
     }
   }
 
+  /// Whether more transport octets could move this body forward.
+  ///
+  /// The question the READ half of the connection's readiness split actually
+  /// asks, answered by the decoder rather than by the receive state that holds
+  /// it — "a body is being received" and "this body needs another octet" are
+  /// different facts, and reading the first for the second tells a driver to
+  /// wait for input that will never change anything:
+  ///
+  /// - A body still owed octets — a `Content-Length` counting down (RFC 9112
+  ///   §6.3 item 6), a chunked body mid-coding (§7.1), one delimited by the
+  ///   close (§6.3 item 8) — wants input, and item 8's wants it until the
+  ///   transport ends.
+  /// - A body whose octets have ALL arrived does not. `Complete` still owes its
+  ///   `Finished` item, but that item comes from the next call, not from the
+  ///   wire; `Done` owes nothing at all.
+  /// - A REFUSED body does not, and this is the sharp case: every further octet
+  ///   is answered with the same refusal, so a driver told to read one is told
+  ///   to wait for bytes that cannot help — and against a peer that is itself
+  ///   waiting (RFC 9110 §10.1.1's `Expect: 100-continue`) both ends wait until
+  ///   a timeout breaks the tie.
+  ///
+  /// EXHAUSTIVE, so a state added later has to say which of the two it is.
+  pub(crate) const fn wants_input(&self) -> bool {
+    match self.state {
+      State::Counting(_) | State::Chunked(_) | State::ReadToClose => true,
+      State::Complete | State::Done | State::Refused => false,
+    }
+  }
+
   /// Narrows this body's ceiling to `max` payload octets, answering whether the
   /// ceiling now in force can still be met.
   ///
@@ -355,12 +384,28 @@ impl BodyDecoder {
   /// reach later: it is a strictly earlier evaluation of the same comparison and
   /// never a second rule.
   ///
-  /// EVERY state answers, and three answer VACUOUSLY `true`. `Complete` and
-  /// `Done` have no octet left to bound — RFC 9112 §6.3 items 1 and 7 put a
-  /// message with no content in `Complete` before a byte is read, so a caller
-  /// that narrows after every head must not be told that a conformant GET, HEAD
-  /// response or 304 was an error — and `Refused` is already refused, since a
-  /// refusal is not undone.
+  /// EVERY state answers, and the check above runs for all but ONE of them.
+  ///
+  /// `Refused` is the exemption, and the whole of it: the refusal already stands
+  /// and a refusal is not undone, so there is no second answer to give.
+  ///
+  /// `Complete` and `Done` are MEASURED like any other. A body whose octets have
+  /// all arrived has still DELIVERED them, and neither the countdown reaching
+  /// zero nor the later call that hands over `Finished` gives them back — so a
+  /// ceiling narrowed below that total was not met, and answering `true` would
+  /// tell a route its bound had been applied to content that had already crossed
+  /// it. What decides is what the body delivered, never how far a caller has got
+  /// through pumping the items that report it: the two states differ only in
+  /// whether `Finished` has been taken, and a rule that turned on that would
+  /// make the answer a fact about the pump rather than about the message.
+  ///
+  /// The message with NO content stays `true`, and by the check rather than by
+  /// exemption. RFC 9112 §6.3 items 1 and 7 put it in `Complete` before a byte
+  /// is read, so `received` is zero, so neither count can fire — at any ceiling,
+  /// nought included. A caller that narrows after every head is still never told
+  /// that a conformant GET, HEAD response or 304 was an error, which is the
+  /// reason that exemption was written for; the reason holds only while nothing
+  /// has been delivered, and this is what says so.
   ///
   /// THE SECOND WRITER of `State::Refused`, the first being
   /// [`new`](Self::new)'s declaration gate. Both write it for one fact — this
@@ -371,21 +416,29 @@ impl BodyDecoder {
     if max < self.limit {
       self.limit = max;
     }
+    // EXHAUSTIVE rather than a `matches!`, so a state added later has to say
+    // whether this end's ceiling still applies to it instead of inheriting an
+    // answer — and it decides only THAT, because the check itself is stated once
+    // below. A copy of it per arm is what comes to be spelled two ways.
     match self.state {
-      State::Complete | State::Done | State::Refused => true,
-      State::Counting(_) | State::Chunked(_) | State::ReadToClose => {
-        // Nothing declared is nothing to measure: only the already-delivered
-        // count can refuse a framing that has committed to no octets.
-        let declared = self.announced().unwrap_or(0);
-        if overruns(self.received, self.limit)
-          || overruns(declared, headroom(self.received, self.limit))
-        {
-          self.state = State::Refused;
-          return false;
-        }
-        true
-      }
+      State::Refused => return true,
+      State::Complete
+      | State::Done
+      | State::Counting(_)
+      | State::Chunked(_)
+      | State::ReadToClose => {}
     }
+    // Nothing declared is nothing to measure: for a body already through, and
+    // for a framing that has committed to no octets, only the already-delivered
+    // count can refuse.
+    let declared = self.announced().unwrap_or(0);
+    if overruns(self.received, self.limit)
+      || overruns(declared, headroom(self.received, self.limit))
+    {
+      self.state = State::Refused;
+      return false;
+    }
+    true
   }
 
   /// Feeds the next slice of received bytes, returning how many of its leading

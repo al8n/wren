@@ -607,6 +607,12 @@ fn narrowing_below_what_has_already_been_delivered_refuses() {
     4,
     "committed before the check, so the refusal names the ceiling that refused"
   );
+  // And a refusal is not UNDONE, so it is not re-taken either: narrowing again
+  // answers the standing refusal rather than reporting a second one. This is
+  // the one state where that exemption is observable, since the six octets
+  // already delivered would otherwise fail the same check a second time.
+  assert!(d.narrow(4));
+  assert!(d.is_refused());
 }
 
 // What each RFC 9112 §6.3 framing has COMMITTED to at the moment its head has
@@ -643,4 +649,53 @@ fn announced_follows_the_chunk_in_flight_rather_than_the_body() {
   assert_eq!(d.announced(), Some(3));
   assert_eq!(d.feed(b"llo").unwrap(), (3, Some(BodyItem::Data(b"llo"))));
   assert_eq!(d.announced(), None, "between chunks nothing is declared");
+}
+
+// A body whose octets have ALL arrived has still delivered them, so a ceiling
+// narrowed below that total was not met. RFC 9112 §6.3 item 6's countdown
+// reaching zero moves the decoder on from counting, and neither that move nor
+// the later one that hands over `Finished` gives back the octets already
+// handed over — the answer turns on what the body DELIVERED, never on how far
+// the caller has got through pumping the items that report it.
+#[test]
+fn a_body_whose_octets_have_all_arrived_is_still_measured() {
+  // COMPLETE: every octet consumed, the `Finished` item still owed.
+  let mut complete = BodyDecoder::new(BodyFraming::ContentLength(5), 1000, u64::MAX);
+  assert_eq!(
+    complete.feed(b"hello").unwrap(),
+    (5, Some(BodyItem::Data(b"hello")))
+  );
+  assert!(!complete.narrow(4));
+  assert!(complete.is_refused());
+  assert_eq!(complete.limit(), 4);
+
+  // DONE: the item stream has ended too, and the answer does not change.
+  let mut done = BodyDecoder::new(BodyFraming::ContentLength(5), 1000, u64::MAX);
+  assert_eq!(
+    done.feed(b"hello").unwrap(),
+    (5, Some(BodyItem::Data(b"hello")))
+  );
+  assert_eq!(done.feed(b"").unwrap(), (0, Some(BodyItem::Finished)));
+  assert!(!done.narrow(4));
+  assert!(done.is_refused());
+
+  // And the ceiling that IS met is still met: RFC 9110 §15.5.14 refuses content
+  // larger than this end will process, not content that meets the ceiling.
+  let mut met = BodyDecoder::new(BodyFraming::ContentLength(5), 1000, u64::MAX);
+  assert_eq!(
+    met.feed(b"hello").unwrap(),
+    (5, Some(BodyItem::Data(b"hello")))
+  );
+  assert!(met.narrow(5));
+  assert!(!met.is_refused());
+
+  // The counterpoint, and the reason the measurement is safe to apply to
+  // `Complete` at all: RFC 9112 §6.3 items 1 and 7 put a message with NO content
+  // in the same state, and it delivered nothing — so the same check answers yes
+  // at every ceiling, nought included, and no exemption is needed to keep a
+  // narrow-after-every-head driver working.
+  let mut bodiless = BodyDecoder::new(BodyFraming::None, 1000, u64::MAX);
+  assert!(bodiless.narrow(0));
+  assert!(!bodiless.is_refused());
+  assert_eq!(bodiless.received(), 0);
 }

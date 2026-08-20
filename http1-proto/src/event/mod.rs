@@ -518,10 +518,16 @@ impl<'a, 'c> Items<'a, 'c> {
   /// committed before satisfiability is checked.
   ///
   /// `Ok(())` on a message with no body — RFC 9112 §6.3 items 1 and 7 make a
-  /// bodiless message a body of no octets, so there is nothing a ceiling could
-  /// be about and a driver that narrows after every head is not punished for a
-  /// conformant GET, HEAD response or 304 — and on a body already through or
-  /// already refused, since neither has an octet left to bound.
+  /// bodiless message a body of no octets, so nothing has been delivered, no
+  /// ceiling can be exceeded, and a driver that narrows after every head is not
+  /// punished for a conformant GET, HEAD response or 304 — and on a body already
+  /// refused, since a refusal is not undone.
+  ///
+  /// A body already THROUGH is not in that list. Its octets are out, so a
+  /// ceiling below what it delivered refuses like any other: the window between
+  /// [`Item::BodyChunk`] and [`Item::ExchangeComplete`] is still a window in
+  /// which this call can be made, and the answer there is about what the body
+  /// delivered rather than about how far the item stream has been pumped.
   ///
   /// `Err(Error::InvalidState(_))` is reserved for a connection that cannot act
   /// on the call at all: no message is being received, or the connection has
