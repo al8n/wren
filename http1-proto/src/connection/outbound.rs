@@ -60,7 +60,7 @@
 use crate::{
   body::encode::{CHUNK_TERMINATOR, encode_chunk_header, encode_last_chunk_and_trailers},
   connection::{
-    CONNECT, Client, Connection, Exchange, FAILED, General, Lifecycle, RecvState,
+    CONNECT, Client, Connection, Exchange, FAILED, General, Lifecycle, RecvState, Role,
     SWITCHING_PROTOCOLS, SendBody, SendState, Server, body_refused, discharge_expect, mint,
     signal_close, tunnel::CONTINUE, writable,
   },
@@ -499,6 +499,30 @@ pub(super) const REFUSED_BODY_NEEDS_CLOSE: &str =
 /// 8297), which invites nothing — what refuses a 103 here is the one-answer
 /// rule above rather than the invitation.
 pub(super) const REFUSED_BODY_TAKES_NO_INTERIM: &str = "no interim response after a refused body";
+
+/// A CLIENT whose inbound response has been refused has nothing left to write,
+/// and the request body still going out is the thing to stop.
+///
+/// RFC 9112 §9.3: "Likewise, a client MUST read the entire response message body
+/// if it intends to reuse the same connection for a subsequent request."
+/// Reading the whole response is exactly what a refusal declines, so this
+/// connection cannot be reused — and §9.5 adds that "A client, server, or proxy
+/// MAY close the transport connection at any time". The remaining octets
+/// therefore serve no exchange that can complete, and every one of them is work
+/// the peer is made to read for an answer this end has already declined.
+///
+/// NOT §9.5's "If the client sees a response that indicates the server does not
+/// wish to receive the message body and is closing the connection, the client
+/// SHOULD immediately cease transmitting the body and close its side of the
+/// connection" — that sentence governs a client reacting to a SERVER's refusal
+/// of the client's request body, and no such response exists here. The
+/// behaviour is the same; the authority is not.
+///
+/// A SERVER is the other way round and is deliberately NOT gated: the body it
+/// is sending is the ANSWER — a 413 carrying its explanation — not the message
+/// that was refused. See [`body_refused`]'s table.
+pub(super) const REFUSED_RESPONSE_ENDS_THE_REQUEST: &str =
+  "a refused response leaves this request body no exchange to complete";
 
 /// The send state a head with this plan leaves behind.
 ///
@@ -972,9 +996,13 @@ impl Connection<Server, General> {
   }
 }
 
-// `Ro` is free: `body_sendable`, `send_body` and `finish_body` turn on
-// `lifecycle` and `send` alone, never on `Role::IS_CLIENT`.
-impl<Ro> Connection<Ro, General> {
+// `Role`-bounded, and this is the one place on the send side where the role is
+// a rule rather than a type-state label: a refused body stops a CLIENT's request
+// body and must not stop a SERVER's response body, because the two are writing
+// opposite things (see `REFUSED_RESPONSE_ENDS_THE_REQUEST`). `send_body` and
+// `finish_body` turn on `lifecycle` and `send` for everything else, and the
+// bound reaches them through `body_sendable`, which is the single gate.
+impl<Ro: Role> Connection<Ro, General> {
   /// The lifecycle gate for a BODY write, which differs from [`sendable`] in one
   /// place and for one reason.
   ///
@@ -988,10 +1016,34 @@ impl<Ro> Connection<Ro, General> {
   /// A latched violation still outranks both: the connection has already handed
   /// its one error back, and nothing after it is anything else.
   ///
+  /// # And it consults the refusal reader, on a client
+  ///
+  /// A CLIENT writing a request body whose response has already been refused is
+  /// writing into an exchange that cannot complete, so the write stops here —
+  /// see [`REFUSED_RESPONSE_ENDS_THE_REQUEST`]. A SERVER is not gated: the body
+  /// it is writing is the ANSWER to the refused message, and stopping it would
+  /// destroy the 413 the refusal exists to make representable.
+  ///
+  /// Checked AHEAD of the abandoned-body reason, so the SPECIFIC reason wins
+  /// wherever the refusal is still readable — including on a head that both
+  /// stated `close` (which abandons a client's body) and declared content past
+  /// the ceiling, where both facts are true and this one is the one the driver
+  /// can act on.
+  ///
+  /// Once the pump RESOLVES a client refusal the fact is no longer readable
+  /// here at all: [`refuse`](crate::connection::refuse) settles the connection,
+  /// which clears the exchange that held the flag, and releases the send side
+  /// for exactly the reason above. So the write is still refused past that
+  /// point, by the abandoned-body branch below, and no octet reaches the wire
+  /// in either window. What differs is only which reason is quoted.
+  ///
   /// [`sendable`]: Connection::sendable
   fn body_sendable(&self) -> Result<(), Error> {
     if matches!(self.lifecycle, Lifecycle::Failed) {
       return Err(Error::InvalidState(FAILED));
+    }
+    if Ro::IS_CLIENT && body_refused(&self.recv, &self.exchange) {
+      return Err(Error::InvalidState(REFUSED_RESPONSE_ENDS_THE_REQUEST));
     }
     if matches!(self.send, SendState::Abandoned) {
       return Err(Error::InvalidState(EXCHANGE_ENDED_BY_PEER));

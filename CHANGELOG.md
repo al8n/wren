@@ -196,10 +196,14 @@ borrowed chunk with no copy path anywhere in this core.
   refused anything.
 
   It answers `Ok(())` on a message with no body. RFC 9112 §6.3 items 1 and 7
-  frame a bodiless message as a body of no octets, so there is nothing a ceiling
-  could be about, and a uniform narrow-after-every-head driver — the natural
-  shape — must not be told that every conformant GET, HEAD response or 304 was an
-  error. `Error::InvalidState` is reserved for a connection that cannot act on
+  frame a bodiless message as a body of no octets, so nothing has been
+  delivered, no ceiling can be exceeded at any value, and a uniform
+  narrow-after-every-head driver — the natural shape — is never told that a
+  conformant GET, HEAD response or 304 was an error. A body already THROUGH is a
+  different case and is measured like any other: its octets are out, so the
+  window between `Item::BodyChunk` and `Item::ExchangeComplete` — in which the
+  iterator is still usable and a route may still narrow — answers about what the
+  body delivered rather than about how far the item stream has been pumped. `Error::InvalidState` is reserved for a connection that cannot act on
   the call at all: no message being received, or a failed or drained connection.
   That reservation is deliberate, because `InvalidState` carries a `&'static str`
   a caller cannot branch on — folding "this message has no body" into it would

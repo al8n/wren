@@ -1505,6 +1505,40 @@ impl<Ro: Role> Connection<Ro, General> {
   ///   §9.6), the inbound side is waiting on the local send side, or this is a
   ///   client with no outstanding request — for which §9.2 makes arriving data a
   ///   fault rather than progress.
+  ///
+  /// # A body being received is not the same as a body that needs an octet
+  ///
+  /// The question is asked of the DECODER — `BodyDecoder::wants_input` — never
+  /// of the receive state that holds it. A body whose octets have all arrived, and a
+  /// body this end has REFUSED, are both mid-`Body` and neither can be moved by
+  /// another read: the first owes an item the next call produces from bytes
+  /// already in hand, and the second answers every further octet with the same
+  /// refusal. Answering "read" for either tells a driver to wait for input that
+  /// changes nothing — and against a peer withholding its content until it is
+  /// answered (RFC 9110 §10.1.1's `Expect: 100-continue`) both ends then wait
+  /// until a timeout breaks the tie.
+  ///
+  /// # A PENDING CONCLUSION, and the one rule a driver needs for it
+  ///
+  /// So `false` here while a message is still being received means something
+  /// specific and new: **the pump owes an item or an error that no further
+  /// octet can change.** Re-offer what the driver already holds — an EMPTY
+  /// slice is a sufficient offer — and [`Items::next`] hands it over: the
+  /// `ExchangeComplete` of a body already through, or the
+  /// [`Error::Refused`] of one this end declined. That
+  /// is the same rule [`handle_eof`](Self::handle_eof) already states for the
+  /// other conclusion nothing but a re-offer can produce, and it is what keeps
+  /// a refusal deliverable to a driver that has stopped reading.
+  ///
+  /// A SERVER is told the same thing twice over, since
+  /// [`is_awaiting_send`](Self::is_awaiting_send) turns true on a refused body
+  /// and its one answer is due. A CLIENT is told it by this call alone: it owes
+  /// no response and its own request body has already been stopped, so both
+  /// readiness answers go quiet together and the pending conclusion is the only
+  /// thing left to collect.
+  ///
+  /// [`Items::next`]: crate::Items::next
+  /// [`Error::Refused`]: crate::Error::Refused
   #[inline]
   pub fn wants_read(&self) -> bool {
     // The transport fact first, because it outranks every reading of the second:
@@ -1515,7 +1549,7 @@ impl<Ro: Role> Connection<Ro, General> {
     }
     match self.lifecycle {
       Lifecycle::Failed | Lifecycle::Draining => false,
-      Lifecycle::Open | Lifecycle::Closing => match self.recv {
+      Lifecycle::Open | Lifecycle::Closing => match &self.recv {
         RecvState::AwaitingRearm => false,
         // An idle client with a half-arrived line terminator in front of it DOES
         // need the next byte: it is what decides whether the CR was a stray empty
@@ -1523,17 +1557,19 @@ impl<Ro: Role> Connection<Ro, General> {
         // response at all. Without this the connection would stall on a CR that
         // only a read can resolve.
         RecvState::Idle => !Ro::IS_CLIENT || self.exchange.is_some() || self.pending_cr,
-        RecvState::Body { .. } => true,
+        // Asked of the decoder, not of the state: see the two sections above.
+        RecvState::Body { decoder, .. } => decoder.wants_input(),
       },
     }
   }
 }
 
-// `Ro` is free rather than `Role`-bounded below: none of `is_awaiting_send`,
-// `close` or `settle` reads `Role::IS_CLIENT` or anything else the trait
-// offers — they turn on `lifecycle`, `recv` and `send` alone, which every
-// `Connection<Ro, General>` carries whatever `Ro` is filled with.
-impl<Ro> Connection<Ro, General> {
+// `Role`-bounded for ONE reason, and it is the same one the body send gate has:
+// a refused body leaves a SERVER owing its one answer and leaves a CLIENT with
+// nothing to write, so `is_awaiting_send` cannot give one answer for both.
+// `body_progress`, `close` and `settle` read `lifecycle`, `recv` and `send`
+// alone and would still compile without the bound.
+impl<Ro: Role> Connection<Ro, General> {
   /// Where the body being received stands, or `None` between messages.
   ///
   /// On the CONNECTION rather than on [`Items`] because the iterator borrows the
@@ -1578,14 +1614,49 @@ impl<Ro> Connection<Ro, General> {
   /// violation; and the same owed reply on a connection whose peer has
   /// closed its write side, where it is the ONLY thing left to do and
   /// `wants_read` has already gone false.
+  ///
+  /// # A refused body is a fourth cause, on a SERVER
+  ///
+  /// The inbound side of an exchange is through when the message ended — and
+  /// also when this end REFUSED it, because no further octet of it will be
+  /// read. RFC 9112 §9.3 has already taken the close branch on the driver's
+  /// behalf, so the one response a server still owes is due from the moment the
+  /// refusal exists, not from the later pump step that formalises it. Waiting
+  /// for that step is the stall: with `wants_read` correctly false, a server
+  /// told "nothing to write" has nothing to do at all.
+  ///
+  /// A CLIENT is deliberately NOT included. It owes no response, and its own
+  /// request body has already been stopped for the same refusal (see
+  /// `REFUSED_RESPONSE_ENDS_THE_REQUEST`), so reporting an obligation would name
+  /// a write every send call refuses. Its readiness goes quiet in both halves
+  /// and the pending conclusion on [`wants_read`](Self::wants_read) is what it
+  /// collects instead.
   #[inline]
   pub fn is_awaiting_send(&self) -> bool {
     match self.lifecycle {
       Lifecycle::Failed => matches!(self.send, SendState::ErrorOwed { .. }),
       Lifecycle::Open | Lifecycle::Closing | Lifecycle::Draining => {
-        matches!(self.recv, RecvState::AwaitingRearm)
+        self.inbound_side_is_through()
           && !matches!(self.send, SendState::Idle | SendState::Abandoned)
       }
+    }
+  }
+
+  /// Whether the inbound side of the exchange in flight will produce nothing
+  /// further that this end's answer should wait for.
+  ///
+  /// Exhaustive over the receive states, so a state added later has to say
+  /// which side of that line it falls on.
+  fn inbound_side_is_through(&self) -> bool {
+    match self.recv {
+      RecvState::AwaitingRearm => true,
+      // The refusal, on a server. Read through the ONE reader, so this answer
+      // and the send gates' cannot come to disagree about when a body counts as
+      // refused; it covers both windows, and in this one the flag half is not
+      // yet written.
+      RecvState::Body { .. } => !Ro::IS_CLIENT && body_refused(&self.recv, &self.exchange),
+      // Nothing is in flight to be through with.
+      RecvState::Idle => false,
     }
   }
 
@@ -1870,6 +1941,30 @@ pub(crate) fn latch(
 ///
 /// Exhaustive over [`RecvState`], so a receive state added later has to say
 /// whether it can hold a refused body rather than defaulting to "no".
+///
+/// # Every public call whose answer depends on a refused body, and what it does
+///
+/// The class is "who ANSWERS A QUESTION about this refusal", not "who writes
+/// the wire" — a narrower reading of it left the readiness pair out and cost a
+/// round, because a driver told the wrong thing about what to do next does not
+/// have to write a byte to hang. A call that must NOT consult this says so
+/// below with its reason: silence is what let the omissions through.
+///
+/// | Call | Consults | Why |
+/// |---|---|---|
+/// | `wants_read` | **yes**, through `BodyDecoder::wants_input` | a refused body cannot be moved by another octet, so advertising read work stalls a driver — fatally against a peer withholding content until it is answered |
+/// | `is_awaiting_send` | **yes**, SERVER only | the refusal ends the inbound side, so the one answer RFC 9112 §9.3's close branch owes is due from that moment; a client owes no response and its request body is already stopped |
+/// | `handle` / `Items::next` | **produces** it, does not consult | the pump reads the decoder directly through `feed` and is what turns a refusal into `Error::Refused`; consulting a flag it is about to write would be circular |
+/// | `Items::limit_body` | **yes**, through `narrow` | a decoder already refused answers `Ok` vacuously — the refusal stands and a narrowing cannot add to it |
+/// | `body_progress` | **no** — orthogonal | it reports counts and what the framing declared, all of which stay true of a refused body; `received` is the primitive a driver samples for liveness |
+/// | `poll_event`, `handle_eof`, `close` | **no** — connection-scoped | they answer about the CONNECTION's lifecycle, which `refuse` moves through `signal_close` like every other cause rather than through anything read here |
+/// | `max_body_bytes`, `max_chunk_framing_bytes` | **no** — constants | written once at construction and never a function of any message |
+/// | `send_interim` (General) | **yes** | RFC 9110 §10.1.1 makes a `100` an invitation to send content this end has refused, and a refused exchange owes one final answer and nothing else |
+/// | `send_response` | **yes**, inside `check_response_framing` | the answer must state `close` (RFC 9112 §9.3), and this is the call that SPENDS it |
+/// | `send_body`, `finish_body` | **yes, on a CLIENT only**, through `body_sendable` | a client's outbound body is the REQUEST, and a refused response leaves it no exchange to complete; a server's outbound body IS the answer and must finish |
+/// | `send_error_response` | **no** — vacuous | requires `Lifecycle::Failed` with `SendState::ErrorOwed`, and a refusal never calls [`latch`], so `Failed` is unreachable from it |
+/// | `open_request` (client) | **no** — subsumed | refused in BOTH windows by `ONE_REQUEST_AT_A_TIME`, since a refused body means an exchange is outstanding and the receive side is not idle; and by `sendable()` once the refusal has drained the connection |
+/// | Tunnel `open_upgrade`, `open_connect`, `send_interim`, `accept`, `reject` | **no** — unreachable | reaching any of them needs `into_tunnel`, refused in window one by `REQUEST_INCOMPLETE` (a server's receive side sits in `Body`, not `AwaitingRearm`) or `EXCHANGE_IN_FLIGHT` (a client's exchange is outstanding), and in window two by `take_over`'s `Lifecycle::Open` gate and its queued-`Event` gate |
 ///
 /// [`State::Refused`]: crate::body::BodyDecoder::is_refused
 /// [`Items::limit_body`]: crate::Items::limit_body
