@@ -963,7 +963,13 @@ pub enum ParamValue<'a> {
 
 /// One member of a parameterised `#`-list: a name and its parameters, with
 /// quoted-string values kept intact.
-#[derive(Debug, Copy, Clone)]
+///
+/// `PartialEq` is over these bytes as written, not the parsed parameters:
+/// `params` is the untrimmed remainder after the member's first `;`, so
+/// `ext; q=1` and `ext;  q=1` compare unequal here even though both walk to
+/// the same `(name, ParamValue)` pairs through [`params`](ListMember::params).
+/// A caller wanting that value equality compares `params()`'s output instead.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct ListMember<'a> {
   name: &'a [u8],
   params: &'a [u8],
@@ -1031,6 +1037,24 @@ pub fn parameterised_list<'a, I>(
 where
   I: IntoIterator<Item = &'a [u8]>,
 {
+  parameterised_list_with(lines, is_token)
+}
+
+/// [`parameterised_list`] with the member-name grammar supplied by the caller.
+///
+/// The list construct is RFC 9110 §5.6.1's and the parameters are §5.6.6's, but
+/// what a member NAME may be belongs to the field: §10.1.4 spells a
+/// `transfer-coding`'s name `token`, while §8.3.1 spells a `media-type`
+/// `type "/" subtype` — and `/` is not a `tchar`. One walk, one name rule per
+/// entry point, and no caller re-reading bytes this crate already read.
+#[inline]
+pub(crate) fn parameterised_list_with<'a, I>(
+  lines: I,
+  name_ok: fn(&[u8]) -> bool,
+) -> impl Iterator<Item = Result<ListMember<'a>, ListError>>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
   ParameterisedList {
     lines: lines.into_iter(),
     // The walk starts with no line in hand, which is the same position as a
@@ -1039,7 +1063,22 @@ where
     at: 0,
     exhausted: false,
     done: false,
+    name_ok,
   }
+}
+
+/// Whether a comma appears OUTSIDE a §5.6.4 quoted-string.
+///
+/// A singleton field cannot answer this by counting members: §5.6.1.2 has the
+/// walk skip empty elements, so `text/plain,` yields one member and looks
+/// singular. The comma itself is the evidence.
+// No non-test caller yet: this exists for the media-type list walk that
+// consumes it, which is not built in this change. `#[cfg(test)]` is the only
+// reachable call site until then.
+#[cfg_attr(not(test), allow(dead_code))]
+#[inline]
+pub(crate) fn has_bare_comma(value: &[u8]) -> bool {
+  matches!(scan_to_delim(value, 0, b','), Delim::At(at) if at < value.len())
 }
 
 /// Walks one member's parameters, `*( OWS ";" OWS [ parameter ] )`
@@ -1203,6 +1242,9 @@ struct ParameterisedList<'a, I> {
   /// so, and RFC 9110 §5.2's value ends at the last line either way.
   exhausted: bool,
   done: bool,
+  /// The grammar a member NAME must satisfy. Each public entry point supplies
+  /// its own, so each guarantees its own name grammar and no caller re-checks.
+  name_ok: fn(&[u8]) -> bool,
 }
 
 impl<'a, I> Iterator for ParameterisedList<'a, I>
@@ -1325,7 +1367,7 @@ where
       Delim::Open(_) | Delim::Invalid => (head, [].as_slice()),
     };
     let name = trim_ows(name);
-    if !is_token(name) {
+    if !(self.name_ok)(name) {
       return Err(ListError::NotAToken);
     }
     Ok(ListMember { name, params, tail })
