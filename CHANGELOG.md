@@ -53,7 +53,15 @@ weight applies and nothing about what to serve.
   case-insensitively". That exception is load-bearing rather than cosmetic:
   without it `text/plain;charset=UTF-8;q=0` would not match a candidate spelling
   its charset `utf-8`, and the field's own refusal would be answered with the
-  weight of whatever coarser range sat behind it.
+  weight of whatever coarser range sat behind it. An ABSENT field is a third
+  input rather than an empty one: no lines at all is how a caller spells a
+  request that carried no `Accept`, and §12.4.1 — titled Absence — says such a
+  request "implies that the sender has no preference on that dimension of
+  negotiation", so every candidate keeps `Weight::ONE`. ONE line that happens
+  to be empty is a field that WAS sent naming an empty `#`-list, which stays
+  `Weight::ZERO` with every other unmentioned value (§12.4.3). The lines
+  iterator already carries the distinction — zero items against one empty item
+  — so no signature encodes what the input already says.
 - **`Weight`**: a §12.4.2 `qvalue` in thousandths, `0..=1000`. Fixed point rather
   than a float, because the grammar is already fixed point and this core compares
   weights exactly, on tiers with no FPU and under a link-time no-panic proof.
