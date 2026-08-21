@@ -84,6 +84,7 @@ pub use head::{
 };
 pub use media::{
   MAX_TRACKED_PARAMS, MediaError, MediaRange, MediaType, Weight, accept, media_type, weight_for,
+  weight_for_with,
 };
 // `validate::BodyFraming` is deliberately NOT re-exported here. It is the
 // receive side's own RFC 9112 §6.3 decision, and no public signature hands one
