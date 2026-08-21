@@ -61,7 +61,13 @@ weight applies and nothing about what to serve.
   to be empty is a field that WAS sent naming an empty `#`-list, which stays
   `Weight::ZERO` with every other unmentioned value (§12.4.3). The lines
   iterator already carries the distinction — zero items against one empty item
-  — so no signature encodes what the input already says.
+  — so no signature encodes what the input already says. Field order settles
+  every residual tie, and does so through the STRICT key comparison alone: a
+  later range whose key ties the incumbent's leaves it standing. There is no
+  positional counter in the key, deliberately — one would decide nothing the
+  strict comparison has not already decided, while carrying an `enumerate`
+  index over a caller-supplied iterator that a 16-bit `usize` can overflow,
+  which panics with checks on and wraps without them.
 - **`Weight`**: a §12.4.2 `qvalue` in thousandths, `0..=1000`. Fixed point rather
   than a float, because the grammar is already fixed point and this core compares
   weights exactly, on tiers with no FPU and under a link-time no-panic proof.

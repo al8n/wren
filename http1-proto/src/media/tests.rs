@@ -452,6 +452,56 @@ fn a_residual_tie_takes_the_first_in_field_order() {
 }
 
 #[test]
+fn an_equal_specificity_tie_is_settled_by_the_strict_comparison_alone() {
+  // The precedence key carries no positional counter: two ranges that tie on
+  // shape AND on matched parameter count produce EQUAL keys, and first-in-field
+  // -order is what the strict `<` means. These pin that on both sides of a
+  // §5.2 line join, since the walk is one list either way and a tie has to be
+  // decided the same way in both places.
+  let plain = media_type(b"text/plain").expect("valid");
+  // Equal shape, equal parameter count (zero), within one line.
+  assert_eq!(
+    weight_for(&plain, [b"text/plain;q=0.3, text/plain;q=0.9".as_slice()]),
+    Ok(Weight(300))
+  );
+  // The same tie across a line boundary.
+  assert_eq!(
+    weight_for(
+      &plain,
+      [b"text/plain;q=0.3".as_slice(), b"text/plain;q=0.9"]
+    ),
+    Ok(Weight(300))
+  );
+  // Equal shape and a nonzero equal parameter count, both ways round.
+  let one = media_type(b"text/plain;a=1").expect("valid");
+  assert_eq!(
+    weight_for(
+      &one,
+      [b"text/plain;a=1;q=0.3, text/plain;a=1;q=0.9".as_slice()]
+    ),
+    Ok(Weight(300))
+  );
+  assert_eq!(
+    weight_for(
+      &one,
+      [b"text/plain;a=1;q=0.3".as_slice(), b"text/plain;a=1;q=0.9"]
+    ),
+    Ok(Weight(300))
+  );
+  // Wildcards tie with each other too, and the first still wins.
+  assert_eq!(
+    weight_for(&plain, [b"*/*;q=0.2".as_slice(), b"*/*;q=0.8"]),
+    Ok(Weight(200))
+  );
+  // A tie is not a rank: a genuinely higher-precedence range on a LATER line
+  // still displaces an earlier one, so this is a tie rule and not last-loses.
+  assert_eq!(
+    weight_for(&plain, [b"*/*;q=0.2".as_slice(), b"text/plain;q=0.8"]),
+    Ok(Weight(800))
+  );
+}
+
+#[test]
 fn duplicate_range_parameters_match_per_instance() {
   let one = media_type(b"text/html;a=1").expect("valid");
   let two = media_type(b"text/html;a=1;a=1").expect("valid");
@@ -878,9 +928,11 @@ fn a_field_split_across_lines_is_one_list_with_one_running_order() {
     weight_for(&m, [b"text/*;q=0.3".as_slice(), b"text/plain;q=0.8"]),
     Ok(Weight(800))
   );
-  // Second: the index §5.3's key breaks residual ties on keeps COUNTING across
-  // the join rather than restarting per line. Restarting would give the second
-  // line's range index 0 against the first line's 1, inverting this to 0.9.
+  // Second: field order settles a residual tie ACROSS the join and not only
+  // within a line. The two `text/plain` ranges tie on shape and on matched
+  // parameter count, and the one on the SECOND line loses because the key
+  // comparison is strict — the incumbent stands. A `<=` there would answer
+  // 0.9, which is the last-wins contract rather than this one.
   assert_eq!(
     weight_for(
       &m,
