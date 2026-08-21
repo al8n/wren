@@ -713,6 +713,122 @@ fn a_non_charset_parameter_value_still_compares_byte_exact() {
     weight_for(&m, [b"multipart/form-data;boundary=AbC;q=0".as_slice()]),
     Ok(Weight::ZERO)
   );
+  // The same answer through the policy entry point with an empty policy, which
+  // is what `weight_for` passes: the two must not drift apart.
+  assert_eq!(
+    weight_for_with(
+      &m,
+      [b"multipart/form-data;boundary=abc;q=0, */*;q=0.1".as_slice()],
+      NO_FOLDING
+    ),
+    Ok(Weight(100))
+  );
+}
+
+/// A policy that adds nothing — the one `weight_for` passes.
+const NO_FOLDING: fn(&[u8], &[u8], &[u8]) -> bool = |_, _, _| false;
+
+/// RFC 9782 §6.3 registers `eat_profile` for `application/eat+cwt` with a
+/// case-insensitive value. RFC 9110 settles nothing about it, so it is exactly
+/// the class `weight_for_with` exists for.
+const EAT_PROFILE: fn(&[u8], &[u8], &[u8]) -> bool = |ty, subtype, name| {
+  ty.eq_ignore_ascii_case(b"application")
+    && subtype.eq_ignore_ascii_case(b"eat+cwt")
+    && name.eq_ignore_ascii_case(b"eat_profile")
+};
+
+#[test]
+fn a_registered_parameter_needs_the_callers_own_rule() {
+  // The reproduction, asserted on BOTH sides so it pins the hook rather than a
+  // value: the default is byte-exact and misses the refusal, and the caller's
+  // own rule sees it. A test asserting only the second would also pass if the
+  // default had started folding everything.
+  let m =
+    media_type(b"application/eat+cwt;eat_profile=\"tag:evidence.example,2022\"").expect("valid");
+  let field = b"application/eat+cwt;eat_profile=\"TAG:EVIDENCE.EXAMPLE,2022\";q=0, */*;q=1";
+
+  // Byte-exact: the `q=0` range does not match, and the wildcard behind it
+  // answers. This is the documented default, and the reason the doc warns that
+  // a refusal can be missed.
+  assert_eq!(weight_for(&m, [field.as_slice()]), Ok(Weight::ONE));
+  assert_eq!(
+    weight_for_with(&m, [field.as_slice()], NO_FOLDING),
+    Ok(Weight::ONE)
+  );
+
+  // With the registration's rule supplied, the refusal is seen.
+  assert_eq!(
+    weight_for_with(&m, [field.as_slice()], EAT_PROFILE),
+    Ok(Weight::ZERO)
+  );
+
+  // And folding is still not blanket matching: a different profile is a
+  // different value under the same policy, so the `q=0` misses on merit.
+  assert_eq!(
+    weight_for_with(
+      &m,
+      [b"application/eat+cwt;eat_profile=\"tag:other.example,2022\";q=0, */*;q=1".as_slice()],
+      EAT_PROFILE
+    ),
+    Ok(Weight::ONE)
+  );
+}
+
+#[test]
+fn the_folding_policy_is_keyed_on_the_media_type_and_not_the_name_alone() {
+  // A parameter is registered PER media type, so the policy is asked about all
+  // three. `EAT_PROFILE` answers only for `application/eat+cwt`; the same
+  // parameter name on another type keeps comparing byte-exact.
+  let other =
+    media_type(b"application/eat+jwt;eat_profile=\"tag:evidence.example,2022\"").expect("valid");
+  assert_eq!(
+    weight_for_with(
+      &other,
+      [b"application/eat+jwt;eat_profile=\"TAG:EVIDENCE.EXAMPLE,2022\";q=0, */*;q=1".as_slice()],
+      EAT_PROFILE
+    ),
+    Ok(Weight::ONE),
+    "the policy names eat+cwt, not eat+jwt"
+  );
+
+  // The type handed to the policy is the CANDIDATE's, not the range's: this
+  // range is `*/*` and carries no type of its own, and the parameter must still
+  // fold, because the candidate is what the registration is about.
+  let cwt =
+    media_type(b"application/eat+cwt;eat_profile=\"tag:evidence.example,2022\"").expect("valid");
+  // The trailing `*/*;q=1` MATCHES either way, so this assertion discriminates:
+  // without the fold the parameterised range misses and the bare wildcard
+  // answers `ONE`; with it the parameterised range outranks the bare one on
+  // matched-parameter count and the `q=0` answers.
+  assert_eq!(
+    weight_for_with(
+      &cwt,
+      [b"*/*;eat_profile=\"TAG:EVIDENCE.EXAMPLE,2022\";q=0, */*;q=1".as_slice()],
+      EAT_PROFILE
+    ),
+    Ok(Weight::ZERO)
+  );
+}
+
+#[test]
+fn charset_folds_even_when_the_policy_adds_nothing() {
+  // §8.3.2 is RFC 9110's own rule, not a default a caller may switch off, so
+  // it applies UNDER any policy. A design that made `charset` merely the
+  // default argument would answer `ONE` here the moment a caller supplied a
+  // policy of its own — which is a silent regression on the most common
+  // parameter there is.
+  let m = media_type(b"text/plain;charset=utf-8").expect("valid");
+  let field = b"text/plain;charset=UTF-8;q=0, text/plain;q=1";
+  assert_eq!(weight_for(&m, [field.as_slice()]), Ok(Weight::ZERO));
+  assert_eq!(
+    weight_for_with(&m, [field.as_slice()], NO_FOLDING),
+    Ok(Weight::ZERO)
+  );
+  // Including under a policy that is busy with something else entirely.
+  assert_eq!(
+    weight_for_with(&m, [field.as_slice()], EAT_PROFILE),
+    Ok(Weight::ZERO)
+  );
 }
 
 #[test]

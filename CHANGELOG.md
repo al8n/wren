@@ -53,7 +53,11 @@ weight applies and nothing about what to serve.
   case-insensitively". That exception is load-bearing rather than cosmetic:
   without it `text/plain;charset=UTF-8;q=0` would not match a candidate spelling
   its charset `utf-8`, and the field's own refusal would be answered with the
-  weight of whatever coarser range sat behind it. An ABSENT field is a third
+  weight of whatever coarser range sat behind it. A parameter whose own
+  registration gives its value other semantics is NOT settled here and compares
+  byte-exact, with the same failure shape — including against a `q=0` range, so
+  a refusal can be missed; `weight_for_with` below is how a caller supplies what
+  it knows. An ABSENT field is a third
   input rather than an empty one: no lines at all is how a caller spells a
   request that carried no `Accept`, and §12.4.1 — titled Absence — says such a
   request "implies that the sender has no preference on that dimension of
@@ -68,6 +72,24 @@ weight applies and nothing about what to serve.
   strict comparison has not already decided, while carrying an `enumerate`
   index over a caller-supplied iterator that a 16-bit `usize` can overflow,
   which panics with checks on and wraps without them.
+- **`weight_for_with`**: `weight_for` with the caller's own rule for which
+  parameter VALUES compare ASCII-case-insensitively. §8.3.1 makes that a
+  property of the parameter's REGISTRATION — "Parameter values might or might
+  not be case-sensitive, depending on the semantics of the parameter name" —
+  and registrations do use non-byte semantics: RFC 9782 §6.3 registers
+  `eat_profile` for `application/eat+cwt` with a case-insensitive value. This
+  crate does not carry the registry, and without a hook a caller needing one
+  such parameter compared correctly would have to re-implement §12.5.1's whole
+  selection, which is the second-reader failure the scope rule's first clause
+  exists to prevent. So the ranking stays here and the one fact the caller has
+  arrives as an argument. `fold(ty, subtype, name)` is keyed on all three,
+  because a parameter is registered per media type; the type handed over is the
+  CANDIDATE's, since it is always concrete while the range may be `*/*`. It is
+  generic rather than a `fn` pointer, so each policy monomorphises and no two
+  callers share one instantiation. It ADDS to RFC 9110's own rule and cannot
+  subtract: `charset` folds under any policy, because §8.3.2 settles it and it
+  is not a default anyone may disagree with — so `weight_for` is exactly
+  `weight_for_with` with a policy that answers `false`.
 - **`Weight`**: a §12.4.2 `qvalue` in thousandths, `0..=1000`. Fixed point rather
   than a float, because the grammar is already fixed point and this core compares
   weights exactly, on tiers with no FPU and under a link-time no-panic proof.

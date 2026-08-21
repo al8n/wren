@@ -503,50 +503,59 @@ where
 /// cannot raise it.
 pub const MAX_TRACKED_PARAMS: usize = 16;
 
-/// Whether two parameter values are the same value, under `name`'s own case
-/// rule.
+/// Whether two parameter values are the same value, folding ASCII case when
+/// `fold_case`.
 ///
 /// RFC 9110 §5.6.6: "A parameter value that matches the token production can be
 /// transmitted either as a token or within a quoted-string." and "The quoted
 /// and unquoted values are equivalent." §5.6.4 adds the recipient MUST that
-/// removes `quoted-pair` escapes. Byte-exact after both — except for `charset`,
-/// which folds ASCII case.
+/// removes `quoted-pair` escapes. Both are done here, on both sides, and what
+/// is left is a byte comparison.
 ///
-/// The DEFAULT is byte-exact because §8.3.1 leaves it so: "Parameter values
-/// might or might not be case-sensitive, depending on the semantics of the
-/// parameter name", which is each registration's business rather than this
-/// crate's. That is the general clause, and it is not the last word: RFC 9110
-/// settles one parameter itself, two sections later. §8.3.2: "In the fields
-/// defined by this document, charset names appear either in parameters
-/// (Content-Type), or, for Accept-Encoding, in the form of a plain token. In
-/// both cases, charset names are matched case-insensitively." §8.3.1's own next
-/// sentence points the same way, calling four spellings of one media type
-/// equivalent because "the `charset` parameter value is defined as being
-/// case-insensitive in [RFC2046], Section 4.1.2".
-///
-/// So `charset` folds and NOTHING else does. Every other case rule RFC 9110
-/// states is about a NAME — field names, parameter names, connection options,
-/// content codings, range units, auth schemes, protocol names — or about `q`,
-/// which §12.5.1 takes as weight before a value ever reaches here. `boundary`
-/// in particular is given no case rule by RFC 9110 at all — RFC 2046 §4.1.2
-/// grants that exemption to `charset` alone, and a `boundary` is matched
-/// against the literal octets of a delimiter line (RFC 2046 §5.1.1) — so it
-/// keeps comparing byte-exact. This is ONE stated exception
-/// rather than a per-parameter policy hook: a hook would be somewhere for a
-/// caller to disagree with the RFC, and there is nothing here to disagree
-/// about.
-///
-/// `name` is the parameter's name, which the caller has already matched
-/// ASCII-case-insensitively (§5.6.6: "Parameter names are case-insensitive"),
-/// so `Charset` selects the exception exactly as `charset` does.
-fn same_value(name: &[u8], a: ParamValue<'_>, b: ParamValue<'_>) -> bool {
-  if name.eq_ignore_ascii_case(b"charset") {
+/// WHETHER to fold is not decided here. §8.3.1: "Parameter values might or
+/// might not be case-sensitive, depending on the semantics of the parameter
+/// name" — so the decision belongs to whoever knows the parameter, and it
+/// arrives as an argument. [`rfc_folds_case`] is what RFC 9110 knows;
+/// [`weight_for_with`] is where a caller adds what it knows.
+fn same_value(fold_case: bool, a: ParamValue<'_>, b: ParamValue<'_>) -> bool {
+  if fold_case {
     return a
       .unescaped()
       .map(|byte| byte.to_ascii_lowercase())
       .eq(b.unescaped().map(|byte| byte.to_ascii_lowercase()));
   }
   a.unescaped().eq(b.unescaped())
+}
+
+/// Whether RFC 9110 ITSELF settles this parameter's value as case-insensitive.
+///
+/// One parameter does: §8.3.2 says "In the fields defined by this document,
+/// charset names appear either in parameters (Content-Type), or, for
+/// Accept-Encoding, in the form of a plain token. In both cases, charset names
+/// are matched case-insensitively." §8.3.1's own next sentence points the same
+/// way, calling four spellings of one media type equivalent because "the
+/// `charset` parameter value is defined as being case-insensitive in
+/// [RFC2046], Section 4.1.2".
+///
+/// And only that one. Every other case rule RFC 9110 states is about a NAME —
+/// field names, parameter names, connection options, content codings, range
+/// units, auth schemes, protocol names — or about `q`, which §12.5.1 takes as
+/// weight before a value reaches a comparison. `boundary` in particular is
+/// given no case rule by RFC 9110 at all: RFC 2046 §4.1.2 grants that exemption
+/// to `charset` alone, and a `boundary` is matched against the literal octets of
+/// a delimiter line (RFC 2046 §5.1.1).
+///
+/// This is the floor rather than the whole rule. A parameter whose own
+/// registration gives it other semantics is a case RFC 9110 does not settle and
+/// this crate does not know; [`weight_for_with`] is how a caller supplies it.
+/// It cannot be turned OFF, because §8.3.2 is not a default anyone may
+/// disagree with.
+///
+/// `name` has already been matched ASCII-case-insensitively by the caller
+/// (§5.6.6: "Parameter names are case-insensitive"), so `Charset` selects this
+/// exactly as `charset` does.
+fn rfc_folds_case(name: &[u8]) -> bool {
+  name.eq_ignore_ascii_case(b"charset")
 }
 
 /// How specific a shape is: smaller wins. `type/subtype` 0, `type/*` 1,
@@ -569,10 +578,14 @@ const fn shape_rank(range: &MediaRange<'_>) -> u8 {
 /// A [`MediaError`] the candidate's own parameter walk produced, or
 /// [`MediaError::TooManyParameters`] when the match would have to look past
 /// [`MAX_TRACKED_PARAMS`] candidate instances.
-fn matched_instances(
+fn matched_instances<F>(
   range: &MediaRange<'_>,
   candidate: &MediaType<'_>,
-) -> Result<Option<usize>, MediaError> {
+  fold: &F,
+) -> Result<Option<usize>, MediaError>
+where
+  F: Fn(&[u8], &[u8], &[u8]) -> bool,
+{
   // Shape decides the type/subtype test, per §12.5.1's two named wildcards.
   // `MediaType` stores the two tokens as bytes; `ty()`/`subtype()` are the
   // `&str` VIEW of them, so compare the fields, not the accessors.
@@ -607,11 +620,19 @@ fn matched_instances(
     // and the blocks stop being complete, because neither of those is
     // symmetric: first fit then silently stops being maximum and undercounts.
     //
-    // `same_value`'s `charset` folding is NOT in that class and is not what
-    // this rules out. Name equality is already a precondition of the
-    // comparison, so a per-name folding rule is still an equivalence on the
-    // pairs and the blocks stay complete. What breaks it is a predicate that
-    // is not an equivalence at all.
+    // Case FOLDING is not in that class and is not what this rules out,
+    // whether it comes from `rfc_folds_case` or from the caller's `fold`. Name
+    // equality is already a precondition of the comparison, so a per-name
+    // folding rule is still an equivalence on the pairs and the blocks stay
+    // complete. What breaks it is a predicate that is not an equivalence at
+    // all — and a `fold` that answered differently for the same name would be
+    // exactly that, which is why it is asked ONCE per range parameter, here,
+    // rather than once per candidate instance inside the loop.
+    //
+    // The media type handed to `fold` is the CANDIDATE's, not the range's: a
+    // parameter is registered per media type, and the candidate is always a
+    // concrete `type/subtype` while the range may be `*/*`.
+    let fold_case = rfc_folds_case(name) || fold(candidate.ty, candidate.subtype, name);
     for (at, candidate_param) in candidate.params().enumerate() {
       let (candidate_name, candidate_value) = candidate_param.map_err(MediaError::from)?;
       let Some(slot) = taken.get_mut(at) else {
@@ -621,7 +642,7 @@ fn matched_instances(
       // §5.6.6: "Parameter names are case-insensitive".
       if !*slot
         && candidate_name.eq_ignore_ascii_case(name)
-        && same_value(name, value, candidate_value)
+        && same_value(fold_case, value, candidate_value)
       {
         *slot = true;
         found = true;
@@ -672,6 +693,18 @@ fn matched_instances(
 /// split is the RFC's rather than this crate's. A candidate carrying parameters
 /// the range does not name DOES still match, which is how `text/*` matches
 /// `text/html;level=3`.
+///
+/// That leaves a case worth stating outright, because its failure mode is a
+/// SAFE-looking wrong answer. A parameter whose own registration gives its
+/// value semantics other than byte equality — RFC 9782 §6.3 registers
+/// `eat_profile` for `application/eat+cwt` with a case-insensitive value, one
+/// of many — is not something RFC 9110 settles and not something this crate
+/// knows. Here, such a parameter compares byte-exact, so a range spelling it
+/// differently does NOT match, INCLUDING a range that says `q=0`: the refusal
+/// is missed, the walk falls through to whatever coarser range sits behind it,
+/// and a representation the client refused comes back acceptable. Use
+/// [`weight_for_with`] to supply what your caller knows about its own
+/// parameters.
 ///
 /// [`Weight::ZERO`] is the answer both for a matching range that says `q=0` and
 /// for a candidate nothing matched. §12.4.3: "If no wildcard is present, values
@@ -726,6 +759,83 @@ pub fn weight_for<'a, I>(candidate: &MediaType<'_>, accept_lines: I) -> Result<W
 where
   I: IntoIterator<Item = &'a [u8]>,
 {
+  // The empty policy: this crate adds nothing to what RFC 9110 itself settles.
+  // `rfc_folds_case` still applies inside — see `weight_for_with`.
+  weight_for_with(candidate, accept_lines, |_: &[u8], _: &[u8], _: &[u8]| {
+    false
+  })
+}
+
+/// [`weight_for`], with the caller's own rule for which parameter VALUES
+/// compare ASCII-case-insensitively.
+///
+/// Everything [`weight_for`] documents holds here — §12.5.1's precedence,
+/// §12.4.1's absence, the three-way rule for an absent, empty or unmatching
+/// field. What this adds is `fold`.
+///
+/// `fold(ty, subtype, name)` answers whether that parameter's value compares
+/// ASCII-case-insensitively. `ty` and `subtype` are the CANDIDATE's, because a
+/// parameter is registered per media type rather than globally, and because the
+/// candidate is always a concrete `type/subtype` while the range it is being
+/// matched against may be `*/*`. `name` is the parameter's name as written; it
+/// has already been matched ASCII-case-insensitively (§5.6.6: "Parameter names
+/// are case-insensitive"), so a `fold` that compares it should do the same.
+///
+/// It is asked ONCE per range parameter, before that parameter is matched
+/// against the candidate's instances, so it must be a function of its three
+/// arguments and nothing else. It is not asked at all for a range that carries
+/// no parameters, nor for `q`, which §12.5.1 takes as weight first.
+///
+/// `fold` ADDS to RFC 9110's own rule and cannot subtract from it. `charset`
+/// folds whatever `fold` answers, because §8.3.2 settles that one and it is not
+/// a default a caller may disagree with; returning `false` for everything —
+/// which is what [`weight_for`] passes — therefore reproduces [`weight_for`]
+/// exactly.
+///
+/// # Why this is a hook and not a table
+///
+/// §8.3.1: "Parameter values might or might not be case-sensitive, depending on
+/// the semantics of the parameter name." That makes the answer a property of a
+/// registration, and the registry is knowledge this crate deliberately does not
+/// carry. What it does carry is §12.5.1's selection — so a caller that needs
+/// `eat_profile` (RFC 9782 §6.3, case-insensitive for `application/eat+cwt`)
+/// compared correctly supplies that one fact rather than re-implementing the
+/// ranking around it. Re-implementing it is the failure this exists to prevent:
+/// a second reader of the same field, deciding differently.
+///
+/// ```
+/// use http1_proto::media::{media_type, weight_for, weight_for_with, Weight};
+///
+/// let candidate = media_type(b"application/eat+cwt;eat_profile=\"tag:evidence.example,2022\"")?;
+/// let field = b"application/eat+cwt;eat_profile=\"TAG:EVIDENCE.EXAMPLE,2022\";q=0, */*;q=1";
+///
+/// // Byte-exact: the `q=0` range misses, and the wildcard behind it answers.
+/// assert_eq!(weight_for(&candidate, [field.as_slice()])?, Weight::ONE);
+///
+/// // With the registration's own rule, the refusal is seen.
+/// let weight = weight_for_with(&candidate, [field.as_slice()], |ty, subtype, name| {
+///   ty.eq_ignore_ascii_case(b"application")
+///     && subtype.eq_ignore_ascii_case(b"eat+cwt")
+///     && name.eq_ignore_ascii_case(b"eat_profile")
+/// })?;
+/// assert_eq!(weight, Weight::ZERO);
+/// # Ok::<(), http1_proto::media::MediaError>(())
+/// ```
+///
+/// # Errors
+///
+/// The same [`MediaError`]s [`weight_for`] produces, for the same reasons.
+/// `fold` cannot fail: it answers a question about a name, and a caller with
+/// nothing to say about a name says `false`.
+pub fn weight_for_with<'a, I, F>(
+  candidate: &MediaType<'_>,
+  accept_lines: I,
+  fold: F,
+) -> Result<Weight, MediaError>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+  F: Fn(&[u8], &[u8], &[u8]) -> bool,
+{
   let mut lines = accept_lines.into_iter();
   // §12.4.1's absence, told from §5.6.1.1's empty list by the one thing that
   // separates them: a field that was never sent has no lines, and a field sent
@@ -738,7 +848,7 @@ where
   let mut best: Option<((u8, usize), Weight)> = None;
   for range in accept(core::iter::once(first).chain(lines)) {
     let range = range?;
-    let Some(matched) = matched_instances(&range, candidate)? else {
+    let Some(matched) = matched_instances(&range, candidate, &fold)? else {
       continue;
     };
     // `usize::MAX - matched` inverts "more is better" into "smaller wins"
