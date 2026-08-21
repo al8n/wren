@@ -105,9 +105,6 @@ fn media_type_refuses_what_is_not_type_solidus_subtype() {
 
 #[test]
 fn a_valueless_parameter_is_refused_by_the_media_grammar() {
-  // The walker admits `ParamValue::None` for fields like RFC 6455's that
-  // define their own parameter grammar. §5.6.6's `parameter` requires the `=`,
-  // so for a media type it is a violation.
   assert_eq!(
     media_type(b"text/html;charset"),
     Err(MediaError::ValuelessParameter)
@@ -275,18 +272,15 @@ fn an_empty_accept_value_yields_no_ranges() {
 
 #[test]
 fn a_value_spanning_the_join_is_lifted_to_its_own_variant() {
-  // A quoted-string opened on one field line and closed on the next is well
-  // formed (§5.2 joins them with a comma, which is data inside the string)
-  // and not one contiguous slice.
+  // The minimal case behind the latch test above: no trailing member, so this
+  // isolates whether the span itself is lifted to its own variant rather than
+  // nested inside `Parameters`.
   let mut it = accept([b"text/html;boundary=\"a".as_slice(), b"b\"".as_slice()]);
   assert_eq!(it.next(), Some(Err(MediaError::ValueSpansFieldLines)));
 }
 
 #[test]
 fn a_valueless_parameter_is_refused_in_a_range_too() {
-  // The same refusal `media_type` makes, for the same reason: §5.6.6's
-  // `parameter` grammar requires the `=`, and a media range defines no
-  // grammar of its own that admits a bare name.
   assert_eq!(
     accept([b"text/html;charset".as_slice()]).next(),
     Some(Err(MediaError::ValuelessParameter))
@@ -368,9 +362,9 @@ fn rfc_7231_table_is_reproduced_too() {
 #[test]
 fn a_parameterised_wildcard_outranks_its_bare_form() {
   // §12.5.1: "The media-range can include media type parameters that are
-  // applicable to that range." — of ANY shape. A precedence rule transcribed
-  // from the section's four-item printed list gives 0.1 here; the sentence
-  // that generates the list gives 0.9.
+  // applicable to that range." — of ANY shape, including a wildcard's; see
+  // `weight_for`'s doc for why the key generates the section's precedence
+  // list rather than transcribing it.
   let m = media_type(b"text/plain;format=flowed").expect("valid");
   assert_eq!(
     weight_for(&m, [b"text/*;q=0.1, text/*;format=flowed;q=0.9".as_slice()]),
@@ -453,11 +447,10 @@ fn a_residual_tie_takes_the_first_in_field_order() {
 
 #[test]
 fn an_equal_specificity_tie_is_settled_by_the_strict_comparison_alone() {
-  // The precedence key carries no positional counter: two ranges that tie on
-  // shape AND on matched parameter count produce EQUAL keys, and first-in-field
-  // -order is what the strict `<` means. These pin that on both sides of a
-  // §5.2 line join, since the walk is one list either way and a tie has to be
-  // decided the same way in both places.
+  // The strict `<` and its no-positional-counter contract are `weight_for_with`'s
+  // (see its body). Pinned on both sides of a §5.2 line join here, since the
+  // walk is one list either way and a tie has to be decided the same way in
+  // both places.
   let plain = media_type(b"text/plain").expect("valid");
   // Equal shape, equal parameter count (zero), within one line.
   assert_eq!(
@@ -893,9 +886,8 @@ fn an_absent_accept_field_is_no_preference_not_a_refusal() {
 
 #[test]
 fn a_present_but_empty_accept_field_is_not_an_absent_one() {
-  // Row 2, on its own. `Accept = #( media-range [ weight ] )`, and §5.6.1.1
-  // expands the construct to `#element => [ 1#element ]`, so an empty list is
-  // a field the sender was entitled to write. It was SENT, it named no range,
+  // Row 2, on its own (see `weight_for`'s doc for why an empty list is still a
+  // field the sender was entitled to write). It was SENT, it named no range,
   // and §12.4.3 makes an unmentioned value unacceptable — which is the same
   // answer as row 3 and NOT the answer to row 1.
   let m = media_type(b"text/html").expect("valid");
@@ -1044,11 +1036,10 @@ fn a_field_split_across_lines_is_one_list_with_one_running_order() {
     weight_for(&m, [b"text/*;q=0.3".as_slice(), b"text/plain;q=0.8"]),
     Ok(Weight(800))
   );
-  // Second: field order settles a residual tie ACROSS the join and not only
-  // within a line. The two `text/plain` ranges tie on shape and on matched
-  // parameter count, and the one on the SECOND line loses because the key
-  // comparison is strict — the incumbent stands. A `<=` there would answer
-  // 0.9, which is the last-wins contract rather than this one.
+  // Second: the same strict-`<` tie rule (see `weight_for_with`'s body) reaches
+  // ACROSS the join, not only within a line — the two `text/plain` ranges tie
+  // on shape and on matched parameter count, and the incumbent from the FIRST
+  // line still stands against the SECOND line's tying range.
   assert_eq!(
     weight_for(
       &m,

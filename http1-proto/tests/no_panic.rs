@@ -625,12 +625,8 @@ Connection: Upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n";
 
 // ── the inbound body budget's four leaves ─────────────────────────────────────
 //
-// The whole of the bound's arithmetic, and the only spellings of it in the
-// crate. `charge` is the one that matters most: it runs once per payload item
-// the receive pump hands over, so a surviving panic edge would be one on the
-// path of every message that carries content. The other three are the
-// declared-count comparison, the slice-length conversion and the remaining
-// allowance — all pure, all reached from the same path.
+// The four pure functions the module doc's Coverage paragraph names as
+// carrying the whole of the bound's arithmetic.
 //
 // Each shim returns a value derived from its result, so nothing here can be
 // dropped as dead: a call whose answer is unused takes the shim's body with it
@@ -863,11 +859,9 @@ fn encode_request_head_runs_clean() {
 // NOTE — the head scan is NOT wrapped in `#[no_panic]`. `scan_head` calls
 // through the line delimiter, the shared field-line validator, the RFC 9110
 // §5.6 grammar validators and the key-field recorder — a call tree whose depth
-// prevents full inlining into a single shim. Its panic-freedom is held by the
-// crate-wide clippy lint wall (`unwrap_used` / `indexing_slicing` /
-// `arithmetic_side_effects` / … in `lib.rs`), transitively covering exactly
-// these functions. The smoke below still *runs* the path in release so any
-// panic would surface as a test failure.
+// prevents full inlining into a single shim, held by the lint wall instead
+// (see the module doc's Coverage paragraph). The smoke below still *runs* the
+// path in release so any panic would surface as a test failure.
 
 fn scan_head_run(head: &[u8]) -> bool {
   match scan_head(head) {
@@ -918,11 +912,10 @@ fn scan_head_runs_clean() {
 
 /// One full receive step: `handle` → drain items → drain events.
 ///
-/// NOTE — this path is NOT wrapped in `#[no_panic]`. The call tree fans out
-/// across the whole receive FSM; its panic-freedom is held by the crate-wide
-/// clippy lint wall (`unwrap_used` / `indexing_slicing` /
-/// `arithmetic_side_effects` / … in `lib.rs`), transitively covering exactly
-/// these functions. This smoke still *runs* the path in release so any panic
+/// NOTE — this path is NOT wrapped in `#[no_panic]`, for the same kind of
+/// reason as `scan_head`'s (see its note above): the call tree fans out too
+/// far to inline into one shim — here, across the whole receive FSM. Held by
+/// the lint wall; this smoke still *runs* the path in release so any panic
 /// would surface as a test failure.
 fn handle_step(
   conn: &mut http1_proto::Connection<http1_proto::Server, http1_proto::General>,
@@ -974,22 +967,12 @@ fn connection_handle_step_runs_clean() {
 
 // ── the lie-check: this file's own guard against going vacuous ────────────────
 //
-// PERMANENT, and it is the thing that makes every assertion above mean
-// something. `no-panic` proves a shim panic-free by failing the LINK when a
-// reachable panic edge survives into it — so a shim that was never instantiated
-// over opaque input, or a build whose optimizer folded the call away, "passes"
-// with an empty proof. That failure mode is silent by construction: nothing in
-// a green run distinguishes "proved panic-free" from "never compiled".
-//
-// So the file carries a shim that MUST NOT link. Under the internal
-// `test-no-panic-lie` feature (which implies `test-no-panic`) the build below
-// indexes a `black_box`-fed slice — a bounds check the optimizer cannot prune,
-// because `black_box` is exactly the barrier that stops it proving the length —
-// and `no-panic` therefore refuses to link it. CI asserts that the build FAILS
-// (see the `no-panic` job in `.github/workflows/ci.yml`); a green build there is
-// the report that the guard has stopped working, whether the cause is a dropped
-// `black_box`, a profile without fat LTO, or a `no-panic` release that no longer
-// emits the symbol.
+// PERMANENT: the vacuous-proof failure mode the module doc's `black_box`
+// section describes is silent by construction, and this is the check that it
+// has not happened here. The file carries a shim that MUST NOT link — see
+// `shim_lie` below for how — and CI asserts that the build FAILS (the
+// `no-panic` job in `.github/workflows/ci.yml`); a green build there is the
+// report that the guard has stopped working.
 //
 // It is a separate FEATURE rather than a `#[should_panic]` test because the
 // failure is a link error: it kills the whole test binary, so it cannot share

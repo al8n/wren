@@ -369,11 +369,9 @@ fn range_from(member: ListMember<'_>) -> Result<MediaRange<'_>, MediaError> {
     // always reads back as the `type/*` wildcard's `None`, never as a token.
     _ => (Some(ty), Some(subtype)),
   };
-  // §5.6.6's `parameter` requires the `=`; a media range defines no grammar of
-  // its own that admits a bare name (contrast RFC 6455 §9.1's
-  // `extension-param`), so a valueless parameter is refused here exactly as
-  // `media_type` refuses one. Every parameter named `q` that DOES carry a
-  // value is weight, in wire order, last one wins.
+  // A valueless parameter is refused here exactly as `media_type` refuses one
+  // (`MediaError::ValuelessParameter`). Every parameter named `q` that DOES
+  // carry a value is weight, in wire order, last one wins.
   let mut weight = Weight::ONE;
   for param in member.params() {
     let (name, value) = param.map_err(MediaError::from)?;
@@ -629,9 +627,8 @@ where
     // exactly that, which is why it is asked ONCE per range parameter, here,
     // rather than once per candidate instance inside the loop.
     //
-    // The media type handed to `fold` is the CANDIDATE's, not the range's: a
-    // parameter is registered per media type, and the candidate is always a
-    // concrete `type/subtype` while the range may be `*/*`.
+    // `fold` receives the CANDIDATE's type/subtype, not the range's — see
+    // `weight_for_with`'s doc for why.
     let fold_case = rfc_folds_case(name) || fold(candidate.ty, candidate.subtype, name);
     for (at, candidate_param) in candidate.params().enumerate() {
       let (candidate_name, candidate_value) = candidate_param.map_err(MediaError::from)?;
@@ -837,10 +834,9 @@ where
   F: Fn(&[u8], &[u8], &[u8]) -> bool,
 {
   let mut lines = accept_lines.into_iter();
-  // §12.4.1's absence, told from §5.6.1.1's empty list by the one thing that
-  // separates them: a field that was never sent has no lines, and a field sent
-  // empty has one line that is empty. Peeling the first line reads that off the
-  // input without a second parameter to say what the input already says, and
+  // §12.4.1's absence vs. §5.6.1.1's empty list (see `weight_for`'s doc for the
+  // full rule): peeling the first line reads that distinction off the input
+  // itself, without a second parameter to say what the input already says, and
   // the peeled line is handed straight back to the walk below.
   let Some(first) = lines.next() else {
     return Ok(Weight::ONE);
