@@ -735,8 +735,8 @@ where
   let Some(first) = lines.next() else {
     return Ok(Weight::ONE);
   };
-  let mut best: Option<((u8, usize, usize), Weight)> = None;
-  for (at, range) in accept(core::iter::once(first).chain(lines)).enumerate() {
+  let mut best: Option<((u8, usize), Weight)> = None;
+  for range in accept(core::iter::once(first).chain(lines)) {
     let range = range?;
     let Some(matched) = matched_instances(&range, candidate)? else {
       continue;
@@ -744,16 +744,27 @@ where
     // `usize::MAX - matched` inverts "more is better" into "smaller wins"
     // without a signed key; `saturating_sub` keeps it off the lint wall.
     // `core::cmp::Reverse(matched)` is NOT the simplification it looks like:
-    // it makes `best`'s annotation `Option<((u8, Reverse<usize>, usize),
-    // Weight)>`, which `clippy::type_complexity` rejects under `-D warnings`.
-    // Checked, not assumed.
+    // it makes `best`'s annotation `Option<((u8, Reverse<usize>), Weight)>`,
+    // which `clippy::type_complexity` rejects under `-D warnings`. Checked,
+    // not assumed.
     //
-    // `at` and the strict `<` below are redundant with each other, and both
-    // stay. `at` is what makes the key TOTAL — no two ranges can tie — and the
-    // strict `<` is what keeps the first of any tie. Dropping either one alone
-    // still answers first-in-field-order; dropping both answers LAST, which is
-    // a different contract. Neither is dead code because of the other.
-    let key = (shape_rank(&range), usize::MAX.saturating_sub(matched), at);
+    // The strict `<` is what answers first-in-field-order, and it does so
+    // alone: a later range whose key TIES the incumbent's fails the test and
+    // leaves it standing. A positional counter in the key would decide nothing
+    // the strict comparison has not already decided — every tie it could break
+    // is a tie `<` has kept — while carrying a way to be wrong. `enumerate`'s
+    // index is a `usize` over a CALLER-supplied iterator, and a 16-bit `usize`
+    // holds fewer ranges than an `Accept` field may name; overflowing it panics
+    // with checks on and WRAPS without them, and a wrapped index hands a later
+    // range a smaller key, which displaces the earlier one. That is a silently
+    // wrong weight on exactly the release profiles the link-time no-panic proof
+    // does not speak for. So there is no counter, and the comparison carries
+    // the contract.
+    //
+    // Relaxing `<` to `<=` is what WOULD change that contract: with nothing
+    // positional left in the key, every tie would go to the LAST range instead
+    // of the first.
+    let key = (shape_rank(&range), usize::MAX.saturating_sub(matched));
     if best.is_none_or(|(best_key, _)| key < best_key) {
       best = Some((key, range.weight()));
     }
