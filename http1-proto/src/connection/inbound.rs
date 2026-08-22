@@ -104,8 +104,9 @@ const CONNECT_NEEDS_TUNNEL: &str = "CONNECT requires a Tunnel-mode connection";
 pub(super) const SWITCH_AFTER_CLOSE: &str = "a protocol takeover after the peer stated close";
 
 /// RFC 9112 §9.2: a client that receives data on a connection with no outstanding
-/// request "MUST NOT consider [it] a response" — message delimitation is
-/// ambiguous from there on, so nothing about the connection can be trusted.
+/// request "MUST NOT consider that data to be a valid response" — message
+/// delimitation is ambiguous from there on, so nothing about the connection can
+/// be trusted.
 const RESPONSE_WITHOUT_REQUEST: &str = "response bytes with no outstanding request";
 
 /// RFC 9110 §9.3.2, and the one method RFC 9112 §6.3 item 1 makes the response
