@@ -78,12 +78,33 @@
 //! unrelated point is not thereby a quotation of it, and grading it as one is
 //! exactly how a block's own rhetorical asides — a title, a question, an
 //! author's paraphrase — got checked against spec text they were never
-//! claiming to be. An UNANCHORED span in a cited block is therefore not a
-//! failure; it is counted separately (`unattributable`, printed by [`run`])
-//! rather than either silently dropped or wrongly graded — UNLESS the block
-//! cites a spec this run never loaded, in which case "unanchored" proves
-//! nothing (this run was never given the text to match against) and
-//! [`Grade::Unloaded`] is the honest answer instead.
+//! claiming to be.
+//!
+//! An UNANCHORED span's fate then depends on whether the block gave anyone a
+//! REASON to expect a quotation (Ruling 10a):
+//!
+//! - The block cites a spec this run never loaded: "unanchored" proves
+//!   nothing (this run was never given the text to match against), so
+//!   [`Grade::Unloaded`] is the honest answer.
+//! - The block cites a spec this run DID load: someone had reason to expect
+//!   a quotation here and did not get one. Not a failure — it is counted
+//!   separately (`unattributable`, printed by [`run`]) rather than either
+//!   silently dropped or wrongly graded.
+//! - The block cites nothing at all: nobody had any reason to think this
+//!   was a quotation in the first place. This is the ORIGINAL silent
+//!   `None`, uncounted anywhere — conflating "not my business" with "my
+//!   business and I could not do it" is the same category error as
+//!   reporting the author's own words as a failure, just moved from the
+//!   pass/fail line to the backlog count instead.
+//!
+//! `unattributable` is therefore a BACKLOG of untriaged spans, not a defect
+//! list: even narrowed to blocks that cite a loaded spec, it still holds two
+//! different things a human has not yet told apart — a possible quotation
+//! that genuinely does not match (worth reading), and the author's own
+//! rhetorical prose that happens to sit near a citation for something else
+//! (not worth reading twice). A reader who takes the count for a defect tally
+//! will either panic at its size or learn to ignore it; both are worse than
+//! knowing what it actually holds.
 //!
 //! **What this still cannot see**, stated rather than merely being the case:
 //! a quotation so reworded, or so short an excerpt, that its own first
@@ -249,10 +270,12 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
 
   let mut checked = 0usize;
   let mut failures = 0usize;
-  // Anchored to some loaded spec but ungraded because its block cited none
-  // of them: visible so a sudden jump is a signal, never silent and never a
-  // failure — see `grade`'s doc comment (Ruling 9) for the two questions this
-  // separates.
+  // Prose-sized, in a block citing a LOADED spec, and still didn't anchor to
+  // any loaded spec's text — a backlog of untriaged spans (Ruling 10a), not
+  // a defect count: never silent, never a failure. A block citing nothing
+  // gives no reason to expect a quotation and stays the original, uncounted
+  // `None` — see `grade`'s doc comment (Ruling 9, Ruling 10a) for the full
+  // three-way split.
   let mut unattributable = 0usize;
   let mut abnf_checked = 0usize;
   let mut abnf_failures = 0usize;
@@ -346,9 +369,15 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   );
   // Same shape, same reason: a span this is not silence either — it is what
   // Ruling 9 costs, stated as a number instead of merely being the case.
+  // Narrowed to blocks citing a LOADED spec only (Ruling 10a): a block
+  // citing nothing gave no one reason to expect a quotation, so it is the
+  // original, uncounted `None`, not part of this backlog. This number is a
+  // TRIAGE QUEUE, not a defect tally — see the module doc's "Attribution by
+  // citation" section for what it holds and why treating it as a defect
+  // count is the wrong read.
   println!(
-    "quote-check: {unattributable} prose-sized spans in citing blocks matched no loaded spec \
-     — not graded"
+    "quote-check: {unattributable} prose-sized spans in blocks citing a loaded spec matched \
+     nothing — untriaged, not failed"
   );
 
   if failures == 0 && abnf_failures == 0 {
@@ -404,15 +433,24 @@ fn spans_for(path: &Path, text: &str) -> (QuotedSpans, Spans, usize) {
 /// Letting the citation answer BOTH questions — this check's first attempt —
 /// is exactly how a block's own rhetorical prose got graded: prose-sized,
 /// sitting in a block that cites something for an unrelated point, with
-/// nothing else asked. An unanchored span stays ungraded UNLESS the block
-/// cites a spec this run does not have loaded, in which case there is
-/// nothing else to ask either way and [`Grade::Unloaded`] says so — a claim
-/// this run could not check is a different fact from a claim with nothing to
-/// check against, and both are different again from an unanchored span in an
-/// uncited (or already-loaded-but-still-unanchored) block, which is simply
-/// not this check's business and is counted, not failed (`unattributable`,
-/// the caller's running total — see [`run`]'s printed line for what that
-/// number costs).
+/// nothing else asked. An unanchored span stays ungraded either way, but what
+/// happens to it next (Ruling 10a) depends on whether anyone had REASON to
+/// expect a quotation there:
+///
+/// - Cites a spec this run does not have loaded: there is nothing else to
+///   ask, and "unanchored" proves nothing — this run was never given the
+///   text to match against — so [`Grade::Unloaded`] is the honest answer.
+///   A claim this run could not check is a different fact from a claim with
+///   nothing to check against.
+/// - Cites a spec this run DOES have loaded: the block gave a reason to
+///   expect a quotation and this span isn't demonstrably one. Counted, not
+///   failed (`unattributable`, the caller's running total — see [`run`]'s
+///   printed line for what that backlog holds).
+/// - Cites nothing at all: no one had reason to think this was a quotation
+///   in the first place. The original, silent `None` — not counted anywhere,
+///   because conflating "not my business" with "my business and I could not
+///   do it" is the same category error as reporting the author's own words
+///   as a failure.
 ///
 /// This citation-narrows-the-target step is deliberately the OPPOSITE of
 /// [`grade_production`], which grades an admitted candidate against every
@@ -440,20 +478,22 @@ fn grade<'a>(
     .collect();
 
   if anchored.is_empty() {
-    if let Some(number) = cited {
-      let name = format!("rfc{number}");
-      if !specs.iter().any(|spec| spec.name == name) {
-        // The cited spec isn't loaded, so "no anchor match" proves nothing —
-        // this run was never given the text to match against.
-        *checked += 1;
-        return Some(Grade::Unloaded(number));
-      }
+    // Ruling 10a: a block citing NOTHING gave no one reason to expect a
+    // quotation here at all. That is the original, silent `None` — not this
+    // check's business, and not counted anywhere, the same as before this
+    // task existed.
+    let number = cited?;
+    let name = format!("rfc{number}");
+    if !specs.iter().any(|spec| spec.name == name) {
+      // The cited spec isn't loaded, so "no anchor match" proves nothing —
+      // this run was never given the text to match against.
+      *checked += 1;
+      return Some(Grade::Unloaded(number));
     }
-    // Cites nothing, or cites a spec this run DOES have and still didn't
-    // anchor: not demonstrably a quotation of anything checkable. Visible,
-    // not silent, and not a failure either — an internal quotation, a quoted
-    // identifier, or prose that merely sits near a citation for an unrelated
-    // point.
+    // Cites a spec this run DOES have, and still didn't anchor: the block
+    // gave a reason to expect a quotation (it cites a live spec) and this
+    // span isn't demonstrably one. Visible, not silent, and not a failure —
+    // see `run`'s printed line for what this backlog holds.
     *unattributable += 1;
     return None;
   }
@@ -1694,6 +1734,36 @@ mod tests {
     );
     assert_eq!(checked, 0, "not graded means not counted as checked");
     assert_eq!(unattributable, 1, "but it is not silent either");
+  }
+
+  // Ruling 10a: an unanchored span in a block citing NOTHING is a different
+  // fact from one in a block citing a loaded spec, and gets a different
+  // answer — the original, silent `None`. Nobody had reason to expect a
+  // quotation here at all, so unlike the test above, this one is not counted
+  // anywhere: conflating "not my business" with "my business and I could not
+  // do it" would blur exactly the distinction `unattributable` exists to
+  // draw.
+  #[test]
+  fn an_unanchored_uncited_span_is_silently_not_this_checks_business() {
+    let specs = [test_spec(
+      "rfc1",
+      "completely unrelated spec text that shares no opening",
+    )];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let graded = super::grade(
+      "some sentence in quotes that matches nothing loaded here at all",
+      None,
+      &specs,
+      &mut checked,
+      &mut unattributable,
+    );
+    assert!(graded.is_none());
+    assert_eq!(checked, 0);
+    assert_eq!(
+      unattributable, 0,
+      "cites nothing: never a candidate, not even counted in the backlog"
+    );
   }
 
   // Ruling 9, Row 4: a span that DOES anchor, in a block citing a spec this
