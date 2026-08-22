@@ -178,12 +178,7 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = source.strip_prefix(&root).unwrap_or(source).display();
-    let quoted_here = if source.extension().and_then(|ext| ext.to_str()) == Some("md") {
-      markdown_quotations(&text)
-    } else {
-      quotations(&text)
-    };
-    for (line, span) in quoted_here {
+    for (line, span) in spans_for(source, &text) {
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
         let Some(grade) = grade(&quoted, &specs, &mut checked) else {
@@ -206,6 +201,16 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     }
   }
 
+  // Printed regardless of what the loop above found: a failing run has MORE
+  // reason to know what went unscanned, not less.
+  if !include_ignored && skipped > 0 {
+    println!(
+      "quote-check: {skipped} git-ignored director{} not scanned — quotations \
+       there are UNCHECKED (pass --include-ignored to scan them)",
+      if skipped == 1 { "y" } else { "ies" }
+    );
+  }
+
   let specs_shown = specs
     .iter()
     .map(|spec| spec.name.as_str())
@@ -213,16 +218,23 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     .join(", ");
   if failures == 0 {
     println!("quote-check: {checked} quotations verbatim against {specs_shown}");
-    if !include_ignored && skipped > 0 {
-      println!(
-        "quote-check: {skipped} git-ignored director{} not scanned — quotations \
-         there are UNCHECKED (pass --include-ignored to scan them)",
-        if skipped == 1 { "y" } else { "ies" }
-      );
-    }
     return Ok(());
   }
   Err(format!("{failures} of {checked} quotations are not the spec's own characters").into())
+}
+
+/// Every quotation `path`'s contents holds, dispatched by extension.
+///
+/// `.md` is read as one long comment block ([`markdown_quotations`]);
+/// anything else — in practice always `.rs`, since [`collect_sources`] hands
+/// this only `.rs` or `.md` paths — is read as `.rs`-style comments
+/// ([`quotations`]).
+fn spans_for(path: &Path, text: &str) -> Vec<(usize, String)> {
+  if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+    markdown_quotations(text)
+  } else {
+    quotations(text)
+  }
 }
 
 /// Grades one normalised span, counting it when it is one this check governs.
@@ -345,6 +357,17 @@ fn quotations(source: &str) -> Vec<(usize, String)> {
 /// find and no code half to discard — but fenced blocks are still skipped, for
 /// the same reason they are in a doc comment: a fence holds code, and a
 /// quotation mark inside code is not opening a quotation.
+///
+/// Unlike [`quotations`], this function flushes the block on EVERY fence
+/// toggle, open and close alike. `quotations` does not: it toggles `fenced`
+/// and moves on, so the prose before a `.rs` doc-comment fence and the prose
+/// after it stay in the same block, and a quote mark on one side can pair with
+/// a quote mark on the other into one spurious span crossing the fence.
+/// Flushing here trades that for the opposite failure — a quotation that
+/// itself opens before a fence and closes after it is silently uncounted
+/// rather than joined — which is the safer of the two: a fence is far likelier
+/// to separate two unrelated paragraphs than a real quotation is to straddle
+/// one.
 fn markdown_quotations(source: &str) -> Vec<(usize, String)> {
   let mut out = Vec::new();
   let mut block = String::new();
@@ -761,19 +784,35 @@ fn collect_sources(
 /// Whether git ignores `path`.
 ///
 /// `git check-ignore` exits 0 when the path IS ignored and 1 when it is not,
-/// so the exit code is the answer and no output needs parsing.
+/// so the exit code is the answer and no output needs parsing — but only 0 and
+/// 1 are that answer. Anything else (128 on a fatal error such as "not a
+/// repository", or no code at all if the process was killed by a signal) is a
+/// failure to check, and reporting it as `false` would be this exact defect in
+/// miniature: an unchecked path silently counted as "checked, and fine".
 fn is_ignored(path: &Path) -> Result<bool, Error> {
   let status = Command::new("git")
     .args(["check-ignore", "--quiet"])
     .arg(path)
     .status()
     .map_err(|err| format!("could not run git check-ignore: {err}"))?;
-  Ok(status.success())
+  match status.code() {
+    Some(0) => Ok(true),
+    Some(1) => Ok(false),
+    Some(code) => Err(
+      format!(
+        "git check-ignore on {}: exited with status {code}",
+        path.display()
+      )
+      .into(),
+    ),
+    None => Err(format!("git check-ignore on {}: killed by signal", path.display()).into()),
+  }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{markdown_quotations, quotations};
+  use super::{markdown_quotations, quotations, spans_for};
+  use std::path::Path;
 
   fn spans(source: &str) -> Vec<String> {
     quotations(source).into_iter().map(|(_, s)| s).collect()
@@ -873,5 +912,29 @@ mod tests {
   fn a_markdown_quotation_is_read() {
     let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
     assert_eq!(markdown_spans(source), ["the server MUST NOT process"]);
+  }
+
+  // Unlike `quotations`, a fence flushes the block on both toggles (see
+  // `markdown_quotations`'s doc comment for why): a quotation that opens
+  // before a fence and closes after it is silently uncounted rather than
+  // spuriously spanning the fence. Without the flush this same input pairs
+  // "beta" with "gamma" into one bogus span joining the two paragraphs.
+  #[test]
+  fn a_quotation_straddling_a_fence_is_not_joined() {
+    let source = "Alpha \"beta\n```\ncode\n```\ngamma\" delta\n";
+    assert!(markdown_spans(source).is_empty());
+  }
+
+  // `run` picks `markdown_quotations` or `quotations` by extension; this is
+  // the one place that choice is exercised, so it is asserted directly rather
+  // than resting on a human reading a printed count.
+  #[test]
+  fn spans_for_dispatches_by_extension() {
+    let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
+    assert_eq!(
+      spans_for(Path::new("notes.md"), source),
+      vec![(1, "the server MUST NOT process".to_string())]
+    );
+    assert!(spans_for(Path::new("notes.rs"), source).is_empty());
   }
 }
