@@ -114,6 +114,7 @@
 //! `.txt` in the directory is loaded, so adding a spec is adding a file.
 
 use std::{
+  collections::HashSet,
   fs,
   path::{Path, PathBuf},
   process::Command,
@@ -121,14 +122,9 @@ use std::{
 
 type Error = Box<dyn std::error::Error>;
 
-/// A quotation found in one file, paired with the source line its opening
-/// mark is on.
+/// A quotation, or a candidate ABNF production, found in one file — paired
+/// with the source line its opening mark is on.
 type Spans = Vec<(usize, String)>;
-
-/// An ABNF production found in one file, paired with the source line its
-/// opening backtick is on and the single RFC number [`cited_rfc`] found for
-/// its comment block.
-type Productions = Vec<(usize, String, u32)>;
 
 /// The default, gitignored cache directory, relative to the workspace root.
 pub const DEFAULT_DIR: &str = ".rfc-cache";
@@ -197,11 +193,13 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   let mut failures = 0usize;
   let mut abnf_checked = 0usize;
   let mut abnf_failures = 0usize;
-  let mut abnf_unfetched = 0usize;
+  let mut abnf_skipped = 0usize;
+  let mut abnf_exempt = 0usize;
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = source.strip_prefix(&root).unwrap_or(source).display();
-    let (spans, productions) = spans_for(source, &text);
+    let (spans, productions, skipped_here) = spans_for(source, &text);
+    abnf_skipped += skipped_here;
     for (line, span) in spans {
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
@@ -223,30 +221,23 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
         }
       }
     }
-    for (line, production, cited) in productions {
+    // Per-file: a marker in one file cannot exempt a span in another.
+    let exempt = exempted_spans(&text);
+    for (line, production) in productions {
+      if exempt.contains(&production) {
+        abnf_exempt += 1;
+        continue;
+      }
       // A deliberately elided production promises only that what remains is
       // verbatim — the same reading `run` already gives a quotation span.
       for segment in production.split(['…']).flat_map(|part| part.split("...")) {
-        let Some(grade) =
-          grade_production(segment, cited, &specs, &normalised_specs, &mut abnf_checked)
+        let Some(spec) = grade_production(segment, &specs, &normalised_specs, &mut abnf_checked)
         else {
           continue;
         };
-        match grade {
-          ProductionGrade::Unfetched(rfc) => {
-            abnf_unfetched += 1;
-            println!(
-              "{shown}:{line}: ABNF production cites RFC {rfc}, which is not loaded — add {rfc} \
-               to FETCHED"
-            );
-            println!("  comment: `{segment}`");
-          }
-          ProductionGrade::Mismatch(spec) => {
-            abnf_failures += 1;
-            println!("{shown}:{line}: ABNF production is not {}'s", spec.name);
-            println!("  comment: `{segment}`");
-          }
-        }
+        abnf_failures += 1;
+        println!("{shown}:{line}: ABNF production is not {}'s", spec.name);
+        println!("  comment: `{segment}`");
       }
     }
   }
@@ -260,8 +251,17 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
       if skipped == 1 { "y" } else { "ies" }
     );
   }
+  // Also printed regardless: a span this uncited or exempted is not a
+  // failure, but it is not silence either — a fenced-off count is how
+  // `negotiation.rs:592`'s `quoted-pair` (a real, correctly-quoted RFC 2616
+  // production whose citation sits outside its own block) stays VISIBLE as
+  // unchecked instead of vanishing the way it did before this line existed.
+  println!(
+    "quote-check: {abnf_skipped} production-shaped spans skipped (no RFC cited), {abnf_exempt} \
+     marked gate-exempt"
+  );
 
-  if failures == 0 && abnf_failures == 0 && abnf_unfetched == 0 {
+  if failures == 0 && abnf_failures == 0 {
     println!(
       "quote-check: {checked} quotations verbatim, {abnf_checked} ABNF productions verbatim"
     );
@@ -278,22 +278,17 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
       "{abnf_failures} of {abnf_checked} ABNF productions are not the spec's own characters"
     ));
   }
-  if abnf_unfetched > 0 {
-    reasons.push(format!(
-      "{abnf_unfetched} ABNF production(s) cite an RFC that is not loaded"
-    ));
-  }
   Err(reasons.join("; ").into())
 }
 
-/// Every quotation and ABNF production `path`'s contents holds, dispatched by
-/// extension, as `(quoted, productions)`.
+/// Every quotation and candidate ABNF production `path`'s contents holds,
+/// dispatched by extension, as `(quoted, productions, skipped)`.
 ///
 /// `.md` is read as one long comment block ([`markdown_quotations`]);
 /// anything else — in practice always `.rs`, since [`collect_sources`] hands
 /// this only `.rs` or `.md` paths — is read as `.rs`-style comments
 /// ([`quotations`]).
-fn spans_for(path: &Path, text: &str) -> (Spans, Productions) {
+fn spans_for(path: &Path, text: &str) -> (Spans, Spans, usize) {
   if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
     markdown_quotations(text)
   } else {
@@ -361,23 +356,24 @@ fn excerpt(text: &str, from: usize, len: usize) -> String {
   text.get(start..end).unwrap_or_default().to_string()
 }
 
-/// What grading one production against its cited spec found.
-enum ProductionGrade<'a> {
-  /// The cited RFC is not among the loaded specs.
-  Unfetched(u32),
-  /// The cited spec's text does not contain this production verbatim.
-  Mismatch(&'a Spec),
-}
-
-/// Grades one production segment against the RFC its block cited. `None` when
-/// the segment is too short to be a checkable claim, or the cited spec
-/// contains it verbatim.
+/// Grades one production segment. `None` when it is too short to be a
+/// checkable claim, or when SOME loaded spec contains it verbatim.
 ///
-/// Unlike [`grade`], there is no search over every loaded spec and no
-/// arbitrary first-spec fallback on failure: [`cited_rfc`] already named the
-/// ONE spec this production is a claim about, so grading is a direct lookup
-/// against that spec, and a cited-but-unloaded spec is its own outcome rather
-/// than a false pass or a failure blamed on the wrong RFC.
+/// Every loaded spec is searched, not only the one [`cited_rfc`] named for
+/// the block: 6455 borrows grammar from 2616 and the 723x series, and a
+/// block's citation is often a COMPARISON point rather than an attribution —
+/// three real, correctly-transcribed RFC 6455 productions sit in blocks whose
+/// only citation is RFC 9110, discussing where the two grammars disagree.
+/// That is right for a production the way it would be wrong for a quotation:
+/// a quoted SENTENCE inside a citing block is almost certainly that RFC's
+/// own, but a grammar RULE beside a citation is often shown for contrast.
+/// [`cited_rfc`] still decides whether a span is a candidate at all — a block
+/// naming no RFC makes no checkable claim — it just no longer decides which
+/// spec the candidate is graded against.
+///
+/// On failure the first spec is named, same as [`grade`] falls back to when a
+/// quotation's anchor does not narrow it — arbitrarily, since nothing here
+/// says which loaded spec a production was meant to be quoting.
 ///
 /// `normalised_specs` is [`normalise`] applied to each spec's (already
 /// normalised) text, indexed the same as `specs` — hoisted by the caller so
@@ -385,68 +381,99 @@ enum ProductionGrade<'a> {
 /// O(n × specs).
 fn grade_production<'a>(
   segment: &str,
-  cited: u32,
   specs: &'a [Spec],
   normalised_specs: &[String],
   checked: &mut usize,
-) -> Option<ProductionGrade<'a>> {
+) -> Option<&'a Spec> {
   let wanted = normalise(segment);
   if wanted.split_whitespace().count() < 3 {
     return None;
   }
-  let Some(index) = specs
-    .iter()
-    .position(|spec| spec.name == format!("rfc{cited}"))
-  else {
-    return Some(ProductionGrade::Unfetched(cited));
-  };
   *checked += 1;
-  if normalised_specs[index].contains(&wanted) {
+  if normalised_specs.iter().any(|spec| spec.contains(&wanted)) {
     return None;
   }
-  Some(ProductionGrade::Mismatch(&specs[index]))
+  specs.first()
 }
 
-/// Every quoted span in `source`'s comments, with the line its opening quote is
-/// on — a comment that follows code on the same line included — beside every
-/// backticked ABNF production those lines' blocks name a single RFC for, as
-/// `(quoted, productions)`.
+/// The production-shaped spans `source` marks exempt, matched by the span's
+/// own extracted text.
+///
+/// A `// gate-exempt: <span> — <reason>` comment, anywhere in the file, marks
+/// `<span>` (everything up to the em dash, or the rest of the line when there
+/// is none) as a deliberate non-production rather than a silent one: `` `q =
+/// 1` `` is production-SHAPED — [`is_production`] cannot tell a grammar rule
+/// from a Rust value shown in a block that legitimately cites a spec for
+/// something else — and narrowing the shape-matcher itself was tried and
+/// rejected, because any rule keyed on the right-hand side makes a BROKEN
+/// production stop looking like one too: a check whose defect makes the item
+/// disappear is worse than no check. A marker cannot do that — it names the
+/// exact text it exempts, so it goes stale (and stops matching) the moment
+/// that text changes, rather than silently widening to cover something new.
+///
+/// One mechanism, one spelling: a later check reuses this same marker, so
+/// recognising it lives here rather than folded into the ABNF pipeline.
+fn exempted_spans(source: &str) -> HashSet<String> {
+  let mut out = HashSet::new();
+  for line in source.lines() {
+    let Some((body, _)) = comment_body(line) else {
+      continue;
+    };
+    let Some(rest) = body.strip_prefix("gate-exempt:") else {
+      continue;
+    };
+    let text = rest.split(" — ").next().unwrap_or(rest).trim();
+    if !text.is_empty() {
+      out.insert(text.to_string());
+    }
+  }
+  out
+}
+
+/// Every quoted span in `source`'s comments, with the line its opening quote
+/// is on — a comment that follows code on the same line included — beside
+/// every backticked ABNF production candidate whose block names a single RFC,
+/// as `(quoted, productions, skipped)`. `skipped` counts the production-shaped
+/// spans found in a block that named no RFC, or named more than one — a
+/// candidate this check has no citation to grade, not a failure.
 ///
 /// Consecutive comment lines are one block and are joined before the quotes are
 /// paired, so a quotation wrapped across lines is one span rather than several.
 /// A production is found per raw line, before [`mask_code_spans`] runs on it —
-/// but which block it belongs to, and so which RFC (if any) [`cited_rfc`]
-/// finds for it, is still decided at the block's flush, once the whole block
+/// but which block it belongs to, and so whether [`cited_rfc`] admits it as a
+/// candidate at all, is decided at the block's flush, once the whole block
 /// exists to be asked.
-fn quotations(source: &str) -> (Spans, Productions) {
+fn quotations(source: &str) -> (Spans, Spans, usize) {
   let mut out = Vec::new();
   let mut productions = Vec::new();
+  let mut skipped = 0usize;
   let mut block = String::new();
   // (byte offset into `block`, source line) for the start of each joined line.
   let mut marks: Vec<(usize, usize)> = Vec::new();
-  // ABNF production candidates seen in the block under construction, resolved
-  // against the block's own citation only once it is complete.
+  // ABNF production candidates seen in the block under construction, admitted
+  // or skipped only once the block's own citation is known.
   let mut pending: Vec<(usize, String)> = Vec::new();
   let mut fenced = false;
 
-  let mut flush = |block: &mut String,
-                   marks: &mut Vec<(usize, usize)>,
-                   pending: &mut Vec<(usize, String)>| {
-    for (at, span) in quoted_spans(block) {
-      let line = marks
-        .iter()
-        .take_while(|(offset, _)| *offset <= at)
-        .last()
-        .map_or(0, |(_, line)| *line);
-      out.push((line, span.to_string()));
-    }
-    match cited_rfc(block) {
-      Some(cited) => productions.extend(pending.drain(..).map(|(line, span)| (line, span, cited))),
-      None => pending.clear(),
-    }
-    block.clear();
-    marks.clear();
-  };
+  let mut flush =
+    |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Vec<(usize, String)>| {
+      for (at, span) in quoted_spans(block) {
+        let line = marks
+          .iter()
+          .take_while(|(offset, _)| *offset <= at)
+          .last()
+          .map_or(0, |(_, line)| *line);
+        out.push((line, span.to_string()));
+      }
+      if cited_rfc(block).is_some() {
+        productions.append(pending);
+      } else {
+        skipped += pending.len();
+        pending.clear();
+      }
+      block.clear();
+      marks.clear();
+    };
 
   for (index, raw) in source.lines().enumerate() {
     let Some((body, own_line)) = comment_body(raw) else {
@@ -477,11 +504,12 @@ fn quotations(source: &str) -> (Spans, Productions) {
     block.push_str(&mask_code_spans(body));
   }
   flush(&mut block, &mut marks, &mut pending);
-  (out, productions)
+  (out, productions, skipped)
 }
 
 /// Every quotation in a Markdown file, beside every backticked ABNF production
-/// whose block names a single RFC, as `(quoted, productions)`.
+/// candidate whose block names a single RFC, as `(quoted, productions,
+/// skipped)` — see [`quotations`] for what `skipped` counts and why.
 ///
 /// A `.md` file is comment text throughout, so there is no comment prefix to
 /// find and no code half to discard — but fenced blocks are still skipped, for
@@ -498,35 +526,37 @@ fn quotations(source: &str) -> (Spans, Productions) {
 /// rather than joined — which is the safer of the two: a fence is far likelier
 /// to separate two unrelated paragraphs than a real quotation is to straddle
 /// one.
-fn markdown_quotations(source: &str) -> (Spans, Productions) {
+fn markdown_quotations(source: &str) -> (Spans, Spans, usize) {
   let mut out = Vec::new();
   let mut productions = Vec::new();
+  let mut skipped = 0usize;
   let mut block = String::new();
   let mut marks: Vec<(usize, usize)> = Vec::new();
-  // ABNF production candidates seen in the block under construction, resolved
-  // against the block's own citation only once it is complete — see
+  // ABNF production candidates seen in the block under construction, admitted
+  // or skipped only once the block's own citation is known — see
   // `quotations`'s `pending` for why this can't be decided per-line.
   let mut pending: Vec<(usize, String)> = Vec::new();
   let mut fenced = false;
 
-  let mut flush = |block: &mut String,
-                   marks: &mut Vec<(usize, usize)>,
-                   pending: &mut Vec<(usize, String)>| {
-    for (at, span) in quoted_spans(block) {
-      let line = marks
-        .iter()
-        .take_while(|(offset, _)| *offset <= at)
-        .last()
-        .map_or(0, |(_, line)| *line);
-      out.push((line, span.to_string()));
-    }
-    match cited_rfc(block) {
-      Some(cited) => productions.extend(pending.drain(..).map(|(line, span)| (line, span, cited))),
-      None => pending.clear(),
-    }
-    block.clear();
-    marks.clear();
-  };
+  let mut flush =
+    |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Vec<(usize, String)>| {
+      for (at, span) in quoted_spans(block) {
+        let line = marks
+          .iter()
+          .take_while(|(offset, _)| *offset <= at)
+          .last()
+          .map_or(0, |(_, line)| *line);
+        out.push((line, span.to_string()));
+      }
+      if cited_rfc(block).is_some() {
+        productions.append(pending);
+      } else {
+        skipped += pending.len();
+        pending.clear();
+      }
+      block.clear();
+      marks.clear();
+    };
 
   for (index, raw) in source.lines().enumerate() {
     if raw.trim_start().starts_with("```") {
@@ -551,7 +581,7 @@ fn markdown_quotations(source: &str) -> (Spans, Productions) {
     block.push_str(&mask_code_spans(raw));
   }
   flush(&mut block, &mut marks, &mut pending);
-  (out, productions)
+  (out, productions, skipped)
 }
 
 /// The comment on one source line, and whether the line is nothing but that
@@ -1152,12 +1182,14 @@ mod tests {
   #[test]
   fn spans_for_dispatches_by_extension() {
     let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
-    let (quoted, productions) = spans_for(Path::new("notes.md"), source);
+    let (quoted, productions, skipped) = spans_for(Path::new("notes.md"), source);
     assert_eq!(quoted, vec![(1, "the server MUST NOT process".to_string())]);
     assert!(productions.is_empty());
-    let (quoted, productions) = spans_for(Path::new("notes.rs"), source);
+    assert_eq!(skipped, 0);
+    let (quoted, productions, skipped) = spans_for(Path::new("notes.rs"), source);
     assert!(quoted.is_empty());
     assert!(productions.is_empty());
+    assert_eq!(skipped, 0);
   }
 
   // An ABNF production reaches neither existing path: `mask_code_spans` erases
@@ -1225,19 +1257,49 @@ mod tests {
   }
 
   // The gate is applied to the WHOLE block, not the line: a production
-  // reached through `quotations` survives only when its block names exactly
-  // one RFC — ambiguous and uncited blocks both drop theirs silently, the
-  // same outcome `grade` gives an unanchored quotation.
+  // reached through `quotations` is a CANDIDATE only when its block names
+  // exactly one RFC. Ambiguous and uncited blocks both withhold theirs — not
+  // silently: each is counted as skipped rather than dropped without a trace.
   #[test]
   fn a_production_survives_only_in_a_single_rfc_block() {
     let cited = "  /// RFC 6455 §9.1's `extension-param = token`\n";
+    let (_, productions, skipped) = quotations(cited);
     assert_eq!(
-      quotations(cited).1,
-      vec![(1, "extension-param = token".to_string(), 6455)]
+      productions,
+      vec![(1, "extension-param = token".to_string())]
     );
+    assert_eq!(skipped, 0);
+
     let ambiguous = "  /// RFC 2616 and RFC 9110 both define `token = 1*tchar`\n";
-    assert!(quotations(ambiguous).1.is_empty());
+    let (_, productions, skipped) = quotations(ambiguous);
+    assert!(productions.is_empty());
+    assert_eq!(skipped, 1);
+
     let uncited = "  /// see `last = false` above\n";
-    assert!(quotations(uncited).1.is_empty());
+    let (_, productions, skipped) = quotations(uncited);
+    assert!(productions.is_empty());
+    assert_eq!(skipped, 1);
+  }
+
+  // A production the citation gate would otherwise admit is withheld anyway
+  // when a `gate-exempt:` marker names its exact text — the mechanism a
+  // narrower `is_production` cannot be, because a marker names what it
+  // exempts rather than a shape a broken production could also stop matching.
+  #[test]
+  fn a_gate_exempt_marker_is_recognised_by_its_exact_span() {
+    let source = "// gate-exempt: q = 1 — a weight value in prose, not RFC 9110 grammar\n";
+    let exempt = super::exempted_spans(source);
+    assert!(exempt.contains("q = 1"));
+    assert!(!exempt.contains("q = 2"));
+  }
+
+  // Prose before the em dash is the exemption; the rationale after it is not
+  // part of what must match.
+  #[test]
+  fn a_gate_exempt_marker_stops_at_the_em_dash() {
+    let exempt =
+      super::exempted_spans("// gate-exempt: answerable = false — a Rust flag, not grammar\n");
+    assert!(exempt.contains("answerable = false"));
+    assert!(!exempt.iter().any(|span| span.contains('—')));
   }
 }
