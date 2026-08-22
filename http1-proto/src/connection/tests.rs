@@ -5103,6 +5103,8 @@ fn an_inbound_close_delimited_response_signals_the_end_of_keep_alive() {
   assert_eq!(c.poll_event(), None);
 }
 
+// gate-exempt: split_robustness::byte_at_a_time_head_parse_stays_linear — names a wall-clock probe in `http1-proto/tests/split_robustness.rs`, a
+// SEPARATE integration-test compilation unit this check does not scan; this test pins the field-level invariant that probe depends on.
 // The head-scan watermark is progress through ONE head, so it may never go
 // BACKWARDS within that head — and an offer SHORTER than the last one is the way
 // it could. A driver that calls `handle` with an empty slice (a zero-byte read,
@@ -6339,6 +6341,8 @@ fn a_counted_body_over_the_limit_refuses_without_failing_the_connection() {
 // bound has to be cumulative. Every octet the ceiling allowed is delivered
 // first, and the eleventh chunk is refused with the ceiling named as the limit.
 //
+// gate-exempt: body::tests::a_later_chunk_overrunning_the_remainder_is_refused_at_its_size_line — names a DIFFERENT test, in `body`'s own test
+// module, that pins the fact this paragraph cites; a test does not call another test.
 // WHERE inside that chunk the refusal falls is not decidable from here, and this
 // test does not claim it: the whole body rides in ONE offer, so a gate at the
 // size line and the shell's charge on the data one call later reach a driver as
@@ -7653,6 +7657,8 @@ mod tunnel {
     );
   }
 
+  // gate-exempt: validate::has_close_option — names the predicate Tunnel's 101 arm asks IN PRODUCTION CODE; this test pins the outcome by
+  // driving the public API and asserting on it, and never calls the predicate directly itself.
   // The same 101, the same verdict, in the mode that reads it natively. RFC 9112
   // §9.6: this peer has committed to closing, so it has nothing to continue
   // INTO — and Tunnel's 101 arm asks `validate::has_close_option` for it, the

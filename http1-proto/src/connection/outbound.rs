@@ -356,6 +356,9 @@ pub(super) const REQUEST_NEEDS_HOST: &str = "an HTTP/1.1 request states its Host
 /// which is §11.2's primitive with the sender on this side of it.
 pub(super) const ONE_HOST_LINE: &str = "a request states exactly one Host field line";
 
+// gate-exempt: validate::host_value_is_valid — names the RECEIVE-side
+// predicate this constant's message is the SEND-side counterpart of; the
+// constant is a string, and does not call the predicate itself.
 /// RFC 9112 §3.2's third: a `Host` "with an invalid field value" is the same
 /// 400, and the same unqualified scope.
 ///
@@ -816,6 +819,9 @@ impl Connection<Client, General> {
       head_digest: 0,
       // The RESPONSE this request will draw has not been read, let alone
       // refused. Set by `connection::refuse` and never cleared.
+      // gate-exempt: connection::refuse — names the function that later WRITES
+      // this field to true, the same reason given at its inbound-side twin in
+      // `inbound.rs`; this initializer only ever writes false.
       body_refused: false,
     });
     self.send = started(body);
@@ -1481,6 +1487,12 @@ pub(super) struct Declared {
 }
 
 impl Declared {
+  // gate-exempt: tunnel::names_a_protocol — names this method's RECEIVE-side
+  // twin, an independent parallel implementation, not a function this method
+  // calls.
+  // gate-exempt: grammar::is_protocol_list — the grammar helper the TWIN
+  // named above uses; this method is described as sharing the same grammar,
+  // not calling this specific helper out of its own reduction walk.
   /// Whether the section states BOTH halves of RFC 9110 §7.8's offer — the
   /// `upgrade` connection option, and an `Upgrade` field naming at least one
   /// well-formed protocol.
@@ -1680,6 +1692,9 @@ pub(super) fn continue_needs_content(declared: &Declared, has_content: bool) -> 
 /// `open_connect` all write `HTTP/1.1` requests, so all three owe the same
 /// field under the same three rules.
 ///
+// gate-exempt: validate::host_value_is_valid — names where the value question
+// was already answered; this function only reads the resulting
+// `declared.host_invalid` flag, it does not call the predicate itself.
 /// The rules are the receive side's, in the order §3.2 states them and with the
 /// scopes it gives them — a MISSING `Host` is a fault of "any HTTP/1.1 request
 /// message" and the other two of "any request message". Every request this core

@@ -58,6 +58,8 @@ use crate::{
   grammar::{is_token, is_token_byte, validate_field_value},
 };
 
+// gate-exempt: super::delimit_line — names the INBOUND rule's single home, contrasted with this OUTBOUND constant; a `const` byte string
+// calls nothing.
 /// RFC 9112 §2.2's line terminator, and the only one this core writes.
 ///
 /// The outbound counterpart of [`super::delimit_line`], which is the single
@@ -408,6 +410,8 @@ pub(crate) fn two_pass(
   Ok(writer.written)
 }
 
+// gate-exempt: head::validate_field_line — names the INBOUND analogue of this function's own OUTBOUND sharing with `body::encode`; this
+// function IS the outbound half, so it is not the inbound function it draws the parallel to.
 /// Writes one field section: a `field-line` per pair, in the order supplied,
 /// each terminated by CRLF (RFC 9112 §5).
 ///

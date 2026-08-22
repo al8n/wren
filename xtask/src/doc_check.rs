@@ -85,6 +85,7 @@ pub fn run(require_all: bool, bless: bool) -> Result<(), Error> {
   let root = crate::workspace_root()?;
   continuity(&root, bless, &mut report)?;
   verdicts(&root, &mut report)?;
+  callees(&root, &mut report)?;
   report.finish(require_all)
 }
 
@@ -573,6 +574,312 @@ fn leading_caps(cell: &str) -> String {
     .join(" ")
 }
 
+/// Fails when a `http1-proto` comment path-qualifies a callee — `` `module::
+/// name` `` — that the item it documents never uses; see [`callee_problems`].
+///
+/// Scoped to comments, not to items with a `///` doc block: the defect this
+/// check exists for (see `callee_problems`'s own doc) lived in a `//` comment
+/// inside a `match` arm, not on a declared item's doc block, so [`items_in`]
+/// starts a fresh item at ANY comment run — `//`, `///`, or `//!` — and ends
+/// it at the next one, not only at `///` runs the way [`doc_runs`] does.
+///
+/// What this does NOT catch: an UNQUALIFIED mention. Of the two comments in
+/// the defect this exists for, only one was path-qualified; the other read
+/// "through the same `ends_persistence`" — no module, so [`qualified_final_segment`]
+/// never sees a `::` and this check passes over it in silence. Half a class
+/// caught by a gate that stays ON beats a whole class caught by a gate that
+/// gets disabled over its false-positive rate — see [`callee_problems`] for
+/// why path-qualification is the line drawn — so the narrower rule is what
+/// ships, with the miss stated here rather than assumed away.
+fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
+  let dir = root.join("http1-proto/src");
+  let mut files = Vec::new();
+  collect_rs_files(&dir, &mut files)?;
+  files.sort();
+
+  let mut mentions = 0usize;
+  let mut exempt = 0usize;
+  for file in &files {
+    let text = fs::read_to_string(file)?;
+    let display = file
+      .strip_prefix(root)
+      .unwrap_or(file)
+      .display()
+      .to_string();
+    for item in items_in(&text) {
+      let (comments, _) = split_comments(&item);
+      for (path, _) in path_qualified_mentions(&comments) {
+        mentions += 1;
+        if exemption_reason(&comments, &path).is_some_and(|reason| !reason.trim().is_empty()) {
+          exempt += 1;
+        }
+      }
+      for problem in callee_problems(&item) {
+        report.fail(format!("{display}: {problem}"));
+      }
+    }
+  }
+  report.checked(format!(
+    "path-qualified callee: {mentions} mentions checked, {exempt} exempt"
+  ));
+  Ok(())
+}
+
+/// Splits `text` into non-overlapping items: a leading run of comment lines
+/// (`//`, `///`, or `//!`, any mixture) plus the source that follows it up to
+/// the next such run, or EOF.
+///
+/// Code with no leading comment run at all — before the file's first
+/// comment, or right after an item whose own run was empty — belongs to no
+/// item and is not scanned. That is not a blind spot: a path-qualified
+/// mention can only ever live inside a comment, so code no item's comments
+/// cover has nothing this check could find in it anyway.
+fn items_in(text: &str) -> Vec<String> {
+  let lines: Vec<&str> = text.lines().collect();
+  let is_comment = |line: &str| line.trim_start().starts_with("//");
+  let mut starts = Vec::new();
+  for (index, line) in lines.iter().enumerate() {
+    if is_comment(line) && (index == 0 || !is_comment(lines[index - 1])) {
+      starts.push(index);
+    }
+  }
+  starts
+    .iter()
+    .enumerate()
+    .map(|(position, &start)| {
+      let end = starts.get(position + 1).copied().unwrap_or(lines.len());
+      lines[start..end].join("\n")
+    })
+    .collect()
+}
+
+/// `item`'s leading comment lines (`//`, `///`, or `//!`, any mixture),
+/// rejoined with `\n`, and everything from the first non-comment line on.
+fn split_comments(item: &str) -> (String, String) {
+  let lines: Vec<&str> = item.lines().collect();
+  let split_at = lines
+    .iter()
+    .position(|line| !line.trim_start().starts_with("//"))
+    .unwrap_or(lines.len());
+  (lines[..split_at].join("\n"), lines[split_at..].join("\n"))
+}
+
+/// Mentions this item asserts and does not use.
+///
+/// Path-qualified only, and that is the whole of why this can be a gate rather
+/// than a lint: an unqualified name in prose is usually an English word — 797
+/// sites, `close` 74 of them — while `module::name` is a claim that THIS
+/// function, from THIS module, is what runs here. Qualified mentions: 46.
+fn callee_problems(item: &str) -> Vec<String> {
+  let mut problems = Vec::new();
+  let (comments, body) = split_comments(item);
+  for (path, name) in path_qualified_mentions(&comments) {
+    if let Some(reason) = exemption_reason(&comments, &path) {
+      if reason.trim().is_empty() {
+        problems.push(format!(
+          "`{path}` is exempted without a reason after the em dash — an \
+           exemption is a statement, and one that says nothing is silence"
+        ));
+      }
+      continue;
+    }
+    if !names_identifier(&body, &name) {
+      problems.push(format!(
+        "the comment names `{path}`, asserting it is what this item uses, but \
+         the item never names `{name}`.\n  \
+         If the mention is deliberate contrast, mark it:\n  \
+         `// gate-exempt: {path} — <why this is not the one called>`"
+      ));
+    }
+  }
+  problems
+}
+
+/// The path-qualified backtick mentions in `comments`, as `(path, name)` —
+/// the full backticked text, and its final `::`-separated segment.
+///
+/// Regex-free: walk the backtick pairs by hand, then classify what sits
+/// between a pair with [`qualified_final_segment`].
+fn path_qualified_mentions(comments: &str) -> Vec<(String, String)> {
+  let mut out = Vec::new();
+  let mut rest = comments;
+  while let Some(open) = rest.find('`') {
+    let after_open = &rest[open + 1..];
+    let Some(close) = after_open.find('`') else {
+      break;
+    };
+    let span = &after_open[..close];
+    if let Some(name) = qualified_final_segment(span) {
+      out.push((span.to_string(), name.to_string()));
+    }
+    rest = &after_open[close + 1..];
+  }
+  out
+}
+
+/// `span`'s final segment when every `::`-separated segment is shaped like a
+/// module or function name — starts with a lowercase ASCII letter or `_`, and
+/// otherwise holds only lowercase ASCII letters, digits, and `_` — the final
+/// segment names neither a lint nor a module this crate declares, and `span`
+/// has at least one `::` to begin with. `None` in every other case.
+///
+/// The case restriction is what the doc on [`callee_problems`] means by
+/// `module::name`, and it is what keeps this a CALLEE check rather than a
+/// path-shaped-text check: it excludes a type (`` `Item::Switched` ``,
+/// `PascalCase`) and a constant (`` `u64::MAX` ``, `SCREAMING_SNAKE`), neither
+/// of which is a claim about what code RUNS. Confirmed against this crate's
+/// own comments, not assumed: the unrestricted rule (any backtick span with
+/// `::`) matches several hundred sites here, dominated by exactly these two
+/// shapes.
+///
+/// Two more exclusions, added after running the case-restricted rule for
+/// real and reading what it found:
+///
+/// - A **lint's own name** (`` `clippy::integer_division` ``) is lowercase on
+///   both sides of the `::`, syntactically indistinguishable from a real
+///   module path, but never a place this crate's code runs — the tool, not
+///   this crate, owns everything after the `::`. Every `clippy::`/`rustdoc::`
+///   mention here today cites a crate-wide `deny`, not a nearby `#[allow]`,
+///   so the body right below it was never going to repeat the lint's name.
+/// - A **module this crate declares** (`` `head::encode` ``, the `encode`
+///   submodule of `head`) is where code LIVES, not a specific place it RUNS —
+///   [`KNOWN_MODULES`] lists them, and `mod` itself is excluded too for the
+///   one comment that writes `` `connection::mod` `` to mean "that module's
+///   own file", which is not a path any real code can name. Read against
+///   this crate as it stands, not derived from its grammar: a future function
+///   named the same as one of its own modules — this crate already has both a
+///   `body` module and a `fn body`, though never mentioned so far in this
+///   qualified-and-final shape — would be missed here, the same direction
+///   every choice in this function errs: a false PASS, not a false failure.
+fn qualified_final_segment(span: &str) -> Option<&str> {
+  if !span.contains("::") || is_lint_namespace(span) {
+    return None;
+  }
+  let mut final_segment = None;
+  for segment in span.split("::") {
+    let mut chars = segment.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_lowercase() || first == '_') {
+      return None;
+    }
+    if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_') {
+      return None;
+    }
+    final_segment = Some(segment);
+  }
+  match final_segment {
+    Some(name) if name == "mod" || KNOWN_MODULES.contains(&name) => None,
+    other => other,
+  }
+}
+
+/// Whether `span` opens with a lint tool's own namespace rather than a path
+/// this crate could declare — see [`qualified_final_segment`].
+fn is_lint_namespace(span: &str) -> bool {
+  matches!(
+    span.split("::").next(),
+    Some("clippy" | "rustdoc" | "rustc")
+  )
+}
+
+/// Every `mod NAME` this crate declares under `http1-proto/src`, leaf name
+/// only (no path) — see [`qualified_final_segment`].
+///
+/// A fixed list, not a scan: keeping [`qualified_final_segment`] free of
+/// filesystem access is what keeps it a pure function a unit test can call on
+/// a literal string, the same way [`KNOWN_MODULES`]'s sibling exclusion
+/// ([`is_lint_namespace`]) is. Regenerate by reviewing, from the workspace
+/// root:
+/// `grep -rhoE '(^|[[:space:]])mod [a-z_][a-z0-9_]*' http1-proto/src | awk '{print $NF}' | sort -u`
+const KNOWN_MODULES: &[&str] = &[
+  "__no_panic_internals",
+  "body",
+  "chunked",
+  "connection",
+  "encode",
+  "error",
+  "event",
+  "grammar",
+  "head",
+  "heap",
+  "heap_tests",
+  "inbound",
+  "macros",
+  "media",
+  "mode_edges",
+  "outbound",
+  "request_line",
+  "scan",
+  "sealed",
+  "status_line",
+  "tests",
+  "tunnel",
+  "validate",
+  "version",
+  "view",
+];
+
+/// The reason `comments` gives for exempting `path`, when one of its lines is
+/// a `// gate-exempt: <path> — <reason>` marker whose `<path>` is exactly
+/// `path` — `Some("")` when the marker is there but no `—` follows it on that
+/// line, and `None` when no marker names `path` at all.
+///
+/// Same spelling `quote-check` already uses for the same idea
+/// ([`exempted_spans`](crate::quote_check) reads the identical `// gate-exempt:
+/// <span> — <reason>` comment for a different kind of span) — one mechanism,
+/// one convention, rather than a second marker this crate's readers would
+/// have to learn. The difference here is that the REASON is load-bearing: a
+/// quotation's exemption only has to name its span, but an empty reason here
+/// is [`callee_problems`]'s own failure, not silent success.
+fn exemption_reason(comments: &str, path: &str) -> Option<String> {
+  for line in comments.lines() {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix("//") else {
+      continue;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix("gate-exempt:") else {
+      continue;
+    };
+    let rest = rest.trim();
+    let (span, reason) = match rest.split_once('—') {
+      Some((span, reason)) => (span.trim(), reason.trim()),
+      None => (rest, ""),
+    };
+    if span == path {
+      return Some(reason.to_string());
+    }
+  }
+  None
+}
+
+/// Whether `name` appears in `haystack` as its own word — bounded on each
+/// side by the string's edge or a byte that is not an identifier character
+/// (ASCII alphanumeric or `_`).
+///
+/// Deliberately loose about WHAT counts as usage: a mention inside a string
+/// literal, an attribute, or even another comment counts, as long as `name`
+/// appears as its own word somewhere in `haystack`. A false PASS here costs
+/// nothing; a false FAILURE costs the gate — see [`callee_problems`].
+fn names_identifier(haystack: &str, name: &str) -> bool {
+  if name.is_empty() {
+    return false;
+  }
+  let bytes = haystack.as_bytes();
+  let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+  let mut start = 0;
+  while let Some(found) = haystack[start..].find(name) {
+    let index = start + found;
+    let before_ok = index == 0 || !is_ident(bytes[index - 1]);
+    let end = index + name.len();
+    let after_ok = end == bytes.len() || !is_ident(bytes[end]);
+    if before_ok && after_ok {
+      return true;
+    }
+    start = index + 1;
+  }
+  false
+}
+
 /// A minimal JSON reader for rustdoc's `--output-format json` output.
 ///
 /// Hand-rolled rather than an added `serde_json` dependency: `xtask` stays
@@ -990,5 +1297,115 @@ Every such site is one of:
 | originate | `open_request` | GUARDED — ok |
 ";
     assert!(super::verdict_problems(doc).is_empty());
+  }
+
+  #[test]
+  fn a_path_qualified_name_the_body_never_uses_is_a_failure() {
+    let item = "\
+/// Decided through `validate::ends_persistence`, the predicate both modes ask.
+fn switch_or_fault(view: &HeadView<'_>) -> bool {
+  has_close_option(view)
+}";
+    let problems = super::callee_problems(item);
+    assert_eq!(problems.len(), 1);
+    assert!(problems[0].contains("ends_persistence"));
+  }
+
+  #[test]
+  fn an_exempt_mention_is_allowed() {
+    let item = "\
+// gate-exempt: validate::ends_persistence — named for contrast; this arm asks
+// has_close_option, and saying which one it is NOT is the point of the sentence.
+/// Asks `has_close_option`, NOT `validate::ends_persistence`.
+fn switch_or_fault(view: &HeadView<'_>) -> bool {
+  has_close_option(view)
+}";
+    assert!(super::callee_problems(item).is_empty());
+  }
+
+  #[test]
+  fn an_exemption_without_a_reason_is_itself_a_failure() {
+    let item = "\
+// gate-exempt: validate::ends_persistence
+/// Asks `has_close_option`, NOT `validate::ends_persistence`.
+fn switch_or_fault(view: &HeadView<'_>) -> bool { has_close_option(view) }";
+    let problems = super::callee_problems(item);
+    assert_eq!(problems.len(), 1);
+    assert!(problems[0].contains("reason"));
+  }
+
+  // `items_in` is what feeds real files to `callee_problems`, and the defect
+  // this whole check exists for lived in a `//` comment mid-function, not on
+  // a declared item — so this pins that a fresh item starts at ANY comment
+  // run, a blank line does not end one early, and an item's body reaches
+  // forward to the NEXT comment run rather than stopping at the first blank
+  // line or closing brace.
+  #[test]
+  fn items_in_splits_at_each_fresh_comment_run() {
+    let text = "\
+/// First.
+fn a() {}
+
+// Not a doc comment, still starts a fresh item.
+fn b() {
+  a()
+}
+";
+    let items = super::items_in(text);
+    assert_eq!(items.len(), 2);
+    assert!(items[0].starts_with("/// First."));
+    assert!(items[0].contains("fn a"));
+    assert!(items[1].starts_with("// Not a doc comment"));
+    assert!(items[1].contains("fn b"));
+  }
+
+  // Pins the case restriction `qualified_final_segment` applies: it is what
+  // keeps a `PascalCase` type (`Item::Switched`) and a `SCREAMING_SNAKE`
+  // constant (`u64::MAX`) from being read as callee claims, while a genuine
+  // `snake_case::snake_case` mention still is — measured against this crate's
+  // own comments before being drawn this way, not assumed (see
+  // `qualified_final_segment`'s own doc).
+  #[test]
+  fn only_the_lowercase_path_is_read_as_a_callee_claim() {
+    let comments = "/// See `Item::Switched` and `u64::MAX` and `validate::ends_persistence`.";
+    let mentions = super::path_qualified_mentions(comments);
+    assert_eq!(
+      mentions,
+      vec![(
+        "validate::ends_persistence".to_string(),
+        "ends_persistence".to_string()
+      )]
+    );
+  }
+
+  // Pins the two exclusions added after running the check for real: a lint's
+  // own name and this crate's own module names are both syntactically
+  // `lowercase::lowercase`, same as a genuine callee mention, but neither is
+  // a claim about what code RUNS — see `qualified_final_segment`'s own doc.
+  #[test]
+  fn a_lint_name_or_a_known_module_is_not_a_callee_claim() {
+    let comments = "\
+/// See `clippy::integer_division`, `head::encode`, `connection::mod`, and
+/// `validate::ends_persistence`.";
+    let mentions = super::path_qualified_mentions(comments);
+    assert_eq!(
+      mentions,
+      vec![(
+        "validate::ends_persistence".to_string(),
+        "ends_persistence".to_string()
+      )]
+    );
+  }
+
+  // Pins the word-boundary rule `names_identifier` promises: a longer
+  // identifier that merely CONTAINS `name` as a substring — `closed`,
+  // `disclosed` — must not count as naming it.
+  #[test]
+  fn names_identifier_requires_a_word_boundary() {
+    assert!(!super::names_identifier(
+      "this connection is disclosed and closed",
+      "close"
+    ));
+    assert!(super::names_identifier("fn close(&mut self)", "close"));
   }
 }

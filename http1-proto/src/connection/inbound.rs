@@ -59,6 +59,9 @@ use crate::{
 /// [`General`]: crate::connection::General
 const CONNECT_NEEDS_TUNNEL: &str = "CONNECT requires a Tunnel-mode connection";
 
+// gate-exempt: validate::has_close_option — names the shared predicate BOTH
+// readers of this constant go through; the constant itself is a string, and
+// the predicate runs at the call sites this doc lists below, not here.
 /// RFC 9112 §9.6 makes a sender of the `close` connection option "initiate
 /// closure of the connection (see below) after it sends the response containing"
 /// it, so a peer that has stated the option has no continuation left to switch
@@ -414,6 +417,9 @@ fn server_head<'a>(
     },
     // Nothing has been read of this message's body yet, so nothing can have
     // been refused. Set by `connection::refuse` and never cleared.
+    // gate-exempt: connection::refuse — names the function that later WRITES
+    // this field to true; this initializer only ever writes false, so the
+    // writer this comment names is necessarily elsewhere.
     body_refused: false,
   });
   *it.send = SendState::Owed;

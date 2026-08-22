@@ -120,6 +120,8 @@ impl<'a> HeadView<'a> {
     parse_request_line(self.start_line_bytes()).ok()
   }
 
+  // gate-exempt: connection::head_digest — names a CALLER of this accessor and why it calls it; the accessor itself just returns `self.head`
+  // and calls nothing.
   /// The complete head block, exactly as it was scanned: start line, field
   /// lines, and the empty line that ends them.
   ///
