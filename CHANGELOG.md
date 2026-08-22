@@ -1,5 +1,265 @@
 # UNRELEASED
 
+## `http1-proto` — cycle 6 (opportunistic upgrade on an ordinary exchange)
+
+Issue #44. A client could state RFC 9110 §7.8's `Upgrade` offer only by building
+a `Connection<Client, Tunnel>` first, which spends the connection on a handshake
+whether or not the server takes it — so the shape §7.8 is actually written for,
+where a client offers on an ordinary request and carries on in HTTP when the
+server declines, could not be expressed at all. It can now, on a General client
+whose operator asks for it. The mode type-state is unchanged: BUILDING a
+handshake is still `Tunnel`'s, and what General gained is the ability to CARRY
+one that arrived on an exchange it opened for its own reasons.
+
+### Breaking
+
+- **`Event::CloseSignaled` is removed, and `Connection::transport()` replaces
+  it.** A pre-1.0 break, and the one this cycle exists to justify: the end of
+  keep-alive was stored as a queued, once-delivered INSTRUCTION, and eight of the
+  eleven defects found on this branch were lifecycle failures of that stored
+  copy — delivered stale, stranded onto a later exchange, destroyed by a path
+  that owned other state, duplicated beside a terminal error, leaked through
+  `Debug`, and diverged between the two modes. Those are the complete failure
+  catalogue of caching a derived fact.
+
+  The fact is now a LEVEL, derived on the ask and never stored:
+
+  ```rust
+  pub enum Transport { Live, Ending, Failed, HandedOver }
+  impl<Ro, Mo> Connection<Ro, Mo> { pub const fn transport(&self) -> Transport }
+  ```
+
+  One `match`, exhaustive over the tunnel phase and the lifecycle, over fields
+  that already existed — `HandedOver` and `Failed` absorbing, `HandedOver`
+  checked first, which is where "a switch wins over a local close" now lives.
+  `Role`- and `Mode`-free by construction, so a fix applied to one mode and not
+  the other is not a shape it can take. A level has no instances, so it has none
+  of the failures a stored instruction had: nothing to mint stale, nothing to
+  destroy, nothing to deliver twice, no second copy to disagree.
+
+  **Migrating — and this IS a break for every external driver, even though no
+  crate in this workspace needed a line changed.** Nothing here consumed the
+  variant, so a green workspace build proves only that this repo did not use it;
+  it exercises none of the migration below. What an external driver must do:
+  delete the `Event::CloseSignaled` match arm — the variant no longer exists, so
+  the arm will not compile — and read `conn.transport()` after draining items and
+  events instead:
+  `Ending` means finish what is parsed, send what is owed, then close; `Failed`
+  means send the owed error response if `is_awaiting_send()`, then close;
+  `HandedOver` means hand the transport to the negotiated protocol and never
+  close it; `Live` means carry on, refined by `wants_read`/`is_awaiting_send`.
+  A driver that wants to act once on a change edge-detects against its own last
+  value — the crate no longer keeps one, which is the point. A driver that
+  matched `Event` exhaustively without a `_` arm will also stop compiling on the
+  variant's removal; `Event` is `#[non_exhaustive]`, so that arm was always
+  required.
+
+  `poll_event` remains, narrowed to message-scoped facts: `ExchangeAborted` only.
+  The line between the two representations is that **an event is right when its
+  subject dies before the driver could ask** — an exchange, destroyed at
+  settlement — **and a level is right when its subject is the very thing the
+  driver holds.** The crate already applied the level idiom to this same subject
+  in `wants_read` and `is_awaiting_send`, the two transport channels that never
+  produced a defect.
+
+  Removed with it: the queue slot on `Connection`, both producers' mutual dedup,
+  the hold-and-suppress machinery and its four cancel sites, and
+  `SendState::ErrorOwed`'s cached copy of the same bit. Net-negative code and
+  net-negative state; `size_of::<Connection<_, _>>()` falls to 184 bytes against
+  a 256-byte budget.
+
+
+### Added
+
+- **`Limits::allow_opportunistic_upgrade`**: permits a connection to make a §7.8
+  offer on an ordinary `open_request`, and to accept the 101 that answers one.
+  **Off by default**, and conforming rather than merely
+  cautious: §7.8 obliges a client to nothing — the offer is an invitation a
+  server "MAY ignore", and
+  "Upgrade cannot be used to insist on a protocol change" — so refusing is fully
+  conforming, while a proxy-shaped driver forwarding a downstream client's
+  `Upgrade` field never chose to send one and must not be switched for carrying
+  it through. Named `allow_` rather than `with_` like its siblings because they
+  set a VALUE and this grants a PERMISSION:
+  `allow_opportunistic_upgrade(false)` reads as withholding one, which is what
+  it does. It is the operator's CEILING — a request may decline to offer on a
+  permitting connection and may not offer on a refusing one — and it is read
+  once, at construction, so a live connection has no path back to it.
+
+  What the permission governs is §7.8's INDICATION, which is the `Upgrade` field
+  alone: "A server MUST NOT switch to a protocol that was not indicated by the
+  client in the corresponding request's Upgrade header field." The `upgrade`
+  connection option is §7.8's separate sender MUST and is REQUIRED of a
+  permitted offer rather than asked as part of the question — a request
+  carrying the field without it is refused
+  (`an upgrade offer states Connection: upgrade and an Upgrade protocol list`,
+  the constant Tunnel's `open_upgrade` already refuses the same omission under).
+  Keying the permission on both halves would have let the un-optioned field —
+  which a server may legally switch on, and which intermediaries forward — walk
+  past the ceiling and past every rule below it.
+
+  A permitted offer must be bodiless, and this one is a **deviation**, recorded
+  as such. §7.8 permits the message it refuses: a 101 may answer a request whose
+  body is still going out, since "A client cannot begin using an upgraded
+  protocol on the connection until it has completely sent the request message"
+  — the body is finished in the OLD protocol and the new one begins after it,
+  with "the server still has an outstanding request to satisfy after the
+  protocol has been changed". This core does not implement that: it parks at the
+  101 and hands the transport to the caller, so there is no send side left to
+  finish a body through. `open_request` therefore refuses a bodied offer with
+  `Error::InvalidState` — a restriction on this end's own sends, which §7.8
+  obliges no client to observe, and the same one Tunnel's `open_upgrade` keeps
+  on the way out and its `classify` on the way in.
+- **`Connection<Client, Tunnel>::open_connect` refuses an `Upgrade` field.** A
+  CONNECT already states RFC 9110 §9.3.6's takeover, and §7.8's field on it
+  invites a second one this handshake has no answer for: `ClientTunnelOutcome`
+  makes a CONNECT's success the 2xx tunnel, and `handle_response` condemns a
+  `101` to a CONNECT as `SWITCH_WAS_NEVER_OFFERED`. But an `Upgrade` field IS
+  §7.8's indication, so a server that switched on one this core had written
+  would have broken nothing — and the condemnation would be a false accusation.
+  Refused before encoding, over the indication alone (the connection option
+  beside it changes nothing about whether a server may act), for the reason
+  `UPGRADE_NEEDS_TUNNEL` gives on the General side: the request "would have
+  opened an exchange its own continuation forbids".
+
+  §7.8's sender MUST — "A sender of Upgrade MUST also send an `Upgrade`
+  connection option in the Connection header field" — is otherwise SPLIT along
+  the line `connection::outbound`'s delegation table draws, and the table now
+  states it as a RULE rather than a list, so a send path added later is
+  classified without anyone editing the row: ENFORCED where writing the field
+  ARMS a switch, REFUSED where a switch could not be answered at all, and
+  DELEGATED to the caller at every other head-encoding send path, where the
+  field arms nothing and §7.8 gives a server its own reasons to state it — a 426
+  "MUST send an Upgrade header field to indicate the acceptable protocols", and
+  any other response "MAY send an Upgrade header field … to advertise" support.
+  Membership today: arming is `open_request`'s offer branch, `open_upgrade`, and
+  `accept`'s 101 branch; refusing is `open_connect`; delegated is the remaining
+  six — General's `send_interim`, `send_response` and `send_error_response`, and
+  Tunnel's own `send_interim`, `accept`'s CONNECT-2xx branch, and `reject`.
+- **`Item::Switched { head, leftover }`**: the 101 that answered the offer, and
+  the bytes behind it — verbatim, because they are the new protocol's. The
+  connection is spent from there: it holds no leftover, it will read no further
+  byte, and every later call refuses. The exchange is NOT ended and no item says
+  it was, because §7.8 leaves "the server still has an outstanding request to
+  satisfy after the protocol has been changed" — reporting an abort or a
+  completion would be false. WHICH protocol was switched to stays the caller's
+  to check against what it offered: §7.8 makes naming it the server's MUST and
+  this core refuses a 101 that names none, so the field is there in `head` to be
+  read, and only the caller knows what it asked for.
+
+  Every other 101 a General connection can receive is still a protocol error —
+  every 101 at a server, at an unpermitted client, and at a permitted client
+  that offered nothing — because §7.8 makes switching to a protocol "not
+  indicated by the client in the corresponding request's Upgrade header field" a
+  server MUST NOT. Permission is not indication, and the gate reads the OFFER.
+  The 101 it does accept is validated exactly as Tunnel validates the one it
+  accepts: the same head checks, the same both-halves predicate, and RFC 9112
+  §9.6's `close` fact — so a head one mode switches on is a head the other
+  switches on, and this crate does not become two recipients that read one
+  response differently (RFC 9112 §11.1).
+
+  §9.6's fact is asked of the head IN HAND, not only of the heads before it, and
+  in BOTH modes. A 101 may state its own `Connection: close`, and no accumulator
+  can see that — a 101 never reaches the head-commit path that accumulates the
+  option — so both modes asked `validate::ends_persistence` of the 101 itself. A peer that ends the connection's persistence in the very response
+  that would switch has committed to closing and has nothing to continue into,
+  which is the rule both readers were already documented to keep; the same
+  predicate also answers §9.3's HTTP/1.0 half, where a message without
+  `keep-alive` is non-persistent however it spells its `Connection`. One
+  constant, `101 after the peer stated close`, for both statements of the one
+  fact and both modes.
+
+  That rule is one corner of a wider invariant this cycle closed: **no path of
+  this crate arms, makes, or accepts a §7.8 switch on a connection either end has
+  said it is closing.** §9.6 binds both ends with MUSTs, and a switch is the
+  opposite promise. Newly refused: a 101 this end WRITES while stating `close`
+  (`accept`), an offer this end writes while stating it (`open_request`'s offer
+  branch and `open_upgrade`) — both `an upgrade offer or switch states no
+  Connection: close` — and a received offer that states it, which is no longer
+  classified as a handshake (`an upgrade offer that also states Connection:
+  close`). That last one is where Tunnel had stopped agreeing with General about
+  one wire request: General accumulates the close and refuses the transition
+  `NOT_OPEN`, and Tunnel's direct classification now mirrors that answer rather
+  than inventing one. The invariant, its classifying rule and a verdict for every
+  site are stated once on `TunnelPhase::Switched`.
+
+  The rule covers BOTH takeovers, with no exclusion. An earlier version exempted
+  RFC 9110 §9.3.6's tunnel, reading `close` on a CONNECT 2xx as "no HTTP reuse
+  once the tunnel ends". RFC 9112 §9.6's text does not support that: it defines
+  the option unconditionally as an obligation to close after reading the
+  response carrying it, and §9.3.6 has that same response switching to tunnel
+  mode "immediately after the response header section". One instant, opposite
+  demands — so a close-bearing CONNECT or CONNECT 2xx is refused at all four
+  corners, exactly as a close-bearing 101 is.
+- **`TransitionRefused::SWITCHED`**: `into_tunnel` on a connection that has
+  already switched. Never today's reported reason on either edge — a General
+  server cannot reach the phase at all, and a client is refused first by
+  `EXCHANGE_IN_FLIGHT`, which §7.8 makes TRUE rather than coincidental — and
+  gated all the same, because a coincidence between today's writers is not a
+  rule, and what this one guards is a transport another protocol is already
+  reading.
+
+### Changed
+
+- **`Items::next` has THREE `Err` answers, not two**, and the third is new only
+  for a driver that opted in: after `Item::Switched` it answers
+  `Error::InvalidState` on the first call and on every call after it, having
+  latched nothing. The reason string is `pub(crate)`, so the connection cannot
+  tell it apart from post-failure misuse on your behalf — **your own record is
+  the discriminator**. A driver that took `Item::Switched` hands the transport
+  over and must NOT tear it down; one that did not is looking at the
+  post-failure misuse it has always been, and tearing down is exactly right.
+  The rest of the General surface goes quiet with it: `wants_read` and
+  `is_awaiting_send` are both `false`, `handle_eof`, `open_request`, `send_body`
+  and `finish_body` refuse, and `body_progress` reports no body. `wants_read`
+  answers FROM THE PHASE rather than from the message state, and has to — §7.8
+  retains the exchange and the idle-client rule reads exactly that, so an
+  exchange-first answer would send a driver to read the next protocol's bytes.
+  `poll_event` still drains, and that is the deliberate exception: a queued
+  `Event::CloseSignaled` is a fact about the CONNECTION recorded before the
+  transport changed hands, and this crate documents it as arriving exactly once.
+  `close` and `handle_eof` say what they always said, and the notice they queue
+  is HELD rather than delivered while a handover is still possible. There is
+  exactly one place a notice reaches a driver — `poll_event`, which is `Role`-
+  and `Mode`-generic — and that is where the hold lives, so no producer has to
+  remember: an instruction about the transport is not handed over while
+  `handover_possible` says whose transport it is has not been decided, and it is
+  released by the next poll once that is settled — the answering head, a refusal,
+  or the fault that ends the connection. Only an actual handover cancels one, at
+  all four writers of `TunnelPhase::Switched`, through a single routine.
+
+  Nothing is stored and nothing is resolved, which is the point: an earlier
+  design had each producer WITHHOLD the notice and each terminal path resolve
+  it, which put the fact in storage another path could destroy — and one did.
+  Holding at delivery removes the storage and the resolvers together.
+
+  `Event`'s variants carry the classification that decides all of this, once, at
+  the enum: `CloseSignaled` INSTRUCTS a driver about the transport ("then close
+  the transport"), `ExchangeAborted` INFORMS about a message. Informational
+  notices are never held and never suppressed, which is what leaving `poll_event`
+  live after a switch was always for. Both that match and `handover_possible`'s
+  over `TunnelPhase` are exhaustive, so a new notice or a new phase is a compile
+  error rather than a forgotten site.
+
+  After the switch `close` is accepted and INERT, and that is enforced rather
+  than merely true:
+  it would otherwise move the lifecycle and queue the very
+  `Event::CloseSignaled` that tells a driver to close a transport now belonging
+  to the negotiated protocol, which is this feature's contract inverted. It
+  returns through the same phase guard the accessors read, leaving a notice
+  queued before the switch untouched.
+
+  Every entry point above is classified by a RULE rather than by a list, so a
+  method added later lands in one of its cases by construction: an entry point
+  that can return `Result` REFUSES with a reason naming the switch; one that
+  cannot is INERT, taking the only other answer its signature permits; and
+  `poll_event` alone stays LIVE, because a notice recorded before the transport
+  changed hands is still the driver's to collect. Anything that fits none of the
+  three is a hole. The sixteen of them are `poll_event`, `handle`, `handle_eof`,
+  `wants_read`, `is_awaiting_send`, `body_progress`, `close`, `open_request`,
+  `send_body`, `finish_body`, `into_tunnel`, the two `const` limit accessors,
+  and `Items::{next, consumed, limit_body}`.
+
 ## `http1-proto` — cycle 6 (media types and the `Accept` ranking)
 
 Issue #42. `Content-Type` and `Accept` were the two fields this core scanned but

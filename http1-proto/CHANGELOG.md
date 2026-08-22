@@ -111,7 +111,7 @@ its own.
     reach.
   - **`Error::Refused(Refusal::BodyTooLarge { exchange, limit })`**: not an
     `H1Error`, because nothing on the wire broke a rule. The connection does NOT
-    fail, `poll_event` queues `Event::CloseSignaled` exactly once, `wants_read`
+    fail, `transport()` reads `Transport::Ending`, `wants_read`
     goes false, and a server's `is_awaiting_send` stays true until it has
     written its one answer. `SuggestedStatus::ContentTooLarge` (413, RFC 9110
     §15.5.14) is what it advises. The payload names the LIMIT, not the observed
@@ -206,12 +206,16 @@ its own.
 ### Connection
 
 - **Compile-time type-state**: `Connection<Client | Server, General | Tunnel>`.
-  The mode is a type parameter, not a runtime flag, so asking a General
-  connection to switch protocols (or a Tunnel connection to stream exchanges)
-  does not compile.
+  The mode is a type parameter, not a runtime flag, so asking a Tunnel
+  connection to stream exchanges does not compile. BUILDING a handshake is
+  Tunnel's alone; a General client may CARRY one that came back on an ordinary
+  exchange, when its operator permitted the RFC 9110 §7.8 offer that invited it
+  (`Limits::allow_opportunistic_upgrade`).
 - **General mode**: `handle(input) -> Items` yields borrowed
-  `Item::{Head, BodyChunk, Trailer, ExchangeComplete, ExpectContinue}`, each
-  naming its `ExchangeId`; `Items::consumed()` is the driver's cursor. Keep-alive
+  `Item::{Head, BodyChunk, Trailer, ExchangeComplete, ExpectContinue, Switched}`,
+  all but `Switched` naming their `ExchangeId` — the switch ends HTTP framing on
+  the connection rather than reporting anything about an exchange;
+  `Items::consumed()` is the driver's cursor. Keep-alive
   re-arm, inbound pipelining tolerance (RFC 9112 §9.3.2 holds the next request
   unconsumed until the response is written), 1xx interim responses,
   `Expect: 100-continue`, HTTP/1.0 fallback, close-delimited responses, and
@@ -233,8 +237,8 @@ its own.
   permit a trailer is a registry question for the layer that knows the message.
 - An inbound **close-delimited** response (§6.3 item 8) signals the end of
   keep-alive at its HEAD, not at the EOF: §9.3 makes a connection carrying a
-  message with no self-defined length non-persistent, so `Event::CloseSignaled`
-  reaches the driver before it plans a second request.
+  message with no self-defined length non-persistent, so `transport()` reads
+  `Transport::Ending` before the driver plans a second request.
 - **Tunnel mode**: one protocol switch, RFC 9110 §7.8 `Upgrade` or §9.3.6
   `CONNECT`, at either end. Every outcome that CONSUMED a head reports the
   **leftover** — the suffix of the offer belonging to the new protocol, or to the

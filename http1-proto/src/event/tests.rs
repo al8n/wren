@@ -187,10 +187,17 @@ fn expect_continue_names_only_its_exchange() {
 // `#[non_exhaustive]`, so re-adding a variant is free.)
 #[test]
 fn events_are_owned_copyable_values_compared_by_content() {
-  let closed = Event::CloseSignaled;
-  let copied = closed;
-  assert_eq!(closed, copied);
-  assert_eq!(copied, Event::CloseSignaled);
+  let aborted = Event::ExchangeAborted {
+    exchange: ExchangeId::new(7),
+  };
+  let copied = aborted;
+  assert_eq!(aborted, copied);
+  assert_eq!(
+    copied,
+    Event::ExchangeAborted {
+      exchange: ExchangeId::new(7)
+    }
+  );
 }
 
 // `Ok(None)` is "these bytes are exhausted", not "this connection is done": a
@@ -319,6 +326,5 @@ mod heap {
       ),
       "Trailer { exchange: ExchangeId(9), name: \"X-Sum\", value: [49] }"
     );
-    assert_eq!(std::format!("{:?}", Event::CloseSignaled), "CloseSignaled");
   }
 }

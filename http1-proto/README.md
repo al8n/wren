@@ -45,8 +45,9 @@ The scope is a complete HTTP/1.1 **message and connection** layer:
 - **Connection**: a compile-time role/mode type-state —
   `Connection<Client | Server, General | Tunnel>` — carrying the General-mode
   exchange FSM (keep-alive, pipelining tolerance, 1xx, `Expect: 100-continue`,
-  HTTP/1.0 fallback, close-delimited responses) and the Tunnel-mode handshake
-  that switches protocols and hands the leftover byte stream over.
+  HTTP/1.0 fallback, close-delimited responses, and a permitted client's
+  opportunistic RFC 9110 §7.8 upgrade) and the Tunnel-mode handshake that builds
+  such a switch from scratch. Either mode hands the leftover byte stream over.
 
 ### What belongs in this crate, and what does not
 
@@ -156,6 +157,12 @@ example below; the seventh is the error path, and it is the second example.
    already partly on the wire) closes without answering: a second final response
    would be read as part of the first.
 
+   `Item::Switched` is the exception a driver must not get wrong. After it,
+   every later `Items::next` answers `Error::InvalidState` and nothing has
+   latched: that transport is to be **handed over**, not closed. Having taken
+   the item is what tells the two apart, since the reason string is not public.
+   See **Tunnel mode** below.
+
 ```rust
 use http1_proto::{BodyPlan, Connection, General, Item, Server, StartLine, Target};
 
@@ -253,7 +260,7 @@ below unframable, and §6.1 requires a server to "respond with a 400 (Bad
 Request) status code and then close the connection"):
 
 ```rust
-use http1_proto::{Connection, Error, Event, General, Server};
+use http1_proto::{Connection, Error, General, Server, Transport};
 
 fn main() {
   // Both framing fields: two recipients would delimit this message differently,
@@ -291,9 +298,9 @@ fn main() {
     .expect("the one answer is owed");
   assert_eq!(&out[..n], b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
 
-  // 5. Draining: the notice goes out once, nothing further is owed either way,
-  //    and the driver closes the transport.
-  assert_eq!(conn.poll_event(), Some(Event::CloseSignaled));
+  // 5. Draining: nothing further is owed either way, and `transport()` is what
+  //    says to close it — read, not delivered.
+  assert_eq!(conn.transport(), Transport::Ending);
   assert!(!conn.wants_read() && !conn.is_awaiting_send());
   assert!(conn.send_error_response(400, b"", no_fields, &mut out).is_err());
 }
@@ -409,6 +416,7 @@ this crate's own server half accepts.
 | Keep-alive is over, or the connection failed | | |
 | Client with no request outstanding (RFC 9112 §9.2) | | |
 | …with an **undecided CR** at its cursor (RFC 9112 §2.2) | ✅ | |
+| **Client: the connection switched protocols (RFC 9110 §7.8)** | | |
 
 The half-close row is what a server's `handle_eof` produces for any EOF that is
 not a truncation. RFC 9112 §9.6 is explicit that "a TCP connection that is
@@ -443,15 +451,16 @@ that really says "the server MUST NOT process any further requests received on
 that connection". A `close` from the peer's request, from a response you write,
 or from a local `close()` drains the connection and suppresses whatever was
 buffered behind it — while the read-side fact stays set beside it, so
-`wants_read()` remains false and a truncation is still diagnosed. `Event::CloseSignaled` is queued once, at the EOF, so a
-driver knows before it writes that no *new* exchange will follow.
+`wants_read()` remains false and a truncation is still diagnosed. `transport()`
+reads `Transport::Ending` from that point, so a driver knows before it writes
+that no *new* exchange will follow.
 
 Never both: reading cannot clear a stall on the send side, and a connection
 waiting for its own writer wants no bytes.
 
 **Neither true does not mean "drained".** It means nothing is owed to the
-transport *right now*, and the last two rows of the table are two different
-reasons for that:
+transport *right now*, and the table's three blank rows are three different
+reasons for that — with three different next moves:
 
 - **Keep-alive is over** (either role), or the connection failed — the
   connection has drained. RFC 9112 §9.6 makes any further pipelined bytes
@@ -474,16 +483,48 @@ reasons for that:
   it would put a bare CR at the head of the response parse. Read the deciding
   byte first; `wants_read()` is already asking for it.
 
-A driver that drains `poll_event()` already knows which of the two it is in:
-`Event::CloseSignaled` is the notice that keep-alive is over.
+- **A client that switched protocols** (RFC 9110 §7.8) — and this is the one
+  where the first bullet's advice is exactly wrong. Both halves go quiet from
+  the PHASE rather than from the message state: `wants_read()` is false because
+  the bytes on that transport are the next protocol's, and `is_awaiting_send()`
+  is false because this end has no write left to make. The connection is still
+  `Open` and its request is still outstanding — §7.8 leaves it so, since "the
+  server still has an outstanding request to satisfy after the protocol has been
+  changed" — so neither reading above fits. The transport is to be **handed
+  over**, not closed, and it is not idle either: `open_request` is refused. See
+  step 7 above.
+
+A driver never has to guess which of the three it is in — it asks
+`transport()`, which answers `HandedOver` for the third and `Ending` for the
+first, and an idle client is what is left when neither happened. That answer is
+DERIVED on the ask rather than delivered once, so it cannot be missed by a
+driver that was not listening, and asking twice is two reads rather than two
+instructions.
 
 ## Tunnel mode
 
 `Connection<_, Tunnel>` exists to complete exactly one protocol switch — RFC 9110
 §7.8's `Upgrade` or §9.3.6's `CONNECT` — and then get out of the way. It is a
-separate *mode* of the same type-state rather than a runtime flag, so a General
-connection cannot be asked to switch protocols and a Tunnel connection cannot be
-asked to stream exchanges; both are compile errors.
+separate *mode* of the same type-state rather than a runtime flag, so a Tunnel
+connection cannot be asked to stream exchanges; that is a compile error.
+
+BUILDING a handshake is this mode's; CARRYING one that arrived on an ordinary
+exchange is not. A `Connection<Client, General>` constructed with
+`Limits::allow_opportunistic_upgrade(true)` may make a §7.8 offer on an ordinary
+`open_request` — the `Upgrade` field §7.8 makes the *indication*, plus the
+`upgrade` connection option §7.8's sender MUST requires beside it — and takes the
+answering 101 as `Item::Switched { head, leftover }`, after which the connection
+is spent: the transport belongs to the protocol the 101 named and every later
+call refuses. The offering request must be **bodiless**, and that is this
+crate's restriction rather than the RFC's: §7.8 would let a 101 answer a request
+whose body is still going out, the client finishing it in the old protocol
+before beginning the new one, but a core that parks at the 101 and hands the
+transport over has no send side left to finish it through. Every other 101 a
+General connection can receive stays a protocol error, since §7.8 forbids a
+server to switch to a protocol "not indicated by the client in the corresponding
+request's Upgrade header field". The permission is OFF by default — §7.8 obliges a client to nothing, so a driver that wants the
+capability asks for it, and a proxy-shaped driver forwarding a downstream
+client's `Upgrade` field never chose to send one.
 
 Every outcome that **consumed a head** reports the **leftover**: the suffix of
 the offered bytes that head did not cover. There is no exception to remember —

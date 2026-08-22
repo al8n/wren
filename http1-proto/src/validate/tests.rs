@@ -531,10 +531,12 @@ fn a_response_carrying_both_framing_fields_is_unframable() {
 }
 
 // The PRECEDENCE half of the same rule: RFC 9112 §6.3 is a list "in order of
-// precedence", and items 1-2 answer "regardless of the header fields present in
-// the message". A recipient that read the fields first and applied the status
-// rule afterwards would attribute a body nobody expects to the next message
-// (§11.1), so item 3's refusal may not run ahead of them.
+// precedence", and items 1-2 answer before item 3 is reached — item 1 in the
+// words "regardless of the header fields present in the message", item 2 by
+// making a client "ignore any Content-Length or Transfer-Encoding header fields
+// received in such a message". A recipient that read the fields first and
+// applied the status rule afterwards would attribute a body nobody expects to
+// the next message (§11.1), so item 3's refusal may not run ahead of them.
 //
 // Every shape here carries BOTH framing fields and is nonetheless BODILESS.
 #[test]

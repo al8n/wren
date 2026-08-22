@@ -87,7 +87,7 @@ use derive_more::Display;
 use crate::{
   body::{BodyDecoder, Budget},
   error::{Error, H1Error, Refusal},
-  event::{Event, ExchangeId, Item, Items},
+  event::{Event, ExchangeId, Item, Items, SWITCHED},
   head::Version,
 };
 
@@ -102,6 +102,7 @@ pub use tunnel::{ClientTunnelOutcome, HeadBinding, ServerTunnelRequest};
 // they exercise are not the same, and both modes because the type-state is what
 // decides which of those states a connection uses.
 const _: () = assert!(core::mem::size_of::<Connection<Server, General>>() <= 256);
+
 const _: () = assert!(core::mem::size_of::<Connection<Client, General>>() <= 256);
 const _: () = assert!(core::mem::size_of::<Connection<Server, Tunnel>>() <= 256);
 const _: () = assert!(core::mem::size_of::<Connection<Client, Tunnel>>() <= 256);
@@ -284,6 +285,16 @@ pub struct Limits {
   /// `Ro::DEFAULT_MAX_CHUNK_FRAMING_BYTES`, captured where the role was in
   /// scope. Carried so the resolution below has a role-less answer to give.
   floor: u64,
+  /// Whether this connection may offer an RFC 9110 §7.8 upgrade on an ordinary
+  /// exchange, and therefore whether it may accept the 101 that answers one.
+  ///
+  /// **Default: it may not.** §7.8 obliges a client to nothing — it makes the
+  /// offer an invitation the server "MAY ignore" and says "Upgrade cannot be
+  /// used to insist on a protocol change" — so refusing is fully conforming,
+  /// and a driver that wants the capability asks for it. A proxy-shaped driver
+  /// forwarding a downstream client's headers verbatim never chose to send
+  /// `Upgrade`, and must not be switched for carrying one through.
+  opportunistic_upgrade: bool,
 }
 
 impl Limits {
@@ -304,6 +315,7 @@ impl Limits {
       payload: n,
       framing: self.framing,
       floor: self.floor,
+      opportunistic_upgrade: self.opportunistic_upgrade,
     }
   }
 
@@ -328,6 +340,7 @@ impl Limits {
       payload: self.payload,
       framing: Some(n),
       floor: self.floor,
+      opportunistic_upgrade: self.opportunistic_upgrade,
     }
   }
 
@@ -375,6 +388,33 @@ impl Limits {
         }
       }
     }
+  }
+
+  /// Permits this connection to offer an RFC 9110 §7.8 upgrade on an ordinary
+  /// exchange, and to accept the 101 that answers one.
+  ///
+  /// This is the operator's ceiling. A request may decline to offer on a
+  /// permitting connection; it may not offer on a refusing one.
+  ///
+  /// Named `allow_`, not `with_` like its siblings, deliberately: they set a
+  /// VALUE — `with_max_body_bytes(1024)` — where this grants a PERMISSION.
+  /// `with_opportunistic_upgrade(false)` would read as assigning a property
+  /// the value false; `allow_opportunistic_upgrade(false)` reads as
+  /// withholding permission, which is what it does.
+  #[must_use]
+  pub const fn allow_opportunistic_upgrade(self, allow: bool) -> Self {
+    Self {
+      payload: self.payload,
+      framing: self.framing,
+      floor: self.floor,
+      opportunistic_upgrade: allow,
+    }
+  }
+
+  /// Whether [`allow_opportunistic_upgrade`](Self::allow_opportunistic_upgrade)
+  /// was set.
+  pub(crate) const fn opportunistic_upgrade_allowed(&self) -> bool {
+    self.opportunistic_upgrade
   }
 }
 
@@ -466,9 +506,10 @@ pub struct BodyProgress {
 /// can be talked into. RFC 9110 §9.3.6 makes everything after a 2xx to CONNECT
 /// opaque octets, and RFC 9110 §15.2.2 does the same after a 101 — in both cases
 /// the message framing this core applies STOPS applying. A [`General`]
-/// connection therefore refuses both where they arrive instead of switching
-/// itself over, and a driver that wants a tunnel asks for one by naming
-/// [`Tunnel`] in the type it constructs.
+/// connection therefore refuses the CONNECT tunnel where it arrives instead of
+/// switching itself over, and refuses every 101 but the one its own permitted
+/// offer asked for — see [`General`]. A driver that wants to BUILD a handshake
+/// asks for one by naming [`Tunnel`] in the type it constructs.
 ///
 /// No members, unlike [`Role`]. A role reaches the inbound pump as a runtime
 /// `bool` because that pump is ONE non-generic function serving both roles; the
@@ -480,9 +521,23 @@ pub trait Mode: sealed::SealedMode {}
 
 /// Mode marker: an ordinary request/response endpoint.
 ///
-/// Protocol takeover is refused here: an inbound `101` (client) or CONNECT
-/// request (server) is answered as a protocol error, since a General connection
-/// has no state to become a tunnel with.
+/// A CONNECT request arriving at a General server is answered as a protocol
+/// error: RFC 9110 §9.3.6 makes everything after the 2xx that would answer it
+/// opaque octets, and this mode has no state to become a tunnel with.
+///
+/// A `101` is the one takeover this mode can carry, and only in the narrow shape
+/// RFC 9110 §7.8 describes — a CLIENT whose operator permitted an opportunistic
+/// upgrade ([`Limits::allow_opportunistic_upgrade`]) and whose request actually
+/// made the offer. That client takes the answering 101 as
+/// [`Item::Switched`] and is spent from there: the
+/// transport belongs to the protocol switched to, and every later call refuses.
+/// Every OTHER 101 is a protocol error, which is every 101 a server, an
+/// unpermitted client, or a client that offered nothing can receive — §7.8:
+/// "A server MUST NOT switch to a protocol that was not indicated by the client
+/// in the corresponding request's Upgrade header field."
+///
+/// Building a handshake from scratch is still [`Tunnel`]'s: what this mode does
+/// is carry one that arrived on an ordinary exchange.
 #[derive(Debug)]
 pub struct General;
 
@@ -583,7 +638,7 @@ impl Mode for Tunnel {}
 ///
 /// The gates are checked in a FIXED order, which is why this names one rather
 /// than reporting a set: several of them fail together on the same connection —
-/// a peer that stated `close` moved the lifecycle and queued a notice in the
+/// a peer that stated `close` moved the lifecycle and ended the exchange in the
 /// same step — and a caller told a different reason on different runs could act
 /// on none of them.
 ///
@@ -621,6 +676,22 @@ impl TransitionRefused {
   /// already reading as the answer is §11.1 response splitting.
   pub const ANSWER_BEGUN: Self = Self("this exchange's answer has already begun");
 
+  /// The connection already switched protocols under RFC 9110 §7.8. Its
+  /// transport belongs to the protocol the 101 named, and there is no HTTP left
+  /// on it to tunnel.
+  ///
+  /// Never the reported reason on either of today's edges, and both halves of
+  /// that are worth stating. A General SERVER cannot reach the phase at all: the
+  /// only writer of it is the client's response path. A client reaches it, and
+  /// `nothing_outstanding` fires first with
+  /// [`EXCHANGE_IN_FLIGHT`](Self::EXCHANGE_IN_FLIGHT) — which §7.8 makes TRUE
+  /// rather than coincidental, since "the server still has an outstanding
+  /// request to satisfy after the protocol has been changed". Named and gated
+  /// all the same, for the reason [`RECV_NOT_IDLE`](Self::RECV_NOT_IDLE) is: a
+  /// coincidence between today's writers is not a rule, and what this one guards
+  /// is a transport another protocol is already reading.
+  pub const SWITCHED: Self = Self("the connection already switched protocols");
+
   /// Keep-alive is over or the connection has failed. RFC 9112 §9.6 makes the
   /// `close` connection option a promise to close BEHIND the exchange in flight,
   /// and a tunnel that outlives that exchange is the opposite of one; a failed
@@ -647,11 +718,15 @@ impl TransitionRefused {
   /// inherit it as opaque data.
   pub const PENDING_CR: Self = Self("an undecided line terminator is pending");
 
-  /// A connection-scoped notice or an exchange abort is still queued. The
-  /// transition drops the General state that queued it, so a driver that had not
-  /// yet called [`poll_event`](Connection::poll_event) would lose the notice
-  /// outright — and [`Event::CloseSignaled`] is documented as once per
-  /// connection, which a lost one silently breaks.
+  /// An exchange abort is still queued. The transition drops the General state
+  /// that queued it, so a driver that had not yet called
+  /// [`poll_event`](Connection::poll_event) would lose it outright — and an
+  /// abort names a message whose exchange is already gone, so nothing else could
+  /// tell the driver afterwards.
+  ///
+  /// The end of keep-alive is NOT among the things this protects: it is a level
+  /// read from [`transport`](Connection::transport), so it cannot be queued,
+  /// lost, or dropped by a transition.
   pub const EVENT_UNDRAINED: Self = Self("a queued notice has not been drained");
 
   /// An exchange is already outstanding on this connection. The client edge has
@@ -715,7 +790,9 @@ impl TransitionRefused {
 /// can invent.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct Exchange {
-  /// The id every item of this exchange carries.
+  /// The id every item of this exchange carries. [`Item::Switched`] is not one
+  /// of them: RFC 9110 §7.8's switch ends HTTP framing on the CONNECTION rather
+  /// than reporting anything about the exchange, which it leaves outstanding.
   pub(crate) id: ExchangeId,
   /// The request used HEAD, so item 1 makes its response bodiless "regardless of
   /// the header fields present in the message".
@@ -745,24 +822,50 @@ pub(crate) struct Exchange {
   /// written the transient fact is gone. The response cannot be read to recover
   /// it.
   pub(crate) expect_unanswered: bool,
-  /// Whether the request offered a §7.8 upgrade — both halves, and not on a 1.0
-  /// request, since the MUST-ignore is folded into `has_upgrade`. RFC 9110 §7.8:
-  /// "A server MUST NOT switch to a protocol that was not indicated by the
-  /// client in the corresponding request's Upgrade header field."
+  /// Whether the request offered a §7.8 upgrade. RFC 9110 §7.8: "A server MUST
+  /// NOT switch to a protocol that was not indicated by the client in the
+  /// corresponding request's Upgrade header field."
+  ///
+  /// TWO WRITERS, and each records the strongest fact its side can know:
+  ///
+  /// - RECEIVED (`inbound`): both of §7.8's halves, and not on a 1.0 request,
+  ///   since the MUST-ignore is folded into `has_upgrade`. A recipient may be
+  ///   stricter than the MUST NOT — declining to switch is always allowed — so
+  ///   an un-optioned field arriving here is classified as no offer.
+  /// - SENT (`outbound::open_request`): §7.8's indication, which is the
+  ///   `Upgrade` field alone. A sender may NOT be stricter in the same way,
+  ///   because the strictness would be an exemption: the connection option is
+  ///   required inside that branch instead (`OFFER_NEEDS_BOTH_HALVES`), so what
+  ///   is recorded true here still went out stating both halves on HTTP/1.1.
   pub(crate) upgrade_offered: bool,
   /// WHICH request that offer came in, as [`head_digest`] of its whole head
   /// block — the fact a `Tunnel` connection answers
   /// [`head_binding`](Connection::head_binding) from once
   /// [`into_tunnel`](Connection::into_tunnel) has carried it across.
   ///
-  /// NO ABSENT REPRESENTATION, deliberately. Every construction site that did
-  /// not hash a head writes a dead value, and the validity is carried by the
-  /// facts already beside it — [`upgrade_offered`](Self::upgrade_offered) here,
-  /// and a live non-CONNECT handshake on the other side of the transition — so
-  /// the field is never read outside those guards. The phase IS the validity,
-  /// which is what keeps this at eight bytes rather than `Option<u64>`'s sixteen
-  /// on a struct with a const-asserted budget, and what makes a genuine digest
-  /// of `0` harmless rather than a sentinel collision.
+  /// NO ABSENT REPRESENTATION, deliberately: every construction site that did
+  /// not hash a head writes a dead value. What keeps a dead one from being read
+  /// is stated PER SITE, because one rule over the field would be false at one
+  /// of them:
+  ///
+  /// - **A server's exchange** (`inbound`) hashes exactly when
+  ///   [`upgrade_offered`](Self::upgrade_offered) is recorded, and
+  ///   `offered_switch` reads it exactly behind that same fact. Here the fact
+  ///   beside it IS the validity.
+  /// - **A client's exchange** (`outbound::open_request`) never hashes, offer or
+  ///   no offer: a permitted §7.8 offer records `upgrade_offered: true` beside a
+  ///   dead zero, so the rule above does not hold on this side. What holds
+  ///   instead is the ROLE — the sole reader is on `impl Connection<Server,
+  ///   General>` and `Ro` is a type parameter, so an exchange a client built
+  ///   cannot reach it. A client-side reader is therefore a change to this rule
+  ///   and must hash the head where the exchange is built.
+  /// - **Past the transition**, a live non-CONNECT handshake, which is the guard
+  ///   `Handshake::head_digest` states for itself.
+  ///
+  /// The phase and the role ARE the validity, which is what keeps this at eight
+  /// bytes rather than `Option<u64>`'s sixteen on a struct with a const-asserted
+  /// budget, and what makes a genuine digest of `0` harmless rather than a
+  /// sentinel collision.
   pub(crate) head_digest: u64,
   /// This end's own limit refused this exchange's inbound body.
   ///
@@ -861,18 +964,14 @@ pub(crate) enum SendState {
   Abandoned,
   /// The connection failed and a server owes exactly one error response, after
   /// which no further exchange is possible.
-  ErrorOwed {
-    /// Whether the end of keep-alive has already been announced to the driver —
-    /// the peer's `close` option or a local [`close`](Connection::close) reached
-    /// the connection before it failed.
-    ///
-    /// Carried through the latch because [`Lifecycle::Failed`] overwrites the
-    /// state that held it, and the owed answer forces a close of its own: without
-    /// this, a connection that had already signalled one would signal it twice
-    /// and [`Event::CloseSignaled`] would stop being the once-per-connection
-    /// notice [`signal_close`] documents.
-    close_signaled: bool,
-  },
+  ///
+  /// CARRIES NOTHING, and must not. Whether the end of keep-alive has already
+  /// been announced is derivable, and [`Connection::transport`] derives it on
+  /// the ask. Caching it here — because the failure latch overwrites the state
+  /// that held it, and the owed answer forces a close of its own — would be a
+  /// second copy of one bit, put here only because a transition destroyed the
+  /// first.
+  ErrorOwed,
 }
 
 /// The body a head declared, as far as it has been written.
@@ -999,9 +1098,8 @@ pub(crate) const fn writable(lifecycle: Lifecycle) -> Result<(), Error> {
 /// same resumable head scan), `lifecycle` (the failure latch), `tunnel`, and the
 /// pair that carries the TRANSPORT's own ending, which is not a General fact —
 /// `read_closed`, which its reads consult to tell a stop for want of bytes from
-/// a truncation, and `event`, which `latch_read_closed` writes
-/// [`Event::CloseSignaled`] into for the mode-generic
-/// [`poll_event`](Self::poll_event) to drain. It touches none of the rest: it
+/// a truncation and which [`transport`](Self::transport) reads beside the
+/// lifecycle. It touches none of the rest: it
 /// has no exchange to number, no receive or send FSM to advance, no tail to
 /// resolve, and no idle cursor a stray CRLF could sit at, since a tunnel client
 /// reads nothing before it has written its request and a tunnel server's first
@@ -1074,10 +1172,11 @@ pub struct Connection<Ro, Mo> {
   /// GENERAL. The exchange that ended without its final response, waiting to be
   /// reported as [`Event::ExchangeAborted`].
   ///
-  /// Its own slot rather than sharing [`Self::event`]: the two notices are
-  /// different in scope — one names an exchange, the other is about the
-  /// connection — and both can be pending at the same instant, since the head
-  /// that aborts an exchange is also the one that ends keep-alive.
+  /// THE ONLY QUEUED SLOT on this connection. What it holds is message-scoped,
+  /// which is exactly the fact a level cannot carry: the exchange it names is
+  /// destroyed at `settle` before a driver could ask about it. The
+  /// connection-scoped fact — the end of keep-alive — is not stored at all;
+  /// [`transport`](Connection::transport) derives it on the ask.
   aborted: Option<ExchangeId>,
   /// GENERAL, client only. An exchange completed and the offer that completed it
   /// may still hold bytes this connection has not read back.
@@ -1096,14 +1195,19 @@ pub struct Connection<Ro, Mo> {
   /// see the driver's buffer, so exhaustion is not something this end may assume:
   /// the same epistemics the EOF path is built on.
   tail_unresolved: bool,
-  /// GENERAL. The queued connection-scoped notice, drained by
-  /// [`poll_event`](Self::poll_event). One slot: the only notice this task
-  /// produces is the once-per-connection close signal.
-  event: Option<Event>,
-  /// TUNNEL. Where the ONE handshake a tunnel connection carries stands. Its own
-  /// field rather than a reading of the General states above: those states
-  /// describe a message being framed, and a tunnel's question is whether the
-  /// connection is still HTTP at all.
+  /// BOTH MODES. Where the ONE protocol takeover this connection can carry
+  /// stands. Its own field rather than a reading of the General states above:
+  /// those states describe a message being framed, and this one's question is
+  /// whether the connection is still HTTP at all.
+  ///
+  /// TUNNEL walks the whole enum: a handshake is opened or classified, and then
+  /// answered. GENERAL writes exactly one of its values, and only on a CLIENT
+  /// whose operator permitted an opportunistic upgrade and whose request made
+  /// the offer — the inbound pump writes `TunnelPhase::Switched` in the same
+  /// step that yields [`Item::Switched`], and no other General path writes the
+  /// field at all. So a General connection reads `Idle` until RFC 9110 §7.8's
+  /// switch and `Switched` for the rest of its life, which is the whole of what
+  /// `live_general_phase` asks it.
   tunnel: TunnelPhase,
   /// GENERAL. A lone `\r` is sitting unconsumed at a client's idle cursor, waiting for the
   /// byte that decides it (RFC 9112 §2.2: a CR is a line terminator only once its
@@ -1146,6 +1250,14 @@ pub struct Connection<Ro, Mo> {
   /// a handshake — and it neither constrains nor seeds whatever bounds the
   /// protocol on the other side of a switch applies to its own messages.
   max_body: u64,
+  /// BOTH MODES. The OPERATOR'S resolved permission to offer an RFC 9110 §7.8
+  /// upgrade on an ordinary exchange, and to accept the 101 that answers one —
+  /// copied from [`Limits::opportunistic_upgrade_allowed`] at construction.
+  ///
+  /// ONE WRITER, and it is the constructor, for the same reason `max_body` is:
+  /// there is no setter and no `&mut` path to this field on a live connection,
+  /// so a ceiling stated at construction cannot be raised mid-connection.
+  opportunistic_upgrade: bool,
   /// BOTH MODES. The budget for the RFC 9112 §7.1 chunk-size lines one inbound
   /// body may spend, resolved at construction from [`Limits`].
   ///
@@ -1201,6 +1313,7 @@ impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
       payload: Ro::DEFAULT_MAX_BODY_BYTES,
       framing: None,
       floor: Ro::DEFAULT_MAX_CHUNK_FRAMING_BYTES,
+      opportunistic_upgrade: false,
     }
   }
 
@@ -1231,11 +1344,11 @@ impl<Ro: Role, Mo: Mode> Connection<Ro, Mo> {
       peer_close: false,
       tail_unresolved: false,
       aborted: None,
-      event: None,
       tunnel: TunnelPhase::Idle,
       pending_cr: false,
       idle_crlfs: 0,
       max_body: limits.max_body_bytes(),
+      opportunistic_upgrade: limits.opportunistic_upgrade_allowed(),
       // Obtained by CALLING the resolution rather than re-deriving it: written
       // the other way — this connection applying its own `Ro`'s floor to a seed
       // minted from another role — the two answers to one question would differ
@@ -1277,11 +1390,10 @@ impl<Ro, Mo> Connection<Ro, Mo> {
 
   /// Takes the next queued connection-scoped notice, or `None`.
   ///
-  /// Mode-generic, unlike everything else about the receive side: an [`Event`] is
-  /// a fact about the CONNECTION, and the one fact a Tunnel connection can queue
-  /// is the same one — [`Event::CloseSignaled`], which `handle_eof` records
-  /// through the same routine in both modes. Leaving it on `General` alone would
-  /// have made that a notice nothing could ever read.
+  /// Mode-generic, though only General can produce what it carries: an
+  /// [`Event`] is a fact about a MESSAGE, and Tunnel frames none. It stays on
+  /// both modes so a driver polls one surface rather than remembering which mode
+  /// it is holding.
   ///
   /// Drained after the items rather than among them: an [`Event`] is a fact about
   /// the connection, not about any byte of the input, so it neither borrows the
@@ -1293,12 +1405,122 @@ impl<Ro, Mo> Connection<Ro, Mo> {
   ///
   /// `Role`- and `Mode`-free: it reads only `aborted` and `event`, neither of
   /// which either type-state answers a question about.
+  ///
+  /// Not gated by RFC 9110 §7.8's switch either: an abort names a message that
+  /// ended before the transport changed hands, and it stays true afterwards.
+  /// What the driver should DO with that transport is
+  /// [`transport`](Self::transport), which answers
+  /// [`Transport::HandedOver`] — so this call
+  /// carries no instruction and needs no gate.
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event> {
-    if let Some(exchange) = self.aborted.take() {
-      return Some(Event::ExchangeAborted { exchange });
+    self
+      .aborted
+      .take()
+      .map(|exchange| Event::ExchangeAborted { exchange })
+  }
+
+  /// What the driver should now do with the transport — see [`Transport`].
+  ///
+  /// DERIVED, on every ask, from state this connection already holds. Nothing is
+  /// stored and nothing is consumed, so asking twice is two reads rather than
+  /// two instructions, and a driver that never asks is told nothing rather than
+  /// losing something.
+  ///
+  /// # The derivation, and why the order is the answer
+  ///
+  /// One `match`, exhaustive over `TunnelPhase` and `Lifecycle`, so a phase
+  /// or a lifecycle state added later is a compile error here rather than a
+  /// channel somebody forgot to teach. `Role`- and `Mode`-free by construction,
+  /// because every field it reads is shared by all four type-states: a fix
+  /// applied to one mode and not the other is not a shape this can take.
+  ///
+  /// 1. **The phase first.** A completed handover is absorbing and outranks
+  ///    everything: RFC 9110 §7.8 leaves the server still owing an answer in the
+  ///    new protocol, so the transport is the negotiated protocol's whatever
+  ///    this connection went on to record about itself. This is where "a switch
+  ///    wins over a local close" lives now — as one arm's position in one
+  ///    `match`, rather than as machinery that defers a notice and then has to
+  ///    decide when to stop.
+  /// 2. **Then the failure latch**, which is absorbing for the same reason and
+  ///    is checked before the disjunction below because it also satisfies it.
+  /// 3. **Then the end of keep-alive**: RFC 9112 §9.6's option or a local close
+  ///    took the lifecycle off `Lifecycle::Open`, or the read side ended. One
+  ///    answer for all three, and it is the disjunction the failure latch has
+  ///    always computed for itself.
+  /// 4. **Otherwise the connection is this crate's**, and the readiness
+  ///    accessors say what to do with it.
+  #[must_use]
+  #[inline]
+  pub const fn transport(&self) -> Transport {
+    match self.tunnel {
+      TunnelPhase::Switched => Transport::HandedOver,
+      // TERMINAL, and the lifecycle cannot say so. All three writers of this
+      // phase leave `Lifecycle::Open` — a client reading an ordinary final
+      // refusal, a client reading a persistence-ending interim, and a server
+      // that successfully wrote `reject` — so projecting it from the lifecycle
+      // would report `Live` for a connection whose every later call fails, and a
+      // driver treating this accessor as authoritative could pool a dead socket.
+      //
+      // `Failed` still wins, because a connection can fail and then be rejected:
+      // `refuse` sets `RejectionOwed` and latches, and `reject` moves the phase
+      // here while the lifecycle stays `Failed`.
+      //
+      // `RejectionOwed` joins it: it means a server owes exactly one rejection
+      // and nothing after it, which is not `Live` either. It is unreachable
+      // beside `Open` today — `refuse` sets it and latches in the same call —
+      // and it is answered anyway, because "the lifecycle happens to say so" is
+      // not an argument that a phase is live.
+      TunnelPhase::Refused | TunnelPhase::RejectionOwed => match self.lifecycle {
+        Lifecycle::Failed => Transport::Failed,
+        Lifecycle::Open | Lifecycle::Closing | Lifecycle::Draining => Transport::Ending,
+      },
+      TunnelPhase::Idle | TunnelPhase::Handshaking(_) => match self.lifecycle {
+        Lifecycle::Failed => Transport::Failed,
+        Lifecycle::Closing | Lifecycle::Draining => Transport::Ending,
+        Lifecycle::Open => {
+          if self.read_closed {
+            Transport::Ending
+          } else {
+            Transport::Live
+          }
+        }
+      },
     }
-    self.event.take()
+  }
+}
+
+// `Ro` is free, and that is the guard's own claim: RFC 9110 §7.8's switch is a
+// fact about the CONNECTION, not about either end's message state, so nothing
+// that reads it needs the role. A `Connection<Server, General>` cannot reach the
+// phase today — the arm that writes it lives on the client's response path — and
+// a bound here would say the opposite: that the answer depends on which end is
+// asking.
+impl<Ro> Connection<Ro, General> {
+  /// The RFC 9110 §7.8 phase, for a General connection that may have switched.
+  ///
+  /// General's mirror of [`live_phase`], and the ONE reader of the phase on this
+  /// surface: after the switch this connection is spent — the driver holds the
+  /// leftover, and §15.2.2 makes the 101 the head that "indicates which
+  /// protocol(s) will be in effect after this response" — so every entry point
+  /// that can refuse consults this, and the accessors that cannot refuse read it
+  /// through `is_err`. One reader is what keeps the answer from drifting between
+  /// them.
+  ///
+  /// The failure latch is deliberately NOT read here. Each caller keeps its own,
+  /// because they order it differently on purpose ([`body_sendable`] puts the
+  /// specific reason ahead of the generic one), and the two facts cannot both
+  /// hold: a failed connection's pump refuses before it can parse the 101, and a
+  /// switched connection's pump refuses before it can parse anything that would
+  /// latch.
+  ///
+  /// [`live_phase`]: Connection::live_phase
+  /// [`body_sendable`]: Connection::body_sendable
+  fn live_general_phase(&self) -> Result<(), Error> {
+    if matches!(self.tunnel, TunnelPhase::Switched) {
+      return Err(Error::InvalidState(SWITCHED));
+    }
+    Ok(())
   }
 }
 
@@ -1339,8 +1561,8 @@ impl<Ro: Role> Connection<Ro, General> {
       recv,
       exchange,
       send,
+      tunnel,
       lifecycle,
-      event,
       read_closed,
       peer_close,
       tail_unresolved,
@@ -1365,8 +1587,8 @@ impl<Ro: Role> Connection<Ro, General> {
         recv,
         exchange,
         send,
+        tunnel,
         lifecycle,
-        event,
         read_closed,
         peer_close,
         tail_unresolved,
@@ -1401,6 +1623,7 @@ impl<Ro: Role> Connection<Ro, General> {
   /// | **client** | idle with an exchange outstanding — no final head, or interim heads only | any | `Ok(None)` here; **`Err`** (`CLOSED_BEFORE_RESPONSE`) from the re-offer — §9.5: the request went out and no response came back, and an interim head is explicitly not one (RFC 9110 §15.2) |
   /// | **client** | receive side complete | its own request body still owed | `Ok(…)`, and the unwritten body is abandoned — §9.6 tells a client whose peer is closing to "cease sending", so it is not an obligation to preserve |
   /// | **server** | any state that is not a truncation | any | `Ok(…)`, and the connection latches `read_closed` rather than draining: an owed response SURVIVES, and so does every request the peer pipelined behind it |
+  /// | **client** | switched under RFC 9110 §7.8 | any | `Err(Error::InvalidState)` — the transport belongs to the protocol the 101 named, so this call reads nothing off it and records nothing about it |
   /// | either | already failed | any | `Err(Error::InvalidState)` — the violation was handed back once, by the call that found it |
   ///
   /// # What this call does NOT conclude, and the driver step that follows
@@ -1472,12 +1695,23 @@ impl<Ro: Role> Connection<Ro, General> {
   ///
   /// Idempotent: a driver may report the same EOF twice.
   pub fn handle_eof(&mut self) -> Result<Option<Item<'static>>, Error> {
+    // The transport stopped belonging to this connection at the 101, so an EOF
+    // on it is not this connection's news and NOTHING here may act on it:
+    // latching `read_closed` would rewrite a spent connection's state, and
+    // abandoning the send side would write off a request RFC 9110 §7.8 leaves
+    // alive — "the server still has an outstanding request to satisfy after the
+    // protocol has been changed", in a protocol this core does not read.
+    //
+    // Ahead of the failure latch, which costs nothing: the two cannot both hold,
+    // since a switched connection's pump refuses before it can parse anything
+    // that would latch.
+    self.live_general_phase()?;
     if matches!(self.lifecycle, Lifecycle::Failed) {
       return Err(Error::InvalidState(FAILED));
     }
     // The transport fact, latched for BOTH roles and before anything else is
     // decided: it is the only thing this call actually observes.
-    latch_read_closed(&mut self.read_closed, self.lifecycle, &mut self.event);
+    latch_read_closed(&mut self.read_closed);
 
     // RFC 9112 §9.6 tells the sender of a request to "cease sending" once the
     // peer is closing, so a CLIENT's unwritten request body is abandoned. This
@@ -1496,15 +1730,27 @@ impl<Ro: Role> Connection<Ro, General> {
 
   /// Whether more transport bytes would let the connection make progress.
   ///
-  /// The read half of the readiness split, and it consults BOTH of the
-  /// connection's independent facts — reading is pointless if either says so:
+  /// The read half of the readiness split, and it consults every one of the
+  /// connection's independent facts — reading is pointless if any says so:
   ///
+  /// - this connection SWITCHED protocols (RFC 9110 §7.8), so the bytes on that
+  ///   transport are the next protocol's and this end must never ask for them;
   /// - the TRANSPORT can produce no more bytes (`read_closed`), whatever this end
   ///   would have been willing to do with them;
   /// - or POLICY has ended the connection (failed, or drained under RFC 9112
   ///   §9.6), the inbound side is waiting on the local send side, or this is a
   ///   client with no outstanding request — for which §9.2 makes arriving data a
   ///   fault rather than progress.
+  ///
+  /// # The switch is answered from the PHASE, and it has to be
+  ///
+  /// The switch RETAINS the exchange — §7.8 leaves the server with "an
+  /// outstanding request to satisfy after the protocol has been changed", so
+  /// nothing was aborted and nothing completed — and the idle-client rule below
+  /// reads exactly that: an outstanding exchange is a response still to come. An
+  /// exchange-first answer would therefore report `true` on a connection whose
+  /// every further byte belongs to somebody else. The phase is read first, and
+  /// the answer is `false`.
   ///
   /// # A body being received is not the same as a body that needs an octet
   ///
@@ -1541,6 +1787,14 @@ impl<Ro: Role> Connection<Ro, General> {
   /// [`Error::Refused`]: crate::Error::Refused
   #[inline]
   pub fn wants_read(&self) -> bool {
+    // RFC 9110 §7.8's switch, read BEFORE the message state below and through the
+    // one reader of the phase: §15.2.2 makes the 101 the head that "indicates
+    // which protocol(s) will be in effect after this response", so the octets
+    // behind it are that protocol's. The retained exchange would send the
+    // `RecvState::Idle` arm the other way — see the section above.
+    if self.live_general_phase().is_err() {
+      return false;
+    }
     // The transport fact first, because it outranks every reading of the second:
     // no arrangement of the message state makes a byte arrive on a closed read
     // side. This is what keeps a driver from waiting for input that cannot come.
@@ -1583,6 +1837,15 @@ impl<Ro: Role> Connection<Ro, General> {
   /// It is NOT "this message has no body": RFC 9112 §6.3 items 1 and 7 frame a
   /// bodiless message as a body of no octets, which is reported as a body
   /// already through rather than as no body at all.
+  ///
+  /// `None` on a connection that switched protocols (RFC 9110 §7.8) as well, and
+  /// this call needs no phase check to say so: the arm that switches bypasses
+  /// `commit_head`, the only writer of `RecvState::Body`, so the receive side is
+  /// still `Idle` and "no body is being received" is simply TRUE of it. The
+  /// answer is a consequence of the state the switch left behind rather than of
+  /// the phase, so a later switch that retained a body would change it — which
+  /// is why the assertions in `connection/tests.rs` pin it rather than leaving
+  /// it to today's guards.
   ///
   /// Exhaustive over the receive states, so a state added later has to say
   /// whether a body is being received in it.
@@ -1631,10 +1894,26 @@ impl<Ro: Role> Connection<Ro, General> {
   /// a write every send call refuses. Its readiness goes quiet in both halves
   /// and the pending conclusion on [`wants_read`](Self::wants_read) is what it
   /// collects instead.
+  ///
+  /// # A switched connection owes nothing
+  ///
+  /// After RFC 9110 §7.8's switch this end has no write left to make: the
+  /// request that offered the upgrade is being satisfied in a protocol this core
+  /// does not speak, and every send call refuses. So the answer is `false`, from
+  /// the phase, and both halves of the readiness split go quiet together.
   #[inline]
   pub fn is_awaiting_send(&self) -> bool {
+    // Through the one reader, so this answer cannot drift from `wants_read`'s.
+    // Today the message state would say `false` too — a §7.8 offer carries no
+    // content (`OFFER_HAS_NO_CONTENT`), so the request that switched left `send`
+    // at `SendState::Idle` and `recv` at `RecvState::Idle` — but that is a
+    // property of the OFFER's shape rather than a rule about the phase, and a
+    // spent connection owes nothing whatever state it was left holding.
+    if self.live_general_phase().is_err() {
+      return false;
+    }
     match self.lifecycle {
-      Lifecycle::Failed => matches!(self.send, SendState::ErrorOwed { .. }),
+      Lifecycle::Failed => matches!(self.send, SendState::ErrorOwed),
       Lifecycle::Open | Lifecycle::Closing | Lifecycle::Draining => {
         self.inbound_side_is_through()
           && !matches!(self.send, SendState::Idle | SendState::Abandoned)
@@ -1669,9 +1948,37 @@ impl<Ro: Role> Connection<Ro, General> {
   /// re-armed. Between exchanges there is nothing to finish, so it stops at once.
   ///
   /// Idempotent, and a no-op on a connection that has already failed or drained.
+  ///
+  /// Accepted, and INERT, on one that has switched protocols (RFC 9110 §7.8).
+  /// The guard is kept, but it is not what makes the call harmless: after the
+  /// switch [`transport`](Self::transport) answers
+  /// [`Transport::HandedOver`], which is absorbing and checked ahead of the
+  /// lifecycle, so a close recorded here could not change what a driver reads.
+  /// The transport belongs to the protocol the 101 named, and this crate's
+  /// contract is that the driver HANDS IT OVER rather than tearing it down.
+  ///
+  /// There is nothing to say in any case: no further exchange was going to begin
+  /// on a spent connection. What was queued BEFORE the switch is untouched and
+  /// still drainable — see [`poll_event`](Self::poll_event), which is the one
+  /// entry point the phase deliberately leaves live.
   #[inline]
   pub fn close(&mut self) {
-    signal_close(&mut self.lifecycle, &mut self.event, self.read_closed);
+    // Read through the ONE phase guard, as `wants_read` and `is_awaiting_send`
+    // do: this signature cannot return the refusal, so it takes the only other
+    // answer its signature permits.
+    if self.live_general_phase().is_err() {
+      return;
+    }
+    // NOT DEFERRED, and nothing is queued to defer. `signal_close` moves the
+    // lifecycle, and what that means for the transport is read on the ask by
+    // `transport()` — where a completed handover outranks it. Deciding it here
+    // instead would put the question at every producer of the fact, each of
+    // which would have to remember.
+    //
+    // So the lifecycle moves at once, which is also the more faithful reading of
+    // this call: "no further exchange BEGINS" is true from the moment it is
+    // asked, whatever the in-flight one turns into.
+    signal_close(&mut self.lifecycle);
     self.settle();
   }
 
@@ -1687,6 +1994,62 @@ impl<Ro: Role> Connection<Ro, General> {
       &mut self.pending_cr,
     );
   }
+}
+
+/// What the driver should now do with the transport it holds.
+///
+/// **A LEVEL, derived on the ask — never stored, never delivered.** Answering
+/// this question with a queued `Event` would make the answer an INSTANCE:
+/// something minted at one moment, cached in several places, and spoken once.
+/// An instance can be delivered stale, stranded, destroyed, duplicated, leaked
+/// through `Debug`, or diverged between two modes. A level has no instances, so
+/// it has none of those: there is nothing to mint, nothing to destroy, nothing
+/// to deliver twice, and no second copy to disagree with the first. Reading it
+/// twice is two reads.
+///
+/// The crate's two other transport questions are answered the same way —
+/// [`wants_read`](Connection::wants_read) and
+/// [`is_awaiting_send`](Connection::is_awaiting_send) are polled levels about
+/// the same subject. This is the third, and it is the one that says what to do
+/// when they both say nothing.
+///
+/// # Polling it
+///
+/// A driver reads it after draining items and events. Nothing pushes it, so
+/// nothing can be missed by not listening; equally, a driver that stops asking
+/// learns nothing, which is the Sans-I/O bargain this crate makes everywhere. A
+/// driver that wants to act ONCE on a change edge-detects against its own last
+/// value — the crate does not keep one, because keeping one is what this type
+/// exists to stop doing.
+///
+/// [`HandedOver`](Self::HandedOver) and [`Failed`](Self::Failed) are ABSORBING:
+/// once either is the answer, no later state of this connection changes it.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Transport {
+  /// This connection's, and still usable: pump it and send on it, refined by
+  /// [`wants_read`](Connection::wants_read) and
+  /// [`is_awaiting_send`](Connection::is_awaiting_send).
+  Live,
+  /// Keep-alive is over — a local [`close`](Connection::close), the peer's RFC
+  /// 9112 §9.6 `close` option, or a read-EOF. Finish what is already parsed,
+  /// send what is still owed, then close it.
+  ///
+  /// One answer for all three causes, deliberately: §9.6 makes them one fact
+  /// about the connection, and a driver's action is the same for each. Which
+  /// cause it was is not this question.
+  Ending,
+  /// A wire violation latched. Send the owed error response if
+  /// [`is_awaiting_send`](Connection::is_awaiting_send) says one is, then close
+  /// it. Nothing further will be parsed.
+  Failed,
+  /// RFC 9110 §7.8's switch or §9.3.6's tunnel completed: the transport belongs
+  /// to the negotiated protocol. **Hand it over; never close it.**
+  ///
+  /// ABSORBING, and that is what makes a missed guard on a parked connection
+  /// harmless rather than dangerous: a stray write this crate failed to refuse
+  /// cannot change the answer a driver reads here.
+  HandedOver,
 }
 
 /// RFC 9112 §2.1: a message begins with a complete head, so a close inside one
@@ -1735,10 +2098,12 @@ pub(crate) struct Borrows<'c> {
   pub(crate) exchange: &'c mut Option<Exchange>,
   /// Where the local side stands.
   pub(crate) send: &'c mut SendState,
+  /// Where the connection stands on the one RFC 9110 §7.8 switch a General
+  /// connection can take. Borrowed rather than copied — the pump WRITES it and
+  /// re-reads it live; the field doc on [`Items`] carries the whole reason.
+  pub(crate) tunnel: &'c mut TunnelPhase,
   /// Where the connection stands in its life — policy and failure only.
   pub(crate) lifecycle: &'c mut Lifecycle,
-  /// The queued connection-scoped notice.
-  pub(crate) event: &'c mut Option<Event>,
   /// Whether the peer's write side has ended.
   pub(crate) read_closed: &'c mut bool,
   /// Whether the PEER has stated the `close` connection option.
@@ -1757,27 +2122,17 @@ pub(crate) struct Borrows<'c> {
 /// Records the RFC 9112 §9.6 `close` connection option: this end will accept no
 /// further exchange.
 ///
-/// POLICY, and nothing else. `read_closed` is passed BY VALUE — a `bool` copy —
-/// so this function cannot write the transport fact even by accident; that is
-/// the property, not a convention. It reads it for one purpose only: the notice
-/// below is once per connection, and a read-EOF may already have given it.
+/// POLICY, and nothing else. It moves the lifecycle and touches nothing else —
+/// in particular not `read_closed`, which is the TRANSPORT's fact and this
+/// function's counterpart's. Neither producer has to dedup against the other,
+/// because [`Connection::transport`] reads both facts on the ask.
 ///
 /// The option is what makes the §9.6 rule true: "The server MUST NOT process
 /// any further requests received on that connection". That is why it — and not
 /// a transport event — leads to [`Lifecycle::Draining`] through [`settle`].
-pub(crate) fn signal_close(
-  lifecycle: &mut Lifecycle,
-  event: &mut Option<Event>,
-  read_closed: bool,
-) {
+pub(crate) fn signal_close(lifecycle: &mut Lifecycle) {
   if !matches!(*lifecycle, Lifecycle::Open) {
     return;
-  }
-  // Exactly-once across BOTH causes: keep-alive being over is one fact about the
-  // connection, whether the peer said so or its write side simply ended, and a
-  // driver told twice would have to work out that they were the same.
-  if !read_closed {
-    *event = Some(Event::CloseSignaled);
   }
   *lifecycle = Lifecycle::Closing;
 }
@@ -1807,23 +2162,15 @@ pub(crate) fn signal_close(
 ///   encodings lacked: while this lived in the `Lifecycle` enum, any transition
 ///   that moved the policy dimension silently dropped the transport one.
 /// - **Idempotent.** [`handle_eof`](Connection::handle_eof) is documented to
-///   take the same EOF twice; the second report finds the flag set and returns,
-///   so it neither re-queues the notice nor re-decides anything.
+///   take the same EOF twice; the second report finds the flag already set, so
+///   it changes nothing — and there is nothing to re-announce, since what the
+///   flag means is derived on the ask rather than delivered when it is set.
 /// - **Independent of the exchange.** Nothing about the message in flight is
 ///   consulted, so WHEN a driver reports the EOF cannot change what it means.
-pub(crate) fn latch_read_closed(
-  read_closed: &mut bool,
-  lifecycle: Lifecycle,
-  event: &mut Option<Event>,
-) {
-  if *read_closed {
-    return;
-  }
-  // Keep-alive is over: no NEW request can arrive on a connection whose read
-  // side has ended. Once, and only if the `close` option has not already said so.
-  if matches!(lifecycle, Lifecycle::Open) {
-    *event = Some(Event::CloseSignaled);
-  }
+pub(crate) fn latch_read_closed(read_closed: &mut bool) {
+  // The transport fact, and nothing else. Keep-alive being over follows from it
+  // — `Connection::transport` reads this flag beside the lifecycle — so there is
+  // nothing to mint here, and no lifecycle to dedup against.
   *read_closed = true;
 }
 
@@ -1859,26 +2206,19 @@ pub(crate) fn discharge_expect(recv: &mut RecvState) {
 /// so a violation found once the head has gone out kills the connection and owes
 /// nothing.
 ///
-/// No [`Event::CloseSignaled`] is queued here. A latch is reported by the `Err`
-/// the call returns — exactly once, and terminal — while the event marks the
-/// different transition "keep-alive is over but you still have something to
-/// write", which is why that owed answer queues one after it is written and an
-/// unanswerable failure does not.
+/// NOTHING is queued here, and nothing is computed about the transport either.
+/// The latch is reported by the `Err` this call returns — exactly once, and
+/// terminal — and what the transport now is follows from the lifecycle it sets:
+/// [`Connection::transport`] reads [`Lifecycle::Failed`] as
+/// [`Transport::Failed`].
 pub(crate) fn latch(
   send: &mut SendState,
   lifecycle: &mut Lifecycle,
-  read_closed: bool,
   is_client: bool,
   answerable: bool,
   in_flight: bool,
   error: H1Error,
 ) -> Error {
-  // Read before the latch overwrites it: the owed answer forces a close, and
-  // whether one was already announced is a fact only the pre-failure state holds
-  // (see `SendState::ErrorOwed::close_signaled`). BOTH causes count — the `close`
-  // option moved the lifecycle, a read-EOF set the transport flag, and either one
-  // has already given the notice.
-  let close_signaled = !matches!(*lifecycle, Lifecycle::Open) || read_closed;
   let unanswered = match *send {
     // A request was parsed and its response has not started: the one case an
     // error response can take the place of.
@@ -1891,12 +2231,12 @@ pub(crate) fn latch(
     SendState::Idle => !in_flight,
     // A body is part-written or was abandoned mid-way, or a failure was already
     // latched: in none of them is the wire at a message boundary.
-    SendState::Sending(_) | SendState::Abandoned | SendState::ErrorOwed { .. } => false,
+    SendState::Sending(_) | SendState::Abandoned | SendState::ErrorOwed => false,
   };
   *lifecycle = Lifecycle::Failed;
   // A client has no response to send, and an EOF has nobody to send one to.
   *send = if answerable && !is_client && unanswered {
-    SendState::ErrorOwed { close_signaled }
+    SendState::ErrorOwed
   } else {
     SendState::Idle
   };
@@ -2046,9 +2386,7 @@ pub(crate) fn refuse(
   watermark: &mut usize,
   send: &mut SendState,
   lifecycle: &mut Lifecycle,
-  event: &mut Option<Event>,
   pending_cr: &mut bool,
-  read_closed: bool,
   is_client: bool,
   id: ExchangeId,
   budget: Budget,
@@ -2073,10 +2411,11 @@ pub(crate) fn refuse(
     exchange.body_refused = true;
   }
   // 3. RFC 9112 §9.6: keep-alive is over. `signal_close` stays the single
-  //    writer of that rule and of the once-per-connection notice, so the
-  //    doubled cause — a refusal on a connection whose peer already closed —
-  //    is not re-derived here.
-  signal_close(lifecycle, event, read_closed);
+  //    writer of that rule, so the doubled cause — a refusal on a connection
+  //    whose peer already closed — is not re-derived here. Nothing is announced:
+  //    what a driver should do with the transport follows from the lifecycle
+  //    this sets, read by `Connection::transport`.
+  signal_close(lifecycle);
   // 4. A client's own request body, released for the reason above.
   if is_client {
     abandon_send(send);
@@ -2218,12 +2557,20 @@ pub(crate) struct Fingerprint<'a> {
   peer_close: &'a bool,
   aborted: &'a Option<ExchangeId>,
   tail_unresolved: &'a bool,
-  event: &'a Option<Event>,
   tunnel: &'a TunnelPhase,
   pending_cr: &'a bool,
   idle_crlfs: &'a u8,
   max_body: &'a u64,
+  opportunistic_upgrade: &'a bool,
   max_chunk_framing: &'a u64,
+  /// The derived level, compared BESIDE the fields it is derived from.
+  ///
+  /// Redundant by construction, and deliberately so: this is the one place two
+  /// connections that reached the same state by DIFFERENT routes are compared,
+  /// so it is where a derivation that disagreed with its own inputs would show.
+  /// By value rather than by reference — the level is `Copy` and is computed,
+  /// not stored.
+  transport: Transport,
 }
 
 #[cfg(test)]
@@ -2243,17 +2590,18 @@ impl<Ro, Mo> Connection<Ro, Mo> {
       peer_close,
       aborted,
       tail_unresolved,
-      event,
       tunnel,
       pending_cr,
       idle_crlfs,
       max_body,
+      opportunistic_upgrade,
       max_chunk_framing,
       // The type-state, which is zero-sized and is the one thing the two sides
       // of a differential are ALLOWED to differ in until the transition runs.
       shape: _,
     } = self;
     Fingerprint {
+      transport: self.transport(),
       consumed,
       watermark,
       next_exchange,
@@ -2265,13 +2613,23 @@ impl<Ro, Mo> Connection<Ro, Mo> {
       peer_close,
       aborted,
       tail_unresolved,
-      event,
       tunnel,
       pending_cr,
       idle_crlfs,
       max_body,
+      opportunistic_upgrade,
       max_chunk_framing,
     }
+  }
+
+  /// Whether [`Limits::opportunistic_upgrade_allowed`] survived
+  /// [`with_limits`](Connection::with_limits)'s decomposition.
+  ///
+  /// Test-only rather than a public accessor: nothing outside this crate reads
+  /// the field yet, and code inside `connection` that comes to read it can
+  /// reach the private field directly, the way it reaches `max_body`.
+  pub(crate) const fn opportunistic_upgrade_allowed_for_test(&self) -> bool {
+    self.opportunistic_upgrade
   }
 }
 

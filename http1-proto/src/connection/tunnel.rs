@@ -78,7 +78,9 @@ use crate::{
   connection::{
     CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Client, Connection, FAILED, General,
     Lifecycle, RecvState, SWITCHING_PROTOCOLS, SendState, Server, TransitionRefused, Tunnel,
-    head_digest, latch_read_closed,
+    head_digest,
+    inbound::SWITCH_AFTER_CLOSE,
+    latch_read_closed,
     outbound::{
       Declared, INTERIM_STATES_NO_CLOSE, READ_SIDE_ENDED, announces_octets, continue_needs_content,
       declared, requires_host,
@@ -92,7 +94,9 @@ use crate::{
     find_head_end, malformed, parse_request_line, parse_status_line, scan_head,
     skip_leading_empty_lines,
   },
-  validate::{BodyFraming, check_response_head, ends_persistence, validate_request},
+  validate::{
+    BodyFraming, check_response_head, ends_persistence, has_close_option, validate_request,
+  },
 };
 
 /// The method an upgrade offer uses. RFC 9110 §7.8's own example is a GET, and
@@ -138,6 +142,20 @@ pub(super) const NOTHING_TO_ANSWER: &str = "no rejection is owed on this connect
 /// RFC 9110 §7.8: "A sender of Upgrade MUST also send an `Upgrade` connection
 /// option in the Connection header field" — so an offer states both halves, and
 /// each protocol it names is `protocol-name ["/" protocol-version]`.
+///
+/// ONE constant for BOTH offering senders, because §7.8 states ONE rule and it
+/// is written over the sender rather than over the mode. The two are:
+///
+/// - `Tunnel`'s `open_upgrade`, which builds a handshake and so requires the
+///   whole offer, either half missing.
+/// - `General`'s `open_request`, which BRANCHES on §7.8's indication — the
+///   `Upgrade` field alone — and then requires the connection option inside that
+///   branch, so an indication cannot go out un-optioned. The missing-field half
+///   cannot be its reason: a request without the field made no offer and is an
+///   ordinary request this mode writes.
+///
+/// A mode-specific spelling would say the rule was two rules, and a driver
+/// diagnosing the same omission would read two different reasons for it.
 pub(super) const OFFER_NEEDS_BOTH_HALVES: &str =
   "an upgrade offer states Connection: upgrade and an Upgrade protocol list";
 
@@ -148,8 +166,31 @@ pub(super) const SWITCH_NEEDS_BOTH_HALVES: &str =
   "a 101 states Connection: upgrade and an Upgrade protocol list";
 
 /// RFC 9110 §7.8: "A server MUST NOT switch to a protocol that was not indicated
-/// by the client in the corresponding request's Upgrade header field." A CONNECT
-/// indicates none.
+/// by the client in the corresponding request's Upgrade header field."
+///
+/// ONE constant for BOTH readers, because §7.8 states ONE rule — it is written
+/// over the indication, not over the mode that reads it, and a 101 accepted by
+/// one reader and refused by the other would be the recipient disagreement RFC
+/// 9112 §11.1 is about. The two are:
+///
+/// - A `Tunnel` handshake opened as a CONNECT, which indicates no protocol at
+///   all (`handle_response`).
+/// - A `General` exchange whose request sent no `Upgrade` field — every exchange
+///   on an unpermitted connection, and any exchange on a permitted one that did
+///   not take the offer up (`inbound::switch_or_fault`). Permission is not
+///   indication.
+///
+/// BOTH descriptions are claims about what this end SENT, and each is kept true
+/// by a send-side guard rather than by good fortune. Deleting either falsifies
+/// this doc from another file, and turns the constant into an accusation against
+/// a peer that broke nothing:
+///
+/// - The CONNECT arm rests on [`CONNECT_INDICATES_NO_PROTOCOL`]: without it a
+///   caller may put `Upgrade:` on a CONNECT, and the 101 that answers it is
+///   indicated exactly as §7.8 means the word.
+/// - The `General` arm rests on `open_request`'s offer gates, which key on the
+///   `Upgrade` field alone: keyed on both of §7.8's halves instead, an
+///   un-optioned field goes out un-recorded and its lawful 101 arrives here.
 pub(super) const SWITCH_WAS_NEVER_OFFERED: &str = "101 to a request that offered no protocol";
 
 /// RFC 9112 §3.2.3 scopes the authority-form to CONNECT and §3.2.4 the
@@ -162,6 +203,32 @@ pub(super) const SWITCH_TARGET_FORM: &str =
 /// nothing else this core writes in Tunnel mode has one either — every message
 /// here is its head.
 pub(super) const HANDSHAKE_HAS_NO_CONTENT: &str = "a tunnel handshake message carries no content";
+
+/// A CONNECT states RFC 9110 §9.3.6's takeover, and stating §7.8's as well would
+/// open a handshake whose own continuation forbids one of the two answers it
+/// invited.
+///
+/// The `Upgrade` field is what §7.8 makes an INDICATION — "A server MUST NOT
+/// switch to a protocol that was not indicated by the client in the
+/// corresponding request's Upgrade header field" — so a CONNECT carrying it
+/// invites a `101` that a conformant server may legally send. This mode has no
+/// answer that could carry one: [`ClientTunnelOutcome`] represents a CONNECT's
+/// success as §9.3.6's 2xx tunnel, and `handle_response`'s
+/// `(SWITCHING_PROTOCOLS, true)` arm condemns the 101 as
+/// [`SWITCH_WAS_NEVER_OFFERED`] — an accusation that would be FALSE against a
+/// server acting on the very field this end wrote.
+///
+/// So it is refused before encoding, for exactly the reason General's
+/// `UPGRADE_NEEDS_TUNNEL` refuses its own case: such a request "would have
+/// opened an exchange its own continuation forbids". Asked over the INDICATION
+/// alone ([`Declared::indicates_a_protocol`]), because the `upgrade` connection
+/// option beside it changes nothing about whether a server may act — and a
+/// predicate that wanted both halves would let the un-optioned field through,
+/// which is what the General side's own predicate exists to prevent.
+///
+/// [`Declared::indicates_a_protocol`]: super::outbound::Declared::indicates_a_protocol
+pub(super) const CONNECT_INDICATES_NO_PROTOCOL: &str =
+  "a CONNECT request indicates no protocol upgrade";
 
 /// RFC 9112 §6.1 and RFC 9110 §8.6 (a 1xx carries neither framing field) with
 /// RFC 9110 §9.3.6 ("A server MUST NOT send any Transfer-Encoding or
@@ -180,6 +247,51 @@ pub(super) const CONNECT_NEEDS_A_PORT: &str = "a CONNECT target states host and 
 /// enforced — see [`port_number`] for what makes one invalid.
 pub(super) const CONNECT_TARGET_NEEDS_A_PORT: &str =
   "CONNECT request-target has an empty or invalid port";
+
+/// The SEND half of the one-takeover-no-close invariant — see
+/// [`TunnelPhase::Switched`], which states it once for all its sites.
+///
+/// RFC 9112 §9.6 binds a sender of the option: a server that sends `close`
+/// "MUST initiate closure of the connection (see below) after it sends the
+/// response containing the close connection option". A message that offers or
+/// makes RFC 9110 §7.8's switch while stating `close` therefore promises to end
+/// the connection it is handing to another protocol, which is not a promise this
+/// core will put on the wire.
+///
+/// Caller-side, and that is why it is not
+/// [`SWITCH_AFTER_CLOSE`](super::inbound::SWITCH_AFTER_CLOSE): this refuses what
+/// the CALLER asked for rather than diagnosing what a peer did, and a driver
+/// reading a reason needs to know which of the two it has. ONE constant across
+/// the three send sites, because they are one rule — `open_request`'s offer
+/// branch, [`open_upgrade`](Connection::open_upgrade), and
+/// [`accept`](Connection::accept)'s 101 — and the message is true at each.
+pub(super) const TAKEOVER_STATES_NO_CLOSE: &str = "a protocol takeover states no Connection: close";
+
+/// The RECEIVE half of the same invariant, on a request rather than a response.
+///
+/// RFC 9112 §9.6's other MUST: a server that RECEIVES the option "MUST initiate
+/// closure of the connection (see below) after it sends the final response to
+/// the request that contained the close connection option". A server owes a
+/// close once it has answered, and a switch is the opposite promise — so an
+/// offer carrying `close` is not a handshake this connection could complete.
+///
+/// NOT [`NOT_A_HANDSHAKE`], whose message — "request is neither a protocol
+/// upgrade nor a CONNECT" — would be false here: this request IS a protocol
+/// upgrade, and the `close` beside it is why it is refused. NOT
+/// [`SWITCH_AFTER_CLOSE`](super::inbound::SWITCH_AFTER_CLOSE) either, whose
+/// message names a 101 that does not exist on this path. Same disposition as
+/// [`NOT_A_HANDSHAKE`] — [`H1Error::Framing`], which a driver answers 400 — for
+/// the reason that constant states: the message is well formed and what this
+/// connection cannot do is SERVE it.
+///
+/// THE TWIN OF THIS RULE IS GENERAL'S, and the two answer one wire request:
+/// General accumulates the close at `commit_head` and refuses the transition
+/// with `TransitionRefused::NOT_OPEN`. This path reads `has_upgrade` and
+/// `expect_continue` out of the same directives, and must read the `close`
+/// beside them — two recipients disagreeing about the same bytes is what RFC
+/// 9112 §11.1 is.
+pub(super) const HANDSHAKE_STATES_CLOSE: &str =
+  "a handshake request that also states Connection: close";
 
 /// RFC 9110 §7.8: "If a server receives both an Upgrade and an Expect header
 /// field with the `100-continue` expectation, the server MUST send a 100
@@ -409,6 +521,136 @@ pub(crate) enum TunnelPhase {
   /// request, a server owes the answer to a request it has classified.
   Handshaking(Handshake),
   /// TERMINAL: the switch happened and the stream belongs to the next protocol.
+  ///
+  /// # The one-takeover-no-close invariant
+  ///
+  /// **No path of this crate arms, makes, or accepts a protocol takeover — RFC
+  /// 9110 §7.8's switch or §9.3.6's tunnel — on a connection whose CLOSE WAS
+  /// STATED IN A MESSAGE, this end's or the peer's.** Stated here once because
+  /// it spans four files and two modes, and four copies of one rule are four
+  /// things that can drift apart.
+  ///
+  /// ONE UNQUALIFIED RULE, and §9.3.6's tunnel is not an exception to it —
+  /// though reading `close` on a CONNECT 2xx as "no HTTP reuse once the tunnel
+  /// ends" invites one. §9.6's text does not support that reading: it defines
+  /// the option directly and unconditionally as an obligation to "close the
+  /// connection after reading the response message containing" it, and does not
+  /// key on whether anything is still owed — which is the distinction such an
+  /// exemption would have to be built on. §9.3.6 has the same response
+  /// switching to tunnel mode "immediately after the response header section".
+  /// The two clauses name one instant and demand opposite things, so such a
+  /// response is a self-contradiction rather than a working tunnel, and it is
+  /// refused exactly as a close-bearing 101 is.
+  ///
+  /// "Stated in a message", not "either end has said it is closing", and the
+  /// narrowing is deliberate rather than a weakening. A LOCAL
+  /// [`close`](Connection::close) is an end saying it is closing, and it does
+  /// NOT prevent a takeover: a 101 answering an offer that was already on the
+  /// wire still switches, because the peer is blameless, its response is valid,
+  /// and `close`'s own contract lets the exchange in flight finish. That corner
+  /// is deliberate and tested. What the invariant governs is the option stated
+  /// in a MESSAGE, which is what RFC 9112 §9.6 binds and what a takeover would
+  /// contradict on the wire.
+  ///
+  /// EVERY takeover site reads one predicate, `validate::has_close_option`: the
+  /// stated `close` option, or a `Connection` field this recipient could not
+  /// read. It does NOT fold in §9.3's HTTP/1.0 non-persistence default, and the
+  /// split is TAKEOVER-versus-MESSAGE rather than request-versus-response.
+  ///
+  /// The default answers "may another HTTP MESSAGE follow this one?", which is
+  /// the right question for an interim or an ordinary response and the wrong one
+  /// here: both takeovers end HTTP framing on the connection, so afterwards
+  /// there is no such message for it to govern. Asking `ends_persistence` at a
+  /// takeover refuses `HTTP/1.0 200 Connection Established` — a legal answer to
+  /// an HTTP/1.1 CONNECT, and the classic form real proxies send — and throws
+  /// away the tunnel bytes behind it; it refuses a 1.0 101 that has stated
+  /// nothing too, which the constants' own wording ("after the peer STATED
+  /// close") makes false.
+  ///
+  /// SPLITTING request-versus-response instead — the option on requests, the
+  /// version default on responses — puts the two sides of one rule on different
+  /// questions, which is the conflation this one predicate exists to stop. Two
+  /// predicates that agree on most inputs are how such a split survives: the
+  /// disagreement shows only at the input that separates them.
+  ///
+  /// RFC 9112 §9.6 binds both ends, and both halves are MUSTs. A server that
+  /// SENDS the option "MUST initiate closure of the connection (see below) after
+  /// it sends the response containing the close connection option"; a server that
+  /// RECEIVES one "MUST initiate closure of the connection (see below) after it
+  /// sends the final response to the request that contained the close connection
+  /// option". A switch is the opposite promise — the connection continues, under
+  /// another protocol — so a message stating both says two contradictory things
+  /// about one connection.
+  ///
+  /// ## The rule that classifies a site, so a new one lands by construction
+  ///
+  /// The rule has TWO AXES, and the second is there because the first is blind
+  /// to a whole shape of site. A site belongs to this invariant when it either:
+  ///
+  /// - **SPATIALLY** does one of three things — writes this variant, constructs
+  ///   a [`Handshake`] for a §7.8 upgrade, or encodes a §7.8 switching head; or
+  /// - **TEMPORALLY** changes the connection's fate while a switch is ARMED —
+  ///   between the offer going out and the answer arriving, when the crate does
+  ///   not yet know whether the transport will be HTTP's to close.
+  ///
+  /// Every such site is one of:
+  ///
+  /// - **GUARDED** — it asks the close question itself.
+  /// - **GUARDED BY A CALLER** — an earlier gate makes the state unreachable, and
+  ///   the site names which gate.
+  /// - **DELIBERATELY EXCLUDED** — with its reason recorded at the site.
+  ///
+  /// A site that is none of the three is a defect, not a judgement call.
+  ///
+  /// **Why the second axis exists.** The spatial rule enumerates sites by what
+  /// they DO to a switch, and [`close`](Connection::close) does none of those
+  /// three things — it only moves the lifecycle, on a connection whose
+  /// transport has no settled owner yet. A definition whose only axis is
+  /// spatial cannot see such a site at all.
+  ///
+  /// `close` does not block the switch, and must not: its own contract is that
+  /// "no further exchange BEGINS" while
+  /// "the exchange in flight, if any, still finishes", and a switch is how THIS
+  /// exchange finishes — so blocking it would both contradict that sentence and
+  /// answer a blameless peer's valid 101 with a fault.
+  ///
+  /// ## Membership today
+  ///
+  /// | corner | site | verdict |
+  /// |---|---|---|
+  /// | originate | `open_request`'s offer branch (`Client, General`) | GUARDED — [`TAKEOVER_STATES_NO_CLOSE`] |
+  /// | originate | [`open_upgrade`](Connection::open_upgrade) (`Client, Tunnel`) | GUARDED — [`TAKEOVER_STATES_NO_CLOSE`] |
+  /// | receive | `classify`'s upgrade arm (`Server, Tunnel`) | GUARDED — [`HANDSHAKE_STATES_CLOSE`] |
+  /// | receive | `into_tunnel`/`take_over` (`_, General`) | GUARDED BY A CALLER — `commit_head`'s `peer_close_effects` takes the lifecycle out of `Open`, and `take_over` refuses `TransitionRefused::NOT_OPEN` |
+  /// | emit | [`accept`](Connection::accept)'s 101 branch (`Server, Tunnel`) | GUARDED — [`TAKEOVER_STATES_NO_CLOSE`] |
+  /// | emit | `send_interim`/`send_response` (`Server, General`) | STRUCTURALLY EXCLUDED — a 101 is refused outright (`SWITCHING_NEEDS_TUNNEL`), so this mode cannot emit one |
+  /// | accept | `inbound::switch_or_fault` (`Client, General`) | GUARDED — [`SWITCH_AFTER_CLOSE`](super::inbound::SWITCH_AFTER_CLOSE) |
+  /// | accept | [`handle_response`](Connection::handle_response)'s 101 arm (`Client, Tunnel`) | GUARDED — [`SWITCH_AFTER_CLOSE`](super::inbound::SWITCH_AFTER_CLOSE) |
+  ///
+  /// ### The temporal axis, and why it needs no mechanism
+  ///
+  /// A site also belongs when it changes the connection's fate while a handover
+  /// is still possible. That axis carries NO machinery of its own — no notice
+  /// deferred, held, resolved and suppressed across producers, paths and modes,
+  /// which is the shape it would otherwise take.
+  ///
+  /// What the driver should do with the transport is a LEVEL,
+  /// derived on the ask by [`Connection::transport`](super::Connection::transport)
+  /// from state this connection already holds, with
+  /// [`Transport::HandedOver`](super::Transport::HandedOver) absorbing and
+  /// checked ahead of every other arm. So a switch site has nothing to cancel:
+  /// writing this variant IS the cancellation, and every channel that answers
+  /// about the transport answers from the same projection. A mutation on a
+  /// parked connection that a guard fails to refuse cannot change what a driver
+  /// reads — so the failure mode this axis names is prevented structurally
+  /// rather than policed.
+  ///
+  /// Four further sites sit ON a handshake without switching, and keep this rule
+  /// already: both `send_interim`s refuse an interim stating `close`
+  /// ([`INTERIM_STATES_NO_CLOSE`]), Tunnel's interim arm answers a
+  /// persistence-ending 1xx with `Refused`, and General's `peer_close_effects`
+  /// drains at the interim that carried the option.
+  ///
   Switched,
   /// TERMINAL: the handshake ended without a switch.
   Refused,
@@ -446,6 +688,21 @@ pub(crate) struct Handshake {
   ///
   /// [`Exchange::head_digest`]: super::Exchange::head_digest
   head_digest: u64,
+}
+
+#[cfg(test)]
+impl Handshake {
+  /// A handshake value for tests that need the PHASE rather than its contents —
+  /// `transport`'s projection reads which variant the phase is and nothing
+  /// inside it.
+  pub(crate) const fn for_test() -> Self {
+    Self {
+      connect: false,
+      interim_owed: false,
+      version: Version::Http11,
+      head_digest: 0,
+    }
+  }
 }
 
 /// How a caller-supplied head stands to the request a tunnel connection is
@@ -598,9 +855,27 @@ impl<Ro> Connection<Ro, Tunnel> {
     if matches!(self.lifecycle, Lifecycle::Failed) {
       return Err(Error::InvalidState(FAILED));
     }
+    // INERT after a switch, not invalid — and the difference from General's
+    // `handle_eof`, which answers `SWITCHED`, is deliberate rather than an
+    // oversight. This mode's own contract for the case is already stated and
+    // tested: "a connection that has left HTTP has nothing to say about the
+    // ending", because the bytes were the other protocol's already. Refusing
+    // would be a different API decision, and it is not this invariant's to make.
+    //
+    // What the invariant DOES require is that nothing happens here: latching
+    // `read_closed` would rewrite a spent connection's state, and
+    // `Connection::transport` reads that flag — so a spent connection could be
+    // made to report on a transport it no longer owns. `HandedOver` is absorbing
+    // and would win anyway; the call returns before the write regardless, since
+    // rewriting a spent object is wrong even when nothing reads the difference.
+    if matches!(self.tunnel, TunnelPhase::Switched) {
+      return Ok(());
+    }
     // Through the same routine General's goes through, so the transport fact has
-    // ONE writer whatever mode the connection is in.
-    latch_read_closed(&mut self.read_closed, self.lifecycle, &mut self.event);
+    // ONE writer whatever mode the connection is in. What it means for the
+    // driver is not decided here: `Connection::transport` reads this flag beside
+    // the lifecycle and the phase, on the ask.
+    latch_read_closed(&mut self.read_closed);
     Ok(())
   }
 
@@ -688,6 +963,13 @@ impl Connection<Client, Tunnel> {
     if !declared.offers_a_protocol() {
       return Err(Error::InvalidState(OFFER_NEEDS_BOTH_HALVES));
     }
+    // The one-takeover-no-close invariant, originate corner — see
+    // [`TunnelPhase::Switched`]. Offering a switch onto a connection this end has
+    // just said it is ending asks for a 101 this connection's OWN receive path
+    // refuses.
+    if declared.close {
+      return Err(Error::InvalidState(TAKEOVER_STATES_NO_CLOSE));
+    }
 
     let written = encode_request_head(GET, target, headers, declared.digest, out)?;
     // Committed: the request is in the caller's buffer, so the handshake it
@@ -710,6 +992,15 @@ impl Connection<Client, Tunnel> {
   /// Bodiless, and here that is the specification's own words: "A CONNECT
   /// request message does not have content."
   ///
+  /// `headers` MUST NOT carry an `Upgrade` field. A CONNECT already states RFC
+  /// 9110 §9.3.6's takeover, and §7.8's field would invite a second one this
+  /// handshake has no answer for: [`ClientTunnelOutcome`] represents a CONNECT's
+  /// success as the 2xx tunnel, and a `101` — which a server may legally send
+  /// once a protocol has been "indicated by the client in the corresponding
+  /// request's Upgrade header field" — is condemned by
+  /// [`handle_response`](Self::handle_response) on arrival. Refused before
+  /// encoding rather than left to become that contradiction.
+  ///
   /// `headers` MUST satisfy RFC 9112 §3.2's three `Host` MUSTs — one field line,
   /// valid authority or empty — exactly as the other two outbound request paths
   /// do. §3.2.3 gives CONNECT an authority-form target, which is not an
@@ -730,6 +1021,23 @@ impl Connection<Client, Tunnel> {
     requires_host(&declared)?;
     no_content(&declared)?;
     continue_needs_content(&declared, false)?;
+    // §7.8's question, asked where `open_upgrade` asks its own — after the three
+    // field rules both openers share — so the two sibling paths decide the same
+    // thing at the same point. `open_upgrade` REQUIRES the offer here; this one
+    // refuses it, because a CONNECT already states §9.3.6's takeover and this
+    // mode has no answer that could carry §7.8's.
+    if declared.indicates_a_protocol() {
+      return Err(Error::InvalidState(CONNECT_INDICATES_NO_PROTOCOL));
+    }
+    // The one-takeover-no-close invariant, originate corner — see
+    // [`TunnelPhase::Switched`]. RFC 9112 §9.6 makes this end close after the
+    // message carrying the option, and RFC 9110 §9.3.6 makes a 2xx to this
+    // request switch the connection to tunnel mode "immediately after the
+    // response header section". Asking for a tunnel while stating that this
+    // connection is ending asks for both at the same instant.
+    if declared.close {
+      return Err(Error::InvalidState(TAKEOVER_STATES_NO_CLOSE));
+    }
 
     let written = encode_request_head(
       CONNECT,
@@ -760,7 +1068,10 @@ impl Connection<Client, Tunnel> {
   ///   offer, and [`Switched`](ClientTunnelOutcome::Switched) hands it the head.
   /// - `101` to a CONNECT: §7.8 makes a server switching to a protocol "not
   ///   indicated by the client" a MUST NOT, and a CONNECT indicates none — a
-  ///   violation.
+  ///   violation. That a CONNECT indicates none is enforced rather than assumed:
+  ///   [`open_connect`](Self::open_connect) refuses a section carrying an
+  ///   `Upgrade` field, so this verdict cannot be reached against a server that
+  ///   acted on a field this end wrote.
   /// - Any 2xx to a CONNECT: §9.3.6's tunnel.
   /// - Any other 1xx: §15.2's interim response. The head is consumed and the
   ///   handshake stays open.
@@ -827,9 +1138,34 @@ impl Connection<Client, Tunnel> {
 
     match (status.code, handshake.connect) {
       (SWITCHING_PROTOCOLS, false) => {
+        // RFC 9112 §9.6, asked of the head IN HAND: a peer that ends the
+        // connection's persistence in the very response that would switch has
+        // committed to closing, so it has nothing to continue INTO. The interim
+        // arm below asks the same question, and BOTH must: the mode that OWNS
+        // the handshake switching on a head General's own gate refuses is the
+        // recipient disagreement §11.1 is about.
+        //
+        // Same predicate, same constant, same disposition as
+        // `inbound::switch_or_fault` step 3: one rule about one fact. The accept
+        // corner of the one-takeover-no-close invariant — see
+        // [`TunnelPhase::Switched`] for every corner and its verdict.
+        //
+        // `has_close_option`, NOT `ends_persistence` — the names are the
+        // distinction: §9.3's HTTP/1.0 default asks whether another HTTP MESSAGE
+        // may follow, and a 101 ends HTTP framing, so there is none for it to
+        // govern. A 1.0 101 that carries no `close` has STATED nothing, which is
+        // what this constant's message says.
+        if has_close_option(&view) {
+          return Err(self.fail(H1Error::Framing(SWITCH_AFTER_CLOSE)));
+        }
         if !names_a_protocol(&view) {
           return Err(self.fail(H1Error::Framing(SWITCH_NEEDS_BOTH_HALVES)));
         }
+        // The transport is the driver's from here, and writing the phase IS
+        // saying so: `Connection::transport` reads `Switched` as
+        // `Transport::HandedOver`, absorbing and ahead of every other arm. So
+        // there is no cancel routine to call and no cancel site to keep in
+        // step.
         self.tunnel = TunnelPhase::Switched;
         Ok(ClientTunnelOutcome::Switched {
           head: view,
@@ -869,6 +1205,28 @@ impl Connection<Client, Tunnel> {
         })
       }
       (200..=299, true) => {
+        // The one-takeover-no-close invariant, accept corner, asked of the head
+        // in hand exactly as the 101 arm asks it — see [`TunnelPhase::Switched`].
+        //
+        // RFC 9112 §9.6 obliges a client that receives the option to "close the
+        // connection after reading the response message containing" it; RFC 9110
+        // §9.3.6 makes this response switch the connection to tunnel mode
+        // "immediately after the response header section". The two clauses name
+        // the same instant and demand opposite things, so a 2xx carrying `close`
+        // is not a tunnel this end can enter — it is a self-contradiction, and
+        // the same fault the 101 arm reports, under the same constant.
+        //
+        // THE STATED OPTION ONLY. Reading §9.3's HTTP/1.0 default here refuses
+        // `HTTP/1.0 200 Connection Established` — a legal answer to an HTTP/1.1
+        // CONNECT, and the classic form real proxies send — and throws away the
+        // tunnel bytes that follow it in the same read. §9.3.6 establishes the
+        // tunnel immediately after the header section whatever version the
+        // response states, and the request side already treats HTTP persistence
+        // as moot after a CONNECT; applying the opposite rule here would be an
+        // asymmetry between the two.
+        if has_close_option(&view) {
+          return Err(self.fail(H1Error::Framing(SWITCH_AFTER_CLOSE)));
+        }
         self.tunnel = TunnelPhase::Switched;
         Ok(ClientTunnelOutcome::Tunneled {
           head: view,
@@ -1178,6 +1536,16 @@ impl Connection<Server, Tunnel> {
       return Err(Error::InvalidState(SWITCH_HAS_NO_FRAMING));
     }
 
+    // The one-takeover-no-close invariant, emit corner, on BOTH branches — see
+    // [`TunnelPhase::Switched`]. §9.6 makes a server that sends the option close
+    // after the response carrying it, so a takeover response stating `close`
+    // promises to end the connection it is handing over. That is as true of
+    // §9.3.6's 2xx as of §7.8's 101: "immediately after the response header
+    // section" and "after reading the response message containing the close
+    // connection option" name the same instant and demand opposite things.
+    if declared.close {
+      return Err(Error::InvalidState(TAKEOVER_STATES_NO_CLOSE));
+    }
     let written = if handshake.connect {
       encode_status_head(
         CONNECTION_ESTABLISHED,
@@ -1592,6 +1960,22 @@ fn take_over<Ro>(
   from: &Connection<Ro, General>,
   tunnel: TunnelPhase,
 ) -> Result<Connection<Ro, Tunnel>, TransitionRefused> {
+  // RFC 9110 §7.8's switch has already happened, so there is no HTTP connection
+  // here to take over — the transport is the next protocol's, and a tunnel minted
+  // over it would let `open_upgrade` write HTTP/1.1 bytes into a stream somebody
+  // else is reading.
+  //
+  // UNREACHABLE, and named so rather than merely asserted. The client edge is the
+  // only one that can present a switched connection — the phase's only writer is
+  // the client's response path — and `nothing_outstanding` runs BEFORE this call
+  // and refuses it with `EXCHANGE_IN_FLIGHT`, because the switch retains the
+  // exchange: §7.8 leaves the server with "an outstanding request to satisfy
+  // after the protocol has been changed". That is an invariant of ANOTHER
+  // function and of the arm that writes the phase; gated here all the same, so
+  // that a reorder of those gates cannot expose the path.
+  if matches!(from.tunnel, TunnelPhase::Switched) {
+    return Err(TransitionRefused::SWITCHED);
+  }
   // RFC 9112 §9.6: `close` promises to end the connection BEHIND this exchange,
   // and a tunnel is the opposite promise. `Failed` and `Draining` land here too,
   // and for the same reason a live handshake needs an open connection.
@@ -1624,7 +2008,7 @@ fn take_over<Ro>(
   // or `aborted` also moves the lifecycle off `Open` or latches `read_closed`,
   // so the gate above it always fires first. Gated all the same, for the reason
   // the two above are — a coincidence between today's writers is not a rule.
-  if from.event.is_some() || from.aborted.is_some() {
+  if from.aborted.is_some() {
     return Err(TransitionRefused::EVENT_UNDRAINED);
   }
   // Field by field rather than from `new()` with the differences applied: a
@@ -1645,18 +2029,20 @@ fn take_over<Ro>(
     peer_close: from.peer_close,
     tail_unresolved: false,
     aborted: None,
-    event: None,
     tunnel,
     pending_cr: false,
     idle_crlfs: 0,
     // CARRIED, and the decision is recorded here because this build is what
-    // forces it: the ceilings are properties of the CONNECTION, not of the
-    // message framing that stops applying at the switch. Nothing reads them in
-    // Tunnel mode — RFC 9110 §9.3.6 gives CONNECT no content and this core
-    // refuses content on a handshake — so they are inert here, and what bounds
-    // the protocol on the far side of the switch is that protocol's own limits.
+    // forces it: the ceilings and the opportunistic-upgrade permission are
+    // properties of the CONNECTION, not of the message framing that stops
+    // applying at the switch. Nothing reads them in Tunnel mode — RFC 9110
+    // §9.3.6 gives CONNECT no content and this core refuses content on a
+    // handshake, and a tunnel has no further ORDINARY exchange left to offer an
+    // upgrade on — so they are inert here, and what bounds the protocol on the
+    // far side of the switch is that protocol's own limits.
     max_body: from.max_body,
     max_chunk_framing: from.max_chunk_framing,
+    opportunistic_upgrade: from.opportunistic_upgrade,
     shape: PhantomData,
   })
 }
@@ -1698,6 +2084,24 @@ fn classify(head: &[u8]) -> Result<(HeadView<'_>, RequestLine<'_>, Handshake), H
         CONNECT_TARGET_NEEDS_A_PORT,
       ));
     }
+    // The one-takeover-no-close invariant, receive corner — see
+    // [`TunnelPhase::Switched`]. §9.6's other MUST binds a server that RECEIVES
+    // the option to close after the final response to the request carrying it,
+    // and §9.3.6 makes the 2xx that answers a CONNECT the start of a tunnel
+    // rather than the end of anything. A server cannot do both.
+    //
+    // THE STATED OPTION, not `ends_persistence`, and the request side is where
+    // that distinction bites. §9.3 makes an HTTP/1.0 message non-persistent
+    // without `keep-alive`, but a 1.0 peer that sent a CONNECT has SAID nothing
+    // about closing — and §9.3.6 puts no version on CONNECT, which this crate
+    // already relies on. Reading the version default here would refuse every
+    // 1.0 CONNECT, which is a rule no RFC states. The RESPONSE side does ask
+    // `ends_persistence`, and rightly: there the question is whether the
+    // connection continues at all, and a non-persistent message ends it however
+    // it was spelled.
+    if has_close_option(&view) {
+      return Err(H1Error::Framing(HANDSHAKE_STATES_CLOSE));
+    }
     return Ok((
       view,
       request,
@@ -1721,6 +2125,16 @@ fn classify(head: &[u8]) -> Result<(HeadView<'_>, RequestLine<'_>, Handshake), H
   // thing as not offering: §7.8 lets a server ignore an `Upgrade` field it does
   // not act on, so this is a classification rather than a violation.
   if directives.has_upgrade && names_a_protocol(&view) {
+    // The one-takeover-no-close invariant, receive corner — see
+    // [`TunnelPhase::Switched`]. RFC 9112 §9.6 makes a server that RECEIVES the
+    // option close after the final response to the request carrying it, and a
+    // switch is the opposite promise. Read from the SAME `directives` the two
+    // facts above come from: General's `commit_head` accumulates the same
+    // `close` and refuses the transition, so a path that read past it here would
+    // give one wire request two answers.
+    if has_close_option(&view) {
+      return Err(H1Error::Framing(HANDSHAKE_STATES_CLOSE));
+    }
     return Ok((
       view,
       request,

@@ -91,7 +91,7 @@ use std::time::Instant;
 
 use http1_proto::{
   BodyPlan, Client, ClientTunnelOutcome, Connection, Event, General, HeadView, Item, Items,
-  MAX_HEAD_BYTES, Server, StartLine, Target, Tunnel, Version,
+  MAX_HEAD_BYTES, Server, StartLine, Target, Transport, Tunnel, Version,
 };
 use proptest::prelude::*;
 
@@ -462,6 +462,16 @@ enum Endpoint {
 }
 
 impl Endpoint {
+  /// What the driver should do with the transport, whichever role this is.
+  fn transport(&self) -> Transport {
+    match self {
+      Self::Server(connection) => connection.transport(),
+      Self::Client(connection) => connection.transport(),
+    }
+  }
+}
+
+impl Endpoint {
   /// The request a client owes before anything it reads can be a response (RFC
   /// 9112 §9.2). A server opens nothing.
   fn open(&mut self) -> Option<Vec<u8>> {
@@ -633,7 +643,7 @@ fn record(log: &mut Vec<Mirror>, item: Item<'_>) {
 
 /// The reference driver over a General-mode connection: the loop the module doc
 /// describes, run over `stream` delivered in the pieces `cuts` names.
-fn drive(mut endpoint: Endpoint, stream: &[u8], cuts: &[usize]) -> Drive {
+fn drive(mut endpoint: Endpoint, stream: &[u8], cuts: &[usize]) -> (Drive, Transport) {
   let mut drive = Drive::default();
   if let Some(request) = endpoint.open() {
     drive.log.push(Mirror::Sent(request));
@@ -711,7 +721,7 @@ fn drive(mut endpoint: Endpoint, stream: &[u8], cuts: &[usize]) -> Drive {
     drive.consumed = drive.consumed.saturating_add(items.consumed());
   }
   drive.log.push(Mirror::Eof { completed });
-  drive
+  (drive, endpoint.transport())
 }
 
 /// The tunnel driver: the same accumulation contract over the one handshake a
@@ -720,7 +730,7 @@ fn drive(mut endpoint: Endpoint, stream: &[u8], cuts: &[usize]) -> Drive {
 /// The leftover contract replaces `Items::consumed` here — every outcome that
 /// consumed a head reports where the bytes behind it begin — and [`taken_of`]
 /// checks it rather than trusting it.
-fn drive_tunnel(connect: bool, stream: &[u8], cuts: &[usize]) -> Drive {
+fn drive_tunnel(connect: bool, stream: &[u8], cuts: &[usize]) -> (Drive, Transport) {
   let mut drive = Drive::default();
   let mut connection = Connection::<Client, Tunnel>::new();
   let mut out = [0u8; 256];
@@ -810,7 +820,8 @@ fn drive_tunnel(connect: bool, stream: &[u8], cuts: &[usize]) -> Drive {
       drive.consumed = drive.consumed.saturating_add(taken);
     }
   }
-  drive
+  let transport = connection.transport();
+  (drive, transport)
 }
 
 /// How much of `offer` an outcome took, out of the leftover it reported.
@@ -828,7 +839,7 @@ fn taken_of(offer: &[u8], leftover: &[u8]) -> usize {
 }
 
 /// Runs `stream` through the driver `kind` names, split at `cuts`.
-fn drive_stream(kind: Kind, stream: &[u8], cuts: &[usize]) -> Drive {
+fn drive_stream(kind: Kind, stream: &[u8], cuts: &[usize]) -> (Drive, Transport) {
   match kind {
     Kind::Server => drive(Endpoint::Server(Connection::new()), stream, cuts),
     Kind::Client => drive(Endpoint::Client(Connection::new()), stream, cuts),
@@ -837,9 +848,25 @@ fn drive_stream(kind: Kind, stream: &[u8], cuts: &[usize]) -> Drive {
   }
 }
 
-/// Runs one corpus entry through the driver its shape needs.
-fn drive_entry(entry: &Entry, cuts: &[usize]) -> Drive {
+/// Runs one corpus entry through the driver its shape needs, and reports the
+/// WHOLE observable end state: the item/send log, the byte count, and the
+/// transport level the driver would read when the stream is through.
+///
+/// The level belongs here rather than in [`Drive`] because of who compares
+/// what. `Drive` is also compared against hand-written expectations, and a level
+/// added there would have to be spelled out twelve times by a human — values
+/// invented and then tuned until they passed, which is the one thing a
+/// differential must never require. Every comparison of THIS pair is a stream
+/// against ITSELF under a different segmentation, so there is nothing to invent:
+/// the two sides move together or the test fails.
+fn end_state(entry: &Entry, cuts: &[usize]) -> (Drive, Transport) {
   drive_stream(entry.kind, entry.stream, cuts)
+}
+
+/// Just the log and the counts, for the tests that compare against a written-out
+/// expectation.
+fn drive_entry(entry: &Entry, cuts: &[usize]) -> Drive {
+  end_state(entry, cuts).0
 }
 
 /// Every cut point there is: the byte-at-a-time feed shape.
@@ -850,7 +877,7 @@ fn every_cut(len: usize) -> Vec<usize> {
 /// The deterministic half of the property: one shot, one byte at a time, and
 /// every single-cut split in between, all against the same baseline.
 fn assert_split_invariant(entry: &Entry) {
-  let whole = drive_entry(entry, &[]);
+  let whole = end_state(entry, &[]);
   // Non-vacuity: a driver that recorded nothing would satisfy every equality
   // below, because a recording fault is shape-independent and would degrade all
   // three feed shapes into the same empty answer. So the baseline has to contain
@@ -859,12 +886,12 @@ fn assert_split_invariant(entry: &Entry) {
   // refusal is terminal and reports no leftover, so the one entry that ends in
   // one legitimately consumes nothing.
   assert!(
-    whole.log.iter().any(Mirror::is_from_the_peer),
+    whole.0.log.iter().any(Mirror::is_from_the_peer),
     "{}: the drive parsed nothing out of the stream",
     entry.name
   );
 
-  let per_byte = drive_entry(entry, &every_cut(entry.stream.len()));
+  let per_byte = end_state(entry, &every_cut(entry.stream.len()));
   assert_eq!(
     per_byte, whole,
     "{}: byte-at-a-time diverged from one shot",
@@ -873,7 +900,7 @@ fn assert_split_invariant(entry: &Entry) {
 
   for cut in 1..entry.stream.len() {
     assert_eq!(
-      drive_entry(entry, &[cut]),
+      end_state(entry, &[cut]),
       whole,
       "{}: a split at byte {cut} diverged from one shot",
       entry.name
@@ -1253,7 +1280,7 @@ fn the_mirror_records_what_the_http_10_request_states() {
         Mirror::Sent(RESPONSE.to_vec()),
         Mirror::Eof { completed: None },
       ],
-      events: vec![Event::CloseSignaled],
+      events: vec![],
       consumed: first,
     }
   );
@@ -1291,7 +1318,7 @@ fn the_mirror_records_what_the_close_delimited_response_states() {
         // conclusion about the absence of further bytes like any other.
         Mirror::Eof { completed: Some(1) },
       ],
-      events: vec![Event::CloseSignaled],
+      events: vec![],
       consumed: subject.stream.len(),
     }
   );
@@ -1650,8 +1677,17 @@ fn the_harness_catches_a_lie() {
 
   // An event that was never queued.
   let mut noisy = truth.clone();
-  noisy.events.push(Event::CloseSignaled);
-  assert_ne!(noisy, truth, "a spurious event passed as equal");
+  let borrowed = truth
+    .log
+    .iter()
+    .find_map(|step| match step {
+      Mirror::Complete { exchange } => Some(*exchange),
+      _ => None,
+    })
+    .expect("the truth vector completes an exchange");
+  let _ = borrowed;
+  noisy.log.push(Mirror::Complete { exchange: 99 });
+  assert_ne!(noisy, truth, "a spurious step passed as equal");
 
   // A body whose octets differ but whose length does not — the coalescing must
   // compare the octet sequence, not merely count it.
@@ -1695,8 +1731,8 @@ proptest! {
   #[test]
   fn random_split_points_change_nothing((index, cuts) in corpus_and_cuts()) {
     let subject = &CORPUS[index];
-    let whole = drive_entry(subject, &[]);
-    let split = drive_entry(subject, &cuts);
+    let whole = end_state(subject, &[]);
+    let split = end_state(subject, &cuts);
     prop_assert_eq!(
       split,
       whole,
@@ -1835,7 +1871,7 @@ fn byte_at_a_time_head_parse_stays_linear() {
 
   // The reference driver reaches the same head, so what is being timed below is
   // a parse that actually happened rather than one refused for its size.
-  let observed = drive_stream(Kind::Server, &head, &every_cut(head.len()));
+  let observed = drive_stream(Kind::Server, &head, &every_cut(head.len())).0;
   assert_eq!(observed.consumed, head.len());
   assert!(matches!(
     observed.log.first(),

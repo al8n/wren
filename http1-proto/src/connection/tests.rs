@@ -10,8 +10,8 @@ use super::{
     BODILESS_STATUS_FRAMING, BODY_INCOMPLETE, BOTH_FRAMINGS, CHUNKED_DECLARATION,
     CHUNKED_UNANNOUNCED, CLOSE_DELIMITED_IS_UNFRAMED, CONTINUE_NEEDS_CONTENT,
     FIELD_STATES_ITS_GRAMMAR, INTERIM_NEEDS_HTTP_11, LENGTH_DISAGREES, LENGTH_IS_ONE_VALUE,
-    NO_BODY_IN_FLIGHT, NO_SUCCESS_TO_STATE, OVER_SEND, READ_SIDE_ENDED, REFUSED_BODY_NEEDS_CLOSE,
-    REFUSED_BODY_TAKES_NO_INTERIM, REFUSED_RESPONSE_ENDS_THE_REQUEST,
+    NO_BODY_IN_FLIGHT, NO_SUCCESS_TO_STATE, OFFER_HAS_NO_CONTENT, OVER_SEND, READ_SIDE_ENDED,
+    REFUSED_BODY_NEEDS_CLOSE, REFUSED_BODY_TAKES_NO_INTERIM, REFUSED_RESPONSE_ENDS_THE_REQUEST,
     REQUEST_IS_NEVER_CLOSE_DELIMITED, REQUEST_NEEDS_HOST, SENDER_LIST_EMPTY_ELEMENT,
     TE_NEEDS_HTTP_11, TE_WITHOUT_CHUNKED, UNCHUNKED_HAS_NO_TRAILERS, UNFRAMED_RESPONSE,
     UPGRADE_NEEDS_TUNNEL,
@@ -20,8 +20,17 @@ use super::{
 };
 use crate::{
   body::encode::FORBIDDEN_TRAILER,
+  // Fully qualified: the glob above is shadowed by this module's own `tunnel`
+  // submodule, which holds the Tunnel-mode fixtures.
+  connection::{
+    inbound::SWITCH_AFTER_CLOSE,
+    tunnel::{
+      OFFER_NEEDS_BOTH_HALVES, SWITCH_NEEDS_BOTH_HALVES, SWITCH_WAS_NEVER_OFFERED,
+      TAKEOVER_STATES_NO_CLOSE,
+    },
+  },
   error::{Error, H1Error, Refusal, SuggestedStatus},
-  event::{Item, NO_BODY_BEING_RECEIVED, StartLine},
+  event::{Item, NO_BODY_BEING_RECEIVED, SWITCHED, StartLine},
   head::{Target, scan::MAX_LEADING_EMPTY_LINES},
 };
 
@@ -538,9 +547,11 @@ fn items_drop_mid_iteration_is_safe() {
   assert_eq!(it2.consumed(), b"hello".len());
 }
 
-// A 101 in General mode is a protocol error (takeover is Tunnel-only, RFC 9110
-// §15.2.2 — the connection's framing changes after the head, and a General
-// connection has nothing to change it to).
+// A 101 answering a request that made no RFC 9110 §7.8 offer is a protocol
+// error: "A server MUST NOT switch to a protocol that was not indicated by the
+// client in the corresponding request's Upgrade header field", and this
+// connection — built under default `Limits`, so it could not have offered even
+// if it had wanted to — indicated nothing.
 #[test]
 fn client_101_in_general_is_protocol_error() {
   let mut c = Connection::<Client, General>::new();
@@ -651,9 +662,9 @@ fn a_response_carrying_both_framing_fields_latches_the_connection() {
   assert!(!c.is_awaiting_send());
 }
 
-// The PRECEDENCE half at the connection layer: RFC 9112 §6.3 items 1-2 answer
+// The PRECEDENCE half at the connection layer: RFC 9112 §6.3 item 1 answers
 // "regardless of the header fields present in the message", so item 3's refusal
-// may not run ahead of them. A 204 carrying BOTH fields is a bodiless message
+// may not run ahead of it. A 204 carrying BOTH fields is a bodiless message
 // this client accepts and completes — and the connection re-arms behind it,
 // which is the observable proof that the head ended where item 1 said it did.
 #[test]
@@ -684,14 +695,16 @@ fn a_bodiless_response_keeps_item_one_over_item_three() {
 
 // A General connection may not OPEN an exchange its own continuation forbids.
 //
-// `open_request` refused CONNECT but not a complete RFC 9110 §7.8 upgrade offer
-// — while the General receive path condemns every 101 (§15.2.2 makes it the end
-// of HTTP framing, which this mode has nothing to replace). So the offer went
-// out and the connection could only fail on the answer it had asked for.
+// An `open_request` that refused CONNECT but not a complete RFC 9110 §7.8
+// upgrade offer would let one through — while the General receive path condemns
+// a 101 answering an offer the exchange never recorded (§7.8's MUST NOT), which
+// is every 101 an UNPERMITTED connection can receive. So the offer goes out and
+// the connection can only fail on the answer it asked for.
 //
 // Refused before encoding, with a constant that points at the mode that CAN
-// complete it. Notably NOT fixed by teaching General to accept a 101: the
-// type-state split is the design.
+// complete it. What lifts the refusal is the operator's permission, not the
+// mode: `Connection<_, Tunnel>` is still where a handshake is built from
+// scratch.
 #[test]
 fn a_general_connection_opens_no_upgrade_offer() {
   let offer: &[(&str, &[u8])] = &[
@@ -712,19 +725,27 @@ fn a_general_connection_opens_no_upgrade_offer() {
       .is_ok()
   );
 
-  // HALF an offer is not one — §7.8 requires both, and General mode carries such
-  // fields without acting on them exactly as the receive path does.
-  for half in [
-    &[("Host", b"h".as_slice()), ("Upgrade", b"websocket")] as &[(&str, &[u8])],
-    &[("Host", b"h"), ("Connection", b"Upgrade")],
-  ] {
-    let mut c = Connection::<Client, General>::new();
-    assert!(
-      c.open_request("GET", &ORIGIN, half, BodyPlan::None, &mut out)
-        .is_ok(),
-      "{half:?}: half an offer is not a takeover"
-    );
-  }
+  // The two halves are NOT symmetrical, because §7.8 is not symmetrical about
+  // them. The `Upgrade` FIELD is the indication a server may act on — "A server
+  // MUST NOT switch to a protocol that was not indicated by the client in the
+  // corresponding request's Upgrade header field" — so a request carrying it
+  // reaches for the takeover whatever else it states, and the ceiling refuses
+  // it here exactly as it refuses the complete offer above. A connection option
+  // ALONE indicates nothing: §7.6.1's option names no protocol, so there is no
+  // 101 a server could legally answer it with, and the request is ordinary.
+  let field_only: &[(&str, &[u8])] = &[("Host", b"h"), ("Upgrade", b"websocket")];
+  let option_only: &[(&str, &[u8])] = &[("Host", b"h"), ("Connection", b"Upgrade")];
+  let mut c = Connection::<Client, General>::new();
+  assert_eq!(
+    c.open_request("GET", &ORIGIN, field_only, BodyPlan::None, &mut out),
+    Err(Error::InvalidState(UPGRADE_NEEDS_TUNNEL)),
+    "the field alone is the indication, and the ceiling governs it"
+  );
+  assert!(
+    c.open_request("GET", &ORIGIN, option_only, BodyPlan::None, &mut out)
+      .is_ok(),
+    "the option alone names no protocol, so it is not an offer"
+  );
 
   // …and the SAME headers open the handshake in the mode that can complete it.
   let mut t = Connection::<Client, Tunnel>::new();
@@ -735,6 +756,1008 @@ fn a_general_connection_opens_no_upgrade_offer() {
     &out[..n],
     b"GET / HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
   );
+}
+
+/// A fresh client General connection under default `Limits` — refuses every
+/// §7.8 offer, the ceiling [`Connection::new`] always builds.
+fn client_general() -> Connection<Client, General> {
+  Connection::<Client, General>::new()
+}
+
+/// A client General connection whose `Limits` permit a §7.8 offer.
+fn client_general_allowing_upgrade() -> Connection<Client, General> {
+  Connection::<Client, General>::with_limits(
+    Connection::<Client, General>::default_limits().allow_opportunistic_upgrade(true),
+  )
+}
+
+// The permission Task 1 added is a ceiling, not a default: a connection built
+// without it refuses an offer exactly as `a_general_connection_opens_no_upgrade_offer`
+// already pins, through the helper the permitting tests below share.
+#[test]
+fn a_refusing_connection_still_rejects_an_offer() {
+  let mut c = client_general(); // default Limits
+  let offer: &[(&str, &[u8])] = &[
+    ("Host", b"x"),
+    ("Connection", b"Upgrade"),
+    ("Upgrade", b"websocket"),
+  ];
+  let mut out = [0u8; 256];
+  let err = c.open_request("GET", &ORIGIN, offer, BodyPlan::None, &mut out);
+  // The REASON, not merely the refusal: `open_request` has a dozen other
+  // `InvalidState` answers for a request carrying these fields, and a variant
+  // match cannot tell the ceiling from any of them.
+  assert!(matches!(err, Err(Error::InvalidState(why)) if why == UPGRADE_NEEDS_TUNNEL));
+}
+
+#[test]
+fn a_permitting_connection_records_the_offer() {
+  let mut c = client_general_allowing_upgrade();
+  let offer: &[(&str, &[u8])] = &[
+    ("Host", b"x"),
+    ("Connection", b"Upgrade"),
+    ("Upgrade", b"websocket"),
+  ];
+  let mut out = [0u8; 256];
+  c.open_request("GET", &ORIGIN, offer, BodyPlan::None, &mut out)
+    .expect("the offer is permitted");
+  // The fact the response path will read.
+  assert!(c.exchange_upgrade_offered_for_test());
+}
+
+// Permission is not indication: a permitting connection whose request carries
+// no `Upgrade` fields at all must record no offer, or the response path could
+// accept a 101 RFC 9110 §7.8 forbids.
+#[test]
+fn a_permitting_connection_records_no_offer_when_none_was_made() {
+  let mut c = client_general_allowing_upgrade();
+  let mut out = [0u8; 256];
+  c.open_request("GET", &ORIGIN, HOST, BodyPlan::None, &mut out)
+    .expect("ordinary");
+  assert!(
+    !c.exchange_upgrade_offered_for_test(),
+    "permission is not indication"
+  );
+}
+
+// This crate's DEVIATION, pinned as one. RFC 9110 §7.8 permits the message this
+// refuses — a 101 may answer a request whose body is still going out, the client
+// "cannot begin using an upgraded protocol on the connection until it has
+// completely sent the request message", and the answer is still owed after the
+// switch. What this core cannot do is keep writing across the park, so it
+// declines the shape at the send path instead.
+#[test]
+fn an_offering_request_must_be_bodiless() {
+  let mut c = client_general_allowing_upgrade();
+  // `Transfer-Encoding: chunked` alongside the offer, so the request is
+  // otherwise a well-framed `BodyPlan::Chunked` head — `check_framing` has
+  // nothing else to refuse it for, and the bodiless rule is the only thing
+  // this can be failing on.
+  let offer: &[(&str, &[u8])] = &[
+    ("Host", b"x"),
+    ("Connection", b"Upgrade"),
+    ("Upgrade", b"websocket"),
+    ("Transfer-Encoding", b"chunked"),
+  ];
+  let mut out = [0u8; 256];
+  let err = c.open_request("POST", &ORIGIN, offer, BodyPlan::Chunked, &mut out);
+  // BY NAME. `check_framing` and the §7.8 gates share this return type, and this
+  // is the only site in the suite that names this constant — a reorder that made
+  // some other `InvalidState` fire here would otherwise stay green.
+  assert!(matches!(err, Err(Error::InvalidState(why)) if why == OFFER_HAS_NO_CONTENT));
+}
+
+// §7.8's OTHER half, enforced rather than assumed: "A sender of Upgrade MUST
+// also send an `Upgrade` connection option in the Connection header field
+// (Section 7.6.1) to inform intermediaries not to forward this field."
+//
+// This is the request a both-halves predicate lets through. The field is an
+// indication a server may legally switch on, so a core that wrote it un-optioned
+// would emit the very field intermediaries forward, and then condemn the
+// conforming 101 that came back. Refused here, before a byte, with the constant
+// Tunnel's `open_upgrade` refuses the same omission under.
+#[test]
+fn an_offer_states_the_connection_option_beside_the_field() {
+  let mut c = client_general_allowing_upgrade();
+  let half: &[(&str, &[u8])] = &[("Host", b"x"), ("Upgrade", b"websocket")];
+  let mut out = [0xAAu8; 192];
+  let err = c.open_request("GET", &ORIGIN, half, BodyPlan::None, &mut out);
+  assert!(matches!(err, Err(Error::InvalidState(why)) if why == OFFER_NEEDS_BOTH_HALVES));
+  assert_eq!(out, [0xAAu8; 192], "a refused open wrote into the buffer");
+  // Inert: no exchange opened, so the ordinary request behind it still goes out.
+  assert!(
+    c.open_request("GET", &ORIGIN, HOST, BodyPlan::None, &mut out)
+      .is_ok()
+  );
+}
+
+// The ORDER of the three, which is the order of what a driver most needs told.
+// Each request below fails its own gate and every gate after it.
+#[test]
+fn the_offer_gates_report_the_most_fundamental_failure() {
+  let mut out = [0u8; 256];
+
+  // Ceiling before halves: an unpermitted connection is not told how to spell an
+  // offer it may not make at all.
+  let half: &[(&str, &[u8])] = &[("Host", b"x"), ("Upgrade", b"websocket")];
+  let mut c = client_general();
+  let err = c.open_request("GET", &ORIGIN, half, BodyPlan::None, &mut out);
+  assert!(matches!(err, Err(Error::InvalidState(why)) if why == UPGRADE_NEEDS_TUNNEL));
+
+  // Halves before content: the offer is malformed as an offer, which is true of
+  // the head itself and not of the plan beside it.
+  let half_bodied: &[(&str, &[u8])] = &[
+    ("Host", b"x"),
+    ("Upgrade", b"websocket"),
+    ("Transfer-Encoding", b"chunked"),
+  ];
+  let mut c = client_general_allowing_upgrade();
+  let err = c.open_request("POST", &ORIGIN, half_bodied, BodyPlan::Chunked, &mut out);
+  assert!(matches!(err, Err(Error::InvalidState(why)) if why == OFFER_NEEDS_BOTH_HALVES));
+}
+
+// RFC 9112 §9.6 on this crate's fourth corner: the General client ORIGINATING
+// an opportunistic offer. A request that offers an upgrade while stating `close`
+// asks a server to switch onto a connection this end has just said it is
+// ending — and the 101 that answered it would be refused by this very
+// connection's own receive path. This core does not originate a handshake it
+// would itself refuse to complete.
+#[test]
+fn an_offering_request_states_no_close() {
+  let mut c = client_general_allowing_upgrade();
+  let closing: &[(&str, &[u8])] = &[
+    ("Host", b"x"),
+    ("Connection", b"Upgrade, close"),
+    ("Upgrade", b"websocket"),
+  ];
+  let mut out = [0xAAu8; 192];
+  let err = c.open_request("GET", &ORIGIN, closing, BodyPlan::None, &mut out);
+  assert!(matches!(err, Err(Error::InvalidState(why)) if why == TAKEOVER_STATES_NO_CLOSE));
+  assert_eq!(out, [0xAAu8; 192], "a refused open wrote into the buffer");
+
+  // NOT a false refusal, in either direction: the offer without `close` still
+  // goes out, and an ordinary request may still state `close`.
+  assert!(
+    c.open_request("GET", &ORIGIN, UPGRADE_OFFER, BodyPlan::None, &mut out)
+      .is_ok()
+  );
+  let mut c = client_general_allowing_upgrade();
+  let plain_close: &[(&str, &[u8])] = &[("Host", b"x"), ("Connection", b"close")];
+  assert!(
+    c.open_request("GET", &ORIGIN, plain_close, BodyPlan::None, &mut out)
+      .is_ok(),
+    "close on a request that offers nothing is ordinary"
+  );
+}
+
+#[test]
+fn the_permission_is_refused_before_the_body_is() {
+  // Both rules refuse this request. The operator's ceiling is the more
+  // fundamental one, so a driver that was never permitted to offer learns
+  // that rather than being told its body is wrong.
+  let mut c = client_general(); // refusing, and the offer also carries a body
+  let offer: &[(&str, &[u8])] = &[
+    ("Host", b"x"),
+    ("Connection", b"Upgrade"),
+    ("Upgrade", b"websocket"),
+    ("Transfer-Encoding", b"chunked"),
+  ];
+  let mut out = [0u8; 256];
+  let err = c.open_request("POST", &ORIGIN, offer, BodyPlan::Chunked, &mut out);
+  // Assert on the reported reason, not merely that it refused.
+  assert!(matches!(err, Err(Error::InvalidState(reason)) if reason == UPGRADE_NEEDS_TUNNEL));
+}
+
+// Task 3's baseline: adding the phase to the pump's borrow set must not change
+// the pump's answer for an ordinary connection, which is the only thing this can
+// observe until a General connection has a way to reach `Switched`.
+#[test]
+fn the_pump_sees_the_phase_and_a_general_connection_starts_idle() {
+  let mut c = client_general();
+  // Nothing sets Switched yet; the point is that the pump can ask.
+  let mut items = c.handle(b"");
+  assert!(
+    matches!(items.next(), Ok(None)),
+    "an empty offer is exhausted, not refused"
+  );
+}
+
+// The guard itself, exercised where the phase can be reached. A General
+// connection has no route to `Switched` until Task 4's arm exists, so the phase
+// is set directly — this module is `connection`'s own child, so it can — rather
+// than leaving the only behaviour this task adds with no test at all.
+#[test]
+fn the_pump_refuses_every_call_after_a_switch() {
+  let mut c = client_general();
+  c.tunnel = TunnelPhase::Switched;
+
+  // The bytes behind a switching head belong to the NEXT protocol. Without the
+  // guard this input is refused anyway — a pre-existing check answers
+  // `Protocol(Framing("response bytes with no outstanding request"))` — so what
+  // the guard changes here is not the refusal but its DISPOSITION: that one
+  // LATCHES the connection `Failed`, which tells a driver to tear the transport
+  // down at the very moment the transport belongs to the next protocol and has
+  // to be handed over intact.
+  let mut items = c.handle(b"HTTP/1.1 200 OK\r\n\r\n");
+  assert!(matches!(items.next(), Err(Error::InvalidState(reason)) if reason == SWITCHED));
+
+  // `Err`, never `Ok(None)`: a parked driver told "feed me more" beside
+  // `wants_read() == false` would wait for a conclusion that cannot come.
+  //
+  // And on EVERY call, not merely the first: the drain loop calls again over the
+  // same buffer, and nothing is latched or consumed that would change the answer.
+  assert!(matches!(items.next(), Err(Error::InvalidState(reason)) if reason == SWITCHED));
+
+  // Zero because `handle` reset the counter on entry and this offer consumed
+  // nothing — NOT a count that carried over. A switching head's count survives
+  // only WITHIN the one `Items` that yielded the switch.
+  assert_eq!(items.consumed(), 0);
+}
+
+/// A complete RFC 9110 §7.8 offer — both halves, and no content, which is what
+/// `open_request` accepts on a permitting connection.
+const UPGRADE_OFFER: &[(&str, &[u8])] = &[
+  ("Host", b"x"),
+  ("Connection", b"Upgrade"),
+  ("Upgrade", b"websocket"),
+];
+
+/// The 101 that answers it, with its own two halves: RFC 9110 §7.8 makes the
+/// `Upgrade` field a MUST for the server that switches, and §15.2.2 repeats it.
+const SWITCH_101: &[u8] =
+  b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n";
+
+/// A client General connection that has written [`UPGRADE_OFFER`] and is reading
+/// the response to it.
+fn offered_upgrade() -> Connection<Client, General> {
+  let mut c = client_general_allowing_upgrade();
+  let mut out = [0u8; 256];
+  c.open_request("GET", &ORIGIN, UPGRADE_OFFER, BodyPlan::None, &mut out)
+    .expect("a permitted offer goes out");
+  c
+}
+
+// The arm itself: a 101 that answers an offer this connection actually made is
+// the switch, and the bytes behind it are handed over untouched.
+#[test]
+fn a_101_answering_an_offer_yields_the_switch_and_its_leftover() {
+  let mut c = offered_upgrade();
+  let mut items = c.handle(
+    b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nOPAQUE",
+  );
+  match items.next() {
+    Ok(Some(Item::Switched { head, leftover })) => {
+      // §7.8's MUST: the head names the protocol switched to, and only the
+      // caller knows whether that is the one it offered.
+      assert_eq!(head.header("upgrade"), Some(b"websocket".as_slice()));
+      // Verbatim, and NOT consumed: these octets are the new protocol's.
+      assert_eq!(leftover, b"OPAQUE");
+    }
+    other => panic!("expected a switch, got {other:?}"),
+  }
+  // The head, and only the head — what the driver drops before handing the rest
+  // to the protocol that now owns it.
+  assert_eq!(items.consumed(), SWITCH_101.len());
+  // The pump is parked from here, on this call and on every one after it.
+  assert!(matches!(items.next(), Err(Error::InvalidState(reason)) if reason == SWITCHED));
+
+  // NOT `commit_head`'s path: a 101 is in `100..=199`, so falling through would
+  // have classed it interim, left the exchange open and kept this pump parsing
+  // the next protocol's bytes as HTTP.
+  assert_eq!(c.tunnel, TunnelPhase::Switched);
+  assert!(matches!(c.recv, RecvState::Idle), "no body was entered");
+  // RFC 9110 §7.8: "the server still has an outstanding request to satisfy
+  // after the protocol has been changed" — so the exchange is retained, and the
+  // switch neither completed it nor aborted it.
+  assert!(
+    c.exchange_upgrade_offered_for_test(),
+    "the exchange that made the offer is still there"
+  );
+  assert_eq!(c.aborted, None, "nothing was aborted");
+}
+
+// Permission is not indication. RFC 9110 §7.8: "A server MUST NOT switch to a
+// protocol that was not indicated by the client in the corresponding request's
+// Upgrade header field." A permitted connection whose request carried no
+// `Upgrade` field indicated nothing, so the 101 answering it is the peer
+// violating that MUST — whatever the operator allowed this connection to do.
+#[test]
+fn a_101_answering_a_request_that_offered_nothing_is_a_protocol_error() {
+  let mut c = client_general_allowing_upgrade();
+  let mut out = [0u8; 256];
+  c.open_request("GET", &ORIGIN, HOST, BodyPlan::None, &mut out)
+    .expect("an ordinary request");
+  // The head itself is impeccable — both halves of §7.8, and nothing for the
+  // head check to condemn. What is missing is the offer it claims to answer.
+  let mut items = c.handle(SWITCH_101);
+  assert!(
+    matches!(items.next(), Err(Error::Protocol(H1Error::Framing(why))) if why == SWITCH_WAS_NEVER_OFFERED)
+  );
+}
+
+// RFC 9110 §15.2.2 with §7.8: the 101 states BOTH halves or it is not a switch —
+// the `upgrade` connection option, and an `Upgrade` field that names a protocol.
+// Asked through `names_a_protocol`, the predicate the Tunnel client already
+// asks, so a head one mode switches on is one the other switches on.
+#[test]
+fn a_101_naming_only_one_half_is_a_protocol_error() {
+  for half in [
+    // No `connection: upgrade`.
+    b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n".as_slice(),
+    // No `Upgrade` field.
+    b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\n\r\n",
+    // Both fields, and the list still names no protocol: `protocol-name` is a
+    // token, and a space is not in one.
+    b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: web socket\r\n\r\n",
+  ] {
+    let mut c = offered_upgrade();
+    let mut items = c.handle(half);
+    assert!(
+      matches!(items.next(), Err(Error::Protocol(H1Error::Framing(why))) if why == SWITCH_NEEDS_BOTH_HALVES),
+      "{:?}",
+      core::str::from_utf8(half)
+    );
+  }
+}
+
+// Every condemnation of a response head applies to the 101 too, and it is asked
+// with `check_response_head` — the SAME call `Tunnel`'s `handle_response` makes
+// on every head it reads. A head condemned in one mode and switched on in the
+// other is two recipients disagreeing about the same bytes (RFC 9112 §11.1).
+//
+// The fault has to be one a 1xx can carry, and there is exactly one. RFC 9112
+// §6.3 item 1 makes every 1xx bodiless "regardless of the header fields
+// present in the message", so a framing field on a 101 is one a recipient
+// IGNORES — except under §6.1, which sits ahead of the whole list and condemns
+// an HTTP/1.0 message carrying `Transfer-Encoding` "even if a Content-Length is
+// present".
+#[test]
+fn a_101_the_head_check_condemns_is_refused_in_both_modes() {
+  const CONDEMNED: &[u8] = b"HTTP/1.0 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\ntransfer-encoding: chunked\r\n\r\n";
+
+  // General: the offer was made and both halves are named, so the head check is
+  // the only thing left for this to be failing on.
+  let mut c = offered_upgrade();
+  let mut items = c.handle(CONDEMNED);
+  let Err(Error::Protocol(general)) = items.next() else {
+    panic!("General must condemn the head, not switch on it")
+  };
+
+  // Tunnel, over the same bytes.
+  let mut t = Connection::<Client, Tunnel>::new();
+  let mut out = [0u8; 128];
+  t.open_upgrade(&ORIGIN, UPGRADE_OFFER, &mut out)
+    .expect("the mode takeover lives in");
+  let Err(Error::Protocol(tunnel)) = t.handle_response(CONDEMNED) else {
+    panic!("Tunnel must condemn it too")
+  };
+
+  // The SAME fault, not merely two refusals: one check, one verdict, whichever
+  // mode is holding the bytes.
+  assert_eq!(general, tunnel);
+}
+
+// The POSITIVE half of the same symmetry, and the one that is easy to break
+// back. RFC 9112 §6.1 states a SENDER's "A server MUST NOT send a
+// Transfer-Encoding header field in any response with a status code of 1xx
+// (Informational) or 204 (No Content)" — but a recipient rule it is not: §6.3
+// item 1 makes a 1xx bodiless "regardless of the header fields present in the
+// message", so the field is one this end IGNORES, and `check_response_head`
+// says so in both modes. A reader who found §6.1's MUST NOT and "restored" a
+// General-only refusal would recreate exactly the two-recipient split RFC 9112
+// §11.1 is about, and every other test here would stay green.
+//
+// So this pins the agreement rather than either verdict: the same bytes, both
+// modes, the same head and the same leftover handed over.
+#[test]
+fn a_101_carrying_transfer_encoding_switches_in_both_modes() {
+  const WITH_TE: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\ntransfer-encoding: chunked\r\n\r\nOPAQUE";
+
+  let mut c = offered_upgrade();
+  let mut items = c.handle(WITH_TE);
+  let Ok(Some(Item::Switched {
+    head: general_head,
+    leftover: general_leftover,
+  })) = items.next()
+  else {
+    panic!("General must switch on a 101 its offer asked for, TE or no TE")
+  };
+
+  let mut t = Connection::<Client, Tunnel>::new();
+  let mut out = [0u8; 128];
+  t.open_upgrade(&ORIGIN, UPGRADE_OFFER, &mut out)
+    .expect("the mode takeover lives in");
+  let Ok(ClientTunnelOutcome::Switched {
+    head: tunnel_head,
+    leftover: tunnel_leftover,
+  }) = t.handle_response(WITH_TE)
+  else {
+    panic!("Tunnel must switch on it too")
+  };
+
+  // Byte-for-byte the same head, and the same octets left for the protocol that
+  // now owns them.
+  assert_eq!(general_head.block(), tunnel_head.block());
+  assert_eq!(general_leftover, tunnel_leftover);
+  assert_eq!(general_leftover, b"OPAQUE");
+  // And both connections are spent, by the same phase.
+  assert_eq!(c.tunnel, TunnelPhase::Switched);
+  assert_eq!(t.tunnel, TunnelPhase::Switched);
+}
+
+// RFC 9112 §9.6: a peer that stated the `close` connection option closes "after
+// it sends the response containing" it, so it cannot legally continue into
+// another protocol — which is what Tunnel decides on its INTERIM arm, through
+// `ends_persistence`. Its 101 arm asks `has_close_option` instead.
+//
+// General reaches the same end EARLIER, and that is the stronger guarantee: the
+// interim carrying the option ends the exchange and drains the connection
+// (`peer_close_effects`), so the pump stops before the 101 behind it is parsed
+// at all. The arm's own `peer_close` guard sits behind this and cannot fire
+// while that holds — see the comment on it.
+#[test]
+fn a_101_after_the_peer_committed_to_closing_never_switches() {
+  const CLOSING_INTERIM: &[u8] = b"HTTP/1.1 100 Continue\r\nconnection: close\r\n\r\n";
+  let mut c = offered_upgrade();
+  let mut items = c.handle(b"HTTP/1.1 100 Continue\r\nconnection: close\r\n\r\nHTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n");
+  assert!(matches!(
+    items.next(),
+    Ok(Some(Item::Head { interim: true, .. }))
+  ));
+  // Not the switch, and not a second head: the connection is over.
+  assert!(matches!(items.next(), Ok(None)));
+  assert_eq!(
+    items.consumed(),
+    CLOSING_INTERIM.len(),
+    "the 101 behind it is left unread"
+  );
+  assert_ne!(c.tunnel, TunnelPhase::Switched);
+}
+
+// RFC 9112 §9.6 again, on the head IN HAND rather than on one that came before
+// it. `peer_close` accumulates what earlier COMMITTED heads stated, and a 101
+// never reaches `commit_head` — so a 101 stating its own `close` leaves the flag
+// false, and without this gate it switches, handing the transport to a
+// continuing protocol on a connection the peer has just said it is closing.
+//
+// The rule step 3 states — "a peer that stated `close` has committed to closing,
+// so it has nothing to continue INTO" — covers this head exactly as much as an
+// earlier one. It is ONE rule about ONE fact, so it keeps ONE constant.
+#[test]
+fn a_101_stating_its_own_close_never_switches() {
+  const CLOSING_SWITCH: &[u8] =
+    b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade, close\r\nupgrade: websocket\r\n\r\nOPAQUE";
+  let mut c = offered_upgrade();
+  let mut items = c.handle(CLOSING_SWITCH);
+  let Err(Error::Protocol(H1Error::Framing(why))) = items.next() else {
+    panic!("a 101 that states close must not switch")
+  };
+  assert_eq!(why, SWITCH_AFTER_CLOSE);
+  assert_ne!(c.tunnel, TunnelPhase::Switched);
+}
+
+// AN HTTP/1.0 101 WITHOUT `keep-alive` STILL SWITCHES, and widening the guard
+// from the `close` option to `ends_persistence` is what would break it.
+//
+// §9.3's 1.0 default answers "may another HTTP MESSAGE follow this one?" — and a
+// 101 ends HTTP framing on the connection, so there is no such message for the
+// default to govern. The constant is the tell: it reads "a protocol takeover
+// after the peer STATED close", and a 1.0 101 carrying no `close` stated
+// nothing. Refusing it would need a different reason, and this crate has none —
+// nothing else anywhere refuses a 1.0 101.
+//
+// The request side reasons the same way for CONNECT, and the two must not
+// diverge.
+#[test]
+fn an_http_10_101_without_keep_alive_still_switches() {
+  const TEN: &[u8] =
+    b"HTTP/1.0 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nOPAQUE";
+  let mut c = offered_upgrade();
+  let mut items = c.handle(TEN);
+  match items.next() {
+    Ok(Some(Item::Switched { leftover, .. })) => {
+      assert_eq!(
+        leftover, b"OPAQUE",
+        "the new protocol's bytes were discarded"
+      )
+    }
+    other => panic!("a 1.0 101 that states no close still switches, got {other:?}"),
+  }
+  assert_eq!(c.tunnel, TunnelPhase::Switched);
+  assert_eq!(c.transport(), Transport::HandedOver);
+}
+
+// The FALSE direction, at BOTH versions: an explicitly close-bearing 101 is
+// refused whatever version it states, because the option is what the rule is
+// about.
+#[test]
+fn a_101_stating_close_is_refused_at_either_version() {
+  for wire in [
+    b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade, close\r\nupgrade: websocket\r\n\r\n"
+      .as_slice(),
+    b"HTTP/1.0 101 Switching Protocols\r\nconnection: upgrade, close\r\nupgrade: websocket\r\n\r\n",
+  ] {
+    let mut c = offered_upgrade();
+    let mut items = c.handle(wire);
+    let Err(Error::Protocol(H1Error::Framing(why))) = items.next() else {
+      panic!("a 101 that states close must not switch")
+    };
+    assert_eq!(why, SWITCH_AFTER_CLOSE);
+    assert_ne!(c.tunnel, TunnelPhase::Switched);
+  }
+}
+
+// The gate the drain above keeps dead, exercised where the drain cannot reach
+// it — so the state is built by hand, exactly as
+// `the_transition_gate_refuses_a_switch_the_other_gates_would_pass` builds its
+// own. Its deadness is an invariant of ANOTHER function (`peer_close_effects`),
+// which is why the gate is shipped and why a test of the drain is not a test of
+// it: change that function and the drain test above still passes.
+//
+// Every other gate in `switch_or_fault` passes on these bytes —
+// `a_101_answering_an_offer_yields_the_switch_and_its_leftover` switches on the
+// same fixture and the same input — so `peer_close` is the only thing changed,
+// and deleting the gate makes this 101 SWITCH: a driver would be handed a
+// transport RFC 9112 §9.6 says the peer is already closing.
+#[test]
+fn the_close_gate_refuses_a_switch_the_other_gates_would_pass() {
+  let mut c = offered_upgrade();
+  c.peer_close = true;
+
+  let mut items = c.handle(SWITCH_101);
+  let Err(Error::Protocol(H1Error::Framing(why))) = items.next() else {
+    panic!("a peer that stated close gets no switch")
+  };
+  assert_eq!(why, SWITCH_AFTER_CLOSE);
+  assert_ne!(c.tunnel, TunnelPhase::Switched);
+}
+
+// `consumed` accumulates across the WHOLE offer, the way `commit_head`
+// accumulates it: an interim and the 101 can arrive in one buffer, and a driver
+// told only the 101's own length would re-offer the interim it has already seen
+// as the first bytes of the new protocol.
+#[test]
+fn an_interim_before_the_101_leaves_the_offer_intact() {
+  const INTERIM: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+  let mut c = offered_upgrade();
+  let mut items = c.handle(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nOPAQUE");
+  assert!(matches!(
+    items.next(),
+    Ok(Some(Item::Head { interim: true, .. }))
+  ));
+  match items.next() {
+    Ok(Some(Item::Switched { leftover, .. })) => assert_eq!(leftover, b"OPAQUE"),
+    other => panic!("expected a switch, got {other:?}"),
+  }
+  // BOTH heads, not the 101's own length: 25 octets of interim and 77 of switch.
+  assert_eq!(INTERIM.len(), 25);
+  assert_eq!(SWITCH_101.len(), 77);
+  assert_eq!(items.consumed(), INTERIM.len() + SWITCH_101.len());
+}
+
+// A watermark belongs to ONE head. `commit_head` is what normally clears it and
+// the arm bypasses it, so the arm clears it itself: `fingerprint` compares the
+// field exhaustively, and a connection left holding a stale one is one whose
+// state does not describe it.
+#[test]
+fn the_switch_clears_the_watermark_commit_head_would_have() {
+  let mut c = offered_upgrade();
+  // A head that has not terminated: nothing is consumed, and the scan records
+  // how far into it it looked.
+  let partial = SWITCH_101.get(..40).expect("a prefix of the head");
+  assert!(matches!(c.handle(partial).next(), Ok(None)));
+  assert_eq!(c.consumed, 0, "a partial head consumes nothing");
+  assert!(c.watermark > 0, "the partial scan is recorded");
+
+  // The whole head, re-offered from the same start.
+  let mut items = c.handle(SWITCH_101);
+  assert!(matches!(items.next(), Ok(Some(Item::Switched { .. }))));
+  assert_eq!(items.consumed(), SWITCH_101.len());
+  assert_eq!(c.watermark, 0, "the switch cleared it");
+}
+
+/// A client General connection that offered a §7.8 upgrade, took the 101 that
+/// answered it, and is PARKED: the driver holds the head and the leftover, and
+/// this value is everything that is left.
+///
+/// Driven through the real send and receive paths rather than by writing the
+/// phase, because §6's table describes the state a CALLER reaches — and because
+/// the retained exchange, which is what makes half of these rows non-obvious,
+/// only exists on that path.
+fn parked() -> Connection<Client, General> {
+  let mut c = offered_upgrade();
+  {
+    let mut items = c.handle(SWITCH_101);
+    assert!(
+      matches!(items.next(), Ok(Some(Item::Switched { .. }))),
+      "the fixture is the real arm, not a written phase"
+    );
+    assert_eq!(items.consumed(), SWITCH_101.len());
+  }
+  assert_eq!(c.tunnel, TunnelPhase::Switched);
+  c
+}
+
+// Every entry point whose signature can carry a refusal names the SWITCH, and
+// none of them can be satisfied by the state the switch left behind.
+//
+// The reason string is what this asserts, not merely `InvalidState`: three of
+// these four calls refused a parked connection already, for reasons that are
+// true of the message and silent about the connection — `ONE_REQUEST_AT_A_TIME`
+// from the retained exchange, and `NO_BODY_IN_FLIGHT` twice from a send side
+// that is not `Sending`. An assertion on the variant alone would pass with every
+// guard removed.
+#[test]
+fn a_parked_connection_refuses_every_call_that_can_refuse() {
+  let mut c = parked();
+  let mut out = [0u8; 64];
+
+  assert!(
+    matches!(c.open_request("GET", &ORIGIN, HOST, BodyPlan::None, &mut out), Err(Error::InvalidState(why)) if why == SWITCHED)
+  );
+  assert!(matches!(c.send_body(b"x", &mut out), Err(Error::InvalidState(why)) if why == SWITCHED));
+  assert!(
+    matches!(c.finish_body(NO_TRAILERS, &mut out), Err(Error::InvalidState(why)) if why == SWITCHED)
+  );
+  assert!(matches!(c.handle_eof(), Err(Error::InvalidState(why)) if why == SWITCHED));
+
+  // Nothing was encoded: a refusal that had written a head would have put
+  // HTTP/1.1 bytes in a buffer the driver hands to another protocol.
+  assert_eq!(out, [0u8; 64]);
+  // And nothing was RECORDED. `handle_eof` latches `read_closed` and abandons a
+  // client's send side before it returns; both would have run had the guard sat
+  // anywhere but first, and both rewrite a connection that is already spent —
+  // the second of them writing off a request RFC 9110 §7.8 keeps alive: "the
+  // server still has an outstanding request to satisfy after the protocol has
+  // been changed".
+  assert!(
+    !c.read_closed,
+    "the EOF was not this connection's to record"
+  );
+  assert!(matches!(c.send, SendState::Idle), "nothing was abandoned");
+  assert!(matches!(c.lifecycle, Lifecycle::Open));
+}
+
+// `handle` cannot refuse — its signature has no `Result` — so a fresh offer of
+// the next protocol's bytes is refused by the ITERATOR, on the first call and
+// every call after it.
+//
+// `the_pump_refuses_every_call_after_a_switch` pins the same guard with the
+// phase written by hand, and `a_101_answering_an_offer_yields_the_switch_and_its_leftover`
+// pins the second `next()` within the `Items` that yielded the switch. What is
+// new here is the ordinary driver shape: a REAL switch, then a LATER `handle`.
+// Without the guard these bytes reach the parser through the retained exchange
+// and are condemned as a malformed status line, which latches `Failed` — the
+// one disposition that tells a driver to tear down a transport it must hand over
+// intact.
+#[test]
+fn a_parked_connection_refuses_a_later_offer_of_bytes() {
+  let mut c = parked();
+  {
+    let mut items = c.handle(b"more opaque bytes");
+    assert!(matches!(items.next(), Err(Error::InvalidState(why)) if why == SWITCHED));
+    assert!(
+      matches!(items.next(), Err(Error::InvalidState(why)) if why == SWITCHED),
+      "and again: nothing latches, so the answer cannot change"
+    );
+    // `consumed` keeps answering, which is what the drop-safety contract needs:
+    // zero, because this offer produced nothing.
+    assert_eq!(items.consumed(), 0);
+  }
+  // Not latched, which is the whole difference from the refusal above: `Failed`
+  // is a connection to tear down and this one is a transport to hand over.
+  assert!(matches!(c.lifecycle, Lifecycle::Open));
+}
+
+// The readiness split goes quiet in both halves, and the read half is the row
+// that has to be answered from the PHASE.
+//
+// RFC 9110 §7.8 retains the exchange — "the server still has an outstanding
+// request to satisfy after the protocol has been changed" — and `wants_read`'s
+// idle-client arm reads `exchange.is_some()`. So the exchange-first answer here
+// is TRUE: a driver told to read would take the next protocol's bytes off the
+// socket and feed them to a connection that must never see them. Delete the
+// phase check in `wants_read` and this test fails on that line.
+#[test]
+fn a_parked_connection_reads_nothing_and_owes_nothing() {
+  let c = parked();
+  assert!(
+    c.exchange.is_some(),
+    "§7.8 leaves the request outstanding, so the trap is live"
+  );
+  assert!(matches!(c.recv, RecvState::Idle));
+
+  assert!(!c.wants_read(), "the bytes are the next protocol's");
+  // These two answer `false` and `None` from the phase, and would answer the
+  // same today without it: a §7.8 offer carries no content, so the request that
+  // switched left `send` and `recv` both `Idle`. Stated rather than left to be
+  // discovered — they pin §6's rows against a switch that one day retains more,
+  // and no mutation of today's guards kills them.
+  assert!(!c.is_awaiting_send());
+  assert_eq!(c.body_progress(), None);
+}
+
+// The second of the two `Items` accessors §6 keeps working — `consumed` is
+// pinned by `a_parked_connection_refuses_a_later_offer_of_bytes` above.
+//
+// `limit_body` needs no phase check of its own: it asks the RECEIVE state, which
+// the switch left `Idle`, so a parked connection is told there is no body to
+// narrow — the same answer it gives between messages, and the honest one.
+#[test]
+fn a_parked_connection_narrows_no_body() {
+  let mut c = parked();
+  let mut items = c.handle(b"");
+  assert!(
+    matches!(items.limit_body(1), Err(Error::InvalidState(why)) if why == NO_BODY_BEING_RECEIVED)
+  );
+}
+
+// THE WHOLE PRODUCT, enumerated. `transport()` is a pure function of three
+// fields, and the product is small enough to state completely — so it is stated
+// completely rather than sampled, which is what makes a wrong arm impossible to
+// hide behind a reachable-state argument.
+//
+// The state is written by hand because most of the forty combinations are not
+// reachable through the public API — `Lifecycle::Failed` beside
+// `TunnelPhase::Idle` with no read-EOF, for instance. That is the point: a pure
+// projection must answer for every input it can be given, and a future change
+// that makes an unreachable combination reachable then finds the answer already
+// decided rather than accidental.
+#[test]
+fn the_transport_level_is_a_total_function_of_three_fields() {
+  use Lifecycle::{Closing, Draining, Failed, Open};
+  use Transport::{Ending, HandedOver, Live};
+
+  let phases = [
+    ("Idle", TunnelPhase::Idle),
+    (
+      "Handshaking",
+      TunnelPhase::Handshaking(crate::connection::tunnel::Handshake::for_test()),
+    ),
+    ("Switched", TunnelPhase::Switched),
+    ("Refused", TunnelPhase::Refused),
+    ("RejectionOwed", TunnelPhase::RejectionOwed),
+  ];
+  let lifecycles = [
+    ("Open", Open),
+    ("Closing", Closing),
+    ("Draining", Draining),
+    ("Failed", Failed),
+  ];
+
+  for (phase_name, phase) in phases {
+    for (life_name, life) in lifecycles {
+      for read_closed in [false, true] {
+        let mut c = client_general();
+        c.tunnel = phase;
+        c.lifecycle = life;
+        c.read_closed = read_closed;
+
+        // The derivation, restated independently of the code under test: the
+        // handover absorbs, then the failure latch, then the end of keep-alive
+        // by either of its two spellings.
+        let expected = match (phase, life, read_closed) {
+          (TunnelPhase::Switched, _, _) => HandedOver,
+          (_, Failed, _) => Transport::Failed,
+          (TunnelPhase::Refused | TunnelPhase::RejectionOwed, _, _) => Ending,
+          (_, Closing | Draining, _) => Ending,
+          (_, Open, true) => Ending,
+          (_, Open, false) => Live,
+        };
+        assert_eq!(
+          c.transport(),
+          expected,
+          "{phase_name} x {life_name} x read_closed={read_closed}"
+        );
+      }
+    }
+  }
+}
+
+// THE LEVEL, on the connection this whole family is about. What a driver asks is
+// what the connection currently IS: there is no INSTANCE of "close the
+// transport" to be queued, held, deferred, resolved, suppressed, lost or
+// duplicated, so none of those is a thing to assert.
+//
+// `HandedOver` is absorbing and outranks everything, which is where "a switch
+// wins over a local close" lives — one arm's position in one `match`.
+#[test]
+fn a_parked_connection_reads_handed_over() {
+  let mut c = parked();
+  assert_eq!(c.transport(), Transport::HandedOver);
+  // Reading it twice is two reads, not two instructions.
+  assert_eq!(c.transport(), Transport::HandedOver);
+  // And a local close cannot change it back: the level makes the stray write
+  // harmless rather than something a guard has to forbid.
+  c.close();
+  assert_eq!(c.transport(), Transport::HandedOver);
+  assert_eq!(
+    c.poll_event(),
+    None,
+    "poll_event carries message facts only"
+  );
+}
+
+// THE ARMED WINDOW: a local close, then a valid 101. The switch still happens —
+// the peer is blameless and its response is valid — and the transport reads
+// `HandedOver` from the moment it does, with no notice to be minted early or
+// cancelled late.
+#[test]
+fn a_close_before_a_switch_cannot_instruct_a_handed_over_transport() {
+  let mut c = offered_upgrade();
+  c.close();
+  assert_eq!(
+    c.transport(),
+    Transport::Ending,
+    "keep-alive is over the moment it is asked for"
+  );
+
+  {
+    let mut items = c.handle(SWITCH_101);
+    assert!(matches!(items.next(), Ok(Some(Item::Switched { .. }))));
+  }
+  assert_eq!(
+    c.transport(),
+    Transport::HandedOver,
+    "the phase outranks the close, by its position in the match"
+  );
+}
+
+// The same window resolved the other way: the offer is declined, so the
+// transport was this crate's after all and the close the driver asked for is
+// what it reads. Nothing was deferred and nothing was resolved.
+#[test]
+fn a_close_before_a_declined_offer_reads_ending() {
+  let mut c = offered_upgrade();
+  c.close();
+  {
+    let mut items = c.handle(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    while items.next().expect("an ordinary answer").is_some() {}
+  }
+  assert_eq!(c.transport(), Transport::Ending);
+  // The contract `close()` exists for is unchanged.
+  let mut out = [0u8; 128];
+  assert!(
+    c.open_request("GET", &ORIGIN, HOST, BodyPlan::None, &mut out)
+      .is_err(),
+    "no further exchange begins"
+  );
+}
+
+// AN EOF WHILE ARMED, which is the shape a queued answer gets wrong — stale,
+// lost, or doubled. The read side ending is a fact about the transport;
+// `transport()` reads it beside the lifecycle, and no predicate decides "may the
+// driver have it yet".
+#[test]
+fn an_eof_while_armed_reads_ending_then_handed_over() {
+  let mut c = offered_upgrade();
+  assert!(matches!(c.handle_eof(), Ok(None)));
+  assert!(c.read_closed);
+  assert_eq!(
+    c.transport(),
+    Transport::Ending,
+    "the read half ended; keep-alive is over whatever answers"
+  );
+
+  // …and a 101 buffered behind that EOF still hands the transport over, which
+  // the driver reads directly rather than inferring from a notice it may or may
+  // not have already drained.
+  {
+    let mut items = c.handle(SWITCH_101);
+    assert!(matches!(items.next(), Ok(Some(Item::Switched { .. }))));
+  }
+  assert_eq!(c.transport(), Transport::HandedOver);
+}
+
+// A LATCHED FAILURE reads `Failed`, not `Ending`, and it is absorbing. A queued
+// notice has only two answers here, both wrong: deliver it beside the terminal
+// `Err` (duplicate) or drop it (loss). A level has neither — the `Err` says this
+// call failed, and the level says what the connection now is.
+#[test]
+fn a_latched_failure_reads_failed_and_absorbs() {
+  let mut c = offered_upgrade();
+  c.close();
+  {
+    let mut items = c.handle(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\ncontent-length: 2\r\n\r\n");
+    assert!(
+      items.next().is_err(),
+      "a framing fault latches the connection"
+    );
+  }
+  assert_eq!(c.transport(), Transport::Failed);
+  assert_eq!(c.transport(), Transport::Failed, "absorbing");
+  assert_eq!(c.poll_event(), None);
+}
+
+// The FALSE direction: a connection that armed nothing behaves exactly as it
+// always did, and an EOF with an ordinary exchange outstanding still says
+// keep-alive is over at once.
+#[test]
+fn an_unarmed_connection_reads_the_same_levels() {
+  let mut c = client_general();
+  assert_eq!(c.transport(), Transport::Live);
+  assert!(matches!(c.handle_eof(), Ok(None)));
+  assert_eq!(c.transport(), Transport::Ending);
+
+  let mut c = client_general();
+  let mut out = [0u8; 128];
+  c.open_request("GET", &ORIGIN, HOST, BodyPlan::None, &mut out)
+    .expect("ordinary");
+  assert_eq!(c.transport(), Transport::Live);
+  assert!(matches!(c.handle_eof(), Ok(None)));
+  assert_eq!(c.transport(), Transport::Ending);
+}
+
+// §6's `close` row, made true. `close()` initiates RFC 9112 §9.6's local close:
+// it moves the lifecycle, and the transport level follows from that — which
+// to close the transport. After the switch the transport is the negotiated
+// protocol's — the driver HANDS IT OVER, it does not close it — so this is the
+// feature's central promise inverted, and the row already claimed the call was
+// inert.
+#[test]
+fn close_is_inert_on_a_parked_connection() {
+  let mut c = parked();
+  let before = c.lifecycle;
+  c.close();
+  assert_eq!(
+    c.lifecycle, before,
+    "close() moved the lifecycle of a connection whose transport is not ours"
+  );
+  assert_eq!(
+    c.transport(),
+    Transport::HandedOver,
+    "close() changed what a driver reads about a transport that is not ours"
+  );
+
+  // Idempotent in the same way, and it never becomes live again.
+  c.close();
+  assert_eq!(c.lifecycle, before);
+  assert_eq!(c.poll_event(), None);
+}
+
+// The trap §6.1 names: `into_tunnel` would otherwise mint a fresh tunnel over a
+// transport another protocol is already reading, and `open_upgrade` would write
+// HTTP/1.1 into it.
+//
+// The reported reason is `EXCHANGE_IN_FLIGHT`, and asserting it is the point:
+// §7.8 makes it TRUE rather than coincidental — the request really is still
+// outstanding — which is exactly what makes `take_over`'s own phase gate
+// unreachable. A run that reports `SWITCHED` here has changed that argument, not
+// merely a message.
+#[test]
+fn a_parked_connection_cannot_become_a_tunnel() {
+  let c = parked();
+  let (c, why) = c
+    .into_tunnel()
+    .expect_err("a parked connection must not transition");
+  assert_eq!(why, TransitionRefused::EXCHANGE_IN_FLIGHT);
+  // Returned unchanged, still parked: a refused transition costs the caller
+  // nothing, and there was nothing here to salvage anyway.
+  assert_eq!(c.tunnel, TunnelPhase::Switched);
+}
+
+// `take_over`'s phase gate, which nothing can reach through the public API — so
+// the state is built by hand, exactly as `the_pump_refuses_every_call_after_a_switch`
+// builds its own.
+//
+// What is written here is the disposition §6.1 REJECTED: a switch that CLEARED
+// the exchange. With it gone, `nothing_outstanding` passes, and so does every
+// connection gate — the lifecycle is `Open`, the read side is live, no tail, no
+// CR, no queued notice — so the phase is the only thing left to refuse on. That
+// is what makes this the test for a gate that is dead today: delete it and the
+// transition SUCCEEDS, handing back a `Connection<Client, Tunnel>` at
+// `TunnelPhase::Idle` whose `open_upgrade` writes HTTP/1.1 bytes into a stream
+// that belongs to the protocol the 101 named.
+#[test]
+fn the_transition_gate_refuses_a_switch_the_other_gates_would_pass() {
+  let mut c = parked();
+  c.exchange = None;
+
+  let (c, why) = c
+    .into_tunnel()
+    .expect_err("the phase is the gate that is left");
+  assert_eq!(why, TransitionRefused::SWITCHED);
+  assert_eq!(c.tunnel, TunnelPhase::Switched);
 }
 
 // The server twin: RFC 9110 §9.3.6 makes a 2xx to CONNECT turn the connection
@@ -811,7 +1834,7 @@ fn draining_processes_no_further_requests() {
   while it.next().unwrap().is_some() {}
   let consumed = it.consumed();
   // The peer's close option is a connection-scoped fact, drained as an event.
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None);
   // Complete the exchange with a real response…
   send_bodiless_response(&mut c);
@@ -924,7 +1947,7 @@ fn eof_completes_a_close_delimited_response() {
   // §6.3 item 8 frames this message by the close, and §9.3 makes a connection
   // that carries one non-persistent: the notice is what says so in time for the
   // driver to stop planning a second request on it.
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None);
   // The EOF observes the transport and nothing else. §6.3 item 8's "the close IS
   // the delimiter" is a conclusion about the ABSENCE of further octets, so it is
@@ -1150,7 +2173,7 @@ fn a_read_eof_does_not_destroy_an_owed_response() {
     assert!(!c.wants_read(), "{name}");
     assert!(c.is_awaiting_send(), "{name}: the response is still owed");
     // Keep-alive is over and the driver is told once, before it writes.
-    assert_eq!(c.poll_event(), Some(Event::CloseSignaled), "{name}");
+    assert_eq!(c.transport(), Transport::Ending, "{name}");
     assert_eq!(c.poll_event(), None, "{name}");
     // Idempotent: reporting the same EOF again changes nothing.
     assert!(matches!(c.handle_eof(), Ok(None)), "{name}");
@@ -1204,7 +2227,7 @@ fn a_half_closed_server_finishes_the_body_it_started() {
   assert!(matches!(c.handle_eof(), Ok(None)));
   assert!(!c.wants_read());
   assert!(c.is_awaiting_send());
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
 
   // The body still writes, and finishing it drains.
   let n = c.send_body(b"hi", &mut out).unwrap();
@@ -1348,7 +2371,7 @@ fn a_half_closed_server_answers_the_requests_already_in_its_buffer() {
     "no byte can arrive on a half-closed read side"
   );
   assert!(c.is_awaiting_send(), "the first response is owed");
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
 
   // Response one. It re-arms the connection rather than draining it, which is
   // what makes the buffered request reachable.
@@ -1423,7 +2446,7 @@ fn an_eof_reported_after_the_rearm_still_keeps_the_buffered_request() {
 
   // …and only now the EOF.
   assert!(matches!(c.handle_eof(), Ok(None)));
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert!(!c.wants_read(), "nothing can arrive on a closed read side");
 
   // The buffered request is still answerable — the invariant at stake.
@@ -1461,12 +2484,18 @@ fn a_repeated_eof_across_the_rearm_is_not_a_downgrade() {
     at = it.consumed();
   }
   assert!(matches!(c.handle_eof(), Ok(None)));
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   send_bodiless_response(&mut c);
 
-  // The same EOF, reported again now that the connection has re-armed.
+  // The same EOF, reported again now that the connection has re-armed. The
+  // once-only question the old notice raised is retired — a level has no
+  // delivery count — so what is asserted is that the repeat does not MOVE it.
   assert!(matches!(c.handle_eof(), Ok(None)));
-  assert_eq!(c.poll_event(), None, "the notice is not re-queued");
+  assert_eq!(
+    c.transport(),
+    Transport::Ending,
+    "a repeated EOF moved the level"
+  );
 
   serves(
     &mut c,
@@ -1531,10 +2560,11 @@ fn the_read_eof_latch_does_not_depend_on_when_it_is_reported() {
       assert!(matches!(c.handle_eof(), Ok(None)), "{report:?}");
     }
 
-    // Every ordering: the notice exactly once, the read side shut, the buffered
-    // request served, and the connection draining only once it is exhausted.
-    assert_eq!(c.poll_event(), Some(Event::CloseSignaled), "{report:?}");
-    assert_eq!(c.poll_event(), None, "{report:?}");
+    // Every ordering reaches the SAME level: order cannot change what a
+    // connection is, only when a driver asks. The read side is shut, the
+    // buffered request is served, and the connection drains only once it is
+    // exhausted.
+    assert_eq!(c.transport(), Transport::Ending, "{report:?}");
     assert!(!c.wants_read(), "{report:?}");
     serves(
       &mut c,
@@ -1586,7 +2616,7 @@ fn the_read_eof_latch_leaves_the_truncation_rows_alone() {
   feed_request(&mut c, BODILESS);
   send_bodiless_response(&mut c);
   assert!(matches!(c.handle_eof(), Ok(None)));
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   {
     let mut it = c.handle(b"");
     assert!(it.next().unwrap().is_none());
@@ -1891,7 +2921,7 @@ fn an_eof_over_an_unoffered_close_delimited_body_loses_nothing() {
     "the body is still the driver's to offer"
   );
   // §6.3 item 8 with §9.3: the driver already knows keep-alive is over.
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
 
   // Then the socket closes, and the driver says so before offering the rest.
   assert!(
@@ -2185,7 +3215,7 @@ fn a_final_response_that_closes_releases_the_client_from_its_body() {
     ));
     assert!(it.next().unwrap().is_none());
   }
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
 
   // The exchange settled in BOTH directions, so nothing is demanded of the driver.
   assert!(
@@ -2389,7 +3419,7 @@ fn a_close_on_an_interim_response_is_remembered_at_the_final_one() {
     c.poll_event(),
     Some(Event::ExchangeAborted { .. })
   ));
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   // RFC 9112 §9.6 binds the option to the response CARRYING it — "after it sends
   // the response containing the close connection option" — and a 1xx is a
   // response message. So the release is immediate, not deferred to a final
@@ -2455,7 +3485,7 @@ fn a_local_close_during_an_upload_still_lets_the_exchange_finish() {
 
   // OUR close, not the peer's.
   c.close();
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert!(matches!(c.lifecycle, Lifecycle::Closing));
 
   // The response arrives without any `close` of its own.
@@ -2633,11 +3663,7 @@ fn an_interim_close_releases_the_body_at_once() {
       matches!(c.poll_event(), Some(Event::ExchangeAborted { .. })),
       "chunked={chunked}"
     );
-    assert_eq!(
-      c.poll_event(),
-      Some(Event::CloseSignaled),
-      "chunked={chunked}"
-    );
+    assert_eq!(c.transport(), Transport::Ending, "chunked={chunked}");
   }
 }
 
@@ -2759,7 +3785,7 @@ fn an_interim_response_may_not_state_a_close() {
     &out[..n],
     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
   );
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert!(!c.wants_read());
 }
 
@@ -2814,7 +3840,7 @@ fn a_close_bearing_interim_terminates_the_exchange() {
     matches!(c.poll_event(), Some(Event::ExchangeAborted { .. })),
     "the driver never learned this exchange died unanswered"
   );
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None);
   assert_eq!(
     c.send_body(b" world", &mut out),
@@ -2945,11 +3971,11 @@ fn every_received_close_produces_the_same_consequences() {
       }
     }
     assert_eq!(
-      c.poll_event(),
-      Some(Event::CloseSignaled),
-      "{trigger:?}: keep-alive was not announced"
+      c.transport(),
+      Transport::Ending,
+      "{trigger:?}: keep-alive is over"
     );
-    assert_eq!(c.poll_event(), None, "{trigger:?}: announced twice");
+    assert_eq!(c.poll_event(), None, "{trigger:?}: no message fact is owed");
   }
 }
 
@@ -3106,12 +4132,16 @@ fn a_close_option_still_suppresses_the_request_behind_it() {
     while it.next().unwrap().is_some() {}
     at = it.consumed();
   }
-  // The option was read from the head, so the notice is already out.
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  // The option was read from the head, so keep-alive is already over.
+  assert_eq!(c.transport(), Transport::Ending);
 
   assert!(matches!(c.handle_eof(), Ok(None)));
   assert!(c.is_awaiting_send(), "the response to /a is still owed");
-  assert_eq!(c.poll_event(), None, "and the notice is not repeated");
+  assert_eq!(
+    c.transport(),
+    Transport::Ending,
+    "the EOF behind the option moved the level"
+  );
   send_bodiless_response(&mut c);
 
   // Suppressed: §9.6's MUST NOT, unchanged by the half-close.
@@ -3175,7 +4205,7 @@ fn a_local_close_collapses_a_half_closed_connection() {
 // open, so unlike a violation found AT the EOF there is somebody to answer.
 //
 // The close notice is not repeated: it was given when the read side ended, and
-// `Event::CloseSignaled` is once per connection.
+// keep-alive ending is one fact about the connection, read as one level.
 #[test]
 fn a_malformed_buffered_request_still_owes_its_one_answer() {
   const PIPELINED_BAD: &[u8] =
@@ -3188,7 +4218,7 @@ fn a_malformed_buffered_request_still_owes_its_one_answer() {
     at = it.consumed();
   }
   assert!(matches!(c.handle_eof(), Ok(None)));
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   send_bodiless_response(&mut c);
 
   // The buffered request is read, and refused: RFC 9112 §6.3 item 3.
@@ -3294,7 +4324,7 @@ fn a_close_option_on_a_buffered_request_does_not_erase_the_read_eof() {
 
   // The EOF arrives BEFORE response one.
   assert!(matches!(c.handle_eof(), Ok(None)));
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert!(!c.wants_read());
   assert!(c.is_awaiting_send());
   send_bodiless_response(&mut c);
@@ -3360,7 +4390,7 @@ fn a_buffered_request_with_a_close_option_is_served_and_ends_the_connection() {
   }
   assert_eq!(at, REQ1.len());
   assert!(matches!(c.handle_eof(), Ok(None)));
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   send_bodiless_response(&mut c);
 
   // Request two is served whole.
@@ -3424,7 +4454,7 @@ fn local_close_between_exchanges_drains_immediately() {
   let mut c = Connection::<Server, General>::new();
   assert!(c.wants_read());
   c.close();
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert!(!c.wants_read());
   assert!(!c.is_awaiting_send());
   let mut it = c.handle(BODILESS);
@@ -3617,7 +4647,7 @@ fn server_error_response_after_protocol_error() {
   assert!(s.starts_with("HTTP/1.1 400 "));
   assert!(s.contains("Connection: close\r\n"));
   assert_eq!(s, "HTTP/1.1 400 \r\nConnection: close\r\n\r\n");
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled)); // forced Draining (9112 §6.1 MUST close)
+  assert_eq!(c.transport(), Transport::Ending); // forced Draining (9112 §6.1 MUST close)
   assert!(c.send_error_response(400, b"", empty, &mut out).is_err()); // exactly once
   assert!(
     c.send_response(200, b"", empty, BodyPlan::None, &mut out)
@@ -3810,7 +4840,7 @@ fn error_response_does_not_repeat_a_close_already_signaled() {
   let mut it = c.handle(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n");
   while it.next().unwrap().is_some() {}
   c.close();
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
 
   // A chunk-size line that is not `1*HEXDIG` fails the connection while it is
   // already closing (RFC 9112 §7.1).
@@ -3844,7 +4874,7 @@ fn a_response_that_states_close_drains_the_connection() {
     c.send_response(200, b"OK", closing, BodyPlan::None, &mut out)
       .is_ok()
   );
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert!(!c.wants_read());
   // The request pipelined behind it is dead: §9.6 processes no further byte.
   let mut it2 = c.handle(two.get(BODILESS.len()..).unwrap());
@@ -4056,7 +5086,7 @@ fn an_inbound_close_delimited_response_signals_the_end_of_keep_alive() {
     let mut it = c.handle(b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nbody");
     assert!(matches!(it.next().unwrap(), Some(Item::Head { .. })));
   }
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   // Exactly once, like every other close signal (a peer's option, a local
   // `close()`): the driver is told the fact, not each of its causes.
   assert_eq!(c.poll_event(), None);
@@ -4338,7 +5368,7 @@ fn keep_alive_rearms_and_close_drains() {
   assert_eq!(it2.consumed(), two.len().saturating_sub(held));
 
   // The peer's close option is a connection-scoped fact, drained as an event…
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None);
   // …and the exchange in flight still gets its response (§9.6).
   let n = c
@@ -4782,7 +5812,7 @@ fn a_local_close_lets_the_exchange_in_flight_finish() {
   let mut c = Connection::<Server, General>::new();
   feed_request(&mut c, BODILESS);
   c.close();
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert!(c.is_awaiting_send()); // the response is still owed
   let mut out = [0u8; 128];
   assert!(
@@ -4821,9 +5851,8 @@ fn an_http_10_request_ends_the_connection_after_its_response() {
   // and once that response is out it is dead rather than merely waiting.
   assert_eq!(it.consumed(), FIRST);
   // The version IS the directive here — no field said so — and it reaches the
-  // driver as the same once-per-connection notice a `close` option does.
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
-  assert_eq!(c.poll_event(), None);
+  // driver as the same level a stated `close` option produces.
+  assert_eq!(c.transport(), Transport::Ending);
 
   // §9.6: the exchange in flight still gets its answer…
   send_bodiless_response(&mut c);
@@ -4930,7 +5959,7 @@ fn a_client_reads_an_http_10_response_to_the_close() {
   assert!(it.next().unwrap().is_none());
   assert_eq!(it.consumed(), HEAD_AND_START.len());
   // §9.3: a 1.0 response without `keep-alive` is the last on the connection…
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   // …and yet its own body goes on: keep-alive being over does not end a message.
   assert!(c.wants_read());
   let mut it2 = c.handle(b"lo");
@@ -4976,7 +6005,7 @@ fn a_local_close_after_an_exchange_prevents_the_next_one() {
   assert_eq!(c.poll_event(), None);
 
   c.close();
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None); // announced once
   assert!(!c.wants_read());
   assert!(!c.is_awaiting_send());
@@ -4997,7 +6026,7 @@ fn a_local_close_refuses_the_next_client_request() {
   assert_eq!(c.poll_event(), None); // re-armed, and nothing announced
 
   c.close();
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   let mut out = [0u8; 64];
   assert!(matches!(
     c.open_request("GET", &ORIGIN, HOST, BodyPlan::None, &mut out),
@@ -5077,7 +6106,7 @@ fn a_close_delimited_response_is_framed_by_the_close() {
   );
   // The head implies the close, so the notice is due there — the driver has to
   // know before it writes the body that this connection is ending.
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
 
   // Raw octets: no count to keep, and no chunk framing to add.
   w += c.send_body(b"hel", &mut out[w..]).unwrap();
@@ -5246,6 +6275,29 @@ fn the_framing_budget_has_a_floor_and_records_what_was_stated() {
   );
 }
 
+#[test]
+fn opportunistic_upgrade_is_refused_unless_the_builder_allows_it() {
+  type C = Connection<Client, General>;
+  // The posture the README states: reject what an RFC leaves us free to
+  // reject. RFC 9110 §7.8 leaves this free — it obliges a client to nothing.
+  assert!(!C::default_limits().opportunistic_upgrade_allowed());
+  assert!(
+    C::default_limits()
+      .allow_opportunistic_upgrade(true)
+      .opportunistic_upgrade_allowed()
+  );
+  assert!(
+    !C::default_limits()
+      .allow_opportunistic_upgrade(false)
+      .opportunistic_upgrade_allowed()
+  );
+  // Const-usable, like every other Limits builder, and it survives the
+  // decomposition `with_limits` performs.
+  const L: Limits =
+    Connection::<Client, General>::default_limits().allow_opportunistic_upgrade(true);
+  assert!(C::with_limits(L).opportunistic_upgrade_allowed_for_test());
+}
+
 // RFC 9112 §6.3 item 6 with RFC 9110 §15.5.14: a declaration past the ceiling
 // is refused before an octet of content is read, and the refusal is POLICY —
 // nothing on the wire broke a rule, so the connection is not failed and the
@@ -5278,7 +6330,7 @@ fn a_counted_body_over_the_limit_refuses_without_failing_the_connection() {
   // The readiness split says "write, and only write".
   assert!(!c.wants_read());
   assert!(c.is_awaiting_send());
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None);
 }
 
@@ -5506,7 +6558,7 @@ fn the_close_notice_is_queued_once_under_doubled_causes() {
   );
   assert!(matches!(error, Error::Refused(_)), "{error:?}");
   assert!(c.handle_eof().unwrap().is_none());
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None);
 }
 
@@ -5538,7 +6590,7 @@ fn a_client_refuses_a_close_delimited_response_and_drains() {
   // Nothing left to read, and nothing this end could answer with.
   assert!(!c.wants_read());
   assert!(!c.is_awaiting_send());
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None);
 }
 
@@ -5857,7 +6909,7 @@ fn a_chunk_framing_refusal_advises_a_4xx_and_still_owes_one_answer() {
   assert!(!matches!(c.lifecycle, Lifecycle::Failed));
   assert!(!c.wants_read());
   assert!(c.is_awaiting_send());
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
 
   let mut out = [0u8; 128];
   let without_close = c
@@ -5995,7 +7047,7 @@ fn an_unsatisfiable_route_limit_refuses_and_names_the_routes_own_maximum() {
   assert!(!matches!(c.lifecycle, Lifecycle::Failed));
   assert!(!c.wants_read());
   assert!(c.is_awaiting_send());
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   assert_eq!(c.poll_event(), None);
   // The body is gone, so there is no progress left to report.
   assert_eq!(c.body_progress(), None);
@@ -6193,7 +7245,7 @@ fn narrowing_below_a_body_already_delivered_in_full_refuses() {
   // owed still has to state `close` (RFC 9112 §9.3).
   assert!(!matches!(c.lifecycle, Lifecycle::Failed));
   assert!(c.is_awaiting_send());
-  assert_eq!(c.poll_event(), Some(Event::CloseSignaled));
+  assert_eq!(c.transport(), Transport::Ending);
   let mut out = [0u8; 128];
   let without_close = c
     .send_response(
@@ -6231,10 +7283,11 @@ mod tunnel {
   use super::*;
   use crate::{
     connection::tunnel::{
-      CONNECT_NEEDS_A_PORT, CONTINUE_BEFORE_SWITCH, HANDSHAKE_HAS_NO_CONTENT,
-      INTERIM_NEEDS_HTTP_11, NO_HANDSHAKE, NOT_A_HANDSHAKE, NOTHING_TO_ANSWER,
-      OFFER_NEEDS_BOTH_HALVES, ONE_HANDSHAKE, SWITCH_HAS_NO_FRAMING, SWITCH_NEEDS_BOTH_HALVES,
-      SWITCH_TARGET_FORM, SWITCH_THROUGH_ACCEPT, SWITCH_WAS_NEVER_OFFERED,
+      CONNECT_INDICATES_NO_PROTOCOL, CONNECT_NEEDS_A_PORT, CONTINUE_BEFORE_SWITCH,
+      HANDSHAKE_HAS_NO_CONTENT, HANDSHAKE_STATES_CLOSE, INTERIM_NEEDS_HTTP_11, NO_HANDSHAKE,
+      NOT_A_HANDSHAKE, NOTHING_TO_ANSWER, OFFER_NEEDS_BOTH_HALVES, ONE_HANDSHAKE,
+      SWITCH_HAS_NO_FRAMING, SWITCH_NEEDS_BOTH_HALVES, SWITCH_TARGET_FORM, SWITCH_THROUGH_ACCEPT,
+      SWITCH_WAS_NEVER_OFFERED,
     },
     error::H1Error,
   };
@@ -6597,6 +7650,438 @@ mod tunnel {
     assert!(
       s.reject(426, b"Upgrade Required", closing_reject, &mut out)
         .is_ok()
+    );
+  }
+
+  // The same 101, the same verdict, in the mode that reads it natively. RFC 9112
+  // §9.6: this peer has committed to closing, so it has nothing to continue
+  // INTO — and Tunnel's 101 arm asks `validate::has_close_option` for it, the
+  // same predicate General's asks. `ends_persistence` stays on the INTERIM arm
+  // alone, where another HTTP message really does follow.
+  //
+  // Pinned as a PARITY test, over one buffer of bytes, because that is the
+  // property that matters: a head one mode switches on must be a head the other
+  // switches on (RFC 9112 §11.1). Two modes agreeing is not evidence that either
+  // is right, so each mode's own verdict is asserted here beside the parity
+  // rather than in place of it.
+  #[test]
+  fn a_101_stating_close_is_refused_in_both_modes() {
+    const CLOSING_SWITCH: &[u8] =
+      b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade, close\r\nupgrade: websocket\r\n\r\n";
+
+    let mut t = offered();
+    let Err(Error::Protocol(H1Error::Framing(tunnel_why))) = t.handle_response(CLOSING_SWITCH)
+    else {
+      panic!("Tunnel must not switch on a 101 that states close")
+    };
+    assert_eq!(tunnel_why, SWITCH_AFTER_CLOSE);
+    assert_ne!(t.tunnel, TunnelPhase::Switched);
+
+    let mut g = super::offered_upgrade();
+    let mut items = g.handle(CLOSING_SWITCH);
+    let Err(Error::Protocol(H1Error::Framing(general_why))) = items.next() else {
+      panic!("General must not switch on it either")
+    };
+
+    // The SAME fault, not merely two refusals: one rule, one verdict, whichever
+    // mode is holding the bytes.
+    assert_eq!(general_why, tunnel_why);
+  }
+
+  // RFC 9112 §9.6 on the SEND side: "A server that sends a close connection
+  // option MUST initiate closure of the connection … after it sends the response
+  // containing close." A 101 that also states `close` promises to close the
+  // connection it just handed to another protocol, so this end must not write
+  // one — and after `1d2d731` both of this crate's CLIENTS refuse exactly these
+  // bytes, so emitting them would make two endpoints of one crate disagree about
+  // one wire message.
+  #[test]
+  fn a_switch_this_end_writes_states_no_close() {
+    let mut s = asked_to_upgrade();
+    let mut out = [0xAAu8; 128];
+    let closing: &[(&str, &[u8])] = &[("Connection", b"Upgrade, close"), ("Upgrade", b"websocket")];
+    assert_eq!(
+      s.accept(closing, &mut out),
+      Err(Error::InvalidState(TAKEOVER_STATES_NO_CLOSE))
+    );
+    assert_eq!(out, [0xAAu8; 128], "a refused accept wrote into the buffer");
+    assert_ne!(s.tunnel, TunnelPhase::Switched, "the phase moved anyway");
+
+    // NOT a false refusal: the ordinary 101 still goes out and still switches.
+    let n = s
+      .accept(SWITCH, &mut out)
+      .expect("an ordinary 101 still switches");
+    assert!(n > 0);
+    assert_eq!(s.tunnel, TunnelPhase::Switched);
+  }
+
+  // The same rule where this end ORIGINATES the handshake: a request that offers
+  // an upgrade while stating `close` asks for a switch onto a connection it has
+  // just said it is ending. This crate must not originate a handshake it would
+  // itself refuse to complete.
+  #[test]
+  fn an_offer_this_end_writes_states_no_close() {
+    let mut c = Connection::<Client, Tunnel>::new();
+    let mut out = [0xAAu8; 128];
+    let closing: &[(&str, &[u8])] = &[
+      ("Host", b"example.com"),
+      ("Connection", b"Upgrade, close"),
+      ("Upgrade", b"websocket"),
+    ];
+    assert_eq!(
+      c.open_upgrade(&CHAT, closing, &mut out),
+      Err(Error::InvalidState(TAKEOVER_STATES_NO_CLOSE))
+    );
+    assert_eq!(out, [0xAAu8; 128], "a refused open wrote into the buffer");
+    // Inert: the handshake never began, so the ordinary offer still opens it.
+    assert!(c.open_upgrade(&CHAT, OFFER, &mut out).is_ok());
+  }
+
+  // The RECEIVE side of the same fact, and the entry point that disagreed with
+  // General about one wire request. RFC 9112 §9.6: "A server that receives a
+  // close connection option MUST initiate closure of the connection … after it
+  // sends the final response to the request that contained the close connection
+  // option" — so a server owes a close after answering, and a switch is the
+  // opposite promise.
+  //
+  // General already answered correctly: `commit_head` accumulates the close, the
+  // lifecycle leaves `Open`, and `into_tunnel` refuses `NOT_OPEN`. Tunnel's
+  // direct classification bypassed that accumulator and accepted the same bytes,
+  // so ONE request had two answers depending on which entry point read it.
+  #[test]
+  fn an_offer_that_states_close_is_no_handshake_and_general_agrees() {
+    const CLOSING_OFFER: &[u8] =
+      b"GET /chat HTTP/1.1\r\nHost: h\r\nConnection: upgrade, close\r\nUpgrade: websocket\r\n\r\n";
+
+    // Tunnel, classifying directly.
+    let mut s = Connection::<Server, Tunnel>::new();
+    let Err(Error::Protocol(H1Error::Framing(why))) = s.handle_request(CLOSING_OFFER) else {
+      panic!("a close-bearing offer is not a handshake this connection can complete")
+    };
+    assert_eq!(why, HANDSHAKE_STATES_CLOSE);
+
+    // General, reaching the same request through the transition edge.
+    let mut g = Connection::<Server, General>::new();
+    {
+      let mut items = g.handle(CLOSING_OFFER);
+      while items
+        .next()
+        .expect("the request itself is well formed")
+        .is_some()
+      {}
+    }
+    let (_, refused) = g
+      .into_tunnel()
+      .expect_err("General refuses the transition on the same bytes");
+    assert_eq!(refused, TransitionRefused::NOT_OPEN);
+
+    // NOT a false refusal: the same offer WITHOUT close still classifies.
+    let mut s = Connection::<Server, Tunnel>::new();
+    assert!(matches!(
+      s.handle_request(
+        b"GET /chat HTTP/1.1\r\nHost: h\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n"
+      ),
+      Ok(ServerTunnelRequest::Upgrade { .. })
+    ));
+  }
+
+  // An EOF, then a switch out of bytes already buffered behind it — the shape a
+  // queued answer gets wrong, as a stale instruction, a lost one, or a doubled
+  // one.
+  //
+  // ASSERTED AS A LEVEL, and it has to be: `poll_event` can never return
+  // anything in Tunnel mode, because the only notice left names an exchange and
+  // this mode frames none. Asserting `poll_event() == None` here would be
+  // VACUOUSLY true — it would pass with the transport reported completely wrong.
+  #[test]
+  fn an_eof_before_a_buffered_switch_signals_no_close_in_tunnel_mode() {
+    let mut c = offered();
+    c.handle_eof().expect("an EOF on a live handshake");
+    assert!(c.read_closed, "the transport fact must latch at once");
+    assert_eq!(
+      c.transport(),
+      Transport::Ending,
+      "the read half ended; keep-alive is over whatever answers"
+    );
+
+    let switch =
+      b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    assert!(matches!(
+      c.handle_response(switch),
+      Ok(ClientTunnelOutcome::Switched { .. })
+    ));
+    assert_eq!(
+      c.transport(),
+      Transport::HandedOver,
+      "the driver was told to close a transport it had just been handed"
+    );
+  }
+
+  // The CONNECT arm of the same site, which is a separate `TunnelPhase::Switched`
+  // writer and so a separate member.
+  #[test]
+  fn an_eof_before_a_buffered_tunnel_signals_no_close() {
+    let mut c = connected();
+    c.handle_eof().expect("an EOF on a live handshake");
+    assert_eq!(c.transport(), Transport::Ending);
+    assert!(matches!(
+      c.handle_response(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+      Ok(ClientTunnelOutcome::Tunneled { .. })
+    ));
+    assert_eq!(
+      c.transport(),
+      Transport::HandedOver,
+      "the tunnel's transport is the driver's"
+    );
+  }
+
+  // The SERVER's switch site: `accept` writes the phase, so it is a member too.
+  #[test]
+  fn an_eof_before_accept_signals_no_close() {
+    let mut s = asked_to_upgrade();
+    s.handle_eof().expect("an EOF on a live handshake");
+    assert_eq!(s.transport(), Transport::Ending);
+    let mut out = [0u8; 128];
+    s.accept(SWITCH, &mut out)
+      .expect("the switch still goes out");
+    assert_eq!(s.tunnel, TunnelPhase::Switched);
+    assert_eq!(
+      s.transport(),
+      Transport::HandedOver,
+      "the driver was told to close what it handed over"
+    );
+  }
+
+  // Post-switch, `handle_eof` is INERT here rather than invalid — this mode's own
+  // contract, already stated and tested: a connection that has left HTTP has
+  // nothing to say about the ending. What the invariant requires is only that it
+  // does nothing: no latch to rewrite a spent connection, and no notice about a
+  // transport already handed over.
+  #[test]
+  fn a_post_switch_eof_is_inert_in_tunnel_mode() {
+    let mut c = offered();
+    assert!(matches!(
+      c.handle_response(
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+      ),
+      Ok(ClientTunnelOutcome::Switched { .. })
+    ));
+    let before = c.read_closed;
+    c.handle_eof().expect("inert, not invalid");
+    assert_eq!(
+      c.read_closed, before,
+      "a spent connection's state was rewritten"
+    );
+    assert_eq!(
+      c.transport(),
+      Transport::HandedOver,
+      "a spent connection reported something other than the handover"
+    );
+  }
+
+  // The FALSE direction in this mode: a handshake that cannot hand over any more
+  // must signal at once, exactly as it always did.
+  #[test]
+  fn an_eof_on_a_refused_handshake_signals_at_once() {
+    let mut c = offered();
+    assert!(matches!(
+      c.handle_response(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n"),
+      Ok(ClientTunnelOutcome::Refused { .. })
+    ));
+    c.handle_eof().expect("an EOF after the refusal");
+    assert_eq!(c.transport(), Transport::Ending);
+
+    // And one that never opened a handshake at all.
+    let mut c = Connection::<Client, Tunnel>::new();
+    c.handle_eof().expect("an EOF on an idle connection");
+    assert_eq!(c.transport(), Transport::Ending);
+  }
+
+  // §9.3.6's tunnel is NOT excluded from the invariant, though reading `close`
+  // on a CONNECT 2xx as "no HTTP reuse once the tunnel ends" invites an
+  // exemption. RFC 9112 §9.6's text does not support that reading: it defines
+  // the option unconditionally as an obligation to "close the connection after
+  // reading the response message containing" it, and §9.3.6 has the same
+  // response switching to tunnel mode "immediately after the response header
+  // section". One instant, opposite demands — so such a response is a
+  // self-contradiction, not a working tunnel, and it is refused exactly as a
+  // close-bearing 101 is.
+  //
+  // All four corners are covered here.
+  #[test]
+  fn a_connect_takeover_states_no_close_at_every_corner() {
+    let mut out = [0xAAu8; 192];
+
+    // ORIGINATE: the request this end writes.
+    let closing: &[(&str, &[u8])] = &[("Host", b"example.com:443"), ("Connection", b"close")];
+    let mut c = Connection::<Client, Tunnel>::new();
+    assert_eq!(
+      c.open_connect(DESTINATION, closing, &mut out),
+      Err(Error::InvalidState(TAKEOVER_STATES_NO_CLOSE))
+    );
+    assert_eq!(out, [0xAAu8; 192], "a refused open wrote into the buffer");
+
+    // RECEIVE: the request a server classifies.
+    let mut s = Connection::<Server, Tunnel>::new();
+    let Err(Error::Protocol(H1Error::Framing(why))) = s.handle_request(
+      b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nConnection: close\r\n\r\n",
+    ) else {
+      panic!("a close-bearing CONNECT is no handshake this connection can complete")
+    };
+    assert_eq!(why, HANDSHAKE_STATES_CLOSE);
+
+    // EMIT: the 2xx this end writes.
+    let mut s = asked_for_a_tunnel();
+    let mut out = [0xAAu8; 192];
+    let closing_2xx: &[(&str, &[u8])] = &[("Connection", b"close")];
+    assert_eq!(
+      s.accept(closing_2xx, &mut out),
+      Err(Error::InvalidState(TAKEOVER_STATES_NO_CLOSE))
+    );
+    assert_eq!(out, [0xAAu8; 192], "a refused accept wrote into the buffer");
+    assert_ne!(s.tunnel, TunnelPhase::Switched, "the phase moved anyway");
+
+    // ACCEPT: the 2xx this end reads.
+    let mut c = connected();
+    let Err(Error::Protocol(H1Error::Framing(why))) =
+      c.handle_response(b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n")
+    else {
+      panic!("a 2xx that ends persistence is not a tunnel this end can enter")
+    };
+    assert_eq!(why, SWITCH_AFTER_CLOSE);
+    assert_ne!(c.tunnel, TunnelPhase::Switched);
+  }
+
+  // `HTTP/1.0 200 Connection Established` is a legal answer to an HTTP/1.1
+  // CONNECT and the classic form real proxies send. Reading §9.3's 1.0
+  // non-persistence default here latches `Failed` and DISCARDS the tunnel bytes
+  // that follow in the same read — so the leftover is what this asserts, not
+  // merely the outcome.
+  //
+  // §9.3.6 establishes the tunnel "immediately after the response header
+  // section" whatever version the response states, and response downgrading is
+  // permitted. The default governs whether another HTTP MESSAGE may follow, and
+  // after this one none can.
+  #[test]
+  fn an_http_10_connect_2xx_still_tunnels_with_its_leftover() {
+    const TEN: &[u8] = b"HTTP/1.0 200 Connection Established\r\n\r\n\x16\x03\x01\x00\x05";
+    let mut c = connected();
+    let ClientTunnelOutcome::Tunneled { leftover, .. } = c
+      .handle_response(TEN)
+      .expect("a 1.0 2xx to CONNECT still establishes the tunnel")
+    else {
+      panic!("a 1.0 2xx to CONNECT must tunnel")
+    };
+    assert_eq!(
+      leftover, b"\x16\x03\x01\x00\x05",
+      "the tunnel's first bytes were discarded"
+    );
+    assert_eq!(c.tunnel, TunnelPhase::Switched);
+    assert_eq!(c.transport(), Transport::HandedOver);
+  }
+
+  // The FALSE direction for the same head: the option is what the rule reads, so
+  // a close-bearing 2xx is refused at EITHER version.
+  #[test]
+  fn a_connect_2xx_stating_close_is_refused_at_either_version() {
+    for wire in [
+      b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n".as_slice(),
+      b"HTTP/1.0 200 Connection Established\r\nConnection: close\r\n\r\n",
+    ] {
+      let mut c = connected();
+      let Err(Error::Protocol(H1Error::Framing(why))) = c.handle_response(wire) else {
+        panic!("a 2xx that states close is not a tunnel this end can enter")
+      };
+      assert_eq!(why, SWITCH_AFTER_CLOSE);
+      assert_ne!(c.tunnel, TunnelPhase::Switched);
+    }
+  }
+
+  // The INTERIM arm asks `ends_persistence`, and that is the split: a 1xx IS an
+  // HTTP message, and another one follows it, so §9.3's 1.0 default means
+  // exactly what it says there. The takeover heads above are where it does not.
+  #[test]
+  fn an_http_10_interim_still_ends_the_handshake() {
+    let mut c = connected();
+    assert!(matches!(
+      c.handle_response(b"HTTP/1.0 100 Continue\r\n\r\n"),
+      Ok(ClientTunnelOutcome::Refused { .. })
+    ));
+    assert_eq!(c.tunnel, TunnelPhase::Refused);
+  }
+
+  // The FALSE direction at all four corners, in both roles: a CONNECT without
+  // `close` still works exactly as it did.
+  #[test]
+  fn a_connect_without_close_still_tunnels_at_every_corner() {
+    let mut out = [0u8; 192];
+
+    let mut c = Connection::<Client, Tunnel>::new();
+    assert!(c.open_connect(DESTINATION, CONNECT_HOST, &mut out).is_ok());
+
+    let mut s = asked_for_a_tunnel();
+    let n = s
+      .accept(NO_FIELDS, &mut out)
+      .expect("the 2xx still goes out");
+    assert_eq!(&out[..n], b"HTTP/1.1 200 Connection Established\r\n\r\n");
+    assert_eq!(s.tunnel, TunnelPhase::Switched);
+
+    let mut c = connected();
+    assert!(matches!(
+      c.handle_response(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+      Ok(ClientTunnelOutcome::Tunneled { .. })
+    ));
+    assert_eq!(c.transport(), Transport::HandedOver);
+
+    // And an HTTP/1.0 CONNECT still classifies: §9.3 makes a 1.0 message
+    // non-persistent without `keep-alive`, but that peer SAID nothing about
+    // closing, and §9.3.6 puts no version on CONNECT. The request side reads the
+    // stated option for exactly this reason.
+    let mut s = Connection::<Server, Tunnel>::new();
+    assert!(matches!(
+      s.handle_request(b"CONNECT example.com:443 HTTP/1.0\r\nHost: example.com:443\r\n\r\n"),
+      Ok(ServerTunnelRequest::Connect { .. })
+    ));
+  }
+
+  // `TunnelPhase::Refused` is TERMINAL and the lifecycle cannot say so — all
+  // three writers leave it `Open`. Asserted immediately after each refusal
+  // producer, and that placement is the assertion: read AFTER an EOF, every arm
+  // answers `Ending` whatever it was going to say, so a wrong arm survives.
+  #[test]
+  fn a_refused_handshake_reads_ending_at_every_producer() {
+    // A client reading an ordinary final refusal.
+    let mut c = offered();
+    assert!(matches!(
+      c.handle_response(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n"),
+      Ok(ClientTunnelOutcome::Refused { .. })
+    ));
+    assert_eq!(
+      c.transport(),
+      Transport::Ending,
+      "a spent handshake read Live"
+    );
+
+    // A client reading a persistence-ending interim.
+    let mut c = offered();
+    assert!(matches!(
+      c.handle_response(b"HTTP/1.1 100 Continue\r\nConnection: close\r\n\r\n"),
+      Ok(ClientTunnelOutcome::Refused { .. })
+    ));
+    assert_eq!(c.transport(), Transport::Ending);
+
+    // A server that successfully wrote `reject`.
+    let mut s = asked_to_upgrade();
+    let mut out = [0u8; 128];
+    assert!(
+      s.reject(426, b"Upgrade Required", NO_FIELDS, &mut out)
+        .is_ok()
+    );
+    assert_eq!(s.tunnel, TunnelPhase::Refused);
+    assert_eq!(
+      s.transport(),
+      Transport::Ending,
+      "a spent handshake read Live"
     );
   }
 
@@ -7313,6 +8798,12 @@ mod tunnel {
   // indicated by the client in the corresponding request's Upgrade header
   // field" — a CONNECT names none, so a 101 answering one is a switch this end
   // never offered.
+  //
+  // "A CONNECT names none" is ENFORCED, not assumed —
+  // `a_connect_indicates_no_protocol` is the guard that makes it so. Delete that
+  // guard and this verdict becomes reachable against a server that switched on
+  // an `Upgrade` field this end itself wrote — blaming a peer for acting on our
+  // own bytes.
   #[test]
   fn a_101_to_a_connect_is_a_switch_that_was_never_offered() {
     let mut c = connected();
@@ -7322,6 +8813,49 @@ mod tunnel {
       )
       .unwrap_err(),
       Error::Protocol(H1Error::Framing(SWITCH_WAS_NEVER_OFFERED))
+    );
+  }
+
+  // The send-side half of the rule above. A CONNECT already states RFC 9110
+  // §9.3.6's takeover; an `Upgrade` field on it invites §7.8's as well, and this
+  // handshake has no answer that could carry one — `ClientTunnelOutcome` makes a
+  // CONNECT's success the 2xx tunnel, and the test above condemns the 101. So
+  // the request that would create the contradiction is refused before a byte.
+  //
+  // Both spellings are refused, and the SECOND is the point: the predicate is
+  // §7.8's INDICATION — the `Upgrade` field alone, which is what a server may
+  // legally act on — not both halves of an offer. A both-halves predicate would
+  // pass the un-optioned field straight through to the wire.
+  #[test]
+  fn a_connect_indicates_no_protocol() {
+    let both: &[(&str, &[u8])] = &[
+      ("Host", b"example.com:443"),
+      ("Connection", b"Upgrade"),
+      ("Upgrade", b"websocket"),
+    ];
+    let field_only: &[(&str, &[u8])] = &[("Host", b"example.com:443"), ("Upgrade", b"websocket")];
+
+    for headers in [both, field_only] {
+      let mut out = [0xAAu8; 128];
+      let mut c = Connection::<Client, Tunnel>::new();
+      assert_eq!(
+        c.open_connect(DESTINATION, headers, &mut out),
+        Err(Error::InvalidState(CONNECT_INDICATES_NO_PROTOCOL)),
+        "{headers:?}: a CONNECT indicates no protocol"
+      );
+      assert_eq!(out, [0xAAu8; 128], "a refused open wrote into the buffer");
+      // Inert: the handshake never began, so an ordinary CONNECT still opens it.
+      assert!(c.open_connect(DESTINATION, CONNECT_HOST, &mut out).is_ok());
+    }
+
+    // The connection option ALONE names no protocol, so it indicates nothing and
+    // this stays an ordinary CONNECT — the same asymmetry `open_request` keeps.
+    let option_only: &[(&str, &[u8])] = &[("Host", b"example.com:443"), ("Connection", b"Upgrade")];
+    let mut out = [0u8; 128];
+    let mut c = Connection::<Client, Tunnel>::new();
+    assert!(
+      c.open_connect(DESTINATION, option_only, &mut out).is_ok(),
+      "the option alone is not an indication"
     );
   }
 
@@ -8070,6 +9604,20 @@ mod tunnel {
   }
 
   /// A server that has classified a CONNECT and owes the answer to it.
+  /// A server that has classified an RFC 9110 §7.8 upgrade offer and owes its
+  /// answer — the state `accept` writes the 101 from.
+  fn asked_to_upgrade() -> Connection<Server, Tunnel> {
+    let mut s = Connection::<Server, Tunnel>::new();
+    assert!(matches!(
+      s.handle_request(
+        b"GET /chat HTTP/1.1\r\nHost: h\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n"
+      )
+      .unwrap(),
+      ServerTunnelRequest::Upgrade { .. }
+    ));
+    s
+  }
+
   fn asked_for_a_tunnel() -> Connection<Server, Tunnel> {
     let mut s = Connection::<Server, Tunnel>::new();
     assert!(matches!(
@@ -9031,6 +10579,7 @@ Connection: Upgrade\r\n\r\nGET /next HTTP/1.1\r\nHost: h\r\n\r\n";
       TransitionRefused::NO_UPGRADE_OFFERED,
       TransitionRefused::REQUEST_INCOMPLETE,
       TransitionRefused::ANSWER_BEGUN,
+      TransitionRefused::SWITCHED,
       TransitionRefused::NOT_OPEN,
       TransitionRefused::READ_CLOSED,
       TransitionRefused::TAIL_UNRESOLVED,
