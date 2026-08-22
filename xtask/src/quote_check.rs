@@ -1302,4 +1302,83 @@ mod tests {
     assert!(exempt.contains("answerable = false"));
     assert!(!exempt.iter().any(|span| span.contains('—')));
   }
+
+  /// A minimal, hand-built spec for testing `grade_production` directly,
+  /// independent of anything the workspace's own comments happen to cite.
+  fn test_spec(name: &str, text: &str) -> super::Spec {
+    super::Spec {
+      name: name.to_string(),
+      text: text.to_string(),
+      lower: text.to_ascii_lowercase(),
+    }
+  }
+
+  // `grade_production` is the function Ruling 7 narrowed to one spec and
+  // Ruling 8 widened back to all of them. Pinned directly, with hand-built
+  // specs, because the property must hold independently of whether the
+  // workspace happens to contain a production whose citing block names a
+  // different RFC than its real source — today it does (three
+  // `handshake/*.rs` sites), but nothing should notice if that ever stops
+  // being true.
+  #[test]
+  fn a_production_found_in_a_later_spec_still_passes() {
+    let specs = [
+      test_spec("rfc1", "an unrelated spec with no matching grammar at all"),
+      test_spec("rfc2", "widget-param = token widget-value here"),
+    ];
+    let normalised: Vec<String> = specs
+      .iter()
+      .map(|spec| super::normalise(&spec.text))
+      .collect();
+    let mut checked = 0;
+    assert!(
+      super::grade_production(
+        "widget-param = token widget-value",
+        &specs,
+        &normalised,
+        &mut checked
+      )
+      .is_none()
+    );
+    assert_eq!(checked, 1);
+  }
+
+  // The property Ruling 8 must not have cost: a production in NO loaded spec
+  // still fails, and still names one — the first, the same arbitrary
+  // fallback `grade` uses for an unanchored quotation.
+  #[test]
+  fn a_production_in_no_spec_fails_and_names_one() {
+    let specs = [
+      test_spec("rfc1", "an unrelated spec with no matching grammar at all"),
+      test_spec("rfc2", "widget-param = token widget-value here"),
+    ];
+    let normalised: Vec<String> = specs
+      .iter()
+      .map(|spec| super::normalise(&spec.text))
+      .collect();
+    let mut checked = 0;
+    let graded = super::grade_production(
+      "gadget-param = token gadget-value",
+      &specs,
+      &normalised,
+      &mut checked,
+    );
+    assert_eq!(graded.map(|spec| spec.name.as_str()), Some("rfc1"));
+    assert_eq!(checked, 1);
+  }
+
+  // Below the three-word floor: not a checkable claim, so `checked` does not
+  // move — this is what keeps a stray two-token span from inflating the
+  // denominator.
+  #[test]
+  fn a_span_below_the_word_floor_is_not_counted() {
+    let specs = [test_spec("rfc1", "x=y is mentioned in here somewhere")];
+    let normalised: Vec<String> = specs
+      .iter()
+      .map(|spec| super::normalise(&spec.text))
+      .collect();
+    let mut checked = 0;
+    assert!(super::grade_production("x=y", &specs, &normalised, &mut checked).is_none());
+    assert_eq!(checked, 0);
+  }
 }
