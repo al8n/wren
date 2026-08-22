@@ -167,7 +167,7 @@ pub const DEFAULT_DIR: &str = ".rfc-cache";
 /// quoting a dead spec a live one now governs, or a deliberate historical
 /// note; either way, adding an obsolete RFC to make a production pass is the
 /// same shape of bending this gate as loosening the extractor would be.
-const FETCHED: &[u32] = &[3986, 6455, 7692, 8441, 9110, 9111, 9112, 9220];
+const FETCHED: &[u32] = &[3986, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220];
 
 /// How much of a span must be found in a spec for the span to be treated as a
 /// quotation OF that spec.
