@@ -414,19 +414,28 @@ fn as_ids(value: Option<&json::Value>) -> Vec<u64> {
 /// verdict word its own declaration does not list, or declares a word no row
 /// uses — see [`verdict_problems`].
 ///
+/// A declaration bullet is `- **VERDICT** — reason`: the bold term
+/// immediately followed by an em dash. A bullet that reaches an em dash only
+/// mid-sentence, or uses different punctuation (a colon, say) in its place,
+/// is not read as a declaration — see [`verdict_problems`]'s own doc for the
+/// real bullet that distinguishes it from a declaration, and why the guard
+/// exists at all.
+///
 /// Scoped to that one header shape rather than every markdown table in the
-/// crate: `outbound`'s RFC-9112-rule table and three tables in
-/// `connection::mod` (`handle_eof`'s disposition, its EOF-ordering
-/// companion, `refuse`'s call/consult table) are ordinary reference tables —
-/// none of them has a bulleted declaration above it saying a site "is one
-/// of" a closed set, the way `TunnelPhase::Switched` does, so there is no
-/// single source for this check to hold them to. Passing one through
-/// `verdict_problems` would report every cell as undeclared, which is not a
-/// defect in that table — it is this check reaching past its own subject.
-/// `| corner | site | verdict |` is, today, unique to `tunnel.rs`; a second
-/// table that states an invariant the same way — declared bullets, a
-/// self-policing closing sentence, a table of sites — earns the same header
-/// and is picked up here without a code change.
+/// crate. Five other tables live in `http1-proto/src` today —
+/// `connection/outbound.rs`'s RFC-9112-rule table, three in
+/// `connection/mod.rs` (`handle_eof`'s disposition, its EOF-ordering
+/// companion, `refuse`'s call/consult table), and `media/mod.rs`'s
+/// `Accept`-weight table — and none of them is governed: none has a bulleted
+/// declaration above it saying a site "is one of" a closed set, the way
+/// `TunnelPhase::Switched` does, so there is no single source for this check
+/// to hold them to. Passing one through `verdict_problems` would report
+/// every cell as undeclared, which is not a defect in that table — it is
+/// this check reaching past its own subject. `| corner | site | verdict |`
+/// is, today, unique to `tunnel.rs`; a second table that states an invariant
+/// the same way — declared bullets, a self-policing closing sentence, a
+/// table of sites — earns the same header and is picked up here without a
+/// code change.
 fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
   let dir = root.join("http1-proto/src");
   let mut files = Vec::new();

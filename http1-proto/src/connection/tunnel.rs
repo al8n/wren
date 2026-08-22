@@ -604,6 +604,12 @@ pub(crate) enum TunnelPhase {
   ///
   /// A site that is none of the three is a defect, not a judgement call.
   ///
+  /// `cargo run -p xtask -- doc-check` checks this declaration against the
+  /// table below it: a bullet counts only in the exact shape `- **VERDICT**
+  /// — reason` (bold term, em dash, gloss). A bullet that reaches the dash
+  /// only mid-sentence, or uses a colon in its place, is not read as a
+  /// declaration at all.
+  ///
   /// **Why the second axis exists.** The spatial rule enumerates sites by what
   /// they DO to a switch, and [`close`](Connection::close) does none of those
   /// three things — it only moves the lifecycle, on a connection whose
