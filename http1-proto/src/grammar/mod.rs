@@ -563,6 +563,7 @@ pub(crate) fn is_sender_token_list(value: &[u8]) -> bool {
 /// parameter   = parameter-name "=" parameter-value
 /// ```
 ///
+// gate-exempt: ext = value — a counterexample the field's production does not admit, not RFC 9110 grammar
 /// Note WHERE the brackets are: `parameters` sits INSIDE the optional group, so
 /// a member carrying a parameter without an argument (`ext;flag`) is not an
 /// `expectation` at all. Note also what is absent: `parameter` has no BWS around
@@ -1287,6 +1288,7 @@ fn scan_to_delim(value: &[u8], at: usize, delim: u8) -> Delim {
 /// One `parameter = parameter-name "=" parameter-value` (RFC 9110 §5.6.6), over
 /// a slice already trimmed of the OWS that production puts around it.
 ///
+// gate-exempt: q = 1 — a weight value in prose, not RFC 9110 grammar
 /// The `=` is the first one outside a quoted-string, and §5.6.6 puts no BWS
 /// around it: `q = 1` names `q `, which is not a `token`, so it is not a
 /// parameter. The same reading as this crate's `Expect` parser, which is the

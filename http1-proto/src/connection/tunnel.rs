@@ -1312,6 +1312,7 @@ impl Connection<Server, Tunnel> {
           // those ended just as cleanly.
           return Ok(ServerTunnelRequest::Closed);
         }
+        // gate-exempt: answerable = false — a Rust flag value, not RFC 9112 grammar
         // RFC 9112 §2.1 again, and through `fail` rather than `refuse`: a
         // truncated request creates NO answer to owe. That is the same call
         // General's `truncated` makes with `answerable = false`, and for the

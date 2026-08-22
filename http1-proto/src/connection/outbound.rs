@@ -1454,6 +1454,7 @@ pub(super) struct Declared {
   /// RFC 9110 §10.1.1's `Expect`, accumulated across the section's field lines
   /// rather than checked one line at a time.
   ///
+  // gate-exempt: ext = value — a counterexample the field's production does not admit, not RFC 9110 grammar
   /// §5.2 makes those lines ONE value, so a legal `quoted-string` argument may
   /// span the join — and the per-line check this replaces refused one, while
   /// accepting `ext = value` and `ext;flag`, which the field's production does
