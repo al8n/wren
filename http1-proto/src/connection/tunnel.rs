@@ -599,7 +599,8 @@ pub(crate) enum TunnelPhase {
   /// - **GUARDED** — it asks the close question itself.
   /// - **GUARDED BY A CALLER** — an earlier gate makes the state unreachable, and
   ///   the site names which gate.
-  /// - **DELIBERATELY EXCLUDED** — with its reason recorded at the site.
+  /// - **STRUCTURALLY EXCLUDED** — the site cannot reach this state at all, and
+  ///   says what stops it.
   ///
   /// A site that is none of the three is a defect, not a judgement call.
   ///
