@@ -57,23 +57,46 @@
 //!
 //! ## Attribution by citation
 //!
-//! A block naming exactly one RFC is a stronger signal than anchoring: the
-//! quotations inside it are graded against ONLY the spec that RFC names, not
-//! against whichever loaded spec happens to share their opening text.
-//! Anchoring is not required in this case — the citation IS the attribution —
-//! and this closes a hole the anchor-only rule always had: a sentence
-//! attributed to RFC 9110 used to pass because RFC 9112 happened to contain
-//! it too, and the citation itself was never read. When the named spec was
-//! never loaded, that is not silence: it is reported as [`Grade::Unloaded`],
-//! because a claim this run could not check is a different fact from a
-//! quotation with no supplied spec to check it against.
+//! Anchoring and citation answer two DIFFERENT questions, asked in that
+//! order, never one standing in for the other:
 //!
-//! An ABNF production goes the OTHER way and is checked against every loaded
-//! spec regardless of citation — see [`grade_production`]'s doc comment for
-//! why. The two are intentionally asymmetric: a quoted SENTENCE inside a
-//! citing block is almost always that RFC's own prose, but a grammar RULE
-//! beside a citation is routinely shown for comparison with a different
-//! spec's.
+//! 1. **Is this span demonstrably a quotation of some loaded spec at all?**
+//!    Anchoring answers this, and only this — the span's own opening
+//!    characters either appear in a loaded spec's text or they do not,
+//!    regardless of what the surrounding block claims.
+//! 2. **If so, which spec is it from?** An anchored span whose own block
+//!    names exactly one LOADED RFC ([`cited_rfc`]) is graded against ONLY
+//!    that spec, not against whichever loaded spec happens to share its
+//!    opening text. This closes a hole the anchor-only rule always had: a
+//!    sentence attributed to RFC 9110 used to pass because RFC 9112 happened
+//!    to contain it too, and the citation itself was never read. An anchored
+//!    span whose block names no RFC, or names one this run did not load,
+//!    keeps the any-spec anchored behaviour above, unchanged.
+//!
+//! Letting the citation answer BOTH questions was tried and reverted: a
+//! prose-sized span sitting anywhere in a block that cites an RFC for one
+//! unrelated point is not thereby a quotation of it, and grading it as one is
+//! exactly how a block's own rhetorical asides — a title, a question, an
+//! author's paraphrase — got checked against spec text they were never
+//! claiming to be. An UNANCHORED span in a cited block is therefore not a
+//! failure; it is counted separately (`unattributable`, printed by [`run`])
+//! rather than either silently dropped or wrongly graded — UNLESS the block
+//! cites a spec this run never loaded, in which case "unanchored" proves
+//! nothing (this run was never given the text to match against) and
+//! [`Grade::Unloaded`] is the honest answer instead.
+//!
+//! **What this still cannot see**, stated rather than merely being the case:
+//! a quotation so reworded, or so short an excerpt, that its own first
+//! [`ANCHOR_CHARS`] characters match nothing in any loaded spec is beyond
+//! this tool's reach — anchoring is the floor the whole check stands on, and
+//! nothing narrows a spec it cannot even find a foothold in.
+//!
+//! An ABNF production goes the OTHER way once admitted as a candidate: it is
+//! checked against every loaded spec regardless of citation — see
+//! [`grade_production`]'s doc comment for why. The two are intentionally
+//! asymmetric: a quoted SENTENCE that anchors inside a citing block is almost
+//! always that RFC's own prose, but a grammar RULE beside a citation is
+//! routinely shown for comparison with a different spec's.
 //!
 //! # What is normalised away on BOTH sides, and why
 //!
@@ -226,19 +249,35 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
 
   let mut checked = 0usize;
   let mut failures = 0usize;
+  // Anchored to some loaded spec but ungraded because its block cited none
+  // of them: visible so a sudden jump is a signal, never silent and never a
+  // failure — see `grade`'s doc comment (Ruling 9) for the two questions this
+  // separates.
+  let mut unattributable = 0usize;
   let mut abnf_checked = 0usize;
   let mut abnf_failures = 0usize;
   let mut abnf_skipped = 0usize;
   let mut abnf_exempt = 0usize;
+  // A quotation this reads as a deliberate historical citation rather than a
+  // checkable claim against a loaded spec — same marker, same mechanism as
+  // `abnf_exempt`, extended to quotations (Ruling 9).
+  let mut quote_exempt = 0usize;
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = source.strip_prefix(&root).unwrap_or(source).display();
     let (spans, productions, skipped_here) = spans_for(source, &text);
     abnf_skipped += skipped_here;
+    // Per-file: a marker in one file cannot exempt a span in another. Read
+    // once and reused below for both quotations and productions.
+    let exempt = exempted_spans(&text);
     for (line, span, cited) in spans {
+      if exempt.contains(&span) {
+        quote_exempt += 1;
+        continue;
+      }
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
-        let Some(grade) = grade(&quoted, cited, &specs, &mut checked) else {
+        let Some(grade) = grade(&quoted, cited, &specs, &mut checked, &mut unattributable) else {
           continue;
         };
         failures += 1;
@@ -264,8 +303,6 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
         }
       }
     }
-    // Per-file: a marker in one file cannot exempt a span in another.
-    let exempt = exempted_spans(&text);
     for (line, production) in productions {
       if exempt.contains(&production) {
         abnf_exempt += 1;
@@ -299,9 +336,19 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   // `negotiation.rs:592`'s `quoted-pair` (a real, correctly-quoted RFC 2616
   // production whose citation sits outside its own block) stays VISIBLE as
   // unchecked instead of vanishing the way it did before this line existed.
+  // `gate-exempt` now marks a QUOTATION the same way (Ruling 9): a deliberate
+  // historical citation of an obsolete spec whose successor does not carry
+  // the same words, so there is no loaded spec left to grade it against —
+  // `negotiation.rs`'s RFC 2616 "implied *LWS rule" quote is the first one.
   println!(
     "quote-check: {abnf_skipped} production-shaped spans skipped (no RFC cited), {abnf_exempt} \
-     marked gate-exempt"
+     marked gate-exempt, {quote_exempt} quotations marked gate-exempt"
+  );
+  // Same shape, same reason: a span this is not silence either — it is what
+  // Ruling 9 costs, stated as a number instead of merely being the case.
+  println!(
+    "quote-check: {unattributable} prose-sized spans in citing blocks matched no loaded spec \
+     — not graded"
   );
 
   if failures == 0 && abnf_failures == 0 {
@@ -342,72 +389,104 @@ fn spans_for(path: &Path, text: &str) -> (QuotedSpans, Spans, usize) {
 
 /// Grades one normalised span, counting it when it is one this check governs.
 ///
-/// `cited` is the single RFC the span's own block named, if any
-/// ([`cited_rfc`]). A block that cites one RFC is claiming THAT spec's
-/// words, so a cited span is graded only against the spec it names — not
-/// against whichever loaded spec happens to contain it. That closes a hole
-/// this check always had: a sentence attributed to RFC 9110 used to pass
-/// because RFC 9112 happened to contain it too, and the attribution itself
-/// was never read. A spec the block names but this run never loaded is not
-/// silence either — it is [`Grade::Unloaded`], because a claim this run could
-/// not check is a different fact from a claim with nothing to check against.
+/// Two different questions, asked in this order (Ruling 9): first, ANCHORING
+/// asks "is this demonstrably a quotation of some loaded spec at all" — the
+/// span's own opening characters either appear in a loaded spec's text or
+/// they do not, independent of anything the block claims. Only once that is
+/// "yes" does `cited` — the single RFC the span's own block named, if any
+/// ([`cited_rfc`]) — get to answer the SECOND question, "which spec is it
+/// from": an anchored span in a block naming one loaded RFC is graded only
+/// against that spec, not against whichever loaded spec happens to contain
+/// it. That closes a hole this check always had: a sentence attributed to
+/// RFC 9110 used to pass because RFC 9112 happened to contain it too, and the
+/// attribution itself was never read.
 ///
-/// This is deliberately the OPPOSITE of [`grade_production`], which grades
-/// against every loaded spec regardless of citation. That is not an
-/// inconsistency: a quoted SENTENCE inside a citing block is almost always
-/// that RFC's own prose, but a grammar RULE beside a citation is routinely
-/// shown for comparison with a different spec's — see `grade_production`'s
-/// doc comment for the worked example.
+/// Letting the citation answer BOTH questions — this check's first attempt —
+/// is exactly how a block's own rhetorical prose got graded: prose-sized,
+/// sitting in a block that cites something for an unrelated point, with
+/// nothing else asked. An unanchored span stays ungraded UNLESS the block
+/// cites a spec this run does not have loaded, in which case there is
+/// nothing else to ask either way and [`Grade::Unloaded`] says so — a claim
+/// this run could not check is a different fact from a claim with nothing to
+/// check against, and both are different again from an unanchored span in an
+/// uncited (or already-loaded-but-still-unanchored) block, which is simply
+/// not this check's business and is counted, not failed (`unattributable`,
+/// the caller's running total — see [`run`]'s printed line for what that
+/// number costs).
+///
+/// This citation-narrows-the-target step is deliberately the OPPOSITE of
+/// [`grade_production`], which grades an admitted candidate against every
+/// loaded spec regardless of citation. That is not an inconsistency: a
+/// quoted SENTENCE that anchors inside a citing block is almost always that
+/// RFC's own prose, but a grammar RULE beside a citation is routinely shown
+/// for comparison with a different spec's — see `grade_production`'s doc
+/// comment for the worked example.
 fn grade<'a>(
   quoted: &str,
   cited: Option<u32>,
   specs: &'a [Spec],
   checked: &mut usize,
+  unattributable: &mut usize,
 ) -> Option<Grade<'a>> {
   if quoted.split_whitespace().count() < MIN_WORDS || quoted.chars().count() < MIN_CHARS {
     return None; // not prose-sized: not a quotation
   }
 
-  if let Some(number) = cited {
-    let name = format!("rfc{number}");
-    let Some(spec) = specs.iter().find(|spec| spec.name == name) else {
-      *checked += 1;
-      return Some(Grade::Unloaded(number));
-    };
-    *checked += 1;
-    if spec.text.contains(quoted) {
-      return None;
-    }
-    let lowered = quoted.to_ascii_lowercase();
-    if let Some(at) = spec.lower.find(&lowered) {
-      return Some(Grade::Recased(spec, excerpt(&spec.text, at, quoted.len())));
-    }
-    let head = anchor(quoted);
-    let at = spec.lower.find(&head).unwrap_or(0);
-    return Some(Grade::Reworded(
-      spec,
-      excerpt(&spec.text, at, quoted.len().saturating_mul(2)),
-    ));
-  }
-
-  // No citation: the pre-existing any-spec behaviour, unchanged. Without a
-  // citation naming which spec is claimed, anchoring — the span's own opening
-  // characters — is the only signal that it is a quotation of a supplied spec
-  // at all.
+  // Q1: is this demonstrably a quotation of some loaded spec at all?
   let head = anchor(quoted);
   let anchored: Vec<&Spec> = specs
     .iter()
     .filter(|spec| spec.lower.contains(&head))
     .collect();
+
   if anchored.is_empty() {
-    // Not a quotation of any supplied spec: an internal quotation, a quoted
-    // identifier, or an UNCITED quotation from a spec this run was not given.
-    // With no citation naming it, there is no spec to report as unloaded —
-    // unlike the cited branch above, this stays silent. Not this check's
-    // business.
+    if let Some(number) = cited {
+      let name = format!("rfc{number}");
+      if !specs.iter().any(|spec| spec.name == name) {
+        // The cited spec isn't loaded, so "no anchor match" proves nothing —
+        // this run was never given the text to match against.
+        *checked += 1;
+        return Some(Grade::Unloaded(number));
+      }
+    }
+    // Cites nothing, or cites a spec this run DOES have and still didn't
+    // anchor: not demonstrably a quotation of anything checkable. Visible,
+    // not silent, and not a failure either — an internal quotation, a quoted
+    // identifier, or prose that merely sits near a citation for an unrelated
+    // point.
+    *unattributable += 1;
     return None;
   }
 
+  // Q2: anchored — which spec is it from? A block naming one LOADED RFC
+  // answers that directly.
+  if let Some(number) = cited {
+    let name = format!("rfc{number}");
+    if let Some(spec) = specs.iter().find(|spec| spec.name == name) {
+      *checked += 1;
+      if spec.text.contains(quoted) {
+        return None;
+      }
+      let lowered = quoted.to_ascii_lowercase();
+      if let Some(at) = spec.lower.find(&lowered) {
+        return Some(Grade::Recased(spec, excerpt(&spec.text, at, quoted.len())));
+      }
+      let at = spec.lower.find(&head).unwrap_or(0);
+      return Some(Grade::Reworded(
+        spec,
+        excerpt(&spec.text, at, quoted.len().saturating_mul(2)),
+      ));
+    }
+    // Cites a spec this run does not have loaded, yet anchored somewhere
+    // else: fall through to the anchored-specs behaviour below, unchanged —
+    // the citation named a spec that cannot answer Q2, so the anchor's own
+    // candidates do instead.
+  }
+
+  // No usable citation (none, or unloaded-but-anchored-elsewhere): the
+  // pre-existing any-spec anchored behaviour, unchanged. Several anchored
+  // specs may hold the same opening, and a verbatim match in any of them
+  // clears it, because nothing here says which one is claimed.
   *checked += 1;
   if anchored.iter().any(|spec| spec.text.contains(quoted)) {
     return None;
@@ -952,6 +1031,7 @@ fn mask_code_spans(line: &str) -> String {
 /// word.
 fn normalise(text: &str) -> String {
   let text = strip_cross_references(text);
+  let text = strip_bracket_insertions(&text);
   let mut out = String::with_capacity(text.len());
   let mut chars = text.chars().peekable();
   let mut space = false;
@@ -971,6 +1051,37 @@ fn normalise(text: &str) -> String {
       }
     }
   }
+  out
+}
+
+/// Removes every `[bracketed]` span, and the space before it.
+///
+/// `[…]` is the standard mark for an editorial insertion or substitution in a
+/// quotation — both what a comment here uses to swap an RFC's bare pronoun
+/// for something legible out of context (`consider [it]` for the RFC's
+/// `consider that data`), and what the RFC's OWN prose uses for an inline
+/// `[RFC2616]`-style reference. Stripping it here, ahead of the character
+/// loop below, applies to both: `normalise` runs over a spec's text exactly
+/// as it runs over a comment's, so a bracket either side chose to insert is
+/// gone from both before anything else is compared.
+fn strip_bracket_insertions(text: &str) -> String {
+  let mut out = String::with_capacity(text.len());
+  let mut rest = text;
+  while let Some(open) = rest.find('[') {
+    let after = &rest[open + 1..];
+    let Some(close) = after.find(']') else {
+      // No closing bracket on the rest of this text: nothing more to strip.
+      out.push_str(&rest[..open]);
+      rest = after;
+      break;
+    };
+    out.push_str(&rest[..open]);
+    while out.ends_with(' ') || out.ends_with('\t') {
+      out.pop();
+    }
+    rest = &after[close + 1..];
+  }
+  out.push_str(rest);
   out
 }
 
@@ -1501,28 +1612,35 @@ mod tests {
   // must not look the same as a run that could not check anything: a block
   // citing RFC 9782 (never loaded — it is not in `FETCHED`) is a checkable
   // claim this run could not honour, and that must surface rather than vanish.
+  // Empty `specs` also means the anchor can never match, so this pins Row 1
+  // of Ruling 9's table (unanchored + cited-but-unloaded => `Unloaded`).
   #[test]
   fn an_unloaded_citation_grades_as_unloaded() {
     let specs: Vec<super::Spec> = Vec::new();
     let mut checked = 0;
+    let mut unattributable = 0;
     let graded = super::grade(
       "the identifier is a valid URI reference and is compared",
       Some(9782),
       &specs,
       &mut checked,
+      &mut unattributable,
     );
     assert!(matches!(graded, Some(super::Grade::Unloaded(9782))));
     assert_eq!(
       checked, 1,
       "an unloaded citation still counts as one this check governs"
     );
+    assert_eq!(unattributable, 0);
   }
 
   // The hole grading-by-citation closes: `rfc1` holds these exact words, but
   // the block cites `rfc2`, which does not — so this must FAIL, not silently
   // pass the way the pre-citation any-spec match did (a sentence attributed to
   // RFC 9110 passing because RFC 9112 happened to contain it too). The
-  // attribution is read, not just present.
+  // attribution is read, not just present. `rfc1` is what ANCHORS this span
+  // (Q1, yes); `rfc2` is what the block CITES, and Ruling 9 makes citation
+  // answer only Q2 once Q1 is already yes — this pins Row 3 of that table.
   #[test]
   fn a_quotation_attributed_to_the_wrong_loaded_spec_fails() {
     let specs = [
@@ -1536,13 +1654,75 @@ mod tests {
       ),
     ];
     let mut checked = 0;
+    let mut unattributable = 0;
     let graded = super::grade(
       "the widget registry must reject a duplicate identifier",
       Some(2),
       &specs,
       &mut checked,
+      &mut unattributable,
     );
     assert!(matches!(graded, Some(super::Grade::Reworded(spec, _)) if spec.name == "rfc2"));
     assert_eq!(checked, 1);
+    assert_eq!(unattributable, 0);
+  }
+
+  // Ruling 9, Row 2: a prose-sized span that does not anchor to ANY loaded
+  // spec is not graded — even though its block cites one, and even though
+  // that cited spec IS loaded. This is the case the first version of this
+  // check got wrong: letting the citation alone decide "is this a quotation"
+  // graded the author's own rhetorical prose against whatever the block
+  // happened to cite nearby. Not a failure, but not silent either.
+  #[test]
+  fn an_unanchored_span_in_a_cited_block_is_not_graded() {
+    let specs = [test_spec(
+      "rfc1",
+      "completely unrelated spec text that shares no opening",
+    )];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let graded = super::grade(
+      "did this head arm this connection and answer truthfully",
+      Some(1),
+      &specs,
+      &mut checked,
+      &mut unattributable,
+    );
+    assert!(
+      graded.is_none(),
+      "an unanchored span must not be graded, even in a cited block"
+    );
+    assert_eq!(checked, 0, "not graded means not counted as checked");
+    assert_eq!(unattributable, 1, "but it is not silent either");
+  }
+
+  // Ruling 9, Row 4: a span that DOES anchor, in a block citing a spec this
+  // run has not loaded, falls back to the pre-existing any-spec anchored
+  // behaviour rather than reporting `Unloaded` — the anchor already found
+  // something checkable, so "unloaded" would be the wrong answer (it isn't
+  // that nothing could be checked; the citation just isn't the useful part
+  // here). Distinguishes this from `an_unloaded_citation_grades_as_unloaded`,
+  // where the anchor could not match anything because `specs` was empty.
+  #[test]
+  fn a_citation_to_an_unloaded_spec_falls_back_to_the_anchor_when_anchored() {
+    let specs = [test_spec(
+      "rfc1",
+      "the widget registry must reject a duplicate identifier",
+    )];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let graded = super::grade(
+      "the widget registry must reject a duplicate identifier",
+      Some(9782),
+      &specs,
+      &mut checked,
+      &mut unattributable,
+    );
+    assert!(
+      graded.is_none(),
+      "verbatim in the anchored spec, so it passes via the fallback"
+    );
+    assert_eq!(checked, 1, "the anchored fallback still counts it");
+    assert_eq!(unattributable, 0);
   }
 }
