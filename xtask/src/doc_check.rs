@@ -94,6 +94,14 @@ pub fn run(require_all: bool, bless: bool) -> Result<(), Error> {
 /// is not an available rule. A delta is — "no item that had a doc has lost
 /// one" — and the snapshot puts the loss in the diff, where a reviewer sees
 /// it without running anything.
+///
+/// What this does NOT detect: a doc comment that got shorter, wrong, or had
+/// a paragraph cut out of it while at least one line survives. The
+/// comparison is presence/absence of `docs` on an item, not a text diff —
+/// proven while building this check, not assumed: deleting one line out of a
+/// multi-line doc comment left `docs` non-empty and produced no failure, and
+/// only removing an item's entire doc block did. A doc that is damaged
+/// rather than gone is invisible here.
 fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error> {
   let path = root.join("xtask/snapshots/http1-proto-documented.txt");
   let Some(current) = documented_items(root, "http1-proto")? else {
@@ -103,20 +111,26 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
     );
     return Ok(());
   };
+  // Printed on every real run, success included: a counted blind spot in the
+  // tool's own output is the point, not a fact that only lives in a report.
+  let collision_note = format!(
+    "{} paths carry two items each — a loss on one of a pair is not visible here",
+    current.collisions
+  );
   if bless {
     let mut body = String::from(
       "# Documented items in http1-proto. Regenerate with:\n\
        #   cargo run -p xtask -- doc-check --bless\n\
        # A line REMOVED by --bless means this change dropped documentation.\n",
     );
-    for item in &current {
+    for item in &current.paths {
       body.push_str(item);
       body.push('\n');
     }
     fs::write(&path, body)?;
     report.checked(format!(
-      "doc-continuity: blessed {} documented items",
-      current.len()
+      "doc-continuity: blessed {} documented items ({collision_note})",
+      current.paths.len()
     ));
     return Ok(());
   }
@@ -125,7 +139,7 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
     .filter(|line| !line.starts_with('#') && !line.is_empty())
     .map(str::to_string)
     .collect();
-  let lost = lost_docs(&snapshot, &current);
+  let lost = lost_docs(&snapshot, &current.paths);
   for item in &lost {
     report.fail(format!(
       "{item} had a doc comment and no longer does.\n  \
@@ -135,8 +149,8 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
     ));
   }
   report.checked(format!(
-    "doc-continuity: {} documented items, {} lost",
-    current.len(),
+    "doc-continuity: {} documented items, {} lost ({collision_note})",
+    current.paths.len(),
     lost.len()
   ));
   Ok(())
@@ -156,7 +170,23 @@ fn lost_docs(snapshot: &[impl AsRef<str>], current: &[impl AsRef<str>]) -> Vec<S
     .collect()
 }
 
-/// Every documented item in `crate_name`, as `path::to::item`, sorted.
+/// What `documented_items` found.
+struct DocumentedItems {
+  /// Every documented item, as `path::to::item`, sorted and deduplicated.
+  paths: Vec<String>,
+  /// How many of `paths` were reached by more than one distinct item id: a
+  /// private field beside its same-named accessor method, or the same
+  /// method name declared in two differently-parameterized impls (say,
+  /// `Connection<General>` and `Connection<Tunnel>`) — `walk_item` builds a
+  /// path from container *names*, not full type identity, so both collapse
+  /// onto one string. A doc lost from one half of such a pair is invisible
+  /// to `continuity`: the path stays in `paths` because its sibling still
+  /// has a doc, so nothing here can report it.
+  collisions: usize,
+}
+
+/// Every documented item in `crate_name`, plus how ambiguous that set is —
+/// see [`DocumentedItems`].
 ///
 /// `--document-private-items` because the hazard is not public-only: the doc
 /// that went missing on #55 was on a `pub(crate)` function, which
@@ -166,7 +196,7 @@ fn lost_docs(snapshot: &[impl AsRef<str>], current: &[impl AsRef<str>]) -> Vec<S
 /// no nightly toolchain, or `-Z unstable-options`/`--output-format json`
 /// rejected — so the caller can `report.skip` a toolchain limitation instead
 /// of failing on it.
-fn documented_items(root: &Path, crate_name: &str) -> Result<Option<Vec<String>>, Error> {
+fn documented_items(root: &Path, crate_name: &str) -> Result<Option<DocumentedItems>, Error> {
   let output = Command::new("cargo")
     .current_dir(root)
     .args([
@@ -204,12 +234,20 @@ fn documented_items(root: &Path, crate_name: &str) -> Result<Option<Vec<String>>
     .and_then(json::Value::as_u64)
     .ok_or("rustdoc JSON has no `root` id")?;
 
-  let mut documented = Vec::new();
+  let mut documented: Vec<(u64, String)> = Vec::new();
   let mut visited = HashSet::new();
   walk_item(root_id, "", index, &mut visited, &mut documented);
-  documented.sort();
-  documented.dedup();
-  Ok(Some(documented))
+  documented.sort_by(|a, b| a.1.cmp(&b.1));
+
+  let mut paths = Vec::with_capacity(documented.len());
+  let mut collisions = 0usize;
+  for group in documented.chunk_by(|a, b| a.1 == b.1) {
+    if group.len() > 1 {
+      collisions += 1;
+    }
+    paths.push(group[0].1.clone());
+  }
+  Ok(Some(DocumentedItems { paths, collisions }))
 }
 
 /// Where `cargo` writes build artifacts for `root`'s workspace:
@@ -229,8 +267,11 @@ fn target_dir(root: &Path) -> PathBuf {
   }
 }
 
-/// Walks the item tree from `id`, recording `path::to::item` in `documented`
-/// for every item that has both a name and a non-empty doc comment.
+/// Walks the item tree from `id`, recording `(id, path::to::item)` in
+/// `documented` for every item that has both a name and a non-empty doc
+/// comment. The id travels alongside the path so the caller can tell when
+/// two distinct items land on the same path — see
+/// [`DocumentedItems::collisions`].
 ///
 /// rustdoc's JSON keys every item by an opaque id and does not hand out a
 /// ready-made qualified path for most of them. The obvious source, the JSON's
@@ -250,7 +291,7 @@ fn walk_item(
   prefix: &str,
   index: &HashMap<String, json::Value>,
   visited: &mut HashSet<u64>,
-  documented: &mut Vec<String>,
+  documented: &mut Vec<(u64, String)>,
 ) {
   use json::Value;
 
@@ -280,7 +321,7 @@ fn walk_item(
       .and_then(Value::as_str)
       .is_some_and(|docs| !docs.is_empty());
     if has_docs {
-      documented.push(path.clone());
+      documented.push((id, path.clone()));
     }
   }
 
@@ -351,7 +392,7 @@ fn walk_all(
   path: &str,
   index: &HashMap<String, json::Value>,
   visited: &mut HashSet<u64>,
-  documented: &mut Vec<String>,
+  documented: &mut Vec<(u64, String)>,
 ) {
   for id in ids {
     walk_item(id, path, index, visited, documented);
