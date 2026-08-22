@@ -23,7 +23,7 @@
 //! RFC 6455 §4.1 tells a client that did not get the switch to handle what it
 //! did get "per HTTP procedures. In particular, the client might perform
 //! authentication if it receives a 401 status code; the server might redirect
-//! the client using a 3xx status code." Authenticating reads
+//! the client using a 3xx status code…" Authenticating reads
 //! `WWW-Authenticate`, redirecting reads `Location` — so a status code alone
 //! answers neither, and a consumer holding only one would need a second head
 //! parser just to find where the fields were.
@@ -1419,7 +1419,7 @@ mod tests {
   /// RFC 6455 §4.1: a client that does not get the switch "handles the response
   /// per HTTP procedures. In particular, the client might perform
   /// authentication if it receives a 401 status code; the server might redirect
-  /// the client using a 3xx status code."
+  /// the client using a 3xx status code…"
   ///
   /// Both of those read FIELDS — `WWW-Authenticate`, `Location` — so the status
   /// on its own is not enough, and a consumer must be able to get back to the

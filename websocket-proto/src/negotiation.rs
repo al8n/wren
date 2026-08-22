@@ -409,6 +409,8 @@ fn parse_extension(extension: &[u8]) -> Result<Extension<'_>, Malformed> {
 /// parameter already trimmed of the surrounding whitespace.
 fn parse_param(param: &[u8]) -> Result<(&[u8], ExtensionValue<'_>), Malformed> {
   if param.is_empty() {
+    // gate-exempt: between any two adjacent words … and between adjacent words and separators — RFC 2616's own wording for the implied *LWS rule; its current successor dropped that whole convention for explicit OWS/RWS grammar instead, so no loaded spec restates it
+    //
     // `*( ";" extension-param )` puts a MANDATORY `extension-param` after every
     // semicolon: what §9.1 makes optional is the `[ "=" … ]` half, not the
     // production itself, so `ext;` and `ext;;x` state a parameter slot the
@@ -2076,7 +2078,7 @@ mod tests {
       "x-private; a; b=c, permessage-deflate",
       // RFC 9110 §5.6.1.2's ignorable empty elements, around a real one.
       ", permessage-deflate,",
-      // §9.1 states its ABNF "including the 'implied *LWS rule'", so
+      // RFC 6455 §9.1 states its ABNF "including the 'implied *LWS rule'", so
       // whitespace between words and separators does not make a value
       // malformed — even where RFC 9110 §5.6.6's `parameter` would refuse it.
       // The negotiation behind this gate reads the same grammar, so it
@@ -2167,10 +2169,10 @@ mod tests {
       lines.get(..MAX_SUBPROTOCOL_OFFERS).unwrap().iter().copied()
     ));
 
-    // Null elements do not count toward it — RFC 2616 §2.1 says they "do not
-    // contribute to the count of elements present" — so a value padded with
-    // commas is still read, and still bounded by the elements that name
-    // something.
+    // Null elements do not count toward it — RFC 9110 §5.6.1.2 says empty
+    // elements "do not contribute to the count of elements present" — so a
+    // value padded with commas is still read, and still bounded by the
+    // elements that name something.
     let padded = format!(",,,{at_cap},,,");
     assert!(subprotocol_list_conforms([padded.as_bytes()]));
 
