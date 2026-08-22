@@ -819,9 +819,6 @@ impl Connection<Client, General> {
       head_digest: 0,
       // The RESPONSE this request will draw has not been read, let alone
       // refused. Set by `connection::refuse` and never cleared.
-      // gate-exempt: connection::refuse — names the function that later WRITES
-      // this field to true, the same reason given at its inbound-side twin in
-      // `inbound.rs`; this initializer only ever writes false.
       body_refused: false,
     });
     self.send = started(body);
@@ -1487,12 +1484,6 @@ pub(super) struct Declared {
 }
 
 impl Declared {
-  // gate-exempt: tunnel::names_a_protocol — names this method's RECEIVE-side
-  // twin, an independent parallel implementation, not a function this method
-  // calls.
-  // gate-exempt: grammar::is_protocol_list — the grammar helper the TWIN
-  // named above uses; this method is described as sharing the same grammar,
-  // not calling this specific helper out of its own reduction walk.
   /// Whether the section states BOTH halves of RFC 9110 §7.8's offer — the
   /// `upgrade` connection option, and an `Upgrade` field naming at least one
   /// well-formed protocol.

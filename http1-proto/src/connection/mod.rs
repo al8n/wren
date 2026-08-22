@@ -822,10 +822,6 @@ pub(crate) struct Exchange {
   /// written the transient fact is gone. The response cannot be read to recover
   /// it.
   pub(crate) expect_unanswered: bool,
-  // gate-exempt: outbound::open_request — the SENT half of a two-writer field;
-  // this field's own declaration writes neither half, both writers named here
-  // are elsewhere, and RECEIVED's writer (`inbound`) is bare prose next to
-  // it for the same reason.
   /// Whether the request offered a §7.8 upgrade. RFC 9110 §7.8: "A server MUST
   /// NOT switch to a protocol that was not indicated by the client in the
   /// corresponding request's Upgrade header field."
@@ -842,9 +838,6 @@ pub(crate) struct Exchange {
   ///   required inside that branch instead (`OFFER_NEEDS_BOTH_HALVES`), so what
   ///   is recorded true here still went out stating both halves on HTTP/1.1.
   pub(crate) upgrade_offered: bool,
-  // gate-exempt: outbound::open_request — the client-exchange half of a
-  // per-site rule stated over TWO fields' relationship; this field's own
-  // declaration hashes nothing itself, so neither named site is this one.
   /// WHICH request that offer came in, as [`head_digest`] of its whole head
   /// block — the fact a `Tunnel` connection answers
   /// [`head_binding`](Connection::head_binding) from once
@@ -1140,9 +1133,6 @@ pub struct Connection<Ro, Mo> {
   lifecycle: Lifecycle,
   /// GENERAL. The PEER's write side has ended, so no further byte can arrive.
   ///
-  // gate-exempt: inbound::no_more_input — names the pump function that READS
-  // this field once set; the field's own declaration only latches the flag,
-  // it never itself calls the reader.
   /// Its own field rather than a `Lifecycle` state, and that is the whole point:
   /// "can the transport still produce bytes?" and "will this end accept another
   /// exchange?" are ORTHOGONAL — a peer can half-close without ever stating
@@ -2455,9 +2445,6 @@ pub(crate) fn refuse(
 
 /// Abandons a client's outstanding request body, if it has one.
 ///
-// gate-exempt: inbound::commit_head — one of TWO named CALLERS of this
-// function (the other is `handle_eof`, linked beside it); `abandon_send`
-// itself is called BY both, and calls neither.
 /// Not §9.6's "cease sending", which governs requests: what releases this end
 /// from finishing a body already in flight is the close-after-reading MUST
 /// beside it, and RFC 9112 §9.5 states the same of the body — "the client SHOULD
@@ -2526,9 +2513,6 @@ pub(crate) fn settle(
   // `Closing` and `Closing` alone: a `close` option was stated, so RFC 9112 §9.6
   // forbids processing anything further and the completed exchange is the last.
   //
-  // gate-exempt: inbound::no_more_input — names the function that drains the
-  // connection once re-arming's buffer turns out exhausted; this block only
-  // re-arms the lifecycle, it does not itself drain anything.
   // A closed READ side deliberately does not drain here, and cannot be seen from
   // here either — `settle` is handed the policy state and no transport fact. The
   // requests a peer pipelined before closing are still owed responses in §9.3.2's

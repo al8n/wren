@@ -575,7 +575,8 @@ fn leading_caps(cell: &str) -> String {
 }
 
 /// Fails when a `http1-proto` comment path-qualifies a callee — `` `module::
-/// name` `` — that the item it documents never uses; see [`callee_problems`].
+/// name` `` — ON AN ASSERTIVE SENTENCE, that the item it documents never
+/// uses; see [`callee_problems`].
 ///
 /// Scoped to comments, not to items with a `///` doc block: the defect this
 /// check exists for (see `callee_problems`'s own doc) lived in a `//` comment
@@ -583,14 +584,25 @@ fn leading_caps(cell: &str) -> String {
 /// starts a fresh item at ANY comment run — `//`, `///`, or `//!` — and ends
 /// it at the next one, not only at `///` runs the way [`doc_runs`] does.
 ///
-/// What this does NOT catch: an UNQUALIFIED mention. Of the two comments in
-/// the defect this exists for, only one was path-qualified; the other read
-/// "through the same `ends_persistence`" — no module, so [`qualified_final_segment`]
-/// never sees a `::` and this check passes over it in silence. Half a class
-/// caught by a gate that stays ON beats a whole class caught by a gate that
-/// gets disabled over its false-positive rate — see [`callee_problems`] for
-/// why path-qualification is the line drawn — so the narrower rule is what
-/// ships, with the miss stated here rather than assumed away.
+/// TWO things this does NOT catch, both stated rather than assumed away —
+/// see [`callee_problems`]'s own doc for the measurement behind each:
+///
+/// - An **UNQUALIFIED** mention. Of the two comments in the defect this
+///   exists for, only one was path-qualified; the other read "through the
+///   same `ends_persistence`" — no module, so [`qualified_final_segment`]
+///   never sees a `::` and this check passes over it in silence.
+/// - A **path-qualified mention on a sentence with none of
+///   [`ASSERTIVE_VERBS`]** (Ruling 13). Most of this crate's cross-referential
+///   prose — a shared-invariant paragraph, a send/receive counterpart, a note
+///   to a field's future writer — path-qualifies a name without one of these
+///   verbs, and is invisible here by design: it is a "see also", not a claim
+///   this check can verify against the item's own body.
+///
+/// Half a class caught by a gate that stays ON beats a whole class caught by
+/// a gate that gets disabled over its false-positive rate — see
+/// [`callee_problems`] for why both lines are drawn where they are — so the
+/// narrower rule is what ships, with both misses named here rather than left
+/// for a reader to assume "comment names the wrong callee" is fully covered.
 fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
   let dir = root.join("http1-proto/src");
   let mut files = Vec::new();
@@ -608,7 +620,7 @@ fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
       .to_string();
     for item in items_in(&text) {
       let (comments, _) = split_comments(&item);
-      for (path, _) in path_qualified_mentions(&comments) {
+      for (path, _) in assertive_mentions(&comments) {
         mentions += 1;
         if exemption_reason(&comments, &path).is_some_and(|reason| !reason.trim().is_empty()) {
           exempt += 1;
@@ -666,14 +678,39 @@ fn split_comments(item: &str) -> (String, String) {
 
 /// Mentions this item asserts and does not use.
 ///
-/// Path-qualified only, and that is the whole of why this can be a gate rather
-/// than a lint: an unqualified name in prose is usually an English word — 797
-/// sites, `close` 74 of them — while `module::name` is a claim that THIS
-/// function, from THIS module, is what runs here. Qualified mentions: 46.
+/// Two conditions, both required, and neither alone is enough:
+///
+/// - **Path-qualified**, which is the whole of why this can be a gate rather
+///   than a lint: an unqualified name in prose is usually an English word —
+///   797 sites, `close` 74 of them — while `module::name` is a claim that
+///   THIS function, from THIS module, is what runs here.
+/// - **On an assertive sentence** ([`assertive_mentions`], Ruling 13): the
+///   original defect's comment read "Tunnel mode decides the same thing
+///   about the same fact, through `` `validate::has_close_option` ``", and
+///   "through" is the whole claim. The SAME path-qualified name in a
+///   "see also" sentence — a shared-invariant paragraph, a send/receive
+///   counterpart, a note to a field's future writer — refers to a
+///   NEIGHBOUR, not to what this item itself does, and is not a claim this
+///   check can verify locally at all.
+///
+/// Path-qualified mentions of a crate function in `http1-proto/src`: 46.
+/// Of those, on an assertive sentence: 5.
+///
+/// ## The limit this leaves, stated rather than assumed away
+///
+/// Two mentions this rule does not reach, both real: an UNQUALIFIED name (no
+/// `module::` in front — the second comment in the defect this check exists
+/// for read "through the same `ends_persistence`", and has no `::` for
+/// [`qualified_final_segment`] to see) and a path-qualified name on a
+/// sentence with NONE of [`ASSERTIVE_VERBS`] — a comment could still name the
+/// wrong callee using a verb this list does not carry. Neither is "comment
+/// names the wrong callee" caught in full; a reader must not take this check
+/// for that. Half a class caught by a gate that stays ON beats a whole class
+/// caught by a gate that gets disabled over its false-positive rate.
 fn callee_problems(item: &str) -> Vec<String> {
   let mut problems = Vec::new();
   let (comments, body) = split_comments(item);
-  for (path, name) in path_qualified_mentions(&comments) {
+  for (path, name) in assertive_mentions(&comments) {
     if let Some(reason) = exemption_reason(&comments, &path) {
       if reason.trim().is_empty() {
         problems.push(format!(
@@ -693,6 +730,126 @@ fn callee_problems(item: &str) -> Vec<String> {
     }
   }
   problems
+}
+
+/// The path-qualified mentions in `comments` that sit on an ASSERTIVE
+/// sentence — one that also carries one of [`ASSERTIVE_VERBS`] — as
+/// `(path, name)`.
+///
+/// Splits `comments` into flowing [`prose`], then that prose into
+/// [`sentences`], keeps only the sentences [`has_assertive_verb`] admits, and
+/// runs [`path_qualified_mentions`] over each of THOSE — never over a
+/// non-assertive sentence, so a mention there is invisible to this check by
+/// construction rather than found and then set aside.
+fn assertive_mentions(comments: &str) -> Vec<(String, String)> {
+  let text = prose(comments);
+  sentences(&text)
+    .into_iter()
+    .filter(|sentence| has_assertive_verb(sentence))
+    .flat_map(path_qualified_mentions)
+    .collect()
+}
+
+/// `comments` flattened to continuous prose: each line's `//`, `///`, or
+/// `//!` prefix stripped, blank lines dropped, and the survivors rejoined
+/// with a single space.
+///
+/// [`assertive_mentions`] needs this because `comments` (as
+/// [`split_comments`] returns it) keeps each line's own prefix — a sentence
+/// that word-wraps across two `///` lines has that second line's `///`
+/// sitting, still attached, in the middle of the flowing text. Fine for
+/// [`path_qualified_mentions`]'s backtick-pairing, which does not care what
+/// sits between a pair, but fatal for [`sentences`] and a verb search, which
+/// read the text as a human does and would otherwise see a literal `///`
+/// where a space belongs.
+fn prose(comments: &str) -> String {
+  let mut out = String::new();
+  for line in comments.lines() {
+    let trimmed = line.trim_start();
+    let stripped = trimmed
+      .strip_prefix("///")
+      .or_else(|| trimmed.strip_prefix("//!"))
+      .or_else(|| trimmed.strip_prefix("//"))
+      .unwrap_or(trimmed)
+      .trim();
+    if stripped.is_empty() {
+      continue;
+    }
+    if !out.is_empty() {
+      out.push(' ');
+    }
+    out.push_str(stripped);
+  }
+  out
+}
+
+/// Splits `text` into sentences.
+///
+/// A `.`, `!`, or `?` ends a sentence when a whitespace character follows it
+/// immediately AND what comes after that whitespace is either nothing or an
+/// uppercase letter. Approximate rather than a real grammar — this crate's
+/// own "deliberately loose" rule applied to punctuation instead of identifier
+/// search — but the two conditions together are what keep it from splitting
+/// `§9.3`, `9.3.6`, or `HTTP/1.0` mid-number: none of those periods has
+/// whitespace immediately after it, so the check never even reaches the
+/// case-of-the-next-word question for them.
+fn sentences(text: &str) -> Vec<&str> {
+  let bytes = text.as_bytes();
+  let mut out = Vec::new();
+  let mut start = 0usize;
+  for (i, &byte) in bytes.iter().enumerate() {
+    if byte != b'.' && byte != b'!' && byte != b'?' {
+      continue;
+    }
+    let end = i + 1;
+    let rest = &text[end..];
+    let starts_with_ws = rest.starts_with(char::is_whitespace);
+    if !starts_with_ws && !rest.is_empty() {
+      continue;
+    }
+    let after_ws = rest.trim_start();
+    let is_boundary = after_ws.is_empty() || after_ws.starts_with(char::is_uppercase);
+    if is_boundary {
+      let sentence = text[start..end].trim();
+      if !sentence.is_empty() {
+        out.push(sentence);
+      }
+      start = end;
+    }
+  }
+  let tail = text[start..].trim();
+  if !tail.is_empty() {
+    out.push(tail);
+  }
+  out
+}
+
+/// The verbs (or verb phrases) that turn a path-qualified mention into a
+/// checkable CLAIM — "this is what runs here" — rather than a cross-reference
+/// to a neighbour. Closed and printed here, not left for a reader to
+/// reconstruct from behavior — the same lesson `verdicts`'s em-dash rule
+/// already learned (Task 6).
+///
+/// Ruling 13's own seed list: `through`, `asks`, `reads`, `calls`, `via`,
+/// `uses`, `answered by`. Matched case-insensitively and at a word boundary
+/// (via [`names_identifier`]), so `Asks` at a sentence's start still counts
+/// and `via` does not fire inside `trivial`.
+const ASSERTIVE_VERBS: &[&str] = &[
+  "through",
+  "asks",
+  "reads",
+  "calls",
+  "via",
+  "uses",
+  "answered by",
+];
+
+/// Whether `sentence` carries one of [`ASSERTIVE_VERBS`], case-insensitively.
+fn has_assertive_verb(sentence: &str) -> bool {
+  let lower = sentence.to_ascii_lowercase();
+  ASSERTIVE_VERBS
+    .iter()
+    .any(|verb| names_identifier(&lower, verb))
 }
 
 /// The path-qualified backtick mentions in `comments`, as `(path, name)` —
@@ -1407,5 +1564,50 @@ fn b() {
       "close"
     ));
     assert!(super::names_identifier("fn close(&mut self)", "close"));
+  }
+
+  // Ruling 13: a path-qualified mention alone is not yet a checkable claim.
+  // This sentence is exactly the "see also" shape the ruling distinguishes
+  // from the original defect's "through `validate::ends_persistence`" —
+  // naming a TWIN function over shared grammar, no assertive verb anywhere —
+  // so it must produce nothing even though the item's body never uses
+  // `ends_persistence` either. Paired with
+  // `a_path_qualified_name_the_body_never_uses_is_a_failure` (same unused
+  // name, but sitting after `through`), which still fails: the two together
+  // pin that assertiveness, not mere non-use, is what this check now keys on.
+  #[test]
+  fn a_path_qualified_mention_on_a_non_assertive_sentence_is_not_flagged() {
+    let item = "\
+/// The send-side twin of `validate::ends_persistence`, over the same grammar.
+fn open_request(view: &HeadView<'_>) -> bool {
+  has_close_option(view)
+}";
+    assert!(super::callee_problems(item).is_empty());
+  }
+
+  // `sentences` must not treat a section or version number's internal
+  // periods as sentence ends — RFC 9110 §9.3.6 and HTTP/1.0 are both common
+  // in this crate's comments, and a false split there would separate an
+  // assertive verb from a mention that legitimately follows it later in the
+  // SAME sentence.
+  #[test]
+  fn sentences_does_not_split_on_a_section_or_version_number() {
+    let text = "RFC 9110 §9.3.6 and HTTP/1.0 both matter here. A new sentence follows.";
+    let parts = super::sentences(text);
+    assert_eq!(parts.len(), 2);
+    assert!(parts[0].contains("§9.3.6"));
+    assert!(parts[0].contains("HTTP/1.0"));
+  }
+
+  // Case-insensitive (a sentence-initial "Asks" still counts) and
+  // word-bounded (`via` must not fire merely because it is a substring of
+  // `trivial`) — the same guarantee `names_identifier_requires_a_word_boundary`
+  // pins for body-usage, now pinned for the verb search too.
+  #[test]
+  fn has_assertive_verb_is_case_insensitive_and_word_bounded() {
+    assert!(super::has_assertive_verb("Asks the predicate directly."));
+    assert!(!super::has_assertive_verb(
+      "This is a trivial, obvious detail."
+    ));
   }
 }

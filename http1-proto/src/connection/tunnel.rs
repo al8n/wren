@@ -165,8 +165,6 @@ pub(super) const OFFER_NEEDS_BOTH_HALVES: &str =
 pub(super) const SWITCH_NEEDS_BOTH_HALVES: &str =
   "a 101 states Connection: upgrade and an Upgrade protocol list";
 
-// gate-exempt: inbound::switch_or_fault — one of the constant's TWO named readers; the constant is a string, and both named readers are
-// elsewhere.
 /// RFC 9110 §7.8: "A server MUST NOT switch to a protocol that was not indicated
 /// by the client in the corresponding request's Upgrade header field."
 ///
@@ -524,9 +522,8 @@ pub(crate) enum TunnelPhase {
   /// request, a server owes the answer to a request it has classified.
   Handshaking(Handshake),
   // gate-exempt: validate::has_close_option — names the shared predicate EVERY takeover site below reads; this variant is a bare marker with no
-  // body of its own to read anything, and the table below names the actual sites.
-  // gate-exempt: inbound::switch_or_fault — the table's own "accept" row names the SITE it classifies, not a call this variant's declaration
-  // makes; placed here rather than beside the row so the `| corner |` table stays one continuous block for `doc-check`'s table-verdicts check.
+  // body of its own to read anything, and the table below names the actual sites. Placed here, not beside the table's row further down, so the
+  // `| corner |` table stays one continuous block for `doc-check`'s table-verdicts check.
   /// TERMINAL: the switch happened and the stream belongs to the next protocol.
   ///
   /// # The one-takeover-no-close invariant
@@ -828,8 +825,6 @@ impl<Ro> Connection<Ro, Tunnel> {
     }
   }
 
-  // gate-exempt: connection::inbound::no_more_input — contrasts this Tunnel-mode function with General's analogue by name; this function IS
-  // the Tunnel-mode one, so it is necessarily not the General one it is being distinguished from.
   /// Reports that the transport's read side has ended, so no further byte can
   /// arrive on this connection.
   ///
@@ -1154,8 +1149,6 @@ impl Connection<Client, Tunnel> {
 
     match (status.code, handshake.connect) {
       (SWITCHING_PROTOCOLS, false) => {
-        // gate-exempt: inbound::switch_or_fault — cites a DIFFERENT function's step 3 as sharing this arm's predicate, constant, and
-        // disposition; this arm calls `has_close_option` directly below, not the function it is compared to.
         // RFC 9112 §9.6, asked of the head IN HAND: a peer that ends the
         // connection's persistence in the very response that would switch has
         // committed to closing, so it has nothing to continue INTO. The interim
@@ -2008,8 +2001,6 @@ fn take_over<Ro>(
   if from.read_closed {
     return Err(TransitionRefused::READ_CLOSED);
   }
-  // gate-exempt: inbound::idle_client_bytes — names a DIFFERENT function that WRITES the two fields this guard only READS; this block gates on
-  // them, it does not write them.
   // §9.2's barrier and §2.2's undecided terminator. Both are bytes the General
   // side has not finished accounting for, and the tunnel would hand them to the
   // next protocol as its own.

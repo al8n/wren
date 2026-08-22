@@ -8,10 +8,6 @@
 //! out between them — the whole point of a Sans-I/O core is that a body does
 //! not need a copy to be framed.
 //!
-// gate-exempt: head::validate_field_line — names the INBOUND analogue of this
-// module's own sharing with `emit_fields`; this module implements the
-// OUTBOUND direction and never calls the inbound function it is drawing the
-// parallel to.
 //! The head module owns the machinery: [`two_pass`] gives the same
 //! measure-then-write guarantee (an exact `need`, and nothing written when the
 //! buffer is short) and [`emit_fields`] writes the trailer section, because RFC

@@ -297,8 +297,6 @@ mod heap {
     );
   }
 
-  // gate-exempt: grammar::scan_quoted_after_join — names the INTERNAL helper this test exercises indirectly; the test drives the public
-  // `parameterised_list` and asserts on its outcome, it does not call the helper directly.
   // The §5.2 join's comma is DATA inside an open quoted-string
   // (`grammar::scan_quoted_after_join`): the two lines are ONE member, and the
   // member after it is found at the right place. The spanning VALUE is not one

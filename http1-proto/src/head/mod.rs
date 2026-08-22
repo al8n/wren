@@ -200,9 +200,6 @@ pub(crate) struct Field<'a> {
   /// The value with the OWS around it removed (RFC 9110 §5.5), which may be
   /// empty — `field-value = *field-content` admits `Host:`.
   pub(crate) value: &'a [u8],
-  // gate-exempt: crate::grammar::validate_field_value — names the function
-  // that PRODUCES the offset this field stores; the field is plain data, it
-  // does not call the function that computed the value it holds.
   /// Offset of `value` within the line, so a caller can rebase a value-relative
   /// offset (what `crate::grammar::validate_field_value` reports) onto the head.
   pub(crate) value_at: usize,

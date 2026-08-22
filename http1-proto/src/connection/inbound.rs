@@ -417,9 +417,6 @@ fn server_head<'a>(
     },
     // Nothing has been read of this message's body yet, so nothing can have
     // been refused. Set by `connection::refuse` and never cleared.
-    // gate-exempt: connection::refuse — names the function that later WRITES
-    // this field to true; this initializer only ever writes false, so the
-    // writer this comment names is necessarily elsewhere.
     body_refused: false,
   });
   *it.send = SendState::Owed;

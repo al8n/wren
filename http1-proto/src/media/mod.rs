@@ -115,9 +115,6 @@ const fn ascii(bytes: &[u8]) -> &str {
   }
 }
 
-// gate-exempt: str::eq_ignore_ascii_case — advises a CALLER of this derived
-// `PartialEq` how to compare case-insensitively; the derive itself never
-// calls it, which is the byte-equality gap this paragraph is documenting.
 /// One media type: RFC 9110 §8.3.1's `type "/" subtype parameters`.
 ///
 /// Borrows the value it was parsed from; nothing is copied.
@@ -285,9 +282,6 @@ pub(crate) fn parse_qvalue(v: &[u8]) -> Option<Weight> {
   Some(Weight(thousandths))
 }
 
-// gate-exempt: str::eq_ignore_ascii_case — same advisory as `MediaType`'s
-// derive doc above: tells a CALLER how to compare case-insensitively; this
-// derive never calls it either.
 /// One member of an `Accept` list: RFC 9110 §12.5.1's
 /// `media-range = ( "*/*" / ( type "/" "*" ) / ( type "/" subtype ) ) parameters`.
 ///
@@ -407,8 +401,6 @@ fn range_from(member: ListMember<'_>) -> Result<MediaRange<'_>, MediaError> {
   })
 }
 
-// gate-exempt: grammar::parameterised_list — cites an ANALOGOUS function that
-// shares this design reason, not a function this walker calls.
 /// Walks an `Accept` field's ranges (RFC 9110 §12.5.1).
 ///
 /// Takes the field's LINES rather than one value, for the reason
