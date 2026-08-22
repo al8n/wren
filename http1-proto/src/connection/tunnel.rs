@@ -853,7 +853,7 @@ impl<Ro> Connection<Ro, Tunnel> {
   /// | EOF, then `handle_request` with a partial head | `CLOSED_MID_HEAD`, latched, and NO rejection owed — the same call General makes, for the same reason: a 400 describing a request nobody finished sending answers no message |
   /// | EOF, then `handle_request` with nothing buffered | [`ServerTunnelRequest::Closed`]: the peer closed at a boundary, which is a clean ending and not a fault |
   /// | EOF while a rejection is owed | `read_closed`; the obligation stands and [`reject`](Connection::reject) still writes it |
-  /// | EOF after the switch | `read_closed`; the bytes were the other protocol's already, and this core has nothing to say about their ending |
+  /// | EOF after the switch | inert: the call returns BEFORE the latch, so `read_closed` is left as it was — the bytes were the other protocol's already, and this core has nothing to say about their ending |
   /// | The same EOF reported twice | a no-op |
   ///
   /// Nothing here abandons a send, which is the one line General's `handle_eof`
