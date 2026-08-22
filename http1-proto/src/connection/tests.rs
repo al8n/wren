@@ -7901,9 +7901,9 @@ mod tunnel {
   // on a CONNECT 2xx as "no HTTP reuse once the tunnel ends" invites an
   // exemption. RFC 9112 §9.6's text does not support that reading: it defines
   // the option unconditionally as an obligation to "close the connection after
-  // reading the response message containing" it, and §9.3.6 has the same
-  // response switching to tunnel mode "immediately after the response header
-  // section". One instant, opposite demands — so such a response is a
+  // reading the response message containing" it, and RFC 9110 §9.3.6 has the
+  // same response switching to tunnel mode "immediately after the response
+  // header section". One instant, opposite demands — so such a response is a
   // self-contradiction, not a working tunnel, and it is refused exactly as a
   // close-bearing 101 is.
   //

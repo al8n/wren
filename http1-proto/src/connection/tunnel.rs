@@ -365,10 +365,11 @@ pub enum ClientTunnelOutcome<'a> {
     /// The bytes after that head, verbatim: they are the new protocol's.
     leftover: &'a [u8],
   },
-  /// RFC 9110 §9.3.6: a 2xx to CONNECT, so "the connection will become a tunnel
-  /// immediately after the empty line that concludes the header fields". Any
-  /// `Content-Length` or `Transfer-Encoding` in that head is IGNORED, as §9.3.6
-  /// requires of a client — `leftover` is tunnel data, not content.
+  /// RFC 9112 §6.3 item 2: a 2xx to CONNECT, so "the connection will become a
+  /// tunnel immediately after the empty line that concludes the header
+  /// fields". Any `Content-Length` or `Transfer-Encoding` in that head is
+  /// IGNORED, as that item requires of a client — `leftover` is tunnel data,
+  /// not content.
   Tunneled {
     /// The 2xx head.
     head: HeadView<'a>,

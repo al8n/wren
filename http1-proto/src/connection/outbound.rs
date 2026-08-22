@@ -356,8 +356,8 @@ pub(super) const REQUEST_NEEDS_HOST: &str = "an HTTP/1.1 request states its Host
 /// which is §11.2's primitive with the sender on this side of it.
 pub(super) const ONE_HOST_LINE: &str = "a request states exactly one Host field line";
 
-/// §3.2's third: a `Host` "with an invalid field value" is the same 400, and the
-/// same unqualified scope.
+/// RFC 9112 §3.2's third: a `Host` "with an invalid field value" is the same
+/// 400, and the same unqualified scope.
 ///
 /// Checked against the value the RECIPIENT will read — OWS-trimmed, since
 /// RFC 9110 §5.5 makes the whitespace no part of the value — through
