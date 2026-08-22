@@ -107,12 +107,16 @@ pub fn run(require_all: bool, bless: bool) -> Result<(), Error> {
 /// rather than gone is invisible here.
 fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error> {
   let path = root.join("xtask/snapshots/http1-proto-documented.txt");
-  let Some(current) = documented_items(root, "http1-proto")? else {
-    report.skip(
-      "doc-continuity",
-      "requires nightly rustdoc --output-format json",
-    );
-    return Ok(());
+  let current = match documented_items(root, "http1-proto")? {
+    RustdocJson::Items(items) => items,
+    RustdocJson::Unavailable(why) => {
+      report.skip("doc-continuity", &why);
+      return Ok(());
+    }
+    RustdocJson::Failed(what) => {
+      report.fail(what);
+      return Ok(());
+    }
   };
   // Printed on every real run, success included: a counted blind spot in the
   // tool's own output is the point, not a fact that only lives in a report.
@@ -188,6 +192,24 @@ struct DocumentedItems {
   collisions: usize,
 }
 
+/// What one attempt to read rustdoc's JSON produced.
+///
+/// Three answers, not two, and the third is the point: a check that could not
+/// run must not report the SAME reason whatever stopped it. `Unavailable` is
+/// the toolchain limitation this command is designed to skip for;
+/// `Failed` is everything else, which is a run this check owes an accurate
+/// account of rather than a skip that sends its reader to install a toolchain
+/// they already have.
+enum RustdocJson {
+  /// The documented set, read from `<target>/doc/<crate>.json`.
+  Items(DocumentedItems),
+  /// This toolchain cannot produce the JSON at all, with the reason to print.
+  Unavailable(String),
+  /// rustdoc ran on a toolchain that CAN produce the JSON and failed anyway —
+  /// most often because the crate did not build. Carries rustdoc's own words.
+  Failed(String),
+}
+
 /// Every documented item in `crate_name`, plus how ambiguous that set is —
 /// see [`DocumentedItems`].
 ///
@@ -195,11 +217,25 @@ struct DocumentedItems {
 /// that went missing on #55 was on a `pub(crate)` function, which
 /// `missing_docs` cannot see.
 ///
-/// Returns `Ok(None)` when nightly rustdoc's JSON backend is unavailable —
-/// no nightly toolchain, or `-Z unstable-options`/`--output-format json`
-/// rejected — so the caller can `report.skip` a toolchain limitation instead
-/// of failing on it.
-fn documented_items(root: &Path, crate_name: &str) -> Result<Option<DocumentedItems>, Error> {
+/// The two ways this does not produce a set are told apart by ASKING, not by
+/// assuming: on failure it probes whether `cargo +nightly` runs at all. If it
+/// does not, the nightly toolchain really is missing and the caller skips
+/// ([`RustdocJson::Unavailable`]). If it does, the toolchain is present and
+/// something else went wrong — a crate that does not compile, most often — and
+/// the caller FAILS with rustdoc's own output ([`RustdocJson::Failed`]).
+/// Returning the toolchain reason for both was this check's own version of the
+/// defect it exists to catch: one answer covering two different facts, sending
+/// a reader with a broken tree to install a toolchain they already have.
+///
+/// The boundary that leaves, stated: a future nightly that REMOVED
+/// `--output-format json` would land in `Failed` rather than `Unavailable`,
+/// because the probe only asks whether the toolchain exists. The message
+/// carries rustdoc's own words, so the reader is told what was rejected
+/// instead of being told to install nightly — which is the property that
+/// matters here; classifying it as a skip as well would mean matching on
+/// rustdoc's wording, and a matcher that guesses wrong turns a broken build
+/// back into a silent skip.
+fn documented_items(root: &Path, crate_name: &str) -> Result<RustdocJson, Error> {
   let output = Command::new("cargo")
     .current_dir(root)
     .args([
@@ -217,7 +253,23 @@ fn documented_items(root: &Path, crate_name: &str) -> Result<Option<DocumentedIt
     .output()
     .map_err(|err| format!("could not run cargo rustdoc: {err}"))?;
   if !output.status.success() {
-    return Ok(None);
+    if !nightly_runs(root) {
+      return Ok(RustdocJson::Unavailable(
+        "requires nightly rustdoc --output-format json".to_string(),
+      ));
+    }
+    let status = output
+      .status
+      .code()
+      .map_or_else(|| "a signal".to_string(), |code| format!("status {code}"));
+    return Ok(RustdocJson::Failed(format!(
+      "doc-continuity could not run: `cargo +nightly rustdoc -p {crate_name}` exited with \
+       {status}.\n  \
+       This is NOT the nightly-toolchain limitation this check skips for — `cargo +nightly` \
+       runs here. The crate most likely does not build.\n  \
+       What it printed:\n{}",
+      indented_tail(&String::from_utf8_lossy(&output.stderr))
+    )));
   }
 
   let json_path = target_dir(root)
@@ -250,7 +302,39 @@ fn documented_items(root: &Path, crate_name: &str) -> Result<Option<DocumentedIt
     }
     paths.push(group[0].1.clone());
   }
-  Ok(Some(DocumentedItems { paths, collisions }))
+  Ok(RustdocJson::Items(DocumentedItems { paths, collisions }))
+}
+
+/// Whether `cargo +nightly` runs at all in `root`.
+///
+/// The one question that tells a missing toolchain from a failure that merely
+/// happened on one — asked directly rather than inferred from what rustdoc
+/// printed, because a matcher over another tool's wording is a guess and this
+/// is a fact a process exit code already answers.
+fn nightly_runs(root: &Path) -> bool {
+  Command::new("cargo")
+    .current_dir(root)
+    .args(["+nightly", "--version"])
+    .output()
+    .is_ok_and(|probe| probe.status.success())
+}
+
+/// The last few non-empty lines of `text`, each indented, for quoting another
+/// tool's output inside a failure message.
+///
+/// The TAIL rather than the head: cargo prints the summary error last, and a
+/// long build log's opening lines are progress rather than diagnosis.
+fn indented_tail(text: &str) -> String {
+  const LINES: usize = 12;
+  let lines: Vec<&str> = text
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .collect();
+  lines[lines.len().saturating_sub(LINES)..]
+    .iter()
+    .map(|line| format!("    {line}"))
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 /// Where `cargo` writes build artifacts for `root`'s workspace:
@@ -411,9 +495,15 @@ fn as_ids(value: Option<&json::Value>) -> Vec<u64> {
     .unwrap_or_default()
 }
 
-/// Fails when an `http1-proto` table with a `| corner |`-style header uses a
-/// verdict word its own declaration does not list, or declares a word no row
-/// uses — see [`verdict_problems`].
+/// The header substring that marks a table as governed by its own
+/// declaration — the whole of this check's discovery rule, named once so
+/// [`verdicts`] and the test that pins the real table cannot drift apart.
+const GOVERNED_HEADER: &str = "| corner |";
+
+/// Fails when an `http1-proto` table with a [`GOVERNED_HEADER`] header uses a
+/// verdict word its own declaration does not list, declares a word no row
+/// uses, or carries a row whose verdict cell yields no verdict at all — see
+/// [`verdict_problems`]. Fails, too, when NO governed table is found.
 ///
 /// A declaration bullet is `- **VERDICT** — reason`: the bold term
 /// immediately followed by an em dash. A bullet that reaches an em dash only
@@ -422,21 +512,47 @@ fn as_ids(value: Option<&json::Value>) -> Vec<u64> {
 /// real bullet that distinguishes it from a declaration, and why the guard
 /// exists at all.
 ///
+/// **Zero governed tables is a failure, not a quiet zero.** Discovery is a
+/// literal header substring, so renaming one word of it un-governs the
+/// crate's only governed table and every later run reports `0 table(s)
+/// checked, 0 problem(s)` and exits 0 — `--require-all` included, since that
+/// flag gates skips and this check never skips. A check whose subject can
+/// silently cease to exist is the class this whole command was built to
+/// remove, so the floor is here and
+/// `the_real_switched_table_is_discovered` pins the live table as well: the
+/// rename fails the suite instead of emptying the check.
+///
 /// Scoped to that one header shape rather than every markdown table in the
-/// crate. Five other tables live in `http1-proto/src` today —
+/// crate. SIX other tables live in `http1-proto/src` today —
 /// `connection/outbound.rs`'s RFC-9112-rule table, three in
 /// `connection/mod.rs` (`handle_eof`'s disposition, its EOF-ordering
-/// companion, `refuse`'s call/consult table), and `media/mod.rs`'s
-/// `Accept`-weight table — and none of them is governed: none has a bulleted
-/// declaration above it saying a site "is one of" a closed set, the way
-/// `TunnelPhase::Switched` does, so there is no single source for this check
-/// to hold them to. Passing one through `verdict_problems` would report
-/// every cell as undeclared, which is not a defect in that table — it is
-/// this check reaching past its own subject. `| corner | site | verdict |`
-/// is, today, unique to `tunnel.rs`; a second table that states an invariant
-/// the same way — declared bullets, a self-policing closing sentence, a
-/// table of sites — earns the same header and is picked up here without a
-/// code change.
+/// companion, `refuse`'s call/consult table), `media/mod.rs`'s
+/// `Accept`-weight table, and `connection/tunnel.rs`'s own `handle_eof`
+/// Ordering/Result table, further down the same file as the governed one and
+/// the one this sentence has twice failed to name — and none of them
+/// is governed: none has a bulleted declaration above it saying a site "is
+/// one of" a closed set, the way `TunnelPhase::Switched` does, so there is no
+/// single source for this check to hold them to. Passing one through
+/// [`verdict_problems`] would report every cell as undeclared, which is not a
+/// defect in that table — it is this check reaching past its own subject.
+/// That census is a count of files on disk, not a rule, so recount it rather
+/// than trusting this sentence: from the workspace root,
+/// `grep -rn -- "|---" http1-proto/src` lists every table, governed one
+/// included. It has been wrong twice by being written from memory.
+/// `| corner | site | verdict |` is, today, unique to `tunnel.rs`; a second
+/// table that states an invariant the same way — declared bullets, a
+/// self-policing closing sentence, a table of sites — earns the same header
+/// and is picked up here without a code change.
+///
+/// **The rule from the design this does NOT implement.** §5.2 states three;
+/// the two above are rules 1 and 2. Rule 3 — no comment ELSEWHERE in the
+/// crate assigns a different verdict word to a site the table names — is not
+/// here and is not planned as a heuristic: matching a prose sentence to a
+/// table row needs a rule for when two texts name the same site, and a fuzzy
+/// one either misses the case it exists for or reports every neighbouring
+/// paragraph. It is deferred with that reasoning recorded, and named here
+/// rather than only in the ledger, because a reader of this check would
+/// otherwise take the vocabulary for policed everywhere it is written.
 fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
   let dir = root.join("http1-proto/src");
   let mut files = Vec::new();
@@ -453,7 +569,7 @@ fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
       .display()
       .to_string();
     for run in doc_runs(&text) {
-      if !run.contains("| corner |") {
+      if !run.contains(GOVERNED_HEADER) {
         continue;
       }
       tables += 1;
@@ -462,6 +578,19 @@ fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
         report.fail(format!("{display}: {problem}"));
       }
     }
+  }
+  if tables == 0 {
+    problems += 1;
+    report.fail(format!(
+      "table-verdicts governed nothing: no doc comment under {} carries the \
+       `{GOVERNED_HEADER}` header this check discovers a governed table by.\n  \
+       `TunnelPhase::Switched` in `connection/tunnel.rs` is the one this crate \
+       has. If its header was reworded, restore it (or move the wording here); \
+       if the table was deliberately removed, remove this check with it.\n  \
+       A run reporting zero tables and zero problems is this check governing \
+       nothing while still reporting success.",
+      dir.strip_prefix(root).unwrap_or(&dir).display()
+    ));
   }
   report.checked(format!(
     "table-verdicts: {tables} table(s) checked, {problems} problem(s)"
@@ -523,9 +652,26 @@ fn doc_runs(text: &str) -> Vec<String> {
 /// verdict too, then reports it declared-but-unused: two failures about a
 /// sentence making no vocabulary claim at all. Pinned by
 /// `a_bold_bullet_that_is_not_a_definition_is_not_a_declared_verdict`.
+///
+/// **A row whose verdict cell yields no verdict is a problem, not a pass.**
+/// [`leading_caps`] reads only a LEADING run of ALL-CAPS words, so a cell
+/// written in lower case contributes nothing to `used` — and rule 2 stays
+/// quiet as long as some other row still uses the declared word. The rule
+/// would then be opt-in by capitalisation: the one row that steps outside the
+/// vocabulary is the one row not held to it. Every row after the header
+/// separator must therefore yield a verdict, and a cell that does not is
+/// reported with its own text.
+///
+/// A row is a line inside the table BODY: the `|---` separator opens it and
+/// the first line that is not a `|` row closes it. That is what keeps the
+/// HEADER row (`| corner | site | verdict |`, whose last cell names a column
+/// rather than a verdict) out of the rule the header row would otherwise be
+/// the first to break.
 fn verdict_problems(doc: &str) -> Vec<String> {
   let mut declared: Vec<String> = Vec::new();
   let mut used: Vec<String> = Vec::new();
+  let mut problems = Vec::new();
+  let mut in_body = false;
   for line in doc.lines() {
     let trimmed = line.trim();
     if let Some(rest) = trimmed.strip_prefix("- **")
@@ -533,17 +679,36 @@ fn verdict_problems(doc: &str) -> Vec<String> {
       && rest[end + 2..].trim_start().starts_with('—')
     {
       declared.push(rest[..end].to_string());
-    } else if trimmed.starts_with('|')
-      && !trimmed.starts_with("|---")
-      && let Some(cell) = trimmed.rsplit('|').nth(1)
-    {
-      let verdict = leading_caps(cell.trim());
-      if !verdict.is_empty() {
-        used.push(verdict);
-      }
+      continue;
+    }
+    if trimmed.starts_with("|---") {
+      in_body = true;
+      continue;
+    }
+    if !trimmed.starts_with('|') {
+      in_body = false;
+      continue;
+    }
+    if !in_body {
+      continue;
+    }
+    let Some(cell) = trimmed.rsplit('|').nth(1) else {
+      continue;
+    };
+    let cell = cell.trim();
+    let verdict = leading_caps(cell);
+    if verdict.is_empty() {
+      problems.push(format!(
+        "a row's verdict cell begins with no verdict: `{cell}`.\n  \
+         The vocabulary is read from a LEADING run of ALL-CAPS words, so a cell \
+         that opens in lower case is held to nothing — write the declared \
+         verdict, or the declaration above this table governs every row but \
+         this one"
+      ));
+    } else {
+      used.push(verdict);
     }
   }
-  let mut problems = Vec::new();
   for verdict in &used {
     if !declared.contains(verdict) {
       problems.push(format!(
@@ -576,7 +741,15 @@ fn leading_caps(cell: &str) -> String {
 
 /// Fails when a `http1-proto` comment path-qualifies a callee — `` `module::
 /// name` `` — ON AN ASSERTIVE SENTENCE, that the item it documents never
-/// uses; see [`callee_problems`].
+/// uses, or that the named module does not hold; see [`callee_problems`].
+///
+/// BOTH halves of the path are verified, because both halves are claimed.
+/// `module::name` asserts two things — that `name` is what runs here, and
+/// that `name` is the one from `module` — and checking only the final segment
+/// leaves the second unread: `grammar::ends_persistence` then passes exactly
+/// where `validate::ends_persistence` would, though no such item exists. See
+/// [`module_index`] for how the module half is resolved, and for the mentions
+/// it cannot resolve, which are counted rather than assumed correct.
 ///
 /// Scoped to comments, not to items with a `///` doc block: the defect this
 /// check exists for (see `callee_problems`'s own doc) lived in a `//` comment
@@ -608,9 +781,11 @@ fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
   let mut files = Vec::new();
   collect_rs_files(&dir, &mut files)?;
   files.sort();
+  let modules = module_index(&files)?;
 
   let mut mentions = 0usize;
   let mut exempt = 0usize;
+  let mut unresolved = 0usize;
   for file in &files {
     let text = fs::read_to_string(file)?;
     let display = file
@@ -624,17 +799,94 @@ fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
         mentions += 1;
         if exemption_reason(&comments, &path).is_some_and(|reason| !reason.trim().is_empty()) {
           exempt += 1;
+        } else if matches!(module_half(&modules, &path), ModuleHalf::Unresolvable) {
+          unresolved += 1;
         }
       }
-      for problem in callee_problems(&item) {
+      for problem in callee_problems(&item, &modules) {
         report.fail(format!("{display}: {problem}"));
       }
     }
   }
   report.checked(format!(
-    "path-qualified callee: {mentions} mentions checked, {exempt} exempt"
+    "path-qualified callee: {mentions} mentions checked, {exempt} exempt, \
+     {unresolved} whose module half is not this crate's to resolve"
   ));
   Ok(())
+}
+
+/// Every module `http1-proto/src` declares as a FILE, by leaf name, beside
+/// that file's text.
+///
+/// `foo.rs` and `foo/mod.rs` are both module `foo`; `lib.rs` is the crate root
+/// and names no module. Two files that land on the same leaf name — every
+/// `tests.rs` in the crate — are joined, which errs towards a false PASS, the
+/// direction every judgement in this check errs.
+///
+/// A file, not the rustdoc JSON `continuity` reads: this check runs on stable
+/// too, and it would be an odd trade to make the cheapest of the three
+/// nightly-only for a lookup that a directory listing answers.
+fn module_index(files: &[PathBuf]) -> Result<HashMap<String, String>, Error> {
+  let mut index: HashMap<String, String> = HashMap::new();
+  for file in files {
+    let stem = file.file_stem().and_then(|stem| stem.to_str());
+    let name = match stem {
+      Some("mod") => file.parent().and_then(Path::file_name),
+      Some("lib") => None,
+      _ => file.file_stem(),
+    };
+    let Some(name) = name.and_then(|name| name.to_str()) else {
+      continue;
+    };
+    let text = fs::read_to_string(file)?;
+    index.entry(name.to_string()).or_default().push_str(&text);
+  }
+  Ok(index)
+}
+
+/// What [`module_index`] can say about the module half of a path-qualified
+/// mention.
+enum ModuleHalf {
+  /// The module this crate declares under that name does name the item.
+  Holds,
+  /// It exists, and never names the item — the claim is checkable and false.
+  Absent,
+  /// No module of this crate answers to that name, so nothing here can
+  /// settle it: `core::str`'s modules, a `crate`/`self`/`super` prefix, a
+  /// module of another crate. Counted by [`callees`] rather than passed over
+  /// in silence — the mention is checked on its final segment and NOT on its
+  /// module half, and a run should say how many of its mentions are in that
+  /// position.
+  Unresolvable,
+}
+
+/// Whether the module `path` names holds `path`'s final segment.
+///
+/// The module half is the segment immediately before the last one, which is
+/// the one the path claims the item lives in. Membership is the same
+/// deliberately loose test [`names_identifier`] applies to an item's own body,
+/// applied to the module's file: a re-export, a declaration, or a mention in
+/// that file all count. A false PASS here costs nothing; a false FAILURE
+/// costs the gate.
+fn module_half(index: &HashMap<String, String>, path: &str) -> ModuleHalf {
+  let segments: Vec<&str> = path.split("::").collect();
+  let (Some(name), Some(module)) = (
+    segments.last(),
+    segments
+      .len()
+      .checked_sub(2)
+      .and_then(|at| segments.get(at)),
+  ) else {
+    return ModuleHalf::Unresolvable;
+  };
+  let Some(text) = index.get(*module) else {
+    return ModuleHalf::Unresolvable;
+  };
+  if names_identifier(text, name) {
+    ModuleHalf::Holds
+  } else {
+    ModuleHalf::Absent
+  }
 }
 
 /// Splits `text` into non-overlapping items: a leading run of comment lines
@@ -683,7 +935,11 @@ fn split_comments(item: &str) -> (String, String) {
 /// - **Path-qualified**, which is the whole of why this can be a gate rather
 ///   than a lint: an unqualified name in prose is usually an English word —
 ///   797 sites, `close` 74 of them — while `module::name` is a claim that
-///   THIS function, from THIS module, is what runs here.
+///   THIS function, from THIS module, is what runs here. Both halves of that
+///   claim are checked ([`module_half`]): the module must hold the name, and
+///   the item must use it. Reading only the final segment left the module
+///   half — half of the very claim the qualified form is admitted here for —
+///   taken on trust.
 /// - **On an assertive sentence** ([`assertive_mentions`], Ruling 13): the
 ///   original defect's comment read "Tunnel mode decides the same thing
 ///   about the same fact, through `` `validate::has_close_option` ``", and
@@ -707,7 +963,14 @@ fn split_comments(item: &str) -> (String, String) {
 /// names the wrong callee" caught in full; a reader must not take this check
 /// for that. Half a class caught by a gate that stays ON beats a whole class
 /// caught by a gate that gets disabled over its false-positive rate.
-fn callee_problems(item: &str) -> Vec<String> {
+///
+/// A third, narrower limit, and it is COUNTED rather than merely stated: a
+/// mention whose module half names no module of this crate — another crate's,
+/// or a `crate`/`self`/`super` prefix — has that half checked by nothing
+/// ([`ModuleHalf::Unresolvable`]). [`callees`] prints how many of a run's
+/// mentions are in that position, so the number this check verified in full
+/// is never inferred from the number it looked at.
+fn callee_problems(item: &str, modules: &HashMap<String, String>) -> Vec<String> {
   let mut problems = Vec::new();
   let (comments, body) = split_comments(item);
   for (path, name) in assertive_mentions(&comments) {
@@ -719,6 +982,16 @@ fn callee_problems(item: &str) -> Vec<String> {
         ));
       }
       continue;
+    }
+    if matches!(module_half(modules, &path), ModuleHalf::Absent) {
+      let module = path.rsplit("::").nth(1).unwrap_or_default();
+      problems.push(format!(
+        "the comment names `{path}`, asserting `{name}` is the one from \
+         `{module}`, but `{module}` never names `{name}`.\n  \
+         Name the module that declares it, or — if the mention is deliberate \
+         contrast — mark it:\n  \
+         `// gate-exempt: {path} — <why this path is written this way>`"
+      ));
     }
     if !names_identifier(&body, &name) {
       problems.push(format!(
@@ -1357,6 +1630,17 @@ mod json {
 #[cfg(test)]
 mod tests {
   use super::Report;
+  use std::collections::HashMap;
+
+  // The module half `callee_problems` now resolves, as a literal: the crate's
+  // real index is built from files, and a unit test that read the filesystem
+  // would be pinning the crate's layout rather than this function's rule.
+  fn modules(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+      .iter()
+      .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+      .collect()
+  }
 
   // The spine, as a unit: a skip is a printed boundary on a developer's
   // machine and a FAILURE under --require-all, so a check that only ever runs
@@ -1463,7 +1747,8 @@ Every such site is one of:
 fn switch_or_fault(view: &HeadView<'_>) -> bool {
   has_close_option(view)
 }";
-    let problems = super::callee_problems(item);
+    let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
+    let problems = super::callee_problems(item, &modules);
     assert_eq!(problems.len(), 1);
     assert!(problems[0].contains("ends_persistence"));
   }
@@ -1477,7 +1762,8 @@ fn switch_or_fault(view: &HeadView<'_>) -> bool {
 fn switch_or_fault(view: &HeadView<'_>) -> bool {
   has_close_option(view)
 }";
-    assert!(super::callee_problems(item).is_empty());
+    let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
+    assert!(super::callee_problems(item, &modules).is_empty());
   }
 
   #[test]
@@ -1486,7 +1772,8 @@ fn switch_or_fault(view: &HeadView<'_>) -> bool {
 // gate-exempt: validate::ends_persistence
 /// Asks `has_close_option`, NOT `validate::ends_persistence`.
 fn switch_or_fault(view: &HeadView<'_>) -> bool { has_close_option(view) }";
-    let problems = super::callee_problems(item);
+    let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
+    let problems = super::callee_problems(item, &modules);
     assert_eq!(problems.len(), 1);
     assert!(problems[0].contains("reason"));
   }
@@ -1582,7 +1869,8 @@ fn b() {
 fn open_request(view: &HeadView<'_>) -> bool {
   has_close_option(view)
 }";
-    assert!(super::callee_problems(item).is_empty());
+    let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
+    assert!(super::callee_problems(item, &modules).is_empty());
   }
 
   // `sentences` must not treat a section or version number's internal
@@ -1609,5 +1897,161 @@ fn open_request(view: &HeadView<'_>) -> bool {
     assert!(!super::has_assertive_verb(
       "This is a trivial, obvious detail."
     ));
+  }
+
+  // The floor under discovery. Renaming one word of the header substring
+  // un-governs the crate's only governed table, and every run after that
+  // reports zero tables and zero problems and exits 0 — a check governing
+  // nothing while still reporting success. `verdicts` reads the filesystem,
+  // so this hands it a crate root whose only table is not a governed one.
+  #[test]
+  fn a_run_that_governs_no_table_fails() {
+    let root = std::env::temp_dir().join(format!("xtask-verdicts-floor-{}", std::process::id()));
+    let src = root.join("http1-proto").join("src");
+    std::fs::create_dir_all(&src).expect("a scratch crate root");
+    std::fs::write(
+      src.join("lib.rs"),
+      "\
+/// | side | verdict |
+/// |---|---|
+/// | a | GUARDED |
+fn f() {}
+",
+    )
+    .expect("a source file whose table is not governed");
+    let mut report = Report::new();
+    let ran = super::verdicts(&root, &mut report);
+    std::fs::remove_dir_all(&root).ok();
+    ran.expect("the check itself runs");
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+      report.failures[0].contains("governed nothing"),
+      "{}",
+      report.failures[0]
+    );
+    assert!(report.lines[0].contains("0 table(s) checked, 1 problem(s)"));
+  }
+
+  // And the other half of that floor: the LIVE table, read from the crate
+  // itself. A unit test over literals cannot notice a rename in `tunnel.rs`,
+  // which is exactly the edit that empties this check — so this one scans the
+  // real file, through the same constant `verdicts` discovers by, and fails
+  // the suite when the header stops matching from either side.
+  #[test]
+  fn the_real_switched_table_is_discovered() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("..")
+      .join("http1-proto")
+      .join("src")
+      .join("connection")
+      .join("tunnel.rs");
+    let text = std::fs::read_to_string(&path).expect("http1-proto's tunnel.rs");
+    let governed: Vec<String> = super::doc_runs(&text)
+      .into_iter()
+      .filter(|run| run.contains(super::GOVERNED_HEADER))
+      .collect();
+    assert_eq!(
+      governed.len(),
+      1,
+      "TunnelPhase::Switched's table is the one governed table this crate has"
+    );
+    assert!(
+      governed[0].contains("- **GUARDED** —"),
+      "the governed run must be the one carrying the verdict declaration"
+    );
+    assert!(super::verdict_problems(&governed[0]).is_empty());
+  }
+
+  // A cell that opens in lower case yields no verdict, so before this rule it
+  // contributed nothing and rule 2 stayed quiet — the declared word was still
+  // used by the row above. The vocabulary was opt-in by capitalisation. The
+  // count also pins that the HEADER row is not itself read as a row: its last
+  // cell names a column, and reading it would make every governed table fail.
+  #[test]
+  fn a_row_whose_verdict_cell_is_not_a_verdict_is_a_failure() {
+    let doc = "\
+- **GUARDED** — it asks the close question itself.
+
+| corner | site | verdict |
+|---|---|---|
+| originate | `open_request` | GUARDED — ok |
+| emit | `send_response` | guarded — the same word, in lower case |
+";
+    let problems = super::verdict_problems(doc);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("no verdict"), "{}", problems[0]);
+  }
+
+  // The module half of `module::name` is half the claim, and it was the
+  // unverified half: a path naming a module that does not hold the item read
+  // exactly like one that does. The body here DOES use `ends_persistence`, so
+  // the only thing left to fail on is the module.
+  #[test]
+  fn a_module_that_does_not_hold_the_name_is_a_failure() {
+    let item = "\
+/// Decided through `grammar::ends_persistence`, the predicate both modes ask.
+fn switch_or_fault(view: &HeadView<'_>) -> bool {
+  ends_persistence(view)
+}";
+    let modules = modules(&[
+      ("grammar", "pub(crate) fn token_is_valid() {}"),
+      ("validate", "pub(crate) fn ends_persistence() {}"),
+    ]);
+    let problems = super::callee_problems(item, &modules);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("grammar"), "{}", problems[0]);
+  }
+
+  // The boundary that rule leaves, pinned rather than described: a module
+  // this crate does not declare cannot be resolved here, so the mention is
+  // checked on its final segment only — and `callees` counts it, so a run
+  // never implies it verified more than it did.
+  #[test]
+  fn a_module_half_this_crate_does_not_declare_is_unresolvable() {
+    let item = "\
+/// Reads the field through `core::str::from_utf8` before it commits.
+fn f(bytes: &[u8]) {
+  from_utf8(bytes);
+}";
+    let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
+    assert!(super::callee_problems(item, &modules).is_empty());
+    assert!(matches!(
+      super::module_half(&modules, "core::str::from_utf8"),
+      super::ModuleHalf::Unresolvable
+    ));
+  }
+
+  // The two ways doc-continuity can fail to produce a set are different facts
+  // and must not print the same sentence. A missing nightly is a boundary and
+  // skips; anything else — a crate that does not build, most often — is a
+  // failure carrying the tool's own words, and a failure is fatal with or
+  // without --require-all.
+  #[test]
+  fn a_rustdoc_failure_is_fatal_where_a_toolchain_skip_is_not() {
+    let mut skipped = Report::new();
+    skipped.skip(
+      "doc-continuity",
+      "requires nightly rustdoc --output-format json",
+    );
+    assert!(skipped.finish(false).is_ok());
+    let mut failed = Report::new();
+    failed.fail("doc-continuity could not run: the crate did not build");
+    assert!(failed.finish(false).is_err());
+  }
+
+  // What that failure quotes: the TAIL of the tool's output, indented, blank
+  // lines dropped — cargo prints its summary error last, and a build log's
+  // opening lines are progress rather than diagnosis.
+  #[test]
+  fn indented_tail_keeps_the_last_lines_and_indents_them() {
+    let text = "first\n\n  \nsecond\nthird\n";
+    assert_eq!(
+      super::indented_tail(text),
+      "    first\n    second\n    third"
+    );
+    let long: String = (0..20).map(|n| format!("line {n}\n")).collect();
+    let tail = super::indented_tail(&long);
+    assert_eq!(tail.lines().count(), 12);
+    assert!(tail.starts_with("    line 8"));
   }
 }
