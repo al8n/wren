@@ -28,9 +28,10 @@ impl Report {
   }
 
   // `checked`, `skip`, and `fail` are this Report's whole recording surface.
-  // `continuity` (below) calls all three — `checked` and `fail` on every run,
-  // `skip` on a toolchain that lacks nightly rustdoc's JSON output — so none
-  // of them needs a dead-code allow now that this module wires them in.
+  // `continuity` and `verdicts` (below) between them call all three —
+  // `checked` and `fail` from either, `skip` only from `continuity`, on a
+  // toolchain that lacks nightly rustdoc's JSON output — so none of them
+  // needs a dead-code allow now that this module wires them in.
 
   /// Records what one check examined — its denominator.
   pub fn checked(&mut self, line: impl Into<String>) {
@@ -83,6 +84,7 @@ pub fn run(require_all: bool, bless: bool) -> Result<(), Error> {
   let mut report = Report::new();
   let root = crate::workspace_root()?;
   continuity(&root, bless, &mut report)?;
+  verdicts(&root, &mut report)?;
   report.finish(require_all)
 }
 
@@ -406,6 +408,160 @@ fn as_ids(value: Option<&json::Value>) -> Vec<u64> {
     .and_then(json::Value::as_array)
     .map(|items| items.iter().filter_map(json::Value::as_u64).collect())
     .unwrap_or_default()
+}
+
+/// Fails when an `http1-proto` table with a `| corner |`-style header uses a
+/// verdict word its own declaration does not list, or declares a word no row
+/// uses — see [`verdict_problems`].
+///
+/// Scoped to that one header shape rather than every markdown table in the
+/// crate: `outbound`'s RFC-9112-rule table and three tables in
+/// `connection::mod` (`handle_eof`'s disposition, its EOF-ordering
+/// companion, `refuse`'s call/consult table) are ordinary reference tables —
+/// none of them has a bulleted declaration above it saying a site "is one
+/// of" a closed set, the way `TunnelPhase::Switched` does, so there is no
+/// single source for this check to hold them to. Passing one through
+/// `verdict_problems` would report every cell as undeclared, which is not a
+/// defect in that table — it is this check reaching past its own subject.
+/// `| corner | site | verdict |` is, today, unique to `tunnel.rs`; a second
+/// table that states an invariant the same way — declared bullets, a
+/// self-policing closing sentence, a table of sites — earns the same header
+/// and is picked up here without a code change.
+fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
+  let dir = root.join("http1-proto/src");
+  let mut files = Vec::new();
+  collect_rs_files(&dir, &mut files)?;
+  files.sort();
+
+  let mut tables = 0usize;
+  let mut problems = 0usize;
+  for file in &files {
+    let text = fs::read_to_string(file)?;
+    let display = file
+      .strip_prefix(root)
+      .unwrap_or(file)
+      .display()
+      .to_string();
+    for run in doc_runs(&text) {
+      if !run.contains("| corner |") {
+        continue;
+      }
+      tables += 1;
+      for problem in verdict_problems(&run) {
+        problems += 1;
+        report.fail(format!("{display}: {problem}"));
+      }
+    }
+  }
+  report.checked(format!(
+    "table-verdicts: {tables} table(s) checked, {problems} problem(s)"
+  ));
+  Ok(())
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
+  for entry in fs::read_dir(dir)? {
+    let path = entry?.path();
+    if path.is_dir() {
+      collect_rs_files(&path, out)?;
+    } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+      out.push(path);
+    }
+  }
+  Ok(())
+}
+
+/// Splits `text` into its maximal contiguous doc-comment runs — `///` or
+/// `//!` lines with the marker stripped, joined by `\n`. An ordinary `//`
+/// comment or a code line ends a run without starting one; the run it ends
+/// is kept and a run still open at EOF is kept too, but an empty run never
+/// is.
+fn doc_runs(text: &str) -> Vec<String> {
+  let mut runs = Vec::new();
+  let mut current: Vec<&str> = Vec::new();
+  for line in text.lines() {
+    let trimmed = line.trim_start();
+    let stripped = trimmed
+      .strip_prefix("///")
+      .or_else(|| trimmed.strip_prefix("//!"));
+    match stripped {
+      Some(rest) => current.push(rest),
+      None if !current.is_empty() => {
+        runs.push(current.join("\n"));
+        current.clear();
+      }
+      None => {}
+    }
+  }
+  if !current.is_empty() {
+    runs.push(current.join("\n"));
+  }
+  runs
+}
+
+/// Verdict words this doc declares, and the ones its table rows use.
+///
+/// A declaration is `- **VERDICT** — …`: the bold term immediately followed
+/// by an em dash, the same "term — gloss" shape a table cell itself uses
+/// (see [`leading_caps`]). The em dash is load-bearing, not decoration: a
+/// bolded bullet that reaches one only mid-sentence is not declaring a
+/// verdict, it is bolding a word for emphasis. `TunnelPhase::Switched`'s own
+/// doc has both — `- **SPATIALLY** does one of three things — …` bolds an
+/// axis name, `- **GUARDED** — it asks …` declares a verdict — and
+/// collecting every bolded bullet without the guard reads the former as a
+/// verdict too, then reports it declared-but-unused: two failures about a
+/// sentence making no vocabulary claim at all. Pinned by
+/// `a_bold_bullet_that_is_not_a_definition_is_not_a_declared_verdict`.
+fn verdict_problems(doc: &str) -> Vec<String> {
+  let mut declared: Vec<String> = Vec::new();
+  let mut used: Vec<String> = Vec::new();
+  for line in doc.lines() {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("- **")
+      && let Some(end) = rest.find("**")
+      && rest[end + 2..].trim_start().starts_with('—')
+    {
+      declared.push(rest[..end].to_string());
+    } else if trimmed.starts_with('|')
+      && !trimmed.starts_with("|---")
+      && let Some(cell) = trimmed.rsplit('|').nth(1)
+    {
+      let verdict = leading_caps(cell.trim());
+      if !verdict.is_empty() {
+        used.push(verdict);
+      }
+    }
+  }
+  let mut problems = Vec::new();
+  for verdict in &used {
+    if !declared.contains(verdict) {
+      problems.push(format!(
+        "a row uses the verdict `{verdict}`, which the declaration above it does not list"
+      ));
+    }
+  }
+  for verdict in &declared {
+    if !used.contains(verdict) {
+      problems.push(format!(
+        "the declaration lists `{verdict}`, which no row uses — remove it or the \
+         self-policing sentence beneath it is false"
+      ));
+    }
+  }
+  problems
+}
+
+/// The leading run of ALL-CAPS words in `cell`.
+fn leading_caps(cell: &str) -> String {
+  cell
+    .split_whitespace()
+    .take_while(|word| {
+      word.chars().any(|ch| ch.is_ascii_uppercase())
+        && word.chars().all(|ch| ch.is_ascii_uppercase() || ch == '-')
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 /// A minimal JSON reader for rustdoc's `--output-format json` output.
@@ -757,5 +913,73 @@ mod tests {
     let snapshot = ["a::b"];
     let current = ["a::b", "a::c"];
     assert!(super::lost_docs(&snapshot, &current).is_empty());
+  }
+
+  // The brief's own fixture for this test declared two verdicts and used
+  // neither in a row, so — under the brief's own `verdict_problems`, run
+  // verbatim before this file added rows for them — it failed its own
+  // `assert_eq!(problems.len(), 1)` with 3, not 1: the intended STRUCTURALLY
+  // EXCLUDED failure plus GUARDED and GUARDED BY A CALLER both flagged
+  // declared-but-unused. Each declared verdict below now has a row that uses
+  // it, isolating the one failure this test's name is actually about.
+  #[test]
+  fn a_row_using_an_undeclared_verdict_is_a_failure() {
+    let doc = "\
+- **GUARDED** — it asks the close question itself.
+- **GUARDED BY A CALLER** — an earlier gate makes the state unreachable.
+
+| corner | site | verdict |
+|---|---|---|
+| originate | `open_request` | GUARDED — ok |
+| receive | `into_tunnel` | GUARDED BY A CALLER — ok |
+| emit | `send_response` | STRUCTURALLY EXCLUDED — cannot emit one |
+";
+    let problems = super::verdict_problems(doc);
+    assert_eq!(problems.len(), 1);
+    assert!(problems[0].contains("STRUCTURALLY EXCLUDED"));
+  }
+
+  #[test]
+  fn a_declared_verdict_no_row_uses_is_a_failure() {
+    let doc = "\
+- **GUARDED** — it asks the close question itself.
+- **DELIBERATELY EXCLUDED** — with its reason recorded at the site.
+
+| corner | site | verdict |
+|---|---|---|
+| emit | `send_response` | GUARDED — [`X`] |
+";
+    let problems = super::verdict_problems(doc);
+    assert_eq!(problems.len(), 1);
+    assert!(problems[0].contains("DELIBERATELY EXCLUDED"));
+  }
+
+  // Pins a real defect found running this check on `tunnel.rs` itself:
+  // `TunnelPhase::Switched`'s doc bolds two OTHER terms — SPATIALLY,
+  // TEMPORALLY — before its verdict declaration, naming the two axes a site
+  // is classified on. Both match `- **WORD**`, same as a real declaration
+  // bullet, but neither is followed by an em dash the way every actual
+  // verdict bullet is (`- **SPATIALLY** does …`, not `- **SPATIALLY** — …`).
+  // Treating any bolded bullet as a declaration reported both as verdicts
+  // nothing declares them to be, and then as declared verdicts no row uses:
+  // two failures about a sentence that was never making a vocabulary claim.
+  #[test]
+  fn a_bold_bullet_that_is_not_a_definition_is_not_a_declared_verdict() {
+    let doc = "\
+A site belongs to this invariant when it either:
+
+- **SPATIALLY** does one of three things — writes this variant, or
+  encodes a switching head; or
+- **TEMPORALLY** changes the connection's fate while a switch is ARMED.
+
+Every such site is one of:
+
+- **GUARDED** — it asks the close question itself.
+
+| corner | site | verdict |
+|---|---|---|
+| originate | `open_request` | GUARDED — ok |
+";
+    assert!(super::verdict_problems(doc).is_empty());
   }
 }
