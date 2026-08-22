@@ -66,8 +66,8 @@ its own.
   identical comma-repeated `Content-Length` is processed as that single value
   (the exception §6.3 item 5 carves out).
 - The **sender** rules bind at every status, item 1's bodiless responses
-  included: §6.2's "a sender MUST NOT send a Content-Length header field in any
-  message that contains a Transfer-Encoding header field" is unconditional, and
+  included: §6.2's "MUST NOT send a Content-Length header field in any message
+  that contains a Transfer-Encoding header field" is unconditional, and
   §8.6's `1*DIGIT` is what a length has to be. Item 1 tells a RECIPIENT to
   ignore those fields; it is not a licence for this end to write a pair of them
   or an unreadable one. A single well-formed `Content-Length` on a HEAD response

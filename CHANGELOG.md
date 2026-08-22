@@ -1097,7 +1097,7 @@ inline 64-entry header table (~2 KB) is replaced by the borrowed `HeadView`.
 
 - **Interim 1xx responses are parsed instead of failing the handshake.** The old
   client mapped a `100 Continue` prefix to `UnexpectedStatus(100)`, which RFC
-  9110 §15.2.1 forbids: "a client MUST be able to parse one or more 1xx
+  9110 §15.2.1 forbids: "A client MUST be able to parse one or more 1xx
   responses received prior to a final response". `ClientProgress::Interim`
   reports which one arrived AND how far the buffer advanced past it — a driver
   told only that an interim arrived cannot advance, so it re-offers the same

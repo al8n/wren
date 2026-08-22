@@ -447,7 +447,7 @@ that runs out **mid-message** is a truncation *now* (`Err`), not a wait —
 `wants_read()` never goes back to true for bytes that cannot arrive.
 
 What *does* stop it is §9.6's `close` **connection option**, which is the rule
-that really says "the server MUST NOT process any further requests received on
+that really says the server "MUST NOT process any further requests received on
 that connection". A `close` from the peer's request, from a response you write,
 or from a local `close()` drains the connection and suppresses whatever was
 buffered behind it — while the read-side fact stays set beside it, so
