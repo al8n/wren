@@ -121,6 +121,10 @@ use std::{
 
 type Error = Box<dyn std::error::Error>;
 
+/// A quotation or ABNF production found in one file, paired with the source
+/// line its opening mark is on.
+type Spans = Vec<(usize, String)>;
+
 /// The default, gitignored cache directory, relative to the workspace root.
 pub const DEFAULT_DIR: &str = ".rfc-cache";
 
@@ -168,6 +172,11 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   }
 
   let specs = load_specs(&dir)?;
+  // Hoisted once, beside `load_specs`: normalising every spec for every
+  // production would be O(productions × specs) of repeated work, and
+  // `grade_production` needs only the normalised text, not the `Spec` it
+  // came from — `specs` stays alongside for that, indexed the same.
+  let normalised_specs: Vec<String> = specs.iter().map(|spec| normalise(&spec.text)).collect();
   let mut sources = Vec::new();
   let mut skipped = 0usize;
   collect_sources(&root, &mut sources, include_ignored, &mut skipped)?;
@@ -175,10 +184,13 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
 
   let mut checked = 0usize;
   let mut failures = 0usize;
+  let mut abnf_checked = 0usize;
+  let mut abnf_failures = 0usize;
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = source.strip_prefix(&root).unwrap_or(source).display();
-    for (line, span) in spans_for(source, &text) {
+    let (spans, productions) = spans_for(source, &text);
+    for (line, span) in spans {
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
         let Some(grade) = grade(&quoted, &specs, &mut checked) else {
@@ -199,6 +211,15 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
         }
       }
     }
+    for (line, production) in productions {
+      let Some(spec) = grade_production(&production, &specs, &normalised_specs, &mut abnf_checked)
+      else {
+        continue;
+      };
+      abnf_failures += 1;
+      println!("{shown}:{line}: ABNF production is not {}'s", spec.name);
+      println!("  comment: `{production}`");
+    }
   }
 
   // Printed regardless of what the loop above found: a failing run has MORE
@@ -211,25 +232,34 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     );
   }
 
-  let specs_shown = specs
-    .iter()
-    .map(|spec| spec.name.as_str())
-    .collect::<Vec<_>>()
-    .join(", ");
-  if failures == 0 {
-    println!("quote-check: {checked} quotations verbatim against {specs_shown}");
+  if failures == 0 && abnf_failures == 0 {
+    println!(
+      "quote-check: {checked} quotations verbatim, {abnf_checked} ABNF productions verbatim"
+    );
     return Ok(());
   }
-  Err(format!("{failures} of {checked} quotations are not the spec's own characters").into())
+  let mut reasons = Vec::new();
+  if failures > 0 {
+    reasons.push(format!(
+      "{failures} of {checked} quotations are not the spec's own characters"
+    ));
+  }
+  if abnf_failures > 0 {
+    reasons.push(format!(
+      "{abnf_failures} of {abnf_checked} ABNF productions are not the spec's own characters"
+    ));
+  }
+  Err(reasons.join("; ").into())
 }
 
-/// Every quotation `path`'s contents holds, dispatched by extension.
+/// Every quotation and ABNF production `path`'s contents holds, dispatched by
+/// extension, as `(quoted, productions)`.
 ///
 /// `.md` is read as one long comment block ([`markdown_quotations`]);
 /// anything else — in practice always `.rs`, since [`collect_sources`] hands
 /// this only `.rs` or `.md` paths — is read as `.rs`-style comments
 /// ([`quotations`]).
-fn spans_for(path: &Path, text: &str) -> Vec<(usize, String)> {
+fn spans_for(path: &Path, text: &str) -> (Spans, Spans) {
   if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
     markdown_quotations(text)
   } else {
@@ -297,13 +327,45 @@ fn excerpt(text: &str, from: usize, len: usize) -> String {
   text.get(start..end).unwrap_or_default().to_string()
 }
 
+/// Grades one production. `None` when the specs contain it verbatim.
+///
+/// Unlike [`grade`], there is no anchor: a production is short enough that its
+/// opening characters are not a reliable fingerprint of which spec it came
+/// from, so every spec is searched and, on failure, the first is reported —
+/// arbitrarily, since nothing here narrows which one the production is of.
+///
+/// `normalised` is [`normalise`] applied to each spec's (already normalised)
+/// text, indexed the same as `specs`. The caller hoists it once rather than
+/// this function re-normalising every spec for every production, which would
+/// be O(productions × specs) of repeated, wasted work.
+fn grade_production<'a>(
+  production: &str,
+  specs: &'a [Spec],
+  normalised: &[String],
+  checked: &mut usize,
+) -> Option<&'a Spec> {
+  let wanted = normalise(production);
+  if wanted.split_whitespace().count() < 3 {
+    return None;
+  }
+  *checked += 1;
+  if normalised.iter().any(|spec| spec.contains(&wanted)) {
+    return None;
+  }
+  specs.first()
+}
+
 /// Every quoted span in `source`'s comments, with the line its opening quote is
-/// on — a comment that follows code on the same line included.
+/// on — a comment that follows code on the same line included — beside every
+/// backticked ABNF production on those same lines, as `(quoted, productions)`.
 ///
 /// Consecutive comment lines are one block and are joined before the quotes are
 /// paired, so a quotation wrapped across lines is one span rather than several.
-fn quotations(source: &str) -> Vec<(usize, String)> {
+/// A production is not joined this way: [`abnf_spans`] reads one raw line on
+/// its own, before [`mask_code_spans`] runs on it.
+fn quotations(source: &str) -> (Spans, Spans) {
   let mut out = Vec::new();
+  let mut productions = Vec::new();
   let mut block = String::new();
   // (byte offset into `block`, source line) for the start of each joined line.
   let mut marks: Vec<(usize, usize)> = Vec::new();
@@ -345,13 +407,17 @@ fn quotations(source: &str) -> Vec<(usize, String)> {
       block.push(' ');
     }
     marks.push((block.len(), index + 1));
+    for span in abnf_spans(body) {
+      productions.push((index + 1, span));
+    }
     block.push_str(&mask_code_spans(body));
   }
   flush(&mut block, &mut marks);
-  out
+  (out, productions)
 }
 
-/// Every quotation in a Markdown file.
+/// Every quotation in a Markdown file, beside every backticked ABNF production
+/// on those same lines, as `(quoted, productions)`.
 ///
 /// A `.md` file is comment text throughout, so there is no comment prefix to
 /// find and no code half to discard — but fenced blocks are still skipped, for
@@ -368,8 +434,9 @@ fn quotations(source: &str) -> Vec<(usize, String)> {
 /// rather than joined — which is the safer of the two: a fence is far likelier
 /// to separate two unrelated paragraphs than a real quotation is to straddle
 /// one.
-fn markdown_quotations(source: &str) -> Vec<(usize, String)> {
+fn markdown_quotations(source: &str) -> (Spans, Spans) {
   let mut out = Vec::new();
+  let mut productions = Vec::new();
   let mut block = String::new();
   let mut marks: Vec<(usize, usize)> = Vec::new();
   let mut fenced = false;
@@ -404,10 +471,13 @@ fn markdown_quotations(source: &str) -> Vec<(usize, String)> {
       block.push(' ');
     }
     marks.push((block.len(), index + 1));
+    for span in abnf_spans(raw) {
+      productions.push((index + 1, span));
+    }
     block.push_str(&mask_code_spans(raw));
   }
   flush(&mut block, &mut marks);
-  out
+  (out, productions)
 }
 
 /// The comment on one source line, and whether the line is nothing but that
@@ -559,6 +629,46 @@ fn quoted_spans(block: &str) -> Vec<(usize, &str)> {
     at += len + 2;
   }
   out
+}
+
+/// The backticked ABNF productions on one raw comment line.
+///
+/// Runs BEFORE [`mask_code_spans`], which erases a backticked span holding a
+/// `"` — and a production's terminals are quoted, so by the time a block is
+/// built its productions are gone. [`quoted_spans`] would not have found them
+/// either: a production without a terminal carries no `"` at all.
+///
+/// A span counts when it opens with `name =`, which is what separates an RFC
+/// 5234 rule from a backticked identifier. `=/` (incremental alternatives)
+/// counts too.
+fn abnf_spans(line: &str) -> Vec<String> {
+  let mut out = Vec::new();
+  let mut rest = line;
+  while let Some(open) = rest.find('`') {
+    let after = &rest[open + 1..];
+    let Some(close) = after.find('`') else {
+      return out;
+    };
+    let span = &after[..close];
+    if is_production(span) {
+      out.push(span.to_string());
+    }
+    rest = &after[close + 1..];
+  }
+  out
+}
+
+/// Whether `span` opens with an RFC 5234 rule name and an `=`.
+fn is_production(span: &str) -> bool {
+  let trimmed = span.trim_start();
+  let name: String = trimmed
+    .chars()
+    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+    .collect();
+  if name.is_empty() || !name.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
+    return false;
+  }
+  matches!(trimmed[name.len()..].trim_start().chars().next(), Some('='))
 }
 
 /// Masks an inline code span that contains a `"`.
@@ -815,13 +925,14 @@ mod tests {
   use std::path::Path;
 
   fn spans(source: &str) -> Vec<String> {
-    quotations(source).into_iter().map(|(_, s)| s).collect()
+    quotations(source).0.into_iter().map(|(_, s)| s).collect()
   }
 
   // `markdown_quotations` mirrors `spans` above: same shape, different source
   // function, because a `.md` file has no comment prefix to key off of.
   fn markdown_spans(source: &str) -> Vec<String> {
     markdown_quotations(source)
+      .0
       .into_iter()
       .map(|(_, s)| s)
       .collect()
@@ -931,10 +1042,30 @@ mod tests {
   #[test]
   fn spans_for_dispatches_by_extension() {
     let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
+    let (quoted, productions) = spans_for(Path::new("notes.md"), source);
+    assert_eq!(quoted, vec![(1, "the server MUST NOT process".to_string())]);
+    assert!(productions.is_empty());
+    let (quoted, productions) = spans_for(Path::new("notes.rs"), source);
+    assert!(quoted.is_empty());
+    assert!(productions.is_empty());
+  }
+
+  // An ABNF production reaches neither existing path: `mask_code_spans` erases
+  // a backticked span holding a `"`, and `quoted_spans` only takes `"…"`. It
+  // needs its own extractor, and this is the shape that finds one.
+  #[test]
+  fn a_backticked_production_is_extracted() {
+    let line = "  /// RFC 9110 §8.3.1: `media-type = type \"/\" subtype parameters`";
     assert_eq!(
-      spans_for(Path::new("notes.md"), source),
-      vec![(1, "the server MUST NOT process".to_string())]
+      super::abnf_spans(line),
+      ["media-type = type \"/\" subtype parameters"]
     );
-    assert!(spans_for(Path::new("notes.rs"), source).is_empty());
+  }
+
+  // Prose in backticks is not a production. The `=` is what distinguishes a
+  // rule from a name, and requiring it is what keeps this extractor quiet.
+  #[test]
+  fn a_backticked_name_is_not_a_production() {
+    assert!(super::abnf_spans("  /// see `open_request` and `Connection`").is_empty());
   }
 }
