@@ -1307,8 +1307,8 @@ pub use deflate::{
 };
 
 /// Walks a `Sec-WebSocket-Protocol` REQUEST value — RFC 6455 §11.3.4's
-/// `Sec-WebSocket-Protocol = 1#token` — over every field line the client sent,
-/// yielding the offers in preference order.
+/// `Sec-WebSocket-Protocol-Client = 1#token` — over every field line the client
+/// sent, yielding the offers in preference order.
 ///
 /// The `#rule` of RFC 2616 §2.1 (which RFC 9110 §5.6.1.2 restates) makes null
 /// elements ignorable, so `list_elements` drops them; it also makes the `1` in
@@ -1334,7 +1334,7 @@ where
 /// Three rules, all of them the field's own grammar rather than any reader's
 /// preference:
 ///
-/// - `Sec-WebSocket-Protocol = 1#token` (RFC 6455 §11.3.4). Read with the
+/// - `Sec-WebSocket-Protocol-Client = 1#token` (RFC 6455 §11.3.4). Read with the
 ///   `#rule` of RFC 2616 §2.1 — the ABNF RFC 6455 states its grammars in:
 ///   "null elements are allowed, but do not contribute to the count of elements
 ///   present … where at least one element is required, at least one non-null
@@ -2015,7 +2015,7 @@ mod tests {
   #[test]
   fn a_malformed_extension_list_does_not_conform() {
     for bad in [
-      // `extension-token = token`.
+      // `extension-token = registered-token`, `registered-token = token`.
       "x@y",
       "permessage-deflate, x@y",
       "x@y, permessage-deflate",
