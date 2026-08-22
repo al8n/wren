@@ -201,10 +201,10 @@ const ONE_REQUEST_AT_A_TIME: &str = "a request is already outstanding";
 /// arrived BEFORE this request would be written.
 ///
 /// Opening over them would have them parsed as this request's response, which is
-/// exactly what §9.2 forbids — "a client MUST NOT consider [data received on a
-/// connection with no outstanding request] to be a valid response". The idle path
-/// already diagnoses such bytes; the barrier is what keeps them ON that path
-/// instead of letting a new exchange adopt them.
+/// exactly what §9.2 forbids: a client that receives data on a connection with no
+/// outstanding request "MUST NOT consider that data to be a valid response". The
+/// idle path already diagnoses such bytes; the barrier is what keeps them ON that
+/// path instead of letting a new exchange adopt them.
 ///
 /// The cure is one more pump pass: offer the rest of the previous read and pull
 /// to `Ok(None)`. Only the pump can lift this, because only the pump sees the
