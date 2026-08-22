@@ -87,6 +87,23 @@
 //! two unrelated quotations never pair across the code between them. `/* */`
 //! blocks are not read; this workspace writes none.
 //!
+//! A `.md` file has no comment syntax, so the whole file is read as one
+//! comment block: a blank line ends one block the way a bare code line ends a
+//! `.rs` one, and a fenced block is skipped for the same reason a doc
+//! comment's is — a fence holds code, and a quote mark inside it opens no
+//! quotation.
+//!
+//! # Which files are walked
+//!
+//! Every `.rs` and `.md` file under the workspace root, skipping build output
+//! (`target/`), dot directories, and — unless `--include-ignored` — anything
+//! git ignores. `docs/` is the notable case: it holds design documents that
+//! quote the RFCs heavily, and it is gitignored, so it exists on a
+//! developer's disk and not in CI. Walking it by default would make one
+//! command check two different sets of files depending on where it runs,
+//! which is exactly the kind of green run that means nothing.
+//! `--include-ignored` scans it anyway.
+//!
 //! # Where the specs come from
 //!
 //! Raw spec text is about three quarters of a megabyte, which does not belong in
@@ -142,7 +159,7 @@ enum Grade<'a> {
 
 /// Checks every RFC quotation in the workspace's comments against the specs in
 /// `dir` (or [`DEFAULT_DIR`]), downloading them first when `fetch`.
-pub fn run(dir: Option<&str>, fetch: bool) -> Result<(), Error> {
+pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), Error> {
   let root = crate::workspace_root()?;
   let dir = dir.map_or_else(|| root.join(DEFAULT_DIR), PathBuf::from);
 
@@ -152,7 +169,8 @@ pub fn run(dir: Option<&str>, fetch: bool) -> Result<(), Error> {
 
   let specs = load_specs(&dir)?;
   let mut sources = Vec::new();
-  collect_sources(&root, &mut sources)?;
+  let mut skipped = 0usize;
+  collect_sources(&root, &mut sources, include_ignored, &mut skipped)?;
   sources.sort();
 
   let mut checked = 0usize;
@@ -160,7 +178,12 @@ pub fn run(dir: Option<&str>, fetch: bool) -> Result<(), Error> {
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = source.strip_prefix(&root).unwrap_or(source).display();
-    for (line, span) in quotations(&text) {
+    let quoted_here = if source.extension().and_then(|ext| ext.to_str()) == Some("md") {
+      markdown_quotations(&text)
+    } else {
+      quotations(&text)
+    };
+    for (line, span) in quoted_here {
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
         let Some(grade) = grade(&quoted, &specs, &mut checked) else {
@@ -190,6 +213,13 @@ pub fn run(dir: Option<&str>, fetch: bool) -> Result<(), Error> {
     .join(", ");
   if failures == 0 {
     println!("quote-check: {checked} quotations verbatim against {specs_shown}");
+    if !include_ignored && skipped > 0 {
+      println!(
+        "quote-check: {skipped} git-ignored director{} not scanned — quotations \
+         there are UNCHECKED (pass --include-ignored to scan them)",
+        if skipped == 1 { "y" } else { "ies" }
+      );
+    }
     return Ok(());
   }
   Err(format!("{failures} of {checked} quotations are not the spec's own characters").into())
@@ -304,6 +334,54 @@ fn quotations(source: &str) -> Vec<(usize, String)> {
     }
     marks.push((block.len(), index + 1));
     block.push_str(&mask_code_spans(body));
+  }
+  flush(&mut block, &mut marks);
+  out
+}
+
+/// Every quotation in a Markdown file.
+///
+/// A `.md` file is comment text throughout, so there is no comment prefix to
+/// find and no code half to discard — but fenced blocks are still skipped, for
+/// the same reason they are in a doc comment: a fence holds code, and a
+/// quotation mark inside code is not opening a quotation.
+fn markdown_quotations(source: &str) -> Vec<(usize, String)> {
+  let mut out = Vec::new();
+  let mut block = String::new();
+  let mut marks: Vec<(usize, usize)> = Vec::new();
+  let mut fenced = false;
+
+  let mut flush = |block: &mut String, marks: &mut Vec<(usize, usize)>| {
+    for (at, span) in quoted_spans(block) {
+      let line = marks
+        .iter()
+        .take_while(|(offset, _)| *offset <= at)
+        .last()
+        .map_or(0, |(_, line)| *line);
+      out.push((line, span.to_string()));
+    }
+    block.clear();
+    marks.clear();
+  };
+
+  for (index, raw) in source.lines().enumerate() {
+    if raw.trim_start().starts_with("```") {
+      fenced = !fenced;
+      flush(&mut block, &mut marks);
+      continue;
+    }
+    if fenced {
+      continue;
+    }
+    if raw.trim().is_empty() {
+      flush(&mut block, &mut marks);
+      continue;
+    }
+    if !block.is_empty() {
+      block.push(' ');
+    }
+    marks.push((block.len(), index + 1));
+    block.push_str(&mask_code_spans(raw));
   }
   flush(&mut block, &mut marks);
   out
@@ -643,8 +721,18 @@ fn strip_change_bar(line: &str) -> &str {
   }
 }
 
-/// Every `.rs` file in the workspace, skipping build output and dot directories.
-fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
+/// Every `.rs` and `.md` file in the workspace, skipping build output, dot
+/// directories, and — unless `include_ignored` — anything git ignores.
+///
+/// The git-ignore rule is what keeps a green run meaning ONE thing: `docs/` is
+/// ignored, so it exists on a developer's disk and not in CI, and walking it by
+/// default would make the same command check different sets in the two places.
+fn collect_sources(
+  dir: &Path,
+  out: &mut Vec<PathBuf>,
+  include_ignored: bool,
+  skipped: &mut usize,
+) -> Result<(), Error> {
   for entry in fs::read_dir(dir)? {
     let path = entry?.path();
     let name = path
@@ -655,20 +743,49 @@ fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
       if name == "target" || name.starts_with('.') {
         continue;
       }
-      collect_sources(&path, out)?;
-    } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-      out.push(path);
+      if !include_ignored && is_ignored(&path)? {
+        *skipped += 1;
+        continue;
+      }
+      collect_sources(&path, out, include_ignored, skipped)?;
+    } else {
+      match path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs") | Some("md") => out.push(path),
+        _ => {}
+      }
     }
   }
   Ok(())
 }
 
+/// Whether git ignores `path`.
+///
+/// `git check-ignore` exits 0 when the path IS ignored and 1 when it is not,
+/// so the exit code is the answer and no output needs parsing.
+fn is_ignored(path: &Path) -> Result<bool, Error> {
+  let status = Command::new("git")
+    .args(["check-ignore", "--quiet"])
+    .arg(path)
+    .status()
+    .map_err(|err| format!("could not run git check-ignore: {err}"))?;
+  Ok(status.success())
+}
+
 #[cfg(test)]
 mod tests {
-  use super::quotations;
+  use super::{markdown_quotations, quotations};
 
   fn spans(source: &str) -> Vec<String> {
     quotations(source).into_iter().map(|(_, s)| s).collect()
+  }
+
+  // `markdown_quotations` mirrors `spans` above: same shape, different source
+  // function, because a `.md` file has no comment prefix to key off of.
+  fn markdown_spans(source: &str) -> Vec<String> {
+    markdown_quotations(source)
+      .into_iter()
+      .map(|(_, s)| s)
+      .collect()
   }
 
   // A quotation in a comment that FOLLOWS code is governed like any other. A
@@ -748,5 +865,13 @@ mod tests {
   fn a_quote_naming_code_span_is_masked_after_code_too() {
     let source = "  let x = 1; // the `\"` character, and \"the server MUST NOT process\"\n";
     assert_eq!(spans(source), ["the server MUST NOT process"]);
+  }
+
+  // A `.md` file is scanned like a `.rs` one: the convention is about the
+  // quotation, not about which file it was copied into.
+  #[test]
+  fn a_markdown_quotation_is_read() {
+    let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
+    assert_eq!(markdown_spans(source), ["the server MUST NOT process"]);
   }
 }
