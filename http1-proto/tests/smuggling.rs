@@ -773,7 +773,7 @@ fn whitespace_before_the_first_field_line_is_refused() {
   assert_eq!(accepted(BODILESS).seen.len(), 2);
 }
 
-// RFC 9112 §3: `request-line = method SP request-target SP HTTP-version CRLF`.
+// RFC 9112 §3: `request-line = method SP request-target SP HTTP-version`.
 // The section lets a recipient "parse the request-line into its component parts
 // separated by whitespace" instead, and that MAY is deliberately not taken —
 // §3's own warning is that "differences in the handling of such whitespace have
