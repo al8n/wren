@@ -277,6 +277,12 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   // `None` — see `grade`'s doc comment (Ruling 9, Ruling 10a) for the full
   // three-way split.
   let mut unattributable = 0usize;
+  // Ruling 11: of `checked`, how many were graded against the ONE spec their
+  // block cited (`narrow`) versus against any loaded spec because the block
+  // named none or several (`fallback`) — see `grade`'s doc comment for why
+  // this is counted rather than guessed at.
+  let mut narrow = 0usize;
+  let mut fallback = 0usize;
   let mut abnf_checked = 0usize;
   let mut abnf_failures = 0usize;
   let mut abnf_skipped = 0usize;
@@ -300,7 +306,15 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
       }
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
-        let Some(grade) = grade(&quoted, cited, &specs, &mut checked, &mut unattributable) else {
+        let Some(grade) = grade(
+          &quoted,
+          cited,
+          &specs,
+          &mut checked,
+          &mut unattributable,
+          &mut narrow,
+          &mut fallback,
+        ) else {
           continue;
         };
         failures += 1;
@@ -378,6 +392,18 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   println!(
     "quote-check: {unattributable} prose-sized spans in blocks citing a loaded spec matched \
      nothing — untriaged, not failed"
+  );
+  // Ruling 11: printed every run, pass or fail — a coverage claim ("a
+  // quotation is graded against the spec it cites") is exactly the kind of
+  // number this check exists to stop anyone stating without a denominator.
+  // `cited_rfc`'s "exactly one RFC" rule sends a span through `fallback`
+  // whenever its block names zero OR SEVERAL RFCs, even when one of several
+  // is the span's own correctly-loaded spec — this workspace's comments
+  // discuss more than one RFC in a paragraph constantly, so `fallback` being
+  // large is expected, not evidence of a bug.
+  println!(
+    "quote-check: {checked} quotations checked — {narrow} graded against the spec their block \
+     cites, {fallback} against any loaded spec (block cites none, or several)"
   );
 
   if failures == 0 && abnf_failures == 0 {
@@ -459,12 +485,31 @@ fn spans_for(path: &Path, text: &str) -> (QuotedSpans, Spans, usize) {
 /// RFC's own prose, but a grammar RULE beside a citation is routinely shown
 /// for comparison with a different spec's — see `grade_production`'s doc
 /// comment for the worked example.
+///
+/// **Ruling 11: `narrow` and `fallback` count WHICH of the two anchored paths
+/// graded a span** — the cited-spec-only comparison above, or the any-spec
+/// anchored fallback below. `cited_rfc` calls a block naming two or more
+/// different RFCs just as uncited as a block naming none (its "exactly one"
+/// rule), so a comment that discusses several specs in one paragraph — which
+/// this workspace does constantly — sends its quotations through the
+/// fallback even when one of the cited numbers is exactly right. That is not
+/// silently reopening the mis-attribution hole (nothing here accepts a WRONG
+/// spec's match); it means the narrow path's coverage is partial, and the
+/// size of that gap was unmeasured until this ruling. Resolving it by
+/// GUESSING which of several citations a span belongs to — nearest-by-
+/// position, first-mentioned, union-of-cited — was considered and rejected:
+/// every option is plausible and none is verifiable, and picking one without
+/// first knowing how often it would even matter is how the citation-vs-
+/// anchor conflation this whole task exists to fix happened in the first
+/// place. Count first; `run`'s printed line makes the split visible instead.
 fn grade<'a>(
   quoted: &str,
   cited: Option<u32>,
   specs: &'a [Spec],
   checked: &mut usize,
   unattributable: &mut usize,
+  narrow: &mut usize,
+  fallback: &mut usize,
 ) -> Option<Grade<'a>> {
   if quoted.split_whitespace().count() < MIN_WORDS || quoted.chars().count() < MIN_CHARS {
     return None; // not prose-sized: not a quotation
@@ -504,6 +549,7 @@ fn grade<'a>(
     let name = format!("rfc{number}");
     if let Some(spec) = specs.iter().find(|spec| spec.name == name) {
       *checked += 1;
+      *narrow += 1;
       if spec.text.contains(quoted) {
         return None;
       }
@@ -523,11 +569,12 @@ fn grade<'a>(
     // candidates do instead.
   }
 
-  // No usable citation (none, or unloaded-but-anchored-elsewhere): the
-  // pre-existing any-spec anchored behaviour, unchanged. Several anchored
+  // No usable citation (none, ambiguous, or unloaded-but-anchored-elsewhere):
+  // the pre-existing any-spec anchored behaviour, unchanged. Several anchored
   // specs may hold the same opening, and a verbatim match in any of them
   // clears it, because nothing here says which one is claimed.
   *checked += 1;
+  *fallback += 1;
   if anchored.iter().any(|spec| spec.text.contains(quoted)) {
     return None;
   }
@@ -1096,14 +1143,26 @@ fn normalise(text: &str) -> String {
 
 /// Removes every `[bracketed]` span, and the space before it.
 ///
-/// `[…]` is the standard mark for an editorial insertion or substitution in a
-/// quotation — both what a comment here uses to swap an RFC's bare pronoun
-/// for something legible out of context (`consider [it]` for the RFC's
-/// `consider that data`), and what the RFC's OWN prose uses for an inline
-/// `[RFC2616]`-style reference. Stripping it here, ahead of the character
-/// loop below, applies to both: `normalise` runs over a spec's text exactly
-/// as it runs over a comment's, so a bracket either side chose to insert is
-/// gone from both before anything else is compared.
+/// `[…]` is the standard mark for an editorial insertion in a quotation, and
+/// the RFC's OWN prose uses it the same way for an inline `[RFC2616]`-style
+/// reference: RFC 6455 §4.1 reads "...the client handles the response per
+/// HTTP [RFC2616] procedures..." (`.rfc-cache/rfc6455.txt:1031`), while
+/// `websocket-proto/src/handshake/h1/client.rs`'s quotation of that sentence
+/// never spells the citation at all ("...per HTTP procedures..."). Stripping
+/// `[RFC2616]` from the spec's side — nothing needs stripping from the
+/// comment's, since it was never there — is what lets that quotation anchor
+/// and match at all. `normalise` runs over a spec's text exactly as it runs
+/// over a comment's, so a bracket either side chose to insert is gone from
+/// both before anything else is compared.
+///
+/// What this does NOT fix: a bracket that SUBSTITUTES words the RFC has at
+/// that exact point — `consider [it]` standing in for the RFC's own
+/// `consider that data` — still fails, because the substituted words are, by
+/// definition, not the RFC's own characters. Removing the bracket removes the
+/// substitution, not the mismatch: the RFC's real words are still sitting
+/// where the comment's gap now is. A quotation shaped like that has one fix,
+/// and it is not in this function — quote the RFC's own words instead of a
+/// stand-in for them, the way `inbound.rs:107` now does.
 fn strip_bracket_insertions(text: &str) -> String {
   let mut out = String::with_capacity(text.len());
   let mut rest = text;
@@ -1659,12 +1718,16 @@ mod tests {
     let specs: Vec<super::Spec> = Vec::new();
     let mut checked = 0;
     let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
     let graded = super::grade(
       "the identifier is a valid URI reference and is compared",
       Some(9782),
       &specs,
       &mut checked,
       &mut unattributable,
+      &mut narrow,
+      &mut fallback,
     );
     assert!(matches!(graded, Some(super::Grade::Unloaded(9782))));
     assert_eq!(
@@ -1672,6 +1735,11 @@ mod tests {
       "an unloaded citation still counts as one this check governs"
     );
     assert_eq!(unattributable, 0);
+    assert_eq!(
+      (narrow, fallback),
+      (0, 0),
+      "Unloaded is graded against no spec at all — neither path"
+    );
   }
 
   // The hole grading-by-citation closes: `rfc1` holds these exact words, but
@@ -1695,16 +1763,25 @@ mod tests {
     ];
     let mut checked = 0;
     let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
     let graded = super::grade(
       "the widget registry must reject a duplicate identifier",
       Some(2),
       &specs,
       &mut checked,
       &mut unattributable,
+      &mut narrow,
+      &mut fallback,
     );
     assert!(matches!(graded, Some(super::Grade::Reworded(spec, _)) if spec.name == "rfc2"));
     assert_eq!(checked, 1);
     assert_eq!(unattributable, 0);
+    assert_eq!(
+      (narrow, fallback),
+      (1, 0),
+      "graded against the cited spec specifically (rfc2), not any anchored spec"
+    );
   }
 
   // Ruling 9, Row 2: a prose-sized span that does not anchor to ANY loaded
@@ -1721,12 +1798,16 @@ mod tests {
     )];
     let mut checked = 0;
     let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
     let graded = super::grade(
       "did this head arm this connection and answer truthfully",
       Some(1),
       &specs,
       &mut checked,
       &mut unattributable,
+      &mut narrow,
+      &mut fallback,
     );
     assert!(
       graded.is_none(),
@@ -1734,6 +1815,7 @@ mod tests {
     );
     assert_eq!(checked, 0, "not graded means not counted as checked");
     assert_eq!(unattributable, 1, "but it is not silent either");
+    assert_eq!((narrow, fallback), (0, 0), "not graded means neither path");
   }
 
   // Ruling 10a: an unanchored span in a block citing NOTHING is a different
@@ -1751,12 +1833,16 @@ mod tests {
     )];
     let mut checked = 0;
     let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
     let graded = super::grade(
       "some sentence in quotes that matches nothing loaded here at all",
       None,
       &specs,
       &mut checked,
       &mut unattributable,
+      &mut narrow,
+      &mut fallback,
     );
     assert!(graded.is_none());
     assert_eq!(checked, 0);
@@ -1764,6 +1850,7 @@ mod tests {
       unattributable, 0,
       "cites nothing: never a candidate, not even counted in the backlog"
     );
+    assert_eq!((narrow, fallback), (0, 0));
   }
 
   // Ruling 9, Row 4: a span that DOES anchor, in a block citing a spec this
@@ -1781,12 +1868,16 @@ mod tests {
     )];
     let mut checked = 0;
     let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
     let graded = super::grade(
       "the widget registry must reject a duplicate identifier",
       Some(9782),
       &specs,
       &mut checked,
       &mut unattributable,
+      &mut narrow,
+      &mut fallback,
     );
     assert!(
       graded.is_none(),
@@ -1794,5 +1885,57 @@ mod tests {
     );
     assert_eq!(checked, 1, "the anchored fallback still counts it");
     assert_eq!(unattributable, 0);
+    assert_eq!(
+      (narrow, fallback),
+      (0, 1),
+      "the cited spec (9782) was never loaded, so this counts as fallback, not narrow"
+    );
+  }
+
+  // Ruling 11: `cited_rfc`'s "exactly one" rule makes a block naming TWO
+  // different RFCs just as uncited as one naming none — the ambiguous case
+  // falls all the way through to the any-spec fallback, even when the span
+  // anchors to (and verbatim-matches) one of the two cited specs. This is
+  // the split `narrow`/`fallback` exist to measure: a real quotation whose
+  // correct spec IS among the block's citations, graded via `fallback`
+  // rather than `narrow` only because the block also names something else.
+  #[test]
+  fn a_block_naming_two_rfcs_sends_a_correct_quotation_through_fallback() {
+    let specs = [
+      test_spec(
+        "rfc1",
+        "the widget registry must reject a duplicate identifier",
+      ),
+      test_spec(
+        "rfc2",
+        "an unrelated spec discussing something else entirely",
+      ),
+    ];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
+    // `cited` is `None` here because this is exactly what `cited_rfc` would
+    // already have returned for a block naming both rfc1 and rfc2 — `grade`
+    // never sees "two citations", only the ambiguity's result.
+    let graded = super::grade(
+      "the widget registry must reject a duplicate identifier",
+      None,
+      &specs,
+      &mut checked,
+      &mut unattributable,
+      &mut narrow,
+      &mut fallback,
+    );
+    assert!(
+      graded.is_none(),
+      "verbatim in the anchored spec, so it passes via the fallback"
+    );
+    assert_eq!(checked, 1);
+    assert_eq!(
+      (narrow, fallback),
+      (0, 1),
+      "a real quotation of rfc1, but ambiguity sent it through fallback, not narrow"
+    );
   }
 }
