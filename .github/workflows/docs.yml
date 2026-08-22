@@ -16,3 +16,4 @@ jobs:
       # ci.yml ignores '**.md', which is correct for a compile-and-test
       # workflow and is why these cannot live there.
       - run: cargo run -p xtask -- quote-check --fetch
+      - run: cargo run -p xtask -- doc-check

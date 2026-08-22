@@ -79,6 +79,10 @@ jobs:
         env:
           RUSTDOCFLAGS: --cfg docsrs -Dwarnings
         run: cargo doc --workspace --all-features --no-deps
+      # --require-all makes a SKIPPED check a failure. Without it, the
+      # nightly-only doc-continuity check would vanish silently the day this
+      # job is edited, and a green run would not say so.
+      - run: cargo run -p xtask -- doc-check --require-all
 
   hack:
     runs-on: ubuntu-latest
