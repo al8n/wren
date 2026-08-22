@@ -33,10 +33,13 @@
 //!   token also collides with ordinary spec words by accident, which is exactly
 //!   the false positive to avoid.
 //!
-//! An anchored, prose-sized span must then appear in full and case-sensitively
+//! This is the rule for a span whose own block names no RFC, or names more
+//! than one ([`cited_rfc`]) — the rule below, "attribution by citation",
+//! takes over whenever it names exactly one. For an unattributed span: an
+//! anchored, prose-sized span must then appear in full and case-sensitively
 //! in one of the specs it anchored in — several may hold the same opening, and
-//! a verbatim match in any of them clears it, because a quotation names one
-//! spec and the tool is not told which. Failing that, the anchor tells the tool
+//! a verbatim match in any of them clears it, because with no citation naming
+//! one, the tool is not told which. Failing that, the anchor tells the tool
 //! which grade it is: a whole-span match ignoring case is a re-cased quotation,
 //! and no whole-span match at all is one whose WORDS have drifted — the span
 //! demonstrably starts as spec text and then stops being it.
@@ -51,6 +54,26 @@
 //!
 //! A quotation may elide with `…` or `...`; each segment is then checked on its
 //! own, because an ellipsis promises that what remains is verbatim.
+//!
+//! ## Attribution by citation
+//!
+//! A block naming exactly one RFC is a stronger signal than anchoring: the
+//! quotations inside it are graded against ONLY the spec that RFC names, not
+//! against whichever loaded spec happens to share their opening text.
+//! Anchoring is not required in this case — the citation IS the attribution —
+//! and this closes a hole the anchor-only rule always had: a sentence
+//! attributed to RFC 9110 used to pass because RFC 9112 happened to contain
+//! it too, and the citation itself was never read. When the named spec was
+//! never loaded, that is not silence: it is reported as [`Grade::Unloaded`],
+//! because a claim this run could not check is a different fact from a
+//! quotation with no supplied spec to check it against.
+//!
+//! An ABNF production goes the OTHER way and is checked against every loaded
+//! spec regardless of citation — see [`grade_production`]'s doc comment for
+//! why. The two are intentionally asymmetric: a quoted SENTENCE inside a
+//! citing block is almost always that RFC's own prose, but a grammar RULE
+//! beside a citation is routinely shown for comparison with a different
+//! spec's.
 //!
 //! # What is normalised away on BOTH sides, and why
 //!
@@ -122,9 +145,17 @@ use std::{
 
 type Error = Box<dyn std::error::Error>;
 
-/// A quotation, or a candidate ABNF production, found in one file — paired
-/// with the source line its opening mark is on.
+/// A candidate ABNF production found in one file, paired with the source
+/// line its opening backtick is on.
 type Spans = Vec<(usize, String)>;
+
+/// A quotation found in one file, paired with the source line its opening
+/// mark is on and the single RFC its block cited, if any ([`cited_rfc`]).
+///
+/// The citation travels WITH the span rather than being looked up again at
+/// grading time: it is a property of the block the span was cut from, and the
+/// block is gone by the time `run` gets to grading.
+type QuotedSpans = Vec<(usize, String, Option<u32>)>;
 
 /// The default, gitignored cache directory, relative to the workspace root.
 pub const DEFAULT_DIR: &str = ".rfc-cache";
@@ -160,12 +191,16 @@ struct Spec {
   lower: String,
 }
 
-/// What went wrong with one quoted span.
+/// What went wrong with one quoted span — including that it could not be
+/// checked at all.
 enum Grade<'a> {
   /// The spec has these words, in other cases.
   Recased(&'a Spec, String),
   /// The spec begins this way and then says something else.
   Reworded(&'a Spec, String),
+  /// The block cited this RFC, but no spec by that name was loaded — a
+  /// checkable claim this run could not check, not a pass.
+  Unloaded(u32),
 }
 
 /// Checks every RFC quotation in the workspace's comments against the specs in
@@ -200,10 +235,10 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     let shown = source.strip_prefix(&root).unwrap_or(source).display();
     let (spans, productions, skipped_here) = spans_for(source, &text);
     abnf_skipped += skipped_here;
-    for (line, span) in spans {
+    for (line, span, cited) in spans {
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
-        let Some(grade) = grade(&quoted, &specs, &mut checked) else {
+        let Some(grade) = grade(&quoted, cited, &specs, &mut checked) else {
           continue;
         };
         failures += 1;
@@ -217,6 +252,14 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
             println!("{shown}:{line}: quoted words are not {}'s", spec.name);
             println!("  comment: \"{quoted}\"");
             println!("  {}: \"{actual}…\"", spec.name);
+          }
+          Grade::Unloaded(number) => {
+            println!("{shown}:{line}: cites RFC {number}, which was not loaded");
+            println!("  comment: \"{quoted}\"");
+            println!(
+              "  add {number} to FETCHED and run \
+               `cargo run -p xtask -- quote-check --fetch`"
+            );
           }
         }
       }
@@ -282,13 +325,14 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
 }
 
 /// Every quotation and candidate ABNF production `path`'s contents holds,
-/// dispatched by extension, as `(quoted, productions, skipped)`.
+/// dispatched by extension, as `(quoted, productions, skipped)` — each
+/// `quoted` span carrying the single RFC its own block cited, if any.
 ///
 /// `.md` is read as one long comment block ([`markdown_quotations`]);
 /// anything else — in practice always `.rs`, since [`collect_sources`] hands
 /// this only `.rs` or `.md` paths — is read as `.rs`-style comments
 /// ([`quotations`]).
-fn spans_for(path: &Path, text: &str) -> (Spans, Spans, usize) {
+fn spans_for(path: &Path, text: &str) -> (QuotedSpans, Spans, usize) {
   if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
     markdown_quotations(text)
   } else {
@@ -297,10 +341,59 @@ fn spans_for(path: &Path, text: &str) -> (Spans, Spans, usize) {
 }
 
 /// Grades one normalised span, counting it when it is one this check governs.
-fn grade<'a>(quoted: &str, specs: &'a [Spec], checked: &mut usize) -> Option<Grade<'a>> {
+///
+/// `cited` is the single RFC the span's own block named, if any
+/// ([`cited_rfc`]). A block that cites one RFC is claiming THAT spec's
+/// words, so a cited span is graded only against the spec it names — not
+/// against whichever loaded spec happens to contain it. That closes a hole
+/// this check always had: a sentence attributed to RFC 9110 used to pass
+/// because RFC 9112 happened to contain it too, and the attribution itself
+/// was never read. A spec the block names but this run never loaded is not
+/// silence either — it is [`Grade::Unloaded`], because a claim this run could
+/// not check is a different fact from a claim with nothing to check against.
+///
+/// This is deliberately the OPPOSITE of [`grade_production`], which grades
+/// against every loaded spec regardless of citation. That is not an
+/// inconsistency: a quoted SENTENCE inside a citing block is almost always
+/// that RFC's own prose, but a grammar RULE beside a citation is routinely
+/// shown for comparison with a different spec's — see `grade_production`'s
+/// doc comment for the worked example.
+fn grade<'a>(
+  quoted: &str,
+  cited: Option<u32>,
+  specs: &'a [Spec],
+  checked: &mut usize,
+) -> Option<Grade<'a>> {
   if quoted.split_whitespace().count() < MIN_WORDS || quoted.chars().count() < MIN_CHARS {
-    return None;
+    return None; // not prose-sized: not a quotation
   }
+
+  if let Some(number) = cited {
+    let name = format!("rfc{number}");
+    let Some(spec) = specs.iter().find(|spec| spec.name == name) else {
+      *checked += 1;
+      return Some(Grade::Unloaded(number));
+    };
+    *checked += 1;
+    if spec.text.contains(quoted) {
+      return None;
+    }
+    let lowered = quoted.to_ascii_lowercase();
+    if let Some(at) = spec.lower.find(&lowered) {
+      return Some(Grade::Recased(spec, excerpt(&spec.text, at, quoted.len())));
+    }
+    let head = anchor(quoted);
+    let at = spec.lower.find(&head).unwrap_or(0);
+    return Some(Grade::Reworded(
+      spec,
+      excerpt(&spec.text, at, quoted.len().saturating_mul(2)),
+    ));
+  }
+
+  // No citation: the pre-existing any-spec behaviour, unchanged. Without a
+  // citation naming which spec is claimed, anchoring — the span's own opening
+  // characters — is the only signal that it is a quotation of a supplied spec
+  // at all.
   let head = anchor(quoted);
   let anchored: Vec<&Spec> = specs
     .iter()
@@ -308,7 +401,10 @@ fn grade<'a>(quoted: &str, specs: &'a [Spec], checked: &mut usize) -> Option<Gra
     .collect();
   if anchored.is_empty() {
     // Not a quotation of any supplied spec: an internal quotation, a quoted
-    // identifier, or a spec this run was not given. Not this check's business.
+    // identifier, or an UNCITED quotation from a spec this run was not given.
+    // With no citation naming it, there is no spec to report as unloaded —
+    // unlike the cited branch above, this stays silent. Not this check's
+    // business.
     return None;
   }
 
@@ -431,9 +527,9 @@ fn exempted_spans(source: &str) -> HashSet<String> {
 }
 
 /// Every quoted span in `source`'s comments, with the line its opening quote
-/// is on — a comment that follows code on the same line included — beside
-/// every backticked ABNF production candidate whose block names a single RFC,
-/// as `(quoted, productions, skipped)`. `skipped` counts the production-shaped
+/// is on and the single RFC its own block cited (if any) — beside every
+/// backticked ABNF production candidate whose block names a single RFC, as
+/// `(quoted, productions, skipped)`. `skipped` counts the production-shaped
 /// spans found in a block that named no RFC, or named more than one — a
 /// candidate this check has no citation to grade, not a failure.
 ///
@@ -442,9 +538,11 @@ fn exempted_spans(source: &str) -> HashSet<String> {
 /// A production is found per raw line, before [`mask_code_spans`] runs on it —
 /// but which block it belongs to, and so whether [`cited_rfc`] admits it as a
 /// candidate at all, is decided at the block's flush, once the whole block
-/// exists to be asked.
-fn quotations(source: &str) -> (Spans, Spans, usize) {
-  let mut out = Vec::new();
+/// exists to be asked. Every quoted span pulled from the same block carries
+/// the same citation, for the same reason: the block, not the line, is what
+/// was cited.
+fn quotations(source: &str) -> (QuotedSpans, Spans, usize) {
+  let mut out: QuotedSpans = Vec::new();
   let mut productions = Vec::new();
   let mut skipped = 0usize;
   let mut block = String::new();
@@ -457,15 +555,19 @@ fn quotations(source: &str) -> (Spans, Spans, usize) {
 
   let mut flush =
     |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Vec<(usize, String)>| {
+      // Computed once and reused for every span AND for the production gate
+      // below: both readings are "what did this block cite", so there is only
+      // one place that question is asked.
+      let cited = cited_rfc(block);
       for (at, span) in quoted_spans(block) {
         let line = marks
           .iter()
           .take_while(|(offset, _)| *offset <= at)
           .last()
           .map_or(0, |(_, line)| *line);
-        out.push((line, span.to_string()));
+        out.push((line, span.to_string(), cited));
       }
-      if cited_rfc(block).is_some() {
+      if cited.is_some() {
         productions.append(pending);
       } else {
         skipped += pending.len();
@@ -507,9 +609,11 @@ fn quotations(source: &str) -> (Spans, Spans, usize) {
   (out, productions, skipped)
 }
 
-/// Every quotation in a Markdown file, beside every backticked ABNF production
-/// candidate whose block names a single RFC, as `(quoted, productions,
-/// skipped)` — see [`quotations`] for what `skipped` counts and why.
+/// Every quotation in a Markdown file, with the line its opening quote is on
+/// and the single RFC its own block cited (if any), beside every backticked
+/// ABNF production candidate whose block names a single RFC, as `(quoted,
+/// productions, skipped)` — see [`quotations`] for what `skipped` counts and
+/// why, and for the citation this mirrors.
 ///
 /// A `.md` file is comment text throughout, so there is no comment prefix to
 /// find and no code half to discard — but fenced blocks are still skipped, for
@@ -526,8 +630,8 @@ fn quotations(source: &str) -> (Spans, Spans, usize) {
 /// rather than joined — which is the safer of the two: a fence is far likelier
 /// to separate two unrelated paragraphs than a real quotation is to straddle
 /// one.
-fn markdown_quotations(source: &str) -> (Spans, Spans, usize) {
-  let mut out = Vec::new();
+fn markdown_quotations(source: &str) -> (QuotedSpans, Spans, usize) {
+  let mut out: QuotedSpans = Vec::new();
   let mut productions = Vec::new();
   let mut skipped = 0usize;
   let mut block = String::new();
@@ -540,15 +644,18 @@ fn markdown_quotations(source: &str) -> (Spans, Spans, usize) {
 
   let mut flush =
     |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Vec<(usize, String)>| {
+      // See `quotations`'s `flush` for why this is computed once and reused
+      // for both the spans below and the production gate.
+      let cited = cited_rfc(block);
       for (at, span) in quoted_spans(block) {
         let line = marks
           .iter()
           .take_while(|(offset, _)| *offset <= at)
           .last()
           .map_or(0, |(_, line)| *line);
-        out.push((line, span.to_string()));
+        out.push((line, span.to_string(), cited));
       }
-      if cited_rfc(block).is_some() {
+      if cited.is_some() {
         productions.append(pending);
       } else {
         skipped += pending.len();
@@ -1065,7 +1172,11 @@ mod tests {
   use std::path::Path;
 
   fn spans(source: &str) -> Vec<String> {
-    quotations(source).0.into_iter().map(|(_, s)| s).collect()
+    quotations(source)
+      .0
+      .into_iter()
+      .map(|(_, s, _)| s)
+      .collect()
   }
 
   // `markdown_quotations` mirrors `spans` above: same shape, different source
@@ -1074,7 +1185,7 @@ mod tests {
     markdown_quotations(source)
       .0
       .into_iter()
-      .map(|(_, s)| s)
+      .map(|(_, s, _)| s)
       .collect()
   }
 
@@ -1183,7 +1294,11 @@ mod tests {
   fn spans_for_dispatches_by_extension() {
     let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
     let (quoted, productions, skipped) = spans_for(Path::new("notes.md"), source);
-    assert_eq!(quoted, vec![(1, "the server MUST NOT process".to_string())]);
+    // The span carries the block's own citation as its third element.
+    assert_eq!(
+      quoted,
+      vec![(1, "the server MUST NOT process".to_string(), Some(9112))]
+    );
     assert!(productions.is_empty());
     assert_eq!(skipped, 0);
     let (quoted, productions, skipped) = spans_for(Path::new("notes.rs"), source);
@@ -1380,5 +1495,54 @@ mod tests {
     let mut checked = 0;
     assert!(super::grade_production("x=y", &specs, &normalised, &mut checked).is_none());
     assert_eq!(checked, 0);
+  }
+
+  // The three answers `grade` used to collapse into one `None`. A green run
+  // must not look the same as a run that could not check anything: a block
+  // citing RFC 9782 (never loaded — it is not in `FETCHED`) is a checkable
+  // claim this run could not honour, and that must surface rather than vanish.
+  #[test]
+  fn an_unloaded_citation_grades_as_unloaded() {
+    let specs: Vec<super::Spec> = Vec::new();
+    let mut checked = 0;
+    let graded = super::grade(
+      "the identifier is a valid URI reference and is compared",
+      Some(9782),
+      &specs,
+      &mut checked,
+    );
+    assert!(matches!(graded, Some(super::Grade::Unloaded(9782))));
+    assert_eq!(
+      checked, 1,
+      "an unloaded citation still counts as one this check governs"
+    );
+  }
+
+  // The hole grading-by-citation closes: `rfc1` holds these exact words, but
+  // the block cites `rfc2`, which does not — so this must FAIL, not silently
+  // pass the way the pre-citation any-spec match did (a sentence attributed to
+  // RFC 9110 passing because RFC 9112 happened to contain it too). The
+  // attribution is read, not just present.
+  #[test]
+  fn a_quotation_attributed_to_the_wrong_loaded_spec_fails() {
+    let specs = [
+      test_spec(
+        "rfc1",
+        "the widget registry must reject a duplicate identifier",
+      ),
+      test_spec(
+        "rfc2",
+        "an unrelated spec discussing something else entirely",
+      ),
+    ];
+    let mut checked = 0;
+    let graded = super::grade(
+      "the widget registry must reject a duplicate identifier",
+      Some(2),
+      &specs,
+      &mut checked,
+    );
+    assert!(matches!(graded, Some(super::Grade::Reworded(spec, _)) if spec.name == "rfc2"));
+    assert_eq!(checked, 1);
   }
 }
