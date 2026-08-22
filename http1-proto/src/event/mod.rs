@@ -27,7 +27,9 @@
 
 use crate::{
   body::Budget,
-  connection::{Borrows, Exchange, Lifecycle, RecvState, SendState, inbound, writable},
+  connection::{
+    Borrows, Exchange, Lifecycle, RecvState, SendState, inbound, tunnel::TunnelPhase, writable,
+  },
   error::Error,
   head::{HeadView, RequestLine, StatusLine},
 };
@@ -44,6 +46,10 @@ use crate::{
 /// `&'static str`, so folding "this message has no body" in would make it
 /// indistinguishable from "this connection is dead".
 pub(crate) const NO_BODY_BEING_RECEIVED: &str = "no message body is being received";
+
+/// Every General call after a §7.8 switch. The connection is spent: the driver
+/// has the leftover and the transport belongs to the next protocol.
+pub(crate) const SWITCHED: &str = "the connection switched protocols";
 
 /// The number that names one request/response exchange on a connection.
 ///
@@ -118,9 +124,10 @@ pub enum StartLine<'a> {
 ///
 /// The variants are the parts RFC 9112 §2.1 builds a message out of — a head,
 /// then a body — plus the trailer section §7.1.2 allows a chunked body to end
-/// with, plus the two signals a driver has to act on rather than merely forward.
-/// Every one of them names its exchange, because a keep-alive connection carries
-/// many (§9.3).
+/// with, plus the three signals a driver has to act on rather than merely
+/// forward. All but one name an exchange, because a keep-alive connection
+/// carries many (§9.3); [`Switched`](Self::Switched) is the exception, and its
+/// own doc says why it is not an item OF one.
 ///
 /// Borrowed, never owned: `data` and `value` ARE the fed bytes, and `view` reads
 /// its fields straight out of the head block. An item is valid for as long as
@@ -207,6 +214,45 @@ pub enum Item<'a> {
     /// The exchange whose request carried the expectation.
     exchange: ExchangeId,
   },
+  /// Client-side: RFC 9110 §7.8's protocol switch. The server accepted the offer
+  /// this client made on an ordinary exchange, and HTTP framing on this
+  /// connection is over.
+  ///
+  /// The connection is spent after this. It holds no leftover — it is here —
+  /// and it will read no further byte, because the bytes are the new protocol's.
+  /// Every later call refuses, which is the second of the two `InvalidState`
+  /// answers [`next`](Items::next) documents: having TAKEN this item is what
+  /// tells them apart, so a driver that did hands the transport over instead of
+  /// tearing it down.
+  ///
+  /// The exchange is NOT ended, and no item says it was. §7.8 is explicit that
+  /// "the server still has an outstanding request to satisfy after the protocol
+  /// has been changed", so nothing was aborted and nothing completed — reporting
+  /// either would be false.
+  ///
+  /// And it carries NO exchange id, the only variant that does not. The id
+  /// correlates the many messages one keep-alive connection carries (RFC 9112
+  /// §9.3), and this is not a message within an exchange: it is the end of HTTP
+  /// framing on the CONNECTION, after which no item of any exchange will be
+  /// yielded again. There is nothing left to correlate it AGAINST either — the
+  /// request that offered is still outstanding, in a protocol this core no
+  /// longer reads, and a General client holds at most one request of its own in
+  /// flight, so the switch can only answer the one it wrote. An id here would
+  /// promise a correlation this API will never complete.
+  ///
+  /// WHICH protocol was switched to is the caller's to check against what it
+  /// offered. §7.8 makes naming it the server's MUST — "A server that sends a
+  /// 101 (Switching Protocols) response MUST send an Upgrade header field to
+  /// indicate the new protocol(s) to which the connection is being switched" —
+  /// and the core has already refused a 101 that named none, so the field is
+  /// there in [`head`](Self::Switched::head) to be read; only the caller knows
+  /// what it asked for.
+  Switched {
+    /// The 101 head.
+    head: HeadView<'a>,
+    /// The bytes after that head, verbatim: they are the new protocol's.
+    leftover: &'a [u8],
+  },
 }
 
 /// The borrowed iterator a connection returns from `handle`. Drive it with
@@ -249,11 +295,11 @@ pub enum Item<'a> {
 /// vehicle — the borrows land as one field each). Those fields are disjoint, so
 /// the borrow checker allows all of them at once — while a single whole-struct
 /// borrow would make every step re-borrow everything, so that advancing the
-/// receive FSM and, in the same expression, minting an id / pushing an event /
+/// receive FSM and, in the same expression, minting an id / recording an abort /
 /// bumping the consumed counter would conflict. The set is the consumed counter,
 /// the head-scan watermark, the receive FSM, the exchange in flight, the counter
 /// that mints the next [`ExchangeId`], the send-side state the keep-alive re-arm
-/// is gated on, the lifecycle latch, the event slot, the pending-CR flag, and the
+/// is gated on, the lifecycle latch, the abort slot, the pending-CR flag, and the
 /// idle-client CRLF tally. The
 /// rule for adding any more: each must be its OWN `Connection` field. If two pieces of state the pump
 /// mutates independently ever share one field, split that field — do not reach
@@ -335,17 +381,25 @@ pub struct Items<'a, 'c> {
   pub(crate) next_exchange: &'c mut u64,
   /// Where the inbound side of the connection stands.
   pub(crate) recv: &'c mut RecvState,
-  /// The exchange in flight, whose id every item names.
+  /// The exchange in flight, whose id every item but [`Item::Switched`] names.
   pub(crate) exchange: &'c mut Option<Exchange>,
   /// Where the local send side stands — the keep-alive re-arm gate.
   pub(crate) send: &'c mut SendState,
+  /// The tunnel phase, which a General connection reaches only through the
+  /// §7.8 switch the pump itself performs.
+  ///
+  /// `&mut`, and that is the property rather than an economy — the mirror of
+  /// `max_body`'s by-value doc above. The pump WRITES this field, in the same
+  /// step that yields the switch, and re-reads it live on the next entry: a
+  /// copy taken at `handle` time would still say "not switched" when the drain
+  /// loop calls `next` again over the same buffer, and the leftover — the new
+  /// protocol's bytes, which the peer chose — would be parsed as HTTP.
+  pub(crate) tunnel: &'c mut TunnelPhase,
   /// Where the connection stands in its life, including the failure latch.
   ///
   /// POLICY only. Whether the transport can still produce bytes is
   /// [`read_closed`](Self::read_closed), a separate fact — see `Lifecycle`.
   pub(crate) lifecycle: &'c mut Lifecycle,
-  /// The queued connection-scoped notice.
-  pub(crate) event: &'c mut Option<Event>,
   /// Whether the PEER's write side has ended, so no further byte can arrive.
   ///
   /// A fact about the TRANSPORT, borrowed beside the lifecycle rather than
@@ -389,8 +443,8 @@ impl<'a, 'c> Items<'a, 'c> {
       recv,
       exchange,
       send,
+      tunnel,
       lifecycle,
-      event,
       read_closed,
       peer_close,
       tail_unresolved,
@@ -409,8 +463,8 @@ impl<'a, 'c> Items<'a, 'c> {
       recv,
       exchange,
       send,
+      tunnel,
       lifecycle,
-      event,
       read_closed,
       peer_close,
       tail_unresolved,
@@ -429,21 +483,32 @@ impl<'a, 'c> Items<'a, 'c> {
   /// and [`consumed`](Self::consumed) is what says how much of the input to drop
   /// before offering the rest.
   ///
-  /// `Err` is TWO different answers, and a driver that treats them alike loses
-  /// the response it is still allowed to send:
+  /// `Err` is THREE different answers, and a driver that treats them alike
+  /// loses information it needs:
   ///
   /// - [`Error::Protocol`] is a wire violation, and it is terminal for the
   ///   connection rather than for this call: the connection latches into its
   ///   failed state and no further item can surface after it.
   /// - [`Error::Refused`] is this end's own POLICY refusing a message the peer
-  ///   framed correctly. The connection has NOT failed. `poll_event` has queued
-  ///   [`Event::CloseSignaled`], [`wants_read`] is false, and a server's
+  ///   framed correctly. The connection has NOT failed.
+  ///   [`transport`](crate::Connection::transport) reads
+  ///   [`Transport::Ending`](crate::Transport), [`wants_read`] is false, and a server's
   ///   [`is_awaiting_send`] is TRUE until it has written its one answer — which
   ///   must state the `close` connection option (RFC 9112 §9.3). Treating this
   ///   as terminal drops a `413` the peer is entitled to.
+  /// - [`Error::InvalidState`] — the call is misuse rather than a wire event.
+  ///   This method answers it in **two** situations and the reason string is
+  ///   `pub(crate)`, so the connection cannot tell them apart for you: after
+  ///   the failure latch of the first bullet, and after this connection
+  ///   switched protocols under RFC 9110 §7.8. **Your own record is the
+  ///   discriminator.** If you took [`Item::Switched`], the transport belongs to
+  ///   the new protocol: hand it over, and do NOT tear it down. Otherwise this
+  ///   is the post-failure misuse of the first bullet, and tearing down is
+  ///   exactly right.
   ///
   /// [`Error::Protocol`]: crate::Error::Protocol
   /// [`Error::Refused`]: crate::Error::Refused
+  /// [`Error::InvalidState`]: crate::Error::InvalidState
   /// [`wants_read`]: crate::Connection::wants_read
   /// [`is_awaiting_send`]: crate::Connection::is_awaiting_send
   // Not `Iterator`: that trait's `next` cannot be fallible, and `Ok(None)` here
@@ -453,6 +518,12 @@ impl<'a, 'c> Items<'a, 'c> {
   // additional reason that does NOT apply here: its items lend (see the type doc).
   #[allow(clippy::should_implement_trait)]
   pub fn next(&mut self) -> Result<Option<Item<'a>>, Error> {
+    // The connection switched protocols: the bytes after that head are the new
+    // protocol's and this pump will not read them. Refused on the first call
+    // and every call after it.
+    if matches!(*self.tunnel, TunnelPhase::Switched) {
+      return Err(Error::InvalidState(SWITCHED));
+    }
     inbound::pump(self)
   }
 
@@ -536,6 +607,16 @@ impl<'a, 'c> Items<'a, 'c> {
   /// — folding "this message has no body" into it would make it
   /// indistinguishable from "this connection is dead".
   ///
+  /// A connection that switched protocols (RFC 9110 §7.8) takes the FIRST of
+  /// those reasons, and this call needs no phase check to send it there —
+  /// unlike [`next`](Self::next), which refuses outright. The arm that switches
+  /// bypasses `commit_head`, the only writer of `RecvState::Body`, so the
+  /// receive side is `Idle` and there is genuinely no body to narrow: the same
+  /// answer this call gives between messages, and the honest one. It follows
+  /// from the state the switch left behind rather than from the phase, so a
+  /// later switch that retained a body would change it — which is what the
+  /// assertions in `connection/tests.rs` pin.
+  ///
   /// # On `Items` rather than on `Connection`, and only there
   ///
   /// [`Item`] borrows the INPUT rather than the iterator, so a driver narrows
@@ -617,17 +698,17 @@ impl<'a, 'c> Items<'a, 'c> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
-  /// Keep-alive is over: the peer signalled close, or the local driver asked for
-  /// one. Finish draining what is already parsed, then close the transport
-  /// (RFC 9112 §9.6). No further exchange begins on this connection.
-  CloseSignaled,
   /// This exchange ended WITHOUT its final response, and no
   /// [`Item::ExchangeComplete`] will follow for it.
   ///
-  /// Exchange-scoped on purpose: [`CloseSignaled`](Self::CloseSignaled) says the
-  /// connection is over and names nothing, so a consumer tracking exchanges
-  /// cannot learn from it that a particular request went unanswered. It would
-  /// wait, or fail to retry.
+  /// Exchange-scoped on purpose, and the ONLY thing this type carries. What
+  /// the driver should do with the CONNECTION is
+  /// [`Connection::transport`](crate::Connection::transport), a level derived on
+  /// the ask — it names no message, so a consumer tracking exchanges could never
+  /// learn from it that a particular request went unanswered, and would wait or
+  /// fail to retry. That is the line between the two: an event is right when its
+  /// subject dies before the driver could ask, and a level is right when its
+  /// subject is the very thing the driver holds.
   ///
   /// # Exactly one producer
   ///

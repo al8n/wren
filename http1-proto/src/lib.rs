@@ -43,8 +43,9 @@ mod macros;
 pub mod body;
 /// The connection state machine: the compile-time role/mode type-state, the
 /// General-mode inbound FSM that turns fed transport bytes into borrowed items
-/// and its send side, and the Tunnel-mode handshake that switches protocols and
-/// hands the byte stream over.
+/// — the RFC 9110 §7.8 switch a permitted client's own offer brings back
+/// included — and its send side, and the Tunnel-mode handshake that builds such
+/// a switch from scratch. Either mode hands the byte stream over.
 pub mod connection;
 /// Grammar-violation detail, advisory response status, and the error split.
 pub mod error;
@@ -68,7 +69,7 @@ pub mod media;
 pub mod validate;
 pub use connection::{
   BodyPlan, BodyProgress, Client, ClientTunnelOutcome, Connection, General, HeadBinding, Limits,
-  Mode, NO_TRAILERS, Role, Server, ServerTunnelRequest, TransitionRefused, Tunnel,
+  Mode, NO_TRAILERS, Role, Server, ServerTunnelRequest, TransitionRefused, Transport, Tunnel,
 };
 pub use error::{Error, H1Error, MalformedDetail, Refusal, SuggestedStatus};
 pub use event::{Event, ExchangeId, Item, Items, StartLine};

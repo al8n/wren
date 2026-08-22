@@ -36,15 +36,19 @@ use crate::{
   connection::{
     CLOSED_BEFORE_RESPONSE, CLOSED_MID_HEAD, CONNECT, Exchange, FAILED, Lifecycle, RecvState,
     SWITCHING_PROTOCOLS, SendState, abandon_send, head_digest, latch, mint, refuse, settle,
-    signal_close, tunnel::names_a_protocol,
+    signal_close,
+    tunnel::{SWITCH_NEEDS_BOTH_HALVES, SWITCH_WAS_NEVER_OFFERED, TunnelPhase, names_a_protocol},
   },
   error::{Error, H1Error, Refusal},
   event::{ExchangeId, Item, Items, StartLine},
   head::{
-    HeadView, Version, find_head_end, malformed, parse_request_line, parse_status_line,
+    HeadView, StatusLine, Version, find_head_end, malformed, parse_request_line, parse_status_line,
     scan::MAX_LEADING_EMPTY_LINES, scan_head, skip_leading_empty_lines,
   },
-  validate::{BodyFraming, HeadDirectives, validate_request, validate_response},
+  validate::{
+    BodyFraming, HeadDirectives, check_response_head, has_close_option, validate_request,
+    validate_response,
+  },
 };
 
 /// RFC 9110 §9.3.6: a 2xx to CONNECT turns the connection into a tunnel, so the
@@ -55,10 +59,49 @@ use crate::{
 /// [`General`]: crate::connection::General
 const CONNECT_NEEDS_TUNNEL: &str = "CONNECT requires a Tunnel-mode connection";
 
-/// RFC 9110 §15.2.2: a 101 switches the connection to another protocol, and
-/// everything after that head is that protocol's, not HTTP's. Refused in General
-/// mode for the same reason CONNECT is.
-const SWITCHING_NEEDS_TUNNEL: &str = "101 requires a Tunnel-mode connection";
+/// RFC 9112 §9.6 makes a sender of the `close` connection option "initiate
+/// closure of the connection (see below) after it sends the response containing"
+/// it, so a peer that has stated the option has no continuation left to switch
+/// INTO. Tunnel mode decides the same thing about the same fact, through
+/// `validate::has_close_option` — the TAKEOVER predicate both modes ask. It
+/// reads the option and nothing else: §9.3's HTTP/1.0 non-persistence default
+/// belongs to `ends_persistence`, deliberately, and that predicate's own doc
+/// carries the reason.
+///
+/// ONE constant for BOTH statements of the fact and BOTH readers, because it is
+/// one rule about one thing — this peer has committed to closing — and WHICH
+/// head said so is evidence rather than a second rule. The same argument
+/// [`SWITCH_WAS_NEVER_OFFERED`](super::tunnel::SWITCH_WAS_NEVER_OFFERED)
+/// records for its own two readers. The four sites are the two ways to state it
+/// crossed with the two modes:
+///
+/// - An EARLIER committed head accumulated the fact into `peer_close`
+///   (`switch_or_fault`). Dead today, and kept: `peer_close_effects` drains the
+///   connection at the interim that carried the option, so the pump stops before
+///   the 101 behind it is parsed.
+/// - The head IN HAND states it, which no accumulator can see because a 101
+///   never reaches `commit_head`. Asked directly of the 101, in `switch_or_fault`
+///   and in `handle_response`'s own 101 arm.
+///
+/// THE TWO CASES ARE NOT ONE, and the way the second hides is worth the
+/// warning: an unreachability argument about a guard's CONDITION is not one
+/// about the guard's RULE. The first bullet's argument is about the accumulated
+/// FLAG — so when a guard is documented as dead, say what the rule covers that
+/// the condition does not, or the deadness argument becomes the reason nobody
+/// looks further. And two modes agreeing about the same head is not evidence
+/// that either is right: parity is consistency, not conformance.
+///
+/// The four sites are this constant's, not the rule's. The rule is the
+/// one-takeover-no-close invariant, stated once at
+/// [`TunnelPhase::Switched`](super::tunnel::TunnelPhase::Switched) with every
+/// site that arms, makes or accepts a switch and a verdict for each, the CONNECT
+/// corners included. Read that table before concluding this enumeration is the
+/// whole of the rule.
+///
+/// `pub(super)` so the sibling test module can pin these gates by the reason
+/// they report, and so Tunnel's 101 arm reports the same reason for the same
+/// rule.
+pub(super) const SWITCH_AFTER_CLOSE: &str = "a protocol takeover after the peer stated close";
 
 /// RFC 9112 §9.2: a client that receives data on a connection with no outstanding
 /// request "MUST NOT consider [it] a response" — message delimitation is
@@ -250,7 +293,6 @@ fn truncated(it: &mut Items<'_, '_>, error: H1Error) -> Error {
   latch(
     it.send,
     it.lifecycle,
-    *it.read_closed,
     it.is_client,
     false,
     it.exchange.is_some(),
@@ -409,8 +451,9 @@ fn client_head<'a>(
   };
 
   let block = rest.get(..end).unwrap_or_default();
-  let parsed = match parse_response_head(block, exchange) {
-    Ok(parsed) => parsed,
+  let parsed = match parse_response_head(block, exchange, *it.peer_close) {
+    Ok(ResponseHead::Message(parsed)) => parsed,
+    Ok(ResponseHead::Switch(view)) => return Ok(Step::Yield(switch(it, rest, start, end, view))),
     Err(error) => return Err(fail(it, error)),
   };
 
@@ -553,19 +596,42 @@ fn parse_request_head(block: &[u8]) -> Result<ParsedHead<'_>, H1Error> {
   })
 }
 
+/// What a client's response head turned out to be.
+///
+/// Two answers rather than one, because a 101 is not a message this connection
+/// frames anything under: RFC 9110 §15.2.2 makes everything after that head the
+/// new protocol's. So the head goes back to the caller, which holds the buffer
+/// offsets, the phase and the input borrow the switch needs, instead of being
+/// committed like a response.
+enum ResponseHead<'a> {
+  /// An ordinary response, interim or final, for [`commit_head`].
+  Message(ParsedHead<'a>),
+  /// RFC 9110 §7.8's switch, already validated: HTTP framing on this connection
+  /// ends where this head does.
+  Switch(HeadView<'a>),
+}
+
 /// Scans, parses, and validates a RESPONSE head against the request it answers.
-fn parse_response_head(block: &[u8], exchange: Exchange) -> Result<ParsedHead<'_>, H1Error> {
+///
+/// `peer_close` is the connection's accumulated RFC 9112 §9.6 fact, and the 101
+/// arm is the only thing that reads it; every other decision here is a property
+/// of the block and the exchange alone.
+fn parse_response_head(
+  block: &[u8],
+  exchange: Exchange,
+  peer_close: bool,
+) -> Result<ResponseHead<'_>, H1Error> {
   let view = scan_head(block)?;
   let status_line = parse_status_line(view.start_line_bytes())?;
-  // Refused ahead of validation, which is written to rely on it: a 101 is not a
+  // Answered ahead of validation, which is written to rely on it: a 101 is not a
   // response whose body needs framing, it is the end of HTTP framing on this
   // connection.
   if status_line.code == SWITCHING_PROTOCOLS {
-    return Err(H1Error::Framing(SWITCHING_NEEDS_TUNNEL));
+    return switch_or_fault(&status_line, view, exchange, peer_close);
   }
   let (framing, directives) =
     validate_response(&status_line, &view, exchange.method_head, exchange.connect)?;
-  Ok(ParsedHead {
+  Ok(ResponseHead::Message(ParsedHead {
     view,
     framing,
     directives,
@@ -576,7 +642,92 @@ fn parse_response_head(block: &[u8], exchange: Exchange) -> Result<ParsedHead<'_
     method_head: false,
     version: status_line.version,
     line: StartLine::Status(status_line),
-  })
+  }))
+}
+
+/// Every question RFC 9110 §7.8 asks of a 101 before this end may act on it, in
+/// the order the answer depends on.
+///
+/// Every failure is the PEER violating a MUST, so every one is
+/// [`H1Error::Framing`] and the caller latches the connection.
+fn switch_or_fault<'a>(
+  status_line: &StatusLine<'a>,
+  view: HeadView<'a>,
+  exchange: Exchange,
+  peer_close: bool,
+) -> Result<ResponseHead<'a>, H1Error> {
+  // 1. Every condemnation of the head, from the SAME check `Tunnel`'s
+  //    `handle_response` makes on every head including this one. A head is a
+  //    fault or it is not, and which mode is reading it cannot change that —
+  //    two recipients disagreeing about the same bytes is what RFC 9112 §11.1
+  //    is. One fault survives to be found here: §6.3 ITEM 1 makes every 1xx
+  //    bodiless "regardless of the header fields present in the message", so a
+  //    framing field on a 101 is one a recipient IGNORES, except under §6.1,
+  //    which sits ahead of the whole list and condemns an HTTP/1.0 message
+  //    carrying `Transfer-Encoding` "even if a Content-Length is present".
+  //    Item 1 alone: item 2 is the CONNECT-2xx tunnel rule, whose own words are
+  //    "A client MUST ignore any Content-Length or Transfer-Encoding header
+  //    fields received in such a message", and no 101 is a 2xx to CONNECT.
+  //
+  //    `method_head` is the EXCHANGE's, where Tunnel passes a constant `false`.
+  //    That constant is a fact about Tunnel — it writes GET or CONNECT and never
+  //    HEAD — rather than about the head, and it cannot change a 101's verdict
+  //    either way, since item 1 makes every 1xx bodiless whatever the method
+  //    was. This is the honest value at a site that HAS one.
+  check_response_head(status_line, &view, exchange.method_head, exchange.connect)?;
+  // 2. RFC 9110 §7.8: "A server MUST NOT switch to a protocol that was not
+  //    indicated by the client in the corresponding request's Upgrade header
+  //    field."
+  //
+  //    What is read is the OFFER this exchange made, NOT the permission the
+  //    connection carries: a permitting connection whose request sent no
+  //    `Upgrade` field indicated nothing, and §7.8 is about the indication.
+  if !exchange.upgrade_offered {
+    return Err(H1Error::Framing(SWITCH_WAS_NEVER_OFFERED));
+  }
+  // 3. §9.6, above: a peer that stated `close` has committed to closing, so it
+  //    has nothing to continue INTO. Tunnel decides the same thing about the
+  //    same fact, with the same predicate, on the same head. This is the accept
+  //    corner of the one-takeover-no-close invariant, whose every corner and
+  //    verdict is tabled at `tunnel::TunnelPhase::Switched`.
+  //
+  //    TWO WAYS TO STATE ONE FACT, and the rule covers both. `peer_close`
+  //    accumulates what earlier COMMITTED heads said, and a 101 never reaches
+  //    `commit_head`, so a 101 that states its OWN `close` leaves the flag
+  //    false: the accumulator alone cannot see it. The head in hand is asked
+  //    directly, through `validate::has_close_option` — the same predicate every
+  //    other TAKEOVER site in this crate asks, and NOT `ends_persistence`.
+  //    §9.3's HTTP/1.0 default is left out deliberately: it answers "may another
+  //    HTTP MESSAGE follow this one?", and a 101 ends HTTP framing on the
+  //    connection, so there is no such message for it to govern. A 1.0 101
+  //    carrying no `close` has STATED nothing — which is what this constant's
+  //    message says, and what
+  //    `an_http_10_101_without_keep_alive_still_switches` pins.
+  //
+  //    ONE constant for both statements, because it is one rule about one fact:
+  //    this peer has committed to closing. Which head said so is evidence, not a
+  //    second rule — the same argument `SWITCH_WAS_NEVER_OFFERED` records for
+  //    its two readers.
+  //
+  //    The accumulated half remains BELT AND BRACES and is kept deliberately:
+  //    nothing can reach here with the flag set, because the only heads §15.2
+  //    lets precede a 101 in one exchange are interim ones and
+  //    `peer_close_effects` ends the exchange and drains the connection at the
+  //    interim that carried the option. That is an invariant of ANOTHER
+  //    function, and this is the doorway into the next protocol. The head-in-hand
+  //    half is NOT dead: it is the only thing that answers a 101 whose own field
+  //    section ends persistence.
+  if peer_close || has_close_option(&view) {
+    return Err(H1Error::Framing(SWITCH_AFTER_CLOSE));
+  }
+  // 4. §7.8's two halves on the 101 itself — the `upgrade` connection option and
+  //    an `Upgrade` field naming a protocol, which §15.2.2 makes a MUST for the
+  //    server that switches. Asked with the predicate the Tunnel client asks, so
+  //    a head one mode switches on is one the other switches on.
+  if !names_a_protocol(&view) {
+    return Err(H1Error::Framing(SWITCH_NEEDS_BOTH_HALVES));
+  }
+  Ok(ResponseHead::Switch(view))
 }
 
 /// Commits a parsed head: counts its bytes, applies its connection directives,
@@ -642,6 +793,55 @@ fn commit_head<'a>(
   }
 }
 
+/// Commits the RFC 9110 §7.8 switch a validated 101 performs, and builds the item
+/// that hands the connection over.
+///
+/// [`commit_head`]'s counterpart for the one head that is not a message this
+/// connection frames anything under, and deliberately NOT that function: a 101
+/// is in `100..=199`, so falling through would class it INTERIM, leave the
+/// exchange open on the receive side, and keep this pump parsing what follows as
+/// HTTP — and what follows is the next protocol's bytes. Nothing would look
+/// broken either, since an interim is legal and expected.
+///
+/// So the whole commit is here: the phase, the watermark, the counter, and the
+/// item. `end` is where the 101's head ends within `rest`, and `start` is where
+/// `rest` begins in the offer.
+fn switch<'a>(
+  it: &mut Items<'a, '_>,
+  rest: &'a [u8],
+  start: usize,
+  end: usize,
+  view: HeadView<'a>,
+) -> Item<'a> {
+  // The octets behind the head are the new protocol's, verbatim: they go out on
+  // the item and are never consumed, because no HTTP item will ever cover them.
+  let leftover = rest.get(end..).unwrap_or_default();
+  // Written here and re-read live on the next entry, which is what makes every
+  // later call refuse rather than parse those octets as HTTP.
+  *it.tunnel = TunnelPhase::Switched;
+  // The transport is the driver's from here, and the phase itself carries that:
+  // `Connection::transport` reads `TunnelPhase::Switched` as
+  // `Transport::HandedOver`, absorbing, ahead of every other arm. So there is
+  // nothing for this arm to suppress, and no cancel site to keep in step across
+  // the four writers of this phase.
+  // `commit_head` is what normally clears this, and a watermark belongs to ONE
+  // head; the arm bypasses it, so it clears its own.
+  *it.watermark = 0;
+  // Through the end of THIS head within THIS offer, accumulated the way
+  // `commit_head` accumulates it. `handle` reset the counter on entry, so a
+  // count of the 101's own length would lose an interim that arrived in the same
+  // buffer ahead of it.
+  *it.consumed = start.saturating_add(end);
+  // The exchange is RETAINED, and neither the receive state nor the send state
+  // moves. RFC 9110 §7.8: "the server still has an outstanding request to
+  // satisfy after the protocol has been changed" — so nothing was aborted and
+  // nothing completed, and reporting either would be false.
+  Item::Switched {
+    head: view,
+    leftover,
+  }
+}
+
 /// Everything that follows from "this connection received a close".
 ///
 /// ONE routine, invoked wherever `peer_close` holds, so that a consequence added
@@ -674,11 +874,12 @@ fn commit_head<'a>(
 /// exists to move. Its terminal is `TunnelPhase::Refused`, set where it reads the
 /// option.
 fn peer_close_effects(it: &mut Items<'_, '_>, head_is_the_whole_message: bool) {
-  // 1. RFC 9112 §9.6: keep-alive is over. The notice is once per connection,
-  //    which `signal_close` is what guarantees — and it is given from an interim
-  //    head as well, since `close` is a statement about the CONNECTION rather
-  //    than about the message carrying it.
-  signal_close(it.lifecycle, it.event, *it.read_closed);
+  // 1. RFC 9112 §9.6: keep-alive is over, which `signal_close` records by
+  //    moving the lifecycle — and it is recorded from an interim head as well,
+  //    since `close` is a statement about the CONNECTION rather than about the
+  //    message carrying it. Nothing is queued and nothing is once-only:
+  //    `Connection::transport` derives the answer from the lifecycle on the ask.
+  signal_close(it.lifecycle);
 
   // 2. §9.6's "cease sending": a client still writing its request body is
   //    released from the rest of it, because the peer has said it will stop
@@ -823,9 +1024,7 @@ pub(crate) fn refused(it: &mut Items<'_, '_>, exchange: ExchangeId, budget: Budg
     it.watermark,
     it.send,
     it.lifecycle,
-    it.event,
     it.pending_cr,
-    *it.read_closed,
     it.is_client,
     exchange,
     budget,
@@ -841,7 +1040,6 @@ fn fail(it: &mut Items<'_, '_>, error: H1Error) -> Error {
   latch(
     it.send,
     it.lifecycle,
-    *it.read_closed,
     it.is_client,
     true,
     it.exchange.is_some(),

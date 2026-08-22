@@ -594,9 +594,13 @@ fn corpus() -> Vec<Vector> {
       b"HTTP/1.1 999 \r\n\r\n",
       Verdict::Accepts,
     ),
-    // RFC 9110 §15.2.2: well-formed, refused for its mode.
+    // RFC 9110 §7.8: well-formed, and refused because the request this harness
+    // opens made no offer for it to answer — NOT because of the mode. The
+    // response-side driver is an unpermitted `Connection<Client, General>`
+    // sending a plain GET, so what condemns the head is the indication that was
+    // never made.
     v(
-      "101 in General mode",
+      "101 answering no offer",
       Side::Response,
       b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
       Verdict::Rejects,
@@ -822,7 +826,8 @@ const KNOWN_STRICTER: &[(&str, &str)] = &[
      whitespace-delimited word boundaries — is not taken here, because recipients that disagree \
      about where a status-line ends are the §11.1 response-splitting primitive.",
   ),
-  // ---- Mode rules: well-formed heads a GENERAL connection may not act on. ----
+  // ---- Mode and indication rules: well-formed heads THIS driver may not act
+  // on. ----
   (
     "CONNECT in General mode",
     "RFC 9110 §9.3.6: everything after a 2xx to CONNECT is opaque octets, so the framing this \
@@ -831,10 +836,14 @@ const KNOWN_STRICTER: &[(&str, &str)] = &[
      head.",
   ),
   (
-    "101 in General mode",
-    "RFC 9110 §15.2.2: after a 101 the bytes belong to the protocol switched to, which a General \
-     connection has nothing to become. The same head is what Connection<Client, Tunnel> exists to \
-     read.",
+    "101 answering no offer",
+    "RFC 9110 §7.8: \"A server MUST NOT switch to a protocol that was not indicated by the client \
+     in the corresponding request's Upgrade header field\", and the request this harness opens is \
+     a plain GET on a connection the operator never permitted to offer — so it indicated none. \
+     httparse parses the head and stops; which request it answers is context httparse does not \
+     hold. NOT a mode rule, which is what this entry used to say: the same head switches a \
+     Connection<Client, Tunnel>, and a permitted Connection<Client, General> whose request DID \
+     offer takes it as Item::Switched.",
   ),
 ];
 

@@ -60,7 +60,7 @@
 
 use http1_proto::{
   BodyPlan, Connection, Error, Event, General, H1Error, HeadView, Item, Server, StartLine,
-  SuggestedStatus, Target,
+  SuggestedStatus, Target, Transport,
 };
 
 /// The pipelined request every accept-side vector puts behind the message under
@@ -1082,7 +1082,8 @@ fn split_connection_lines_fold_into_one_list() {
       Seen::Complete { exchange: 1 },
     ]
   );
-  assert_eq!(closed.events, [Event::CloseSignaled]);
+  assert_eq!(closed.events, []);
+  assert_eq!(closed.connection.transport(), Transport::Ending);
   // The follower was never read: §9.6 stops the connection at the message that
   // announced the close, whatever is buffered behind it. The consumed count is
   // the closing request and NOT one byte more.
@@ -1190,11 +1191,8 @@ fn the_single_error_response_goes_out_once_and_states_close() {
     out.get(..written),
     Some(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n".as_slice())
   );
-  // §9.6's notice, exactly once, and then a drained connection.
-  assert_eq!(
-    in_the_head.connection.poll_event(),
-    Some(Event::CloseSignaled)
-  );
+  // §9.6's answer, read off the connection rather than delivered once.
+  assert_eq!(in_the_head.connection.transport(), Transport::Ending);
   assert_eq!(in_the_head.connection.poll_event(), None);
   assert!(!in_the_head.connection.is_awaiting_send());
   assert!(!in_the_head.connection.wants_read());

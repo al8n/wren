@@ -50,6 +50,7 @@
 //! | RFC 9110 §7.8/§10.1.1 HTTP/1.0 MUST-ignores | NOT APPLICABLE — receive-side readings of a peer's 1.0 message, and this core writes none |
 //! | `head::scan`'s `MAX_HEAD_BYTES` / `MAX_HEADERS` | DELIBERATELY DELEGATED — those bound work a PEER can ask of us; an outbound head is bounded by the caller's own buffer, and refusing to write one a peer would accept would be a rule no RFC has (`head::encode`'s "NO SIZE CAP") |
 //! | Which authority the `Host` names | DELIBERATELY DELEGATED — only the caller holds the target URI ([`REQUEST_NEEDS_HOST`]) |
+//! | RFC 9110 §7.8 "A sender of Upgrade MUST also send an `Upgrade` connection option in the Connection header field" | SPLIT, and stated as a RULE rather than as a list, so a path added later is classified by construction instead of by someone remembering this row. **ENFORCED** where writing the field ARMS a switch on this connection; **REFUSED** where a switch could not be answered at all; **DELIBERATELY DELEGATED** at EVERY OTHER head-encoding send path, where the field arms nothing — no 101 arrives because of it and no state machine here moves — and where §7.8 gives a server its own reasons to state it (a 426 "MUST send an Upgrade header field to indicate the acceptable protocols"; any other response "MAY send an Upgrade header field … to advertise" support). Membership today: ARMING is `open_request`'s offer branch ([`OFFER_NEEDS_BOTH_HALVES`]), Tunnel's `open_upgrade`, and Tunnel's `accept` on its 101 branch; REFUSING is `open_connect` (`tunnel::CONNECT_INDICATES_NO_PROTOCOL`); DELEGATED is the remaining six — General's `send_interim`, `send_response` and `send_error_response`, and Tunnel's own `send_interim`, `accept` on its CONNECT-2xx branch, and `reject`. Tunnel has its OWN `send_interim`, distinct from General's same-named one, so counting these paths by name alone undercounts them |
 //!
 //! What is left after that table is which fields a message ought to carry, and
 //! that is not this module's: `crate::head::encode` checks the grammar of each
@@ -62,10 +63,11 @@ use crate::{
   connection::{
     CONNECT, Client, Connection, Exchange, FAILED, General, Lifecycle, RecvState, Role,
     SWITCHING_PROTOCOLS, SendBody, SendState, Server, body_refused, discharge_expect, mint,
-    signal_close, tunnel::CONTINUE, writable,
+    signal_close,
+    tunnel::{CONTINUE, OFFER_NEEDS_BOTH_HALVES, TAKEOVER_STATES_NO_CLOSE},
+    writable,
   },
   error::Error,
-  event::Event,
   grammar::{
     Expectations, ListShape, eq_ignore_ascii, is_protocol_list, is_sender_token_list,
     sender_list_shape, token_list_contains, trim_ows,
@@ -251,8 +253,18 @@ const INTERIM_NOT_FINAL: &str = "a 1xx response is interim, not final";
 /// rather than merely that one happened.
 pub(super) const NO_SUCCESS_TO_STATE: &str = "an error response states no 2xx";
 
-/// RFC 9110 §15.2.2: a 101 ends HTTP framing on the connection, which General
-/// mode has nothing to replace it with.
+/// RFC 9110 §15.2.2: a 101 ends HTTP framing on the connection, and a General
+/// SERVER has nothing to replace it with — its route into the next protocol is
+/// the `into_tunnel` edge, taken before the answer is written rather than by
+/// writing one.
+///
+/// SCOPED TO THE SENDER, and the scope is what makes the claim true. A General
+/// CLIENT does now carry exactly this switch, as
+/// [`Item::Switched`](crate::Item::Switched), when its operator permitted the
+/// §7.8 offer that invited it — so "General mode cannot switch" is not what this
+/// states. What it states is that the two calls it guards, `send_interim` and
+/// `send_response`, may not WRITE one; both exist only on
+/// `Connection<Server, General>`, so those are its only reachable sites.
 const SWITCHING_NEEDS_TUNNEL: &str = "101 requires a Tunnel-mode connection";
 
 /// RFC 9110 §9.3.6: the same, for the request that would provoke one.
@@ -260,20 +272,64 @@ const SWITCHING_NEEDS_TUNNEL: &str = "101 requires a Tunnel-mode connection";
 /// CONNECT it RECEIVES.
 const CONNECT_NEEDS_TUNNEL: &str = "CONNECT requires a Tunnel-mode connection";
 
-/// RFC 9110 §7.8's other takeover, refused for exactly the reason CONNECT is.
+/// RFC 9110 §7.8's other takeover, refused for exactly the reason CONNECT is —
+/// unless the operator has permitted this connection to make the offer.
 ///
-/// A request stating both halves of an upgrade offer invites the `101` that RFC
-/// 9110 §15.2.2 makes the end of HTTP framing on the connection — and General
-/// mode's own receive path condemns every 101 it is handed, because it has
-/// nothing to become. So a General connection that sent such an
-/// offer would have opened an exchange its own continuation forbids: the best
-/// case is a server that declines and answers ordinarily, the worst is one that
-/// accepts and a connection this end then fails on the answer it asked for.
+/// A request carrying an `Upgrade` field invites the `101` that RFC 9110
+/// §15.2.2 makes the end of HTTP framing on the connection — and General mode's
+/// own receive path condemns a 101 that answers no offer this connection made,
+/// because §7.8 makes switching to a protocol "not indicated by the client" a
+/// server MUST NOT and an unpermitted connection indicates none. So an
+/// unpermitted General connection that sent such a field would have opened an
+/// exchange its own continuation forbids: the best case is a server that
+/// declines and answers ordinarily, the worst is one that accepts and a
+/// connection this end then fails on the answer it asked for.
 ///
-/// Refused before encoding, like CONNECT. What is NOT done is teaching General
-/// mode to accept a 101 — the type-state split is the design, and
-/// `Connection<_, Tunnel>` is where takeover lives.
+/// THE FIELD, not both of §7.8's halves. What a server may act on is the
+/// indication §7.8 defines — "the corresponding request's Upgrade header field"
+/// — so gating this permission on the `upgrade` connection option beside it
+/// would let a request that omitted the option carry the invitation past the
+/// operator's ceiling. The option is required too, by
+/// [`OFFER_NEEDS_BOTH_HALVES`], and required is a different thing from asked.
+///
+/// Refused before encoding, like CONNECT, whenever the permission is absent —
+/// and it is the PERMISSION that lifts the refusal, not the mode. A permitted
+/// offer opens an exchange whose 101 the receive path accepts, as
+/// [`Item::Switched`](crate::Item::Switched). `Connection<_, Tunnel>` is still
+/// where a handshake is BUILT from scratch, which is a different thing from
+/// carrying one that arrived on an ordinary exchange.
 pub(super) const UPGRADE_NEEDS_TUNNEL: &str = "an upgrade offer requires a Tunnel-mode connection";
+
+/// A DEVIATION this core chooses, and it is recorded as one because RFC 9110
+/// §7.8 permits the message it refuses.
+///
+/// §7.8 contemplates a 101 arriving while the request body is still going out,
+/// and says what a client does about it: "A client cannot begin using an
+/// upgraded protocol on the connection until it has completely sent the request
+/// message (i.e., the client can't change the protocol it is sending in the
+/// middle of a message)." The body is finished in the OLD protocol and the new
+/// one begins after it — and the answer is still owed, since "the server still
+/// has an outstanding request to satisfy after the protocol has been changed".
+/// A bodied offering request is conforming, and this crate will not write one.
+///
+/// WHY IT WILL NOT is architectural rather than normative. This core parks at
+/// the 101 and hands the transport to the caller — [`Item::Switched`] is the
+/// last thing the connection produces and every send call refuses after it — so
+/// there is no send side left to finish a body through once the switch has been
+/// yielded, and no way to pump the rest of the request across it. Refusing at
+/// `open_request` is the one place that can decline the shape before a byte of
+/// it is on the wire; nothing in the response path could repair it later,
+/// because by then the bytes belong to whichever protocol answered.
+///
+/// §7.8 obliges a client to nothing here, so declining is conforming — it is a
+/// restriction this end places on its OWN sends, refused caller-side, and the
+/// same restriction the crate already keeps on both ends of Tunnel's handshake:
+/// `open_upgrade` requires a bodiless request and the server's `classify`
+/// requires a bodiless one to recognize a handshake at all. A design that ever
+/// keeps writing across the switch is the design that may lift this.
+///
+/// [`Item::Switched`]: crate::Item::Switched
+pub(super) const OFFER_HAS_NO_CONTENT: &str = "a request offering an upgrade carries no content";
 
 /// RFC 9112 §3.2: "A client MUST send a Host header field in all HTTP/1.1
 /// request messages." Unconditional, and every request this core writes states
@@ -566,15 +622,24 @@ impl Connection<Client, General> {
   /// And `READ_SIDE_ENDED` once an EOF has been reported: no response could
   /// ever arrive, so there is nothing to open.
   ///
-  /// BOTH TAKEOVERS are REFUSED, because General mode has nothing to become and
-  /// its own receive path says so: a `CONNECT` (RFC 9110
-  /// §9.3.6 makes everything after the 2xx opaque octets) and a request stating
-  /// both halves of a §7.8 upgrade offer (§15.2.2 makes the 101 that answers it
-  /// the end of HTTP framing, and this mode condemns every 101 it reads). Either
-  /// one would open an exchange this connection's own continuation forbids.
-  /// Takeover lives in `Connection<Client, Tunnel>`. Both refusals are
-  /// caller-side ([`Error::InvalidState`]) rather than protocol errors, because
-  /// the request is this end's own.
+  /// CONNECT is always REFUSED, because General mode has nothing to become and
+  /// its own receive path says so: RFC 9110 §9.3.6 makes everything after the
+  /// 2xx opaque octets, which is an exchange this connection's own
+  /// continuation forbids.
+  ///
+  /// A request stating both halves of a §7.8 upgrade offer is refused the same
+  /// way (§15.2.2 makes the 101 that answers it the end of HTTP framing, and a
+  /// 101 answering an offer this connection never made is one its receive path
+  /// condemns) UNLESS the operator has permitted this connection to make the
+  /// offer. A permitted offer must still be bodiless: RFC 9110 §7.8 lets a 101
+  /// answer only a completely sent request, so `body` must be
+  /// [`BodyPlan::None`] wherever `headers` states one — and the 101 that answers
+  /// it arrives as [`Item::Switched`](crate::Item::Switched), after which this
+  /// connection is spent.
+  ///
+  /// Takeover-by-construction lives in `Connection<Client, Tunnel>`. Every
+  /// refusal here is caller-side ([`Error::InvalidState`]) rather than a
+  /// protocol error, because the request is this end's own.
   ///
   /// `body` must agree with the framing fields in `headers` — see the module
   /// doc. A request with neither framing field has NO body (§6.3 item 7 and the
@@ -612,6 +677,13 @@ impl Connection<Client, General> {
     body: BodyPlan,
     out: &mut [u8],
   ) -> Result<usize, Error> {
+    // RFC 9110 §7.8's switch, first, so the reason names it. The switch RETAINS
+    // the exchange — §7.8 leaves the server with "an outstanding request to
+    // satisfy after the protocol has been changed" — so the gate below would
+    // otherwise answer `ONE_REQUEST_AT_A_TIME`: true about the exchange, and
+    // silent about the only thing the caller can act on, which is that this
+    // transport is another protocol's now and no request will ever go out on it.
+    self.live_general_phase()?;
     self.sendable()?;
     // Between messages is the whole condition, stated as the three facts that
     // make it: nothing being received, nothing outstanding, nothing owed.
@@ -648,11 +720,52 @@ impl Connection<Client, General> {
       return Err(Error::InvalidState(what));
     }
     let declared = declared(headers)?;
-    // The same rule that refuses CONNECT above: an offer this connection cannot
-    // see through is an exchange it must not open — General's own receive path
-    // condemns the 101 that answers it.
-    if declared.offers_a_protocol() {
+    // RFC 9110 §7.8's INDICATION, which is the `Upgrade` field and nothing
+    // beside it: "A server MUST NOT switch to a protocol that was not indicated
+    // by the client in the corresponding request's Upgrade header field." The
+    // `upgrade` connection option is §7.8's separate sender MUST, and asking for
+    // it HERE — inside the predicate — would make every rule below skippable by
+    // omitting it, while a server acting on the field alone would be acting on a
+    // real indication. So the field alone opens the branch, and the option is
+    // one of the things the branch then REQUIRES.
+    let offering = declared.indicates_a_protocol();
+    // An offer this connection cannot see through is an exchange it must not
+    // open — General's own receive path condemns the 101 that answers it —
+    // unless the operator has said this connection may see one through. Asked
+    // FIRST of the three, because it is the most fundamental: a driver that was
+    // never permitted to offer learns that, rather than being told how to spell
+    // an offer it may not make at all.
+    if offering && !self.opportunistic_upgrade {
       return Err(Error::InvalidState(UPGRADE_NEEDS_TUNNEL));
+    }
+    // §7.8's other half, kept as a REQUIREMENT rather than spent as a branch
+    // condition: "A sender of Upgrade MUST also send an `Upgrade` connection
+    // option in the Connection header field (Section 7.6.1) to inform
+    // intermediaries not to forward this field." An `Upgrade` an intermediary
+    // forwards is the hazard the MUST names, and this is the same refusal
+    // Tunnel's `open_upgrade` makes of the same omission — one rule, one
+    // constant, both of this crate's offering send paths.
+    if offering && !declared.connection_upgrade {
+      return Err(Error::InvalidState(OFFER_NEEDS_BOTH_HALVES));
+    }
+    // The one-takeover-no-close invariant, originate corner — see
+    // `tunnel::TunnelPhase::Switched`, which states it once for every site.
+    // RFC 9112 §9.6 makes this end close after the message carrying the option,
+    // so offering a switch beside it asks a server for a 101 this connection's
+    // own receive path refuses (`SWITCH_AFTER_CLOSE`). Ahead of the bodiless rule
+    // because this one is the RFC's contradiction and that one is this crate's
+    // own restriction.
+    if offering && declared.close {
+      return Err(Error::InvalidState(TAKEOVER_STATES_NO_CLOSE));
+    }
+    // A DEVIATION this core chooses, not a rule §7.8 states — see
+    // [`OFFER_HAS_NO_CONTENT`]. §7.8 contemplates a 101 answering a request
+    // whose body is still going out and tells the client to finish it in the old
+    // protocol; this core parks at the 101 and hands the transport over, so it
+    // has no way to keep pumping one. Tunnel declines the same thing at
+    // `open_upgrade` and `classify`.
+    if offering && !matches!(body, BodyPlan::None) {
+      return Err(Error::InvalidState(OFFER_HAS_NO_CONTENT));
     }
     requires_host(&declared)?;
     continue_needs_content(&declared, !matches!(body, BodyPlan::None))?;
@@ -662,7 +775,7 @@ impl Connection<Client, General> {
     // Committed: the head is in the caller's buffer, so the exchange it opened
     // exists from here on.
     if declared.close {
-      signal_close(&mut self.lifecycle, &mut self.event, self.read_closed);
+      signal_close(&mut self.lifecycle);
     }
     // A new request opens a new idle period, so the §9.2 stray-CRLF allowance
     // starts over: what it bounds is how long a peer may keep a connection with
@@ -682,13 +795,24 @@ impl Connection<Client, General> {
       // `send_interim`/`send_response` to owe it through, so the fact never
       // applies here.
       expect_unanswered: false,
-      // Unreachable rather than merely unset: an offer was already refused
-      // above with `UPGRADE_NEEDS_TUNNEL`, so a General client's own request
-      // never carries one to record.
-      upgrade_offered: false,
-      // A dead value, and the line above is why it may be one: the digest is
-      // read only behind an offer, and this end records none. See
-      // `Exchange::head_digest` for why the field has no absent spelling.
+      // What the response path reads to decide whether a 101 may be accepted.
+      // RFC 9110 §7.8: "A server MUST NOT switch to a protocol that was not
+      // indicated by the client in the corresponding request's Upgrade header
+      // field." Permission is not indication — a permitting connection that
+      // sent no offer must still refuse the 101 — so the recorded fact is the
+      // INDICATION this request made, on §7.8's own definition of one, which is
+      // the same predicate the three gates above were asked with. A request that
+      // reaches here indicating a protocol also stated the connection option and
+      // carries no content, because those gates refused it otherwise.
+      upgrade_offered: offering,
+      // A dead value, and the line above is NOT what makes it a safe one: a
+      // permitted offer records `true` there beside this zero. What makes it
+      // safe is the ROLE. The only reader of `Exchange::head_digest` is
+      // `offered_switch`, on `impl Connection<Server, General>`, and the role is
+      // a type parameter — so no exchange a CLIENT built can reach it. A
+      // client-side reader added later is a change to that rule and has to hash
+      // the head here rather than inherit this zero. See `Exchange::head_digest`
+      // for why the field has no absent spelling.
       head_digest: 0,
       // The RESPONSE this request will draw has not been read, let alone
       // refused. Set by `connection::refuse` and never cleared.
@@ -696,6 +820,23 @@ impl Connection<Client, General> {
     });
     self.send = started(body);
     Ok(written)
+  }
+}
+
+#[cfg(test)]
+impl Connection<Client, General> {
+  /// Whether the exchange this connection currently holds recorded a §7.8
+  /// offer — the fact the response path's 101 gate reads.
+  ///
+  /// Test-only rather than a public accessor, the way
+  /// `opportunistic_upgrade_allowed_for_test` is: nothing outside this crate
+  /// reads `Exchange::upgrade_offered` yet, and code inside `connection` that
+  /// comes to read it can reach the private field directly.
+  pub(crate) fn exchange_upgrade_offered_for_test(&self) -> bool {
+    self
+      .exchange
+      .as_ref()
+      .is_some_and(|exchange| exchange.upgrade_offered)
   }
 }
 
@@ -797,11 +938,12 @@ impl Connection<Server, General> {
   /// 9112 §6.3's order of precedence rather than by reading the head back:
   ///
   /// - A response to HEAD, a 204, a 304, and a 2xx to CONNECT are terminated by
-  ///   the empty line that ends the head "regardless of the header fields
-  ///   present in the message" (items 1-2), so `body` MUST be
-  ///   [`BodyPlan::None`]. Their framing fields are the caller's to state, since
-  ///   the recipient ignores them — a HEAD response may carry the
-  ///   `Content-Length` of the body a GET would have received.
+  ///   the empty line that ends the head — item 1's four "regardless of the
+  ///   header fields present in the message", and the CONNECT 2xx under item 2's
+  ///   own MUST-ignore — so `body` MUST be [`BodyPlan::None`]. Their framing
+  ///   fields are the caller's to state, since the recipient ignores them — a
+  ///   HEAD response may carry the `Content-Length` of the body a GET would have
+  ///   received.
   /// - A 1xx is not a final response at all: it goes through
   ///   [`send_interim`](Self::send_interim), and `101` is refused outright.
   /// - Otherwise the head must announce what `body` will write: a
@@ -882,7 +1024,7 @@ impl Connection<Server, General> {
     // [`finish_body`](Self::finish_body) so that a driver knows the connection
     // is ending before it writes the first body octet.
     if states_close(&declared, body) {
-      signal_close(&mut self.lifecycle, &mut self.event, self.read_closed);
+      signal_close(&mut self.lifecycle);
     }
     self.send = started(body);
     // A bodiless response is complete here, which may be the second of the two
@@ -930,9 +1072,10 @@ impl Connection<Server, General> {
   /// redirect IS a refusal of the request as it was put.
   ///
   /// EXACTLY ONCE, and only from a failed connection. Afterwards the connection
-  /// is draining: [`poll_event`](Connection::poll_event) yields
-  /// [`Event::CloseSignaled`], no further inbound byte is processed (§9.6), and
-  /// every send call — this one included — is [`Error::InvalidState`].
+  /// is draining: [`transport`](Connection::transport) reads
+  /// [`Transport::Ending`](crate::Transport::Ending), no further inbound byte is
+  /// processed (§9.6), and every send call — this one included — is
+  /// [`Error::InvalidState`].
   pub fn send_error_response<H: Headers + ?Sized>(
     &mut self,
     code: u16,
@@ -940,8 +1083,7 @@ impl Connection<Server, General> {
     headers: &H,
     out: &mut [u8],
   ) -> Result<usize, Error> {
-    let (Lifecycle::Failed, SendState::ErrorOwed { close_signaled }) = (self.lifecycle, self.send)
-    else {
+    let (Lifecycle::Failed, SendState::ErrorOwed) = (self.lifecycle, self.send) else {
       return Err(Error::InvalidState(NO_ERROR_OWED));
     };
     // An interim response answers nothing and would leave this one owed, which
@@ -978,12 +1120,6 @@ impl Connection<Server, General> {
     // in the caller's buffer.
     self.send = SendState::Idle;
     self.lifecycle = Lifecycle::Draining;
-    // The notice keeps the exactly-once rule `signal_close` states: a connection
-    // whose close was already signalled — the peer's option, or a local
-    // `close()` — does not hear it twice for the same fact.
-    if !close_signaled {
-      self.event = Some(Event::CloseSignaled);
-    }
     // Nothing is in flight on a connection that has answered its last message.
     // Said here rather than left to rot: a stale receive state would let
     // `handle_eof` diagnose the truncation of a message this connection has
@@ -1037,8 +1173,20 @@ impl<Ro: Role> Connection<Ro, General> {
   /// point, by the abandoned-body branch below, and no octet reaches the wire
   /// in either window. What differs is only which reason is quoted.
   ///
+  /// # And it is where both body calls meet the §7.8 phase
+  ///
+  /// A connection that switched protocols has no body to write into: the
+  /// transport is the next protocol's. Both calls consult the phase HERE rather
+  /// than each for itself, which is the same argument this function is built on
+  /// — one gate, two callers, one answer. It has to come first, because a parked
+  /// connection's `send` is not `Sending`: left to the states, the two calls
+  /// would answer `NO_BODY_IN_FLIGHT`, which is true of the message and says
+  /// nothing about the connection. Inert on a SERVER, which has no route to the
+  /// phase in General mode.
+  ///
   /// [`sendable`]: Connection::sendable
   fn body_sendable(&self) -> Result<(), Error> {
+    self.live_general_phase()?;
     if matches!(self.lifecycle, Lifecycle::Failed) {
       return Err(Error::InvalidState(FAILED));
     }
@@ -1341,8 +1489,41 @@ impl Declared {
   ///
   /// No malformed-value term: a section whose `Upgrade` does not parse never
   /// reaches this question, because [`declared`] refuses it.
+  ///
+  /// ASKED AS A REFUSAL, at both of its call sites (`open_upgrade` and
+  /// `accept`): a section that fails it is refused rather than routed past
+  /// the rules an offer carries. That is what keeps the conjunction honest, and
+  /// it is why a send path that BRANCHES on the offer asks
+  /// [`indicates_a_protocol`](Self::indicates_a_protocol) instead.
   pub(super) const fn offers_a_protocol(&self) -> bool {
     self.connection_upgrade && self.upgrade_field
+  }
+
+  /// Whether the section INDICATES a protocol in RFC 9110 §7.8's own sense: it
+  /// carries an `Upgrade` field, which then names at least one well-formed
+  /// protocol.
+  ///
+  /// The `upgrade` connection option is NOT part of this question, and the
+  /// distinction is load-bearing. §7.8 writes the server's prohibition over the
+  /// field alone — "A server MUST NOT switch to a protocol that was not
+  /// indicated by the client in the corresponding request's Upgrade header
+  /// field." — while "A sender of Upgrade MUST also send an `Upgrade`
+  /// connection option in the Connection header field (Section 7.6.1) to inform
+  /// intermediaries not to forward this field" is a separate obligation, on the
+  /// SENDER, with its own stated purpose.
+  ///
+  /// So this is the predicate a send path BRANCHES on, and
+  /// [`offers_a_protocol`](Self::offers_a_protocol) is not: a conformance
+  /// requirement used as a branch condition stops applying exactly where it is
+  /// violated, so a section stating the field without the option would skip
+  /// every rule inside the branch — while a server that switched on it would be
+  /// switching on a genuine indication rather than breaking the MUST NOT above.
+  ///
+  /// No empty-value term: [`declared`] refuses an `Upgrade` line that names no
+  /// protocol ([`FIELD_STATES_ITS_GRAMMAR`]), so a section that reaches this
+  /// question carrying the field carries a non-empty one.
+  pub(super) const fn indicates_a_protocol(&self) -> bool {
+    self.upgrade_field
   }
 
   /// Whether the section asks RFC 9110 §10.1.1's `100-continue`.

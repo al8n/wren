@@ -211,10 +211,11 @@ pub(crate) fn validate_request(
 ///   did not already make bodiless. The request path refuses the same pair with
 ///   the same constant.
 ///
-/// A 101 never reaches here: the connection layer refuses a 101 on a General
-/// connection before validation runs. It is nonetheless answered like every
-/// other 1xx, so this function is total over the status space rather than
-/// relying on that guarantee.
+/// A 101 never reaches here: the connection layer answers a 101 on its own,
+/// ahead of validation, because RFC 9110 §15.2.2 makes it the end of HTTP
+/// framing rather than a message whose body needs delimiting. It is nonetheless
+/// answered like every other 1xx, so this function is total over the status
+/// space rather than relying on that guarantee.
 ///
 /// On the status suggestions this may return: a client has no response to send,
 /// so [`SuggestedStatus`](crate::error::SuggestedStatus) is diagnostic here —
@@ -259,8 +260,12 @@ pub(crate) fn validate_response(
   Ok((framing, connection_directives(sl.version, v)))
 }
 
-/// RFC 9112 §6.3 items 1-2: the statuses whose response is bodiless "regardless
-/// of the header fields present in the message".
+/// RFC 9112 §6.3 items 1-2: the responses framed by the head alone. Item 1 is
+/// the quotable one — a HEAD response and a 1xx, 204 or 304 is terminated by the
+/// first empty line "regardless of the header fields present in the message" —
+/// and item 2 reaches the same place for a 2xx to CONNECT in its own words, "A
+/// client MUST ignore any Content-Length or Transfer-Encoding header fields
+/// received in such a message".
 ///
 /// Shared by the fault check and the framing decision, and by both modes,
 /// because it is what makes the difference between a field a recipient IGNORES
@@ -288,11 +293,13 @@ pub(crate) const fn bodiless_response(code: u16, req_method_head: bool, req_conn
 ///   where the body ends. That is [`validate_response`]'s alone, because Tunnel
 ///   mode frames no bodies: every message it reads is its head.
 ///
-/// The order is §6.3's own, and items 1-2 are what scope the rest: they answer
-/// "regardless of the header fields present in the message", so a field they
-/// tell a recipient to IGNORE cannot also condemn it. §6.1's rule sits ahead of
-/// the whole list, because it is not a body-length question — it is a statement
-/// that this message's framing, and the connection under it, cannot be trusted.
+/// The order is §6.3's own, and items 1-2 are what scope the rest: item 1
+/// answers "regardless of the header fields present in the message" and item 2
+/// makes a client "ignore any Content-Length or Transfer-Encoding header fields
+/// received in such a message", so a field they tell a recipient to IGNORE
+/// cannot also condemn it. §6.1's rule sits ahead of the whole list, because it
+/// is not a body-length question — it is a statement that this message's
+/// framing, and the connection under it, cannot be trusted.
 pub(crate) fn check_response_head(
   sl: &StatusLine<'_>,
   v: &HeadView<'_>,
@@ -528,6 +535,35 @@ fn request_framing(version: Version, v: &HeadView<'_>) -> Result<BodyFraming, H1
   }
   // Item 7, and the note under item 8: a request is never close-delimited.
   Ok(BodyFraming::None)
+}
+
+/// Whether a head carries RFC 9112 §9.6's `close` connection option — or a
+/// `Connection` field this recipient could not read, which counts as carrying
+/// it.
+///
+/// THE TAKEOVER PREDICATE, and the difference from [`ends_persistence`] is the
+/// whole reason it exists: this one names an OPTION a sender wrote, that one
+/// names the FACT that follows from it. Only [`ends_persistence`] folds in
+/// §9.3's HTTP/1.0 default, and the two names are meant to be read as that
+/// pair.
+///
+/// That default answers "may another HTTP MESSAGE follow this one?", and it is
+/// exactly right wherever that is the question — an interim response, an
+/// ordinary response, the keep-alive re-arm. It is the wrong question at a
+/// protocol takeover. RFC 9110 §7.8's switch and §9.3.6's tunnel both end HTTP
+/// framing on the connection, so after either there are no more HTTP messages
+/// for the default to govern; what matters is only whether the peer SAID it is
+/// closing. Asking `ends_persistence` there refuses `HTTP/1.0 200 Connection
+/// Established` — a legal answer to an HTTP/1.1 CONNECT and the classic form
+/// real proxies send — and discards the tunnel bytes behind it.
+///
+/// NOT `KeyFields::connection_close`, which the name might otherwise invite: a
+/// `Connection` this recipient could not parse counts here too, on the same
+/// conservative reading [`ends_persistence`] takes and for the same reason — we
+/// cannot know what the peer asked for, and a takeover is not a place to guess.
+pub(crate) fn has_close_option(v: &HeadView<'_>) -> bool {
+  let key = v.key_fields();
+  key.connection_malformed || key.connection_close
 }
 
 /// Whether this message ends the connection's persistence — the ONE question
