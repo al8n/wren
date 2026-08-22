@@ -149,7 +149,7 @@ one that arrived on an exchange it opened for its own reasons.
 
   Every other 101 a General connection can receive is still a protocol error —
   every 101 at a server, at an unpermitted client, and at a permitted client
-  that offered nothing — because §7.8 makes switching to a protocol "not
+  that offered nothing — because RFC 9110 §7.8 makes switching to a protocol "not
   indicated by the client in the corresponding request's Upgrade header field" a
   server MUST NOT. Permission is not indication, and the gate reads the OFFER.
   The 101 it does accept is validated exactly as Tunnel validates the one it
