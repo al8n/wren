@@ -586,6 +586,30 @@ pub(crate) fn has_close_option(v: &HeadView<'_>) -> bool {
 /// `KeyFields::connection_close` alone loses the version half, which leaves an
 /// `HTTP/1.0 100` looking like a handshake still in flight. One rule, one
 /// predicate, both modes.
+///
+/// This function and [`has_close_option`] are the pair a defect once confused:
+/// two comments named `ends_persistence` where the code called
+/// `has_close_option`, restoring — at a glance — the HTTP/1.0 default this
+/// predicate exists to drop (the original comment read, in essence, "decides
+/// the same thing … through" this OTHER predicate's own qualified name — see
+/// [`has_close_option`]'s doc for that pair stated in full).
+/// `cargo run -p xtask -- doc-check` now holds a mention to naming what the
+/// item it sits on actually uses, but only when the mention is BOTH
+/// module-qualified (not the bare name) AND its sentence carries one of a
+/// short list of assertive verbs — `through`, `asks`, `reads`, `calls`,
+/// `via`, `uses`, `answered by` — the words that turn "this name, mentioned"
+/// into "this is what runs here". A deliberate contrast on such a sentence
+/// (documenting one predicate by name while the code below calls the other)
+/// is marked `// gate-exempt: <path> — <why this is not the one called>`,
+/// reason required.
+///
+/// Two mentions this does NOT catch, both real: a BARE mention (no
+/// `validate::` in front), and a module-qualified mention on a sentence with
+/// none of those verbs — this crate's own "shared invariant"/"send-side
+/// twin"/"future writer" cross-references path-qualify a name constantly
+/// without asserting it is what runs HERE, and are silently out of reach by
+/// design. Write the qualified form on an assertive sentence when the
+/// distinction from [`has_close_option`] matters enough to be checked.
 pub(crate) fn ends_persistence(version: Version, v: &HeadView<'_>) -> bool {
   let key = v.key_fields();
   // A `Connection` this recipient could not parse ends persistence, and that is

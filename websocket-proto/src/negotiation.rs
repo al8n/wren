@@ -409,6 +409,8 @@ fn parse_extension(extension: &[u8]) -> Result<Extension<'_>, Malformed> {
 /// parameter already trimmed of the surrounding whitespace.
 fn parse_param(param: &[u8]) -> Result<(&[u8], ExtensionValue<'_>), Malformed> {
   if param.is_empty() {
+    // gate-exempt: between any two adjacent words … and between adjacent words and separators — RFC 2616's own wording for the implied *LWS rule; its current successor dropped that whole convention for explicit OWS/RWS grammar instead, so no loaded spec restates it
+    //
     // `*( ";" extension-param )` puts a MANDATORY `extension-param` after every
     // semicolon: what §9.1 makes optional is the `[ "=" … ]` half, not the
     // production itself, so `ext;` and `ext;;x` state a parameter slot the
@@ -1307,8 +1309,8 @@ pub use deflate::{
 };
 
 /// Walks a `Sec-WebSocket-Protocol` REQUEST value — RFC 6455 §11.3.4's
-/// `Sec-WebSocket-Protocol = 1#token` — over every field line the client sent,
-/// yielding the offers in preference order.
+/// `Sec-WebSocket-Protocol-Client = 1#token` — over every field line the client
+/// sent, yielding the offers in preference order.
 ///
 /// The `#rule` of RFC 2616 §2.1 (which RFC 9110 §5.6.1.2 restates) makes null
 /// elements ignorable, so `list_elements` drops them; it also makes the `1` in
@@ -1334,7 +1336,7 @@ where
 /// Three rules, all of them the field's own grammar rather than any reader's
 /// preference:
 ///
-/// - `Sec-WebSocket-Protocol = 1#token` (RFC 6455 §11.3.4). Read with the
+/// - `Sec-WebSocket-Protocol-Client = 1#token` (RFC 6455 §11.3.4). Read with the
 ///   `#rule` of RFC 2616 §2.1 — the ABNF RFC 6455 states its grammars in:
 ///   "null elements are allowed, but do not contribute to the count of elements
 ///   present … where at least one element is required, at least one non-null
@@ -2015,7 +2017,7 @@ mod tests {
   #[test]
   fn a_malformed_extension_list_does_not_conform() {
     for bad in [
-      // `extension-token = token`.
+      // `extension-token = registered-token`, `registered-token = token`.
       "x@y",
       "permessage-deflate, x@y",
       "x@y, permessage-deflate",
@@ -2076,7 +2078,7 @@ mod tests {
       "x-private; a; b=c, permessage-deflate",
       // RFC 9110 §5.6.1.2's ignorable empty elements, around a real one.
       ", permessage-deflate,",
-      // §9.1 states its ABNF "including the 'implied *LWS rule'", so
+      // RFC 6455 §9.1 states its ABNF "including the 'implied *LWS rule'", so
       // whitespace between words and separators does not make a value
       // malformed — even where RFC 9110 §5.6.6's `parameter` would refuse it.
       // The negotiation behind this gate reads the same grammar, so it
@@ -2167,10 +2169,10 @@ mod tests {
       lines.get(..MAX_SUBPROTOCOL_OFFERS).unwrap().iter().copied()
     ));
 
-    // Null elements do not count toward it — RFC 2616 §2.1 says they "do not
-    // contribute to the count of elements present" — so a value padded with
-    // commas is still read, and still bounded by the elements that name
-    // something.
+    // Null elements do not count toward it — RFC 9110 §5.6.1.2 says empty
+    // elements "do not contribute to the count of elements present" — so a
+    // value padded with commas is still read, and still bounded by the
+    // elements that name something.
     let padded = format!(",,,{at_cap},,,");
     assert!(subprotocol_list_conforms([padded.as_bytes()]));
 

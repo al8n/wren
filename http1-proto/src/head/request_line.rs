@@ -1,4 +1,4 @@
-//! RFC 9112 §3 `request-line = method SP request-target SP HTTP-version CRLF`.
+//! RFC 9112 §3 `request-line = method SP request-target SP HTTP-version`.
 //!
 //! Strict single-SP parsing: §3 allows a recipient to accept "any amount of
 //! whitespace" in place of the two SPs, and that leniency is deliberately not

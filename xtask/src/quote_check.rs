@@ -33,10 +33,13 @@
 //!   token also collides with ordinary spec words by accident, which is exactly
 //!   the false positive to avoid.
 //!
-//! An anchored, prose-sized span must then appear in full and case-sensitively
+//! This is the rule for a span whose own block names no RFC, or names more
+//! than one ([`cited_rfc`]) — the rule below, "attribution by citation",
+//! takes over whenever it names exactly one. For an unattributed span: an
+//! anchored, prose-sized span must then appear in full and case-sensitively
 //! in one of the specs it anchored in — several may hold the same opening, and
-//! a verbatim match in any of them clears it, because a quotation names one
-//! spec and the tool is not told which. Failing that, the anchor tells the tool
+//! a verbatim match in any of them clears it, because with no citation naming
+//! one, the tool is not told which. Failing that, the anchor tells the tool
 //! which grade it is: a whole-span match ignoring case is a re-cased quotation,
 //! and no whole-span match at all is one whose WORDS have drifted — the span
 //! demonstrably starts as spec text and then stops being it.
@@ -51,6 +54,93 @@
 //!
 //! A quotation may elide with `…` or `...`; each segment is then checked on its
 //! own, because an ellipsis promises that what remains is verbatim.
+//!
+//! ## Attribution by citation
+//!
+//! Anchoring and citation answer two DIFFERENT questions, asked in that
+//! order, never one standing in for the other:
+//!
+//! 1. **Is this span demonstrably a quotation of some loaded spec at all?**
+//!    Anchoring answers this, and only this — the span's own opening
+//!    characters either appear in a loaded spec's text or they do not,
+//!    regardless of what the surrounding block claims.
+//! 2. **If so, which spec is it from?** An anchored span whose own block
+//!    names exactly one LOADED RFC ([`cited_rfc`]) is graded against ONLY
+//!    that spec, not against whichever loaded spec happens to share its
+//!    opening text. This closes a hole the anchor-only rule always had: a
+//!    sentence attributed to RFC 9110 used to pass because RFC 9112 happened
+//!    to contain it too, and the citation itself was never read. An anchored
+//!    span whose block names no RFC, or names one this run did not load,
+//!    keeps the any-spec anchored behaviour above, unchanged.
+//!
+//! Letting the citation answer BOTH questions was tried and reverted: a
+//! prose-sized span sitting anywhere in a block that cites an RFC for one
+//! unrelated point is not thereby a quotation of it, and grading it as one is
+//! exactly how a block's own rhetorical asides — a title, a question, an
+//! author's paraphrase — got checked against spec text they were never
+//! claiming to be.
+//!
+//! An UNANCHORED span's fate then depends on whether the block gave anyone a
+//! REASON to expect a quotation (Ruling 10a):
+//!
+//! - The block cites a spec this run never loaded: "unanchored" proves
+//!   nothing (this run was never given the text to match against), so
+//!   [`Grade::Unloaded`] is the honest answer.
+//! - The block cites a spec this run DID load: someone had reason to expect
+//!   a quotation here and did not get one. Not a failure — it is counted
+//!   separately (`unattributable`, printed by [`run`]) rather than either
+//!   silently dropped or wrongly graded.
+//! - The block cites nothing at all: nobody had any reason to think this
+//!   was a quotation in the first place. This is the ORIGINAL silent
+//!   `None`, uncounted anywhere — conflating "not my business" with "my
+//!   business and I could not do it" is the same category error as
+//!   reporting the author's own words as a failure, just moved from the
+//!   pass/fail line to the backlog count instead.
+//!
+//! `unattributable` is therefore a BACKLOG of untriaged spans, not a defect
+//! list: even narrowed to blocks that cite a loaded spec, it still holds two
+//! different things a human has not yet told apart — a possible quotation
+//! that genuinely does not match (worth reading), and the author's own
+//! rhetorical prose that happens to sit near a citation for something else
+//! (not worth reading twice). A reader who takes the count for a defect tally
+//! will either panic at its size or learn to ignore it; both are worse than
+//! knowing what it actually holds.
+//!
+//! **What this still cannot see**, stated rather than merely being the case:
+//! a quotation so reworded, or so short an excerpt, that its own first
+//! [`ANCHOR_CHARS`] characters match nothing in any loaded spec is beyond
+//! this tool's reach — anchoring is the floor the whole check stands on, and
+//! nothing narrows a spec it cannot even find a foothold in.
+//!
+//! An ABNF production goes the OTHER way once admitted as a candidate: it is
+//! checked against every loaded spec regardless of citation — see
+//! [`grade_production`]'s doc comment for why. The two are intentionally
+//! asymmetric: a quoted SENTENCE that anchors inside a citing block is almost
+//! always that RFC's own prose, but a grammar RULE beside a citation is
+//! routinely shown for comparison with a different spec's.
+//!
+//! ## The forms neither extractor reaches
+//!
+//! Both extractors are shape-bound, and each shape leaves a form outside the
+//! check. Neither is a defect found and left; both are boundaries, and a
+//! boundary that no run states is the disease this command exists to remove.
+//!
+//! - **Grammar inside a FENCED block.** [`abnf_spans`] reads backticked
+//!   spans, and a fenced line is skipped before it ever runs — while a fence
+//!   is how this workspace transcribes most of its grammar, several
+//!   productions at a time, one rule per line. Those lines are COUNTED and
+//!   the count is printed on every run. They are not read: reaching into a
+//!   fence needs a rule for which fences hold grammar and which hold Rust
+//!   (this crate's doc comments are full of both), and inventing one to make
+//!   a number go up is how a shape-matcher stops matching the thing it was
+//!   built for. The count is what such a design would be weighed against.
+//! - **A quotation set as a BLOCKQUOTE.** [`quoted_spans`] pairs `"` marks,
+//!   so spec text quoted by indentation and a leading `>` instead carries
+//!   nothing for it to pair. That form is NOT counted, and the difference
+//!   from the one above is worth stating: a production has a shape to
+//!   recognise, while an indented paragraph of prose is indistinguishable
+//!   from any other indented paragraph. Counting it would mean counting
+//!   every blockquote in the workspace, which measures nothing.
 //!
 //! # What is normalised away on BOTH sides, and why
 //!
@@ -87,6 +177,23 @@
 //! two unrelated quotations never pair across the code between them. `/* */`
 //! blocks are not read; this workspace writes none.
 //!
+//! A `.md` file has no comment syntax, so the whole file is read as one
+//! comment block: a blank line ends one block the way a bare code line ends a
+//! `.rs` one, and a fenced block is skipped for the same reason a doc
+//! comment's is — a fence holds code, and a quote mark inside it opens no
+//! quotation.
+//!
+//! # Which files are walked
+//!
+//! Every `.rs` and `.md` file under the workspace root, skipping build output
+//! (`target/`), dot directories, and — unless `--include-ignored` — anything
+//! git ignores. `docs/` is the notable case: it holds design documents that
+//! quote the RFCs heavily, and it is gitignored, so it exists on a
+//! developer's disk and not in CI. Walking it by default would make one
+//! command check two different sets of files depending on where it runs,
+//! which is exactly the kind of green run that means nothing.
+//! `--include-ignored` scans it anyway.
+//!
 //! # Where the specs come from
 //!
 //! Raw spec text is about three quarters of a megabyte, which does not belong in
@@ -97,6 +204,7 @@
 //! `.txt` in the directory is loaded, so adding a spec is adding a file.
 
 use std::{
+  collections::HashSet,
   fs,
   path::{Path, PathBuf},
   process::Command,
@@ -104,11 +212,52 @@ use std::{
 
 type Error = Box<dyn std::error::Error>;
 
+/// A candidate ABNF production found in one file, paired with the source
+/// line its opening backtick is on.
+type Spans = Vec<(usize, String)>;
+
+/// A quotation found in one file, paired with the source line its opening
+/// mark is on and the single RFC its block cited, if any ([`cited_rfc`]).
+///
+/// The citation travels WITH the span rather than being looked up again at
+/// grading time: it is a property of the block the span was cut from, and the
+/// block is gone by the time `run` gets to grading.
+type QuotedSpans = Vec<(usize, String, Option<u32>)>;
+
+/// Everything one file's comments held for this check — what it can grade,
+/// and what it reached but cannot.
+///
+/// A struct rather than a tuple because two of the four are bare counts, and
+/// a caller reading `(spans, productions, 100, 14)` has no way to tell which
+/// boundary is which.
+struct Extracted {
+  /// Quoted spans, for [`grade`].
+  quoted: QuotedSpans,
+  /// Backticked ABNF production candidates whose block named one RFC, for
+  /// [`grade_production`].
+  productions: Spans,
+  /// Production-shaped backticked spans whose block named no RFC, or named
+  /// more than one: a candidate with no citation to grade it against.
+  uncited: usize,
+  /// Production-shaped lines inside a FENCED block, which this extractor does
+  /// not reach at all — see the module doc's boundary section, and
+  /// [`is_production`] for what "production-shaped" means. Counted so the
+  /// boundary is a number in the run's own output rather than a fact about
+  /// the code that only a reader of the code can find.
+  fenced: usize,
+}
+
 /// The default, gitignored cache directory, relative to the workspace root.
 pub const DEFAULT_DIR: &str = ".rfc-cache";
 
 /// The specs `--fetch` downloads: the ones this workspace's comments cite.
-const FETCHED: &[u32] = &[6455, 7692, 8441, 9110, 9112, 9220];
+///
+/// RFC 2616 is deliberately absent. It is obsolete — superseded first by the
+/// 723x series and then by the 91xx series — so a comment citing it is either
+/// quoting a dead spec a live one now governs, or a deliberate historical
+/// note; either way, adding an obsolete RFC to make a production pass is the
+/// same shape of bending this gate as loosening the extractor would be.
+const FETCHED: &[u32] = &[3986, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220];
 
 /// How much of a span must be found in a spec for the span to be treated as a
 /// quotation OF that spec.
@@ -132,17 +281,21 @@ struct Spec {
   lower: String,
 }
 
-/// What went wrong with one quoted span.
+/// What went wrong with one quoted span — including that it could not be
+/// checked at all.
 enum Grade<'a> {
   /// The spec has these words, in other cases.
   Recased(&'a Spec, String),
   /// The spec begins this way and then says something else.
   Reworded(&'a Spec, String),
+  /// The block cited this RFC, but no spec by that name was loaded — a
+  /// checkable claim this run could not check, not a pass.
+  Unloaded(u32),
 }
 
 /// Checks every RFC quotation in the workspace's comments against the specs in
 /// `dir` (or [`DEFAULT_DIR`]), downloading them first when `fetch`.
-pub fn run(dir: Option<&str>, fetch: bool) -> Result<(), Error> {
+pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), Error> {
   let root = crate::workspace_root()?;
   let dir = dir.map_or_else(|| root.join(DEFAULT_DIR), PathBuf::from);
 
@@ -151,19 +304,69 @@ pub fn run(dir: Option<&str>, fetch: bool) -> Result<(), Error> {
   }
 
   let specs = load_specs(&dir)?;
+  // Hoisted once, beside `load_specs`: normalising every spec for every
+  // production would be O(productions × specs) of repeated work, and
+  // `grade_production` needs only the normalised text, not the `Spec` it
+  // came from — `specs` stays alongside for that, indexed the same.
+  let normalised_specs: Vec<String> = specs.iter().map(|spec| normalise(&spec.text)).collect();
   let mut sources = Vec::new();
-  collect_sources(&root, &mut sources)?;
+  let mut skipped = 0usize;
+  collect_sources(&root, &mut sources, include_ignored, &mut skipped)?;
   sources.sort();
 
   let mut checked = 0usize;
   let mut failures = 0usize;
+  // Prose-sized, in a block citing a LOADED spec, and still didn't anchor to
+  // any loaded spec's text — a backlog of untriaged spans (Ruling 10a), not
+  // a defect count: never silent, never a failure. A block citing nothing
+  // gives no reason to expect a quotation and stays the original, uncounted
+  // `None` — see `grade`'s doc comment (Ruling 9, Ruling 10a) for the full
+  // three-way split.
+  let mut unattributable = 0usize;
+  // Ruling 11: of `checked`, how many were graded against the ONE spec their
+  // block cited (`narrow`) versus against any loaded spec because the block
+  // named none or several (`fallback`) — see `grade`'s doc comment for why
+  // this is counted rather than guessed at.
+  let mut narrow = 0usize;
+  let mut fallback = 0usize;
+  let mut abnf_checked = 0usize;
+  let mut abnf_failures = 0usize;
+  let mut abnf_skipped = 0usize;
+  let mut abnf_exempt = 0usize;
+  // Production-shaped lines this extractor never reaches, because they sit
+  // inside a fenced block — the form this workspace transcribes most of its
+  // grammar in. Not a failure and not a candidate: a printed boundary.
+  let mut abnf_fenced = 0usize;
+  // A quotation this reads as a deliberate historical citation rather than a
+  // checkable claim against a loaded spec — same marker, same mechanism as
+  // `abnf_exempt`, extended to quotations (Ruling 9).
+  let mut quote_exempt = 0usize;
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = source.strip_prefix(&root).unwrap_or(source).display();
-    for (line, span) in quotations(&text) {
+    let extracted = spans_for(source, &text);
+    let (spans, productions) = (extracted.quoted, extracted.productions);
+    abnf_skipped += extracted.uncited;
+    abnf_fenced += extracted.fenced;
+    // Per-file: a marker in one file cannot exempt a span in another. Read
+    // once and reused below for both quotations and productions.
+    let exempt = exempted_spans(&text);
+    for (line, span, cited) in spans {
+      if exempt.contains(&span) {
+        quote_exempt += 1;
+        continue;
+      }
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
-        let Some(grade) = grade(&quoted, &specs, &mut checked) else {
+        let Some(grade) = grade(
+          &quoted,
+          cited,
+          &specs,
+          &mut checked,
+          &mut unattributable,
+          &mut narrow,
+          &mut fallback,
+        ) else {
           continue;
         };
         failures += 1;
@@ -178,40 +381,263 @@ pub fn run(dir: Option<&str>, fetch: bool) -> Result<(), Error> {
             println!("  comment: \"{quoted}\"");
             println!("  {}: \"{actual}…\"", spec.name);
           }
+          Grade::Unloaded(number) => {
+            println!("{shown}:{line}: cites RFC {number}, which was not loaded");
+            println!("  comment: \"{quoted}\"");
+            println!(
+              "  add {number} to FETCHED and run \
+               `cargo run -p xtask -- quote-check --fetch`"
+            );
+          }
         }
+      }
+    }
+    for (line, production) in productions {
+      if exempt.contains(&production) {
+        abnf_exempt += 1;
+        continue;
+      }
+      // A deliberately elided production promises only that what remains is
+      // verbatim — the same reading `run` already gives a quotation span.
+      for segment in production.split(['…']).flat_map(|part| part.split("...")) {
+        let Some(spec) = grade_production(segment, &specs, &normalised_specs, &mut abnf_checked)
+        else {
+          continue;
+        };
+        abnf_failures += 1;
+        println!("{shown}:{line}: ABNF production is not {}'s", spec.name);
+        println!("  comment: `{segment}`");
       }
     }
   }
 
-  let specs_shown = specs
-    .iter()
-    .map(|spec| spec.name.as_str())
-    .collect::<Vec<_>>()
-    .join(", ");
-  if failures == 0 {
-    println!("quote-check: {checked} quotations verbatim against {specs_shown}");
+  // Printed regardless of what the loop above found: a failing run has MORE
+  // reason to know what went unscanned, not less.
+  if !include_ignored && skipped > 0 {
+    println!(
+      "quote-check: {skipped} git-ignored director{} not scanned — quotations \
+       there are UNCHECKED (pass --include-ignored to scan them)",
+      if skipped == 1 { "y" } else { "ies" }
+    );
+  }
+  // Also printed regardless: a span this uncited or exempted is not a
+  // failure, but it is not silence either — a fenced-off count is how
+  // `negotiation.rs:592`'s `quoted-pair` (a real, correctly-quoted RFC 2616
+  // production whose citation sits outside its own block) stays VISIBLE as
+  // unchecked instead of vanishing the way it did before this line existed.
+  // `gate-exempt` now marks a QUOTATION the same way (Ruling 9): a deliberate
+  // historical citation of an obsolete spec whose successor does not carry
+  // the same words, so there is no loaded spec left to grade it against —
+  // `negotiation.rs`'s RFC 2616 "implied *LWS rule" quote is the first one.
+  println!(
+    "quote-check: {abnf_skipped} production-shaped spans skipped (no RFC cited), {abnf_exempt} \
+     marked gate-exempt, {quote_exempt} quotations marked gate-exempt"
+  );
+  // The boundary of the ABNF extractor itself, printed for the same reason
+  // the line above it is: this check reads backticked spans, and the grammar
+  // this workspace transcribes inside fenced blocks is outside it — in no
+  // other counter, and previously in no output at all. Whether to reach into
+  // a fence is a design question (which fences hold grammar and which hold
+  // Rust?), and this number is what such a design would have to be weighed
+  // against; it is deliberately not answered by widening the extractor here.
+  println!(
+    "quote-check: {abnf_fenced} production-shaped lines sit inside fenced blocks — UNREACHED \
+     (this check reads backticked spans only)"
+  );
+  // Same shape, same reason: a span this is not silence either — it is what
+  // Ruling 9 costs, stated as a number instead of merely being the case.
+  // Narrowed to blocks citing a LOADED spec only (Ruling 10a): a block
+  // citing nothing gave no one reason to expect a quotation, so it is the
+  // original, uncounted `None`, not part of this backlog. This number is a
+  // TRIAGE QUEUE, not a defect tally — see the module doc's "Attribution by
+  // citation" section for what it holds and why treating it as a defect
+  // count is the wrong read.
+  println!(
+    "quote-check: {unattributable} prose-sized spans in blocks citing a loaded spec matched \
+     nothing — untriaged, not failed"
+  );
+  // Ruling 11: printed every run, pass or fail — a coverage claim ("a
+  // quotation is graded against the spec it cites") is exactly the kind of
+  // number this check exists to stop anyone stating without a denominator.
+  // `cited_rfc`'s "exactly one RFC" rule sends a span through `fallback`
+  // whenever its block names zero OR SEVERAL RFCs, even when one of several
+  // is the span's own correctly-loaded spec — this workspace's comments
+  // discuss more than one RFC in a paragraph constantly, so `fallback` being
+  // large is expected, not evidence of a bug.
+  println!(
+    "quote-check: {checked} quotations checked — {narrow} graded against the spec their block \
+     cites, {fallback} against any loaded spec (block cites none, or several)"
+  );
+
+  if failures == 0 && abnf_failures == 0 {
+    println!(
+      "quote-check: {checked} quotations verbatim, {abnf_checked} ABNF productions verbatim"
+    );
     return Ok(());
   }
-  Err(format!("{failures} of {checked} quotations are not the spec's own characters").into())
+  let mut reasons = Vec::new();
+  if failures > 0 {
+    reasons.push(format!(
+      "{failures} of {checked} quotations are not the spec's own characters"
+    ));
+  }
+  if abnf_failures > 0 {
+    reasons.push(format!(
+      "{abnf_failures} of {abnf_checked} ABNF productions are not the spec's own characters"
+    ));
+  }
+  Err(reasons.join("; ").into())
+}
+
+/// Every quotation and candidate ABNF production `path`'s contents holds,
+/// dispatched by extension, as `(quoted, productions, skipped)` — each
+/// `quoted` span carrying the single RFC its own block cited, if any.
+///
+/// `.md` is read as one long comment block ([`markdown_quotations`]);
+/// anything else — in practice always `.rs`, since [`collect_sources`] hands
+/// this only `.rs` or `.md` paths — is read as `.rs`-style comments
+/// ([`quotations`]).
+fn spans_for(path: &Path, text: &str) -> Extracted {
+  if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+    markdown_quotations(text)
+  } else {
+    quotations(text)
+  }
 }
 
 /// Grades one normalised span, counting it when it is one this check governs.
-fn grade<'a>(quoted: &str, specs: &'a [Spec], checked: &mut usize) -> Option<Grade<'a>> {
+///
+/// Two different questions, asked in this order (Ruling 9): first, ANCHORING
+/// asks "is this demonstrably a quotation of some loaded spec at all" — the
+/// span's own opening characters either appear in a loaded spec's text or
+/// they do not, independent of anything the block claims. Only once that is
+/// "yes" does `cited` — the single RFC the span's own block named, if any
+/// ([`cited_rfc`]) — get to answer the SECOND question, "which spec is it
+/// from": an anchored span in a block naming one loaded RFC is graded only
+/// against that spec, not against whichever loaded spec happens to contain
+/// it. That closes a hole this check always had: a sentence attributed to
+/// RFC 9110 used to pass because RFC 9112 happened to contain it too, and the
+/// attribution itself was never read.
+///
+/// Letting the citation answer BOTH questions — this check's first attempt —
+/// is exactly how a block's own rhetorical prose got graded: prose-sized,
+/// sitting in a block that cites something for an unrelated point, with
+/// nothing else asked. An unanchored span stays ungraded either way, but what
+/// happens to it next (Ruling 10a) depends on whether anyone had REASON to
+/// expect a quotation there:
+///
+/// - Cites a spec this run does not have loaded: there is nothing else to
+///   ask, and "unanchored" proves nothing — this run was never given the
+///   text to match against — so [`Grade::Unloaded`] is the honest answer.
+///   A claim this run could not check is a different fact from a claim with
+///   nothing to check against.
+/// - Cites a spec this run DOES have loaded: the block gave a reason to
+///   expect a quotation and this span isn't demonstrably one. Counted, not
+///   failed (`unattributable`, the caller's running total — see [`run`]'s
+///   printed line for what that backlog holds).
+/// - Cites nothing at all: no one had reason to think this was a quotation
+///   in the first place. The original, silent `None` — not counted anywhere,
+///   because conflating "not my business" with "my business and I could not
+///   do it" is the same category error as reporting the author's own words
+///   as a failure.
+///
+/// This citation-narrows-the-target step is deliberately the OPPOSITE of
+/// [`grade_production`], which grades an admitted candidate against every
+/// loaded spec regardless of citation. That is not an inconsistency: a
+/// quoted SENTENCE that anchors inside a citing block is almost always that
+/// RFC's own prose, but a grammar RULE beside a citation is routinely shown
+/// for comparison with a different spec's — see `grade_production`'s doc
+/// comment for the worked example.
+///
+/// **Ruling 11: `narrow` and `fallback` count WHICH of the two anchored paths
+/// graded a span** — the cited-spec-only comparison above, or the any-spec
+/// anchored fallback below. `cited_rfc` calls a block naming two or more
+/// different RFCs just as uncited as a block naming none (its "exactly one"
+/// rule), so a comment that discusses several specs in one paragraph — which
+/// this workspace does constantly — sends its quotations through the
+/// fallback even when one of the cited numbers is exactly right. That is not
+/// silently reopening the mis-attribution hole (nothing here accepts a WRONG
+/// spec's match); it means the narrow path's coverage is partial, and the
+/// size of that gap was unmeasured until this ruling. Resolving it by
+/// GUESSING which of several citations a span belongs to — nearest-by-
+/// position, first-mentioned, union-of-cited — was considered and rejected:
+/// every option is plausible and none is verifiable, and picking one without
+/// first knowing how often it would even matter is how the citation-vs-
+/// anchor conflation this whole task exists to fix happened in the first
+/// place. Count first; `run`'s printed line makes the split visible instead.
+fn grade<'a>(
+  quoted: &str,
+  cited: Option<u32>,
+  specs: &'a [Spec],
+  checked: &mut usize,
+  unattributable: &mut usize,
+  narrow: &mut usize,
+  fallback: &mut usize,
+) -> Option<Grade<'a>> {
   if quoted.split_whitespace().count() < MIN_WORDS || quoted.chars().count() < MIN_CHARS {
-    return None;
+    return None; // not prose-sized: not a quotation
   }
+
+  // Q1: is this demonstrably a quotation of some loaded spec at all?
   let head = anchor(quoted);
   let anchored: Vec<&Spec> = specs
     .iter()
     .filter(|spec| spec.lower.contains(&head))
     .collect();
+
   if anchored.is_empty() {
-    // Not a quotation of any supplied spec: an internal quotation, a quoted
-    // identifier, or a spec this run was not given. Not this check's business.
+    // Ruling 10a: a block citing NOTHING gave no one reason to expect a
+    // quotation here at all. That is the original, silent `None` — not this
+    // check's business, and not counted anywhere, the same as before this
+    // task existed.
+    let number = cited?;
+    let name = format!("rfc{number}");
+    if !specs.iter().any(|spec| spec.name == name) {
+      // The cited spec isn't loaded, so "no anchor match" proves nothing —
+      // this run was never given the text to match against.
+      *checked += 1;
+      return Some(Grade::Unloaded(number));
+    }
+    // Cites a spec this run DOES have, and still didn't anchor: the block
+    // gave a reason to expect a quotation (it cites a live spec) and this
+    // span isn't demonstrably one. Visible, not silent, and not a failure —
+    // see `run`'s printed line for what this backlog holds.
+    *unattributable += 1;
     return None;
   }
 
+  // Q2: anchored — which spec is it from? A block naming one LOADED RFC
+  // answers that directly.
+  if let Some(number) = cited {
+    let name = format!("rfc{number}");
+    if let Some(spec) = specs.iter().find(|spec| spec.name == name) {
+      *checked += 1;
+      *narrow += 1;
+      if spec.text.contains(quoted) {
+        return None;
+      }
+      let lowered = quoted.to_ascii_lowercase();
+      if let Some(at) = spec.lower.find(&lowered) {
+        return Some(Grade::Recased(spec, excerpt(&spec.text, at, quoted.len())));
+      }
+      let at = spec.lower.find(&head).unwrap_or(0);
+      return Some(Grade::Reworded(
+        spec,
+        excerpt(&spec.text, at, quoted.len().saturating_mul(2)),
+      ));
+    }
+    // Cites a spec this run does not have loaded, yet anchored somewhere
+    // else: fall through to the anchored-specs behaviour below, unchanged —
+    // the citation named a spec that cannot answer Q2, so the anchor's own
+    // candidates do instead.
+  }
+
+  // No usable citation (none, ambiguous, or unloaded-but-anchored-elsewhere):
+  // the pre-existing any-spec anchored behaviour, unchanged. Several anchored
+  // specs may hold the same opening, and a verbatim match in any of them
+  // clears it, because nothing here says which one is claimed.
   *checked += 1;
+  *fallback += 1;
   if anchored.iter().any(|spec| spec.text.contains(quoted)) {
     return None;
   }
@@ -255,35 +681,136 @@ fn excerpt(text: &str, from: usize, len: usize) -> String {
   text.get(start..end).unwrap_or_default().to_string()
 }
 
-/// Every quoted span in `source`'s comments, with the line its opening quote is
-/// on — a comment that follows code on the same line included.
+/// Grades one production segment. `None` when it is too short to be a
+/// checkable claim, or when SOME loaded spec contains it verbatim.
+///
+/// Every loaded spec is searched, not only the one [`cited_rfc`] named for
+/// the block: 6455 borrows grammar from 2616 and the 723x series, and a
+/// block's citation is often a COMPARISON point rather than an attribution —
+/// three real, correctly-transcribed RFC 6455 productions sit in blocks whose
+/// only citation is RFC 9110, discussing where the two grammars disagree.
+/// That is right for a production the way it would be wrong for a quotation:
+/// a quoted SENTENCE inside a citing block is almost certainly that RFC's
+/// own, but a grammar RULE beside a citation is often shown for contrast.
+/// [`cited_rfc`] still decides whether a span is a candidate at all — a block
+/// naming no RFC makes no checkable claim — it just no longer decides which
+/// spec the candidate is graded against.
+///
+/// On failure the first spec is named, same as [`grade`] falls back to when a
+/// quotation's anchor does not narrow it — arbitrarily, since nothing here
+/// says which loaded spec a production was meant to be quoting.
+///
+/// `normalised_specs` is [`normalise`] applied to each spec's (already
+/// normalised) text, indexed the same as `specs` — hoisted by the caller so
+/// grading `n` productions costs O(n + specs) of normalising rather than
+/// O(n × specs).
+fn grade_production<'a>(
+  segment: &str,
+  specs: &'a [Spec],
+  normalised_specs: &[String],
+  checked: &mut usize,
+) -> Option<&'a Spec> {
+  let wanted = normalise(segment);
+  if wanted.split_whitespace().count() < 3 {
+    return None;
+  }
+  *checked += 1;
+  if normalised_specs.iter().any(|spec| spec.contains(&wanted)) {
+    return None;
+  }
+  specs.first()
+}
+
+/// The production-shaped spans `source` marks exempt, matched by the span's
+/// own extracted text.
+///
+/// A `// gate-exempt: <span> — <reason>` comment, anywhere in the file, marks
+/// `<span>` (everything up to the em dash, or the rest of the line when there
+/// is none) as a deliberate non-production rather than a silent one: `` `q =
+/// 1` `` is production-SHAPED — [`is_production`] cannot tell a grammar rule
+/// from a Rust value shown in a block that legitimately cites a spec for
+/// something else — and narrowing the shape-matcher itself was tried and
+/// rejected, because any rule keyed on the right-hand side makes a BROKEN
+/// production stop looking like one too: a check whose defect makes the item
+/// disappear is worse than no check. A marker cannot do that — it names the
+/// exact text it exempts, so it goes stale (and stops matching) the moment
+/// that text changes, rather than silently widening to cover something new.
+///
+/// One mechanism, one spelling: a later check reuses this same marker, so
+/// recognising it lives here rather than folded into the ABNF pipeline.
+fn exempted_spans(source: &str) -> HashSet<String> {
+  let mut out = HashSet::new();
+  for line in source.lines() {
+    let Some((body, _)) = comment_body(line) else {
+      continue;
+    };
+    let Some(rest) = body.strip_prefix("gate-exempt:") else {
+      continue;
+    };
+    let text = rest.split(" — ").next().unwrap_or(rest).trim();
+    if !text.is_empty() {
+      out.insert(text.to_string());
+    }
+  }
+  out
+}
+
+/// Every quoted span in `source`'s comments, with the line its opening quote
+/// is on and the single RFC its own block cited (if any) — beside every
+/// backticked ABNF production candidate whose block names a single RFC, as
+/// `(quoted, productions, skipped)`. `skipped` counts the production-shaped
+/// spans found in a block that named no RFC, or named more than one — a
+/// candidate this check has no citation to grade, not a failure.
 ///
 /// Consecutive comment lines are one block and are joined before the quotes are
 /// paired, so a quotation wrapped across lines is one span rather than several.
-fn quotations(source: &str) -> Vec<(usize, String)> {
-  let mut out = Vec::new();
+/// A production is found per raw line, before [`mask_code_spans`] runs on it —
+/// but which block it belongs to, and so whether [`cited_rfc`] admits it as a
+/// candidate at all, is decided at the block's flush, once the whole block
+/// exists to be asked. Every quoted span pulled from the same block carries
+/// the same citation, for the same reason: the block, not the line, is what
+/// was cited.
+fn quotations(source: &str) -> Extracted {
+  let mut out: QuotedSpans = Vec::new();
+  let mut productions = Vec::new();
+  let mut skipped = 0usize;
+  let mut fenced_productions = 0usize;
   let mut block = String::new();
   // (byte offset into `block`, source line) for the start of each joined line.
   let mut marks: Vec<(usize, usize)> = Vec::new();
+  // ABNF production candidates seen in the block under construction, admitted
+  // or skipped only once the block's own citation is known.
+  let mut pending: Vec<(usize, String)> = Vec::new();
   let mut fenced = false;
 
-  let mut flush = |block: &mut String, marks: &mut Vec<(usize, usize)>| {
-    for (at, span) in quoted_spans(block) {
-      let line = marks
-        .iter()
-        .take_while(|(offset, _)| *offset <= at)
-        .last()
-        .map_or(0, |(_, line)| *line);
-      out.push((line, span.to_string()));
-    }
-    block.clear();
-    marks.clear();
-  };
+  let mut flush =
+    |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Vec<(usize, String)>| {
+      // Computed once and reused for every span AND for the production gate
+      // below: both readings are "what did this block cite", so there is only
+      // one place that question is asked.
+      let cited = cited_rfc(block);
+      for (at, span) in quoted_spans(block) {
+        let line = marks
+          .iter()
+          .take_while(|(offset, _)| *offset <= at)
+          .last()
+          .map_or(0, |(_, line)| *line);
+        out.push((line, span.to_string(), cited));
+      }
+      if cited.is_some() {
+        productions.append(pending);
+      } else {
+        skipped += pending.len();
+        pending.clear();
+      }
+      block.clear();
+      marks.clear();
+    };
 
   for (index, raw) in source.lines().enumerate() {
     let Some((body, own_line)) = comment_body(raw) else {
       fenced = false;
-      flush(&mut block, &mut marks);
+      flush(&mut block, &mut marks, &mut pending);
       continue;
     };
     if own_line {
@@ -292,6 +819,12 @@ fn quotations(source: &str) -> Vec<(usize, String)> {
         continue;
       }
       if fenced {
+        // Reached, not read: counted here and named in the module doc, since
+        // a boundary nobody is told about is the failure this whole command
+        // exists to remove.
+        if is_production(body) {
+          fenced_productions += 1;
+        }
         continue;
       }
     } else {
@@ -303,10 +836,110 @@ fn quotations(source: &str) -> Vec<(usize, String)> {
       block.push(' ');
     }
     marks.push((block.len(), index + 1));
+    for span in abnf_spans(body) {
+      pending.push((index + 1, span));
+    }
     block.push_str(&mask_code_spans(body));
   }
-  flush(&mut block, &mut marks);
-  out
+  flush(&mut block, &mut marks, &mut pending);
+  Extracted {
+    quoted: out,
+    productions,
+    uncited: skipped,
+    fenced: fenced_productions,
+  }
+}
+
+/// Every quotation in a Markdown file, with the line its opening quote is on
+/// and the single RFC its own block cited (if any), beside every backticked
+/// ABNF production candidate whose block names a single RFC, as `(quoted,
+/// productions, skipped)` — see [`quotations`] for what `skipped` counts and
+/// why, and for the citation this mirrors.
+///
+/// A `.md` file is comment text throughout, so there is no comment prefix to
+/// find and no code half to discard — but fenced blocks are still skipped, for
+/// the same reason they are in a doc comment: a fence holds code, and a
+/// quotation mark inside code is not opening a quotation.
+///
+/// Unlike [`quotations`], this function flushes the block on EVERY fence
+/// toggle, open and close alike. `quotations` does not: it toggles `fenced`
+/// and moves on, so the prose before a `.rs` doc-comment fence and the prose
+/// after it stay in the same block, and a quote mark on one side can pair with
+/// a quote mark on the other into one spurious span crossing the fence.
+/// Flushing here trades that for the opposite failure — a quotation that
+/// itself opens before a fence and closes after it is silently uncounted
+/// rather than joined — which is the safer of the two: a fence is far likelier
+/// to separate two unrelated paragraphs than a real quotation is to straddle
+/// one.
+fn markdown_quotations(source: &str) -> Extracted {
+  let mut out: QuotedSpans = Vec::new();
+  let mut productions = Vec::new();
+  let mut skipped = 0usize;
+  let mut fenced_productions = 0usize;
+  let mut block = String::new();
+  let mut marks: Vec<(usize, usize)> = Vec::new();
+  // ABNF production candidates seen in the block under construction, admitted
+  // or skipped only once the block's own citation is known — see
+  // `quotations`'s `pending` for why this can't be decided per-line.
+  let mut pending: Vec<(usize, String)> = Vec::new();
+  let mut fenced = false;
+
+  let mut flush =
+    |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Vec<(usize, String)>| {
+      // See `quotations`'s `flush` for why this is computed once and reused
+      // for both the spans below and the production gate.
+      let cited = cited_rfc(block);
+      for (at, span) in quoted_spans(block) {
+        let line = marks
+          .iter()
+          .take_while(|(offset, _)| *offset <= at)
+          .last()
+          .map_or(0, |(_, line)| *line);
+        out.push((line, span.to_string(), cited));
+      }
+      if cited.is_some() {
+        productions.append(pending);
+      } else {
+        skipped += pending.len();
+        pending.clear();
+      }
+      block.clear();
+      marks.clear();
+    };
+
+  for (index, raw) in source.lines().enumerate() {
+    if raw.trim_start().starts_with("```") {
+      fenced = !fenced;
+      flush(&mut block, &mut marks, &mut pending);
+      continue;
+    }
+    if fenced {
+      // Same boundary as `quotations` draws, for the same reason.
+      if is_production(raw.trim()) {
+        fenced_productions += 1;
+      }
+      continue;
+    }
+    if raw.trim().is_empty() {
+      flush(&mut block, &mut marks, &mut pending);
+      continue;
+    }
+    if !block.is_empty() {
+      block.push(' ');
+    }
+    marks.push((block.len(), index + 1));
+    for span in abnf_spans(raw) {
+      pending.push((index + 1, span));
+    }
+    block.push_str(&mask_code_spans(raw));
+  }
+  flush(&mut block, &mut marks, &mut pending);
+  Extracted {
+    quoted: out,
+    productions,
+    uncited: skipped,
+    fenced: fenced_productions,
+  }
 }
 
 /// The comment on one source line, and whether the line is nothing but that
@@ -460,6 +1093,90 @@ fn quoted_spans(block: &str) -> Vec<(usize, &str)> {
   out
 }
 
+/// The backticked ABNF productions on one raw comment line.
+///
+/// Runs BEFORE [`mask_code_spans`], which erases a backticked span holding a
+/// `"` — and a production's terminals are quoted, so by the time a block is
+/// built its productions are gone. [`quoted_spans`] would not have found them
+/// either: a production without a terminal carries no `"` at all.
+///
+/// A span counts when it opens with `name =`, which is what separates an RFC
+/// 5234 rule from a backticked identifier. `=/` (incremental alternatives)
+/// counts too.
+fn abnf_spans(line: &str) -> Vec<String> {
+  let mut out = Vec::new();
+  let mut rest = line;
+  while let Some(open) = rest.find('`') {
+    let after = &rest[open + 1..];
+    let Some(close) = after.find('`') else {
+      return out;
+    };
+    let span = &after[..close];
+    if is_production(span) {
+      out.push(span.to_string());
+    }
+    rest = &after[close + 1..];
+  }
+  out
+}
+
+/// Whether `span` opens with an RFC 5234 rule name and a single `=`.
+///
+/// Two Rust shapes reach the same first character and neither is assignment:
+/// a comparison (`need == out.len()`) and a match arm (`other => panic!()`).
+/// Requiring the character AFTER the `=` to be neither a second `=` nor a
+/// `>` is what excludes both, while `=/` — RFC 5234's incremental
+/// alternative — still counts, its second character being `/`.
+///
+/// The `=>` half arrived with the fenced-line count, which is where a match
+/// arm turns up: this workspace's two README fences each write one, and a
+/// Rust match arm counted as unreached GRAMMAR would misstate the very
+/// boundary that count exists to state. No BACKTICKED span in this workspace
+/// is production-shaped only through `=>` — checked before the rule narrowed
+/// — so no existing counter moved when it landed.
+fn is_production(span: &str) -> bool {
+  let trimmed = span.trim_start();
+  let name: String = trimmed
+    .chars()
+    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+    .collect();
+  if name.is_empty() || !name.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
+    return false;
+  }
+  let mut after_name = trimmed[name.len()..].trim_start().chars();
+  after_name.next() == Some('=') && !matches!(after_name.next(), Some('=' | '>'))
+}
+
+/// The single RFC number `block` names, or `None` when it names zero or names
+/// more than one.
+///
+/// A bare `name =` cannot say which spec it is a claim about — a production
+/// is too short to anchor on the way [`grade`] anchors a quotation on its own
+/// opening characters. The surrounding prose says it instead: a block naming
+/// exactly one RFC commits every production inside it to that one spec: a
+/// block naming none, or naming several, leaves it unclear which — so neither
+/// is this check's business, the same "not this check's business" `grade`
+/// reaches for an unanchored quotation.
+fn cited_rfc(block: &str) -> Option<u32> {
+  let mut found: Option<u32> = None;
+  let mut rest = block;
+  while let Some(at) = rest.find("RFC ") {
+    let after = &rest[at + 4..];
+    let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    rest = &after[digits.len()..];
+    if digits.is_empty() {
+      continue;
+    }
+    let cited: u32 = digits.parse().ok()?;
+    match found {
+      None => found = Some(cited),
+      Some(existing) if existing == cited => {}
+      Some(_) => return None,
+    }
+  }
+  found
+}
+
 /// Masks an inline code span that contains a `"`.
 ///
 /// `` `"` `` is a quote character being NAMED, not one opening a quotation, and
@@ -494,6 +1211,7 @@ fn mask_code_spans(line: &str) -> String {
 /// word.
 fn normalise(text: &str) -> String {
   let text = strip_cross_references(text);
+  let text = strip_bracket_insertions(&text);
   let mut out = String::with_capacity(text.len());
   let mut chars = text.chars().peekable();
   let mut space = false;
@@ -513,6 +1231,49 @@ fn normalise(text: &str) -> String {
       }
     }
   }
+  out
+}
+
+/// Removes every `[bracketed]` span, and the space before it.
+///
+/// `[…]` is the standard mark for an editorial insertion in a quotation, and
+/// the RFC's OWN prose uses it the same way for an inline `[RFC2616]`-style
+/// reference: RFC 6455 §4.1 reads "...the client handles the response per
+/// HTTP `[RFC2616]` procedures..." (`.rfc-cache/rfc6455.txt:1031`), while
+/// `websocket-proto/src/handshake/h1/client.rs`'s quotation of that sentence
+/// never spells the citation at all ("...per HTTP procedures..."). Stripping
+/// `[RFC2616]` from the spec's side — nothing needs stripping from the
+/// comment's, since it was never there — is what lets that quotation anchor
+/// and match at all. `normalise` runs over a spec's text exactly as it runs
+/// over a comment's, so a bracket either side chose to insert is gone from
+/// both before anything else is compared.
+///
+/// What this does NOT fix: a bracket that SUBSTITUTES words the RFC has at
+/// that exact point — `consider [it]` standing in for the RFC's own
+/// `consider that data` — still fails, because the substituted words are, by
+/// definition, not the RFC's own characters. Removing the bracket removes the
+/// substitution, not the mismatch: the RFC's real words are still sitting
+/// where the comment's gap now is. A quotation shaped like that has one fix,
+/// and it is not in this function — quote the RFC's own words instead of a
+/// stand-in for them, the way `inbound.rs:107` now does.
+fn strip_bracket_insertions(text: &str) -> String {
+  let mut out = String::with_capacity(text.len());
+  let mut rest = text;
+  while let Some(open) = rest.find('[') {
+    let after = &rest[open + 1..];
+    let Some(close) = after.find(']') else {
+      // No closing bracket on the rest of this text: nothing more to strip.
+      out.push_str(&rest[..open]);
+      rest = after;
+      break;
+    };
+    out.push_str(&rest[..open]);
+    while out.ends_with(' ') || out.ends_with('\t') {
+      out.pop();
+    }
+    rest = &after[close + 1..];
+  }
+  out.push_str(rest);
   out
 }
 
@@ -643,8 +1404,18 @@ fn strip_change_bar(line: &str) -> &str {
   }
 }
 
-/// Every `.rs` file in the workspace, skipping build output and dot directories.
-fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
+/// Every `.rs` and `.md` file in the workspace, skipping build output, dot
+/// directories, and — unless `include_ignored` — anything git ignores.
+///
+/// The git-ignore rule is what keeps a green run meaning ONE thing: `docs/` is
+/// ignored, so it exists on a developer's disk and not in CI, and walking it by
+/// default would make the same command check different sets in the two places.
+fn collect_sources(
+  dir: &Path,
+  out: &mut Vec<PathBuf>,
+  include_ignored: bool,
+  skipped: &mut usize,
+) -> Result<(), Error> {
   for entry in fs::read_dir(dir)? {
     let path = entry?.path();
     let name = path
@@ -655,20 +1426,70 @@ fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
       if name == "target" || name.starts_with('.') {
         continue;
       }
-      collect_sources(&path, out)?;
-    } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-      out.push(path);
+      if !include_ignored && is_ignored(&path)? {
+        *skipped += 1;
+        continue;
+      }
+      collect_sources(&path, out, include_ignored, skipped)?;
+    } else {
+      match path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs") | Some("md") => out.push(path),
+        _ => {}
+      }
     }
   }
   Ok(())
 }
 
+/// Whether git ignores `path`.
+///
+/// `git check-ignore` exits 0 when the path IS ignored and 1 when it is not,
+/// so the exit code is the answer and no output needs parsing — but only 0 and
+/// 1 are that answer. Anything else (128 on a fatal error such as "not a
+/// repository", or no code at all if the process was killed by a signal) is a
+/// failure to check, and reporting it as `false` would be this exact defect in
+/// miniature: an unchecked path silently counted as "checked, and fine".
+fn is_ignored(path: &Path) -> Result<bool, Error> {
+  let status = Command::new("git")
+    .args(["check-ignore", "--quiet"])
+    .arg(path)
+    .status()
+    .map_err(|err| format!("could not run git check-ignore: {err}"))?;
+  match status.code() {
+    Some(0) => Ok(true),
+    Some(1) => Ok(false),
+    Some(code) => Err(
+      format!(
+        "git check-ignore on {}: exited with status {code}",
+        path.display()
+      )
+      .into(),
+    ),
+    None => Err(format!("git check-ignore on {}: killed by signal", path.display()).into()),
+  }
+}
+
 #[cfg(test)]
 mod tests {
-  use super::quotations;
+  use super::{markdown_quotations, quotations, spans_for};
+  use std::path::Path;
 
   fn spans(source: &str) -> Vec<String> {
-    quotations(source).into_iter().map(|(_, s)| s).collect()
+    quotations(source)
+      .quoted
+      .into_iter()
+      .map(|(_, s, _)| s)
+      .collect()
+  }
+
+  // `markdown_quotations` mirrors `spans` above: same shape, different source
+  // function, because a `.md` file has no comment prefix to key off of.
+  fn markdown_spans(source: &str) -> Vec<String> {
+    markdown_quotations(source)
+      .quoted
+      .into_iter()
+      .map(|(_, s, _)| s)
+      .collect()
   }
 
   // A quotation in a comment that FOLLOWS code is governed like any other. A
@@ -748,5 +1569,517 @@ mod tests {
   fn a_quote_naming_code_span_is_masked_after_code_too() {
     let source = "  let x = 1; // the `\"` character, and \"the server MUST NOT process\"\n";
     assert_eq!(spans(source), ["the server MUST NOT process"]);
+  }
+
+  // A `.md` file is scanned like a `.rs` one: the convention is about the
+  // quotation, not about which file it was copied into.
+  #[test]
+  fn a_markdown_quotation_is_read() {
+    let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
+    assert_eq!(markdown_spans(source), ["the server MUST NOT process"]);
+  }
+
+  // Unlike `quotations`, a fence flushes the block on both toggles (see
+  // `markdown_quotations`'s doc comment for why): a quotation that opens
+  // before a fence and closes after it is silently uncounted rather than
+  // spuriously spanning the fence. Without the flush this same input pairs
+  // "beta" with "gamma" into one bogus span joining the two paragraphs.
+  #[test]
+  fn a_quotation_straddling_a_fence_is_not_joined() {
+    let source = "Alpha \"beta\n```\ncode\n```\ngamma\" delta\n";
+    assert!(markdown_spans(source).is_empty());
+  }
+
+  // `run` picks `markdown_quotations` or `quotations` by extension; this is
+  // the one place that choice is exercised, so it is asserted directly rather
+  // than resting on a human reading a printed count.
+  #[test]
+  fn spans_for_dispatches_by_extension() {
+    let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
+    let md = spans_for(Path::new("notes.md"), source);
+    // The span carries the block's own citation as its third element.
+    assert_eq!(
+      md.quoted,
+      vec![(1, "the server MUST NOT process".to_string(), Some(9112))]
+    );
+    assert!(md.productions.is_empty());
+    assert_eq!((md.uncited, md.fenced), (0, 0));
+    let rs = spans_for(Path::new("notes.rs"), source);
+    assert!(rs.quoted.is_empty());
+    assert!(rs.productions.is_empty());
+    assert_eq!((rs.uncited, rs.fenced), (0, 0));
+  }
+
+  // An ABNF production reaches neither existing path: `mask_code_spans` erases
+  // a backticked span holding a `"`, and `quoted_spans` only takes `"…"`. It
+  // needs its own extractor, and this is the shape that finds one.
+  #[test]
+  fn a_backticked_production_is_extracted() {
+    let line = "  /// RFC 9110 §8.3.1: `media-type = type \"/\" subtype parameters`";
+    assert_eq!(
+      super::abnf_spans(line),
+      ["media-type = type \"/\" subtype parameters"]
+    );
+  }
+
+  // Prose in backticks is not a production. The `=` is what distinguishes a
+  // rule from a name, and requiring it is what keeps this extractor quiet.
+  #[test]
+  fn a_backticked_name_is_not_a_production() {
+    assert!(super::abnf_spans("  /// see `open_request` and `Connection`").is_empty());
+  }
+
+  // `is_production` once saw only the FIRST character after `name`, so a Rust
+  // equality check opened a production too. Requiring the SECOND character
+  // not to be `=` closes that without rejecting `=/`, RFC 5234's
+  // incremental-alternative operator. A match arm's `=>` is rejected on the
+  // same grounds and for the same reason — it is Rust, not RFC 5234 — which
+  // is what keeps a README fence's match arm out of the fenced-line count.
+  #[test]
+  fn a_double_equals_is_not_a_production() {
+    let line = "  // the EXACT fit, `need == out.len()`: the boundary between the two arms";
+    assert!(super::abnf_spans(line).is_empty());
+    let arm = "  // `other => unreachable!()` is a match arm, not a rule";
+    assert!(super::abnf_spans(arm).is_empty());
+    let incremental = "  // `rule =/ extra-alternative` still opens one";
+    assert_eq!(
+      super::abnf_spans(incremental),
+      ["rule =/ extra-alternative"]
+    );
+  }
+
+  // The boundary this extractor has always had, now counted: a fenced block
+  // is skipped before `abnf_spans` runs, and a fence is how this workspace
+  // transcribes most of its grammar. The count must move for a fenced
+  // production and must NOT move for the same line outside a fence (where the
+  // check reads it for real) or for fenced Rust that merely looks like one.
+  //
+  // Written as ONE source line with escaped newlines, not as a wrapped
+  // literal: a fixture spelled across real lines IS a fenced production to
+  // this file's own scanner, and the workspace count would then carry a
+  // transcription nobody made. The same reason
+  // `a_fenced_block_is_skipped_and_does_not_reach_past_code` is spelled this
+  // way.
+  #[test]
+  fn a_fenced_production_is_counted_as_unreached() {
+    let fenced =
+      "  /// RFC 9112 §7:\n  /// ```text\n  /// transfer-parameter = token BWS\n  /// ```\n";
+    let extracted = quotations(fenced);
+    assert_eq!(extracted.fenced, 1);
+    assert!(
+      extracted.productions.is_empty(),
+      "counted, deliberately not graded"
+    );
+
+    let outside = "  /// RFC 9112 §7: `transfer-parameter = token BWS`\n";
+    let read = quotations(outside);
+    assert_eq!(read.fenced, 0);
+    assert_eq!(read.productions.len(), 1, "the same line, read for real");
+
+    let rust = "  /// ```\n  /// let last = false;\n  ///   other => unreachable!(),\n  /// ```\n";
+    assert_eq!(quotations(rust).fenced, 0);
+  }
+
+  // A `.md` fence draws the same boundary, so the printed number is one rule
+  // over both kinds of file rather than a `.rs`-only figure wearing a
+  // workspace-wide label.
+  #[test]
+  fn a_fenced_production_in_markdown_is_counted_too() {
+    let source = "See RFC 9112 §7:\n\n```abnf\ntransfer-parameter = token BWS\n```\n";
+    assert_eq!(markdown_quotations(source).fenced, 1);
+  }
+
+  // The `=>` half of `is_production`, at the level the count is printed: a
+  // README fence full of Rust must contribute nothing, or the boundary this
+  // number states would be overstated by the code samples beside it.
+  #[test]
+  fn a_markdown_fence_of_rust_counts_nothing() {
+    let source = "```rust\nlet last = false;\nmatch outcome {\n  other => panic!(),\n}\n```\n";
+    assert_eq!(markdown_quotations(source).fenced, 0);
+  }
+
+  // A block naming exactly one RFC commits every production inside it to that
+  // spec — the citation IS the anchor a bare `name =` cannot carry alone.
+  #[test]
+  fn a_block_naming_one_rfc_is_cited() {
+    let block = "RFC 6455 §9.1's extension-param = token [ \"=\" (token | quoted-string) ]";
+    assert_eq!(super::cited_rfc(block), Some(6455));
+  }
+
+  // The same RFC named twice is still one spec, not an ambiguity.
+  #[test]
+  fn a_block_naming_the_same_rfc_twice_is_still_one() {
+    let block = "RFC 6455 §9.1's grammar, restated at RFC 6455 §1.3 for the reader";
+    assert_eq!(super::cited_rfc(block), Some(6455));
+  }
+
+  // Two DIFFERENT RFCs in one block leave it unclear which spec a bare
+  // `name =` inside it is a claim about — not this check's business, the same
+  // way `grade` treats a quotation that anchors to no supplied spec.
+  #[test]
+  fn a_block_naming_two_rfcs_is_not_cited() {
+    let block = "RFC 2616 §2.1's #rule, which RFC 9110 §5.6.1.2 restates";
+    assert!(super::cited_rfc(block).is_none());
+  }
+
+  // Prose that names no RFC at all makes no checkable claim either.
+  #[test]
+  fn a_block_naming_no_rfc_is_not_cited() {
+    assert!(super::cited_rfc("just an ordinary sentence about `last = false`").is_none());
+  }
+
+  // The gate is applied to the WHOLE block, not the line: a production
+  // reached through `quotations` is a CANDIDATE only when its block names
+  // exactly one RFC. Ambiguous and uncited blocks both withhold theirs — not
+  // silently: each is counted as skipped rather than dropped without a trace.
+  #[test]
+  fn a_production_survives_only_in_a_single_rfc_block() {
+    let cited = quotations("  /// RFC 6455 §9.1's `extension-param = token`\n");
+    assert_eq!(
+      cited.productions,
+      vec![(1, "extension-param = token".to_string())]
+    );
+    assert_eq!(cited.uncited, 0);
+
+    let ambiguous = quotations("  /// RFC 2616 and RFC 9110 both define `token = 1*tchar`\n");
+    assert!(ambiguous.productions.is_empty());
+    assert_eq!(ambiguous.uncited, 1);
+
+    let uncited = quotations("  /// see `last = false` above\n");
+    assert!(uncited.productions.is_empty());
+    assert_eq!(uncited.uncited, 1);
+  }
+
+  // A production the citation gate would otherwise admit is withheld anyway
+  // when a `gate-exempt:` marker names its exact text — the mechanism a
+  // narrower `is_production` cannot be, because a marker names what it
+  // exempts rather than a shape a broken production could also stop matching.
+  #[test]
+  fn a_gate_exempt_marker_is_recognised_by_its_exact_span() {
+    let source = "// gate-exempt: q = 1 — a weight value in prose, not RFC 9110 grammar\n";
+    let exempt = super::exempted_spans(source);
+    assert!(exempt.contains("q = 1"));
+    assert!(!exempt.contains("q = 2"));
+  }
+
+  // Prose before the em dash is the exemption; the rationale after it is not
+  // part of what must match.
+  #[test]
+  fn a_gate_exempt_marker_stops_at_the_em_dash() {
+    let exempt =
+      super::exempted_spans("// gate-exempt: answerable = false — a Rust flag, not grammar\n");
+    assert!(exempt.contains("answerable = false"));
+    assert!(!exempt.iter().any(|span| span.contains('—')));
+  }
+
+  /// A minimal, hand-built spec for testing `grade_production` directly,
+  /// independent of anything the workspace's own comments happen to cite.
+  fn test_spec(name: &str, text: &str) -> super::Spec {
+    super::Spec {
+      name: name.to_string(),
+      text: text.to_string(),
+      lower: text.to_ascii_lowercase(),
+    }
+  }
+
+  // `grade_production` is the function Ruling 7 narrowed to one spec and
+  // Ruling 8 widened back to all of them. Pinned directly, with hand-built
+  // specs, because the property must hold independently of whether the
+  // workspace happens to contain a production whose citing block names a
+  // different RFC than its real source — today it does (three
+  // `handshake/*.rs` sites), but nothing should notice if that ever stops
+  // being true.
+  #[test]
+  fn a_production_found_in_a_later_spec_still_passes() {
+    let specs = [
+      test_spec("rfc1", "an unrelated spec with no matching grammar at all"),
+      test_spec("rfc2", "widget-param = token widget-value here"),
+    ];
+    let normalised: Vec<String> = specs
+      .iter()
+      .map(|spec| super::normalise(&spec.text))
+      .collect();
+    let mut checked = 0;
+    assert!(
+      super::grade_production(
+        "widget-param = token widget-value",
+        &specs,
+        &normalised,
+        &mut checked
+      )
+      .is_none()
+    );
+    assert_eq!(checked, 1);
+  }
+
+  // The property Ruling 8 must not have cost: a production in NO loaded spec
+  // still fails, and still names one — the first, the same arbitrary
+  // fallback `grade` uses for an unanchored quotation.
+  #[test]
+  fn a_production_in_no_spec_fails_and_names_one() {
+    let specs = [
+      test_spec("rfc1", "an unrelated spec with no matching grammar at all"),
+      test_spec("rfc2", "widget-param = token widget-value here"),
+    ];
+    let normalised: Vec<String> = specs
+      .iter()
+      .map(|spec| super::normalise(&spec.text))
+      .collect();
+    let mut checked = 0;
+    let graded = super::grade_production(
+      "gadget-param = token gadget-value",
+      &specs,
+      &normalised,
+      &mut checked,
+    );
+    assert_eq!(graded.map(|spec| spec.name.as_str()), Some("rfc1"));
+    assert_eq!(checked, 1);
+  }
+
+  // Below the three-word floor: not a checkable claim, so `checked` does not
+  // move — this is what keeps a stray two-token span from inflating the
+  // denominator.
+  #[test]
+  fn a_span_below_the_word_floor_is_not_counted() {
+    let specs = [test_spec("rfc1", "x=y is mentioned in here somewhere")];
+    let normalised: Vec<String> = specs
+      .iter()
+      .map(|spec| super::normalise(&spec.text))
+      .collect();
+    let mut checked = 0;
+    assert!(super::grade_production("x=y", &specs, &normalised, &mut checked).is_none());
+    assert_eq!(checked, 0);
+  }
+
+  // The three answers `grade` used to collapse into one `None`. A green run
+  // must not look the same as a run that could not check anything: a block
+  // citing RFC 9782 (never loaded — it is not in `FETCHED`) is a checkable
+  // claim this run could not honour, and that must surface rather than vanish.
+  // Empty `specs` also means the anchor can never match, so this pins Row 1
+  // of Ruling 9's table (unanchored + cited-but-unloaded => `Unloaded`).
+  #[test]
+  fn an_unloaded_citation_grades_as_unloaded() {
+    let specs: Vec<super::Spec> = Vec::new();
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
+    let graded = super::grade(
+      "the identifier is a valid URI reference and is compared",
+      Some(9782),
+      &specs,
+      &mut checked,
+      &mut unattributable,
+      &mut narrow,
+      &mut fallback,
+    );
+    assert!(matches!(graded, Some(super::Grade::Unloaded(9782))));
+    assert_eq!(
+      checked, 1,
+      "an unloaded citation still counts as one this check governs"
+    );
+    assert_eq!(unattributable, 0);
+    assert_eq!(
+      (narrow, fallback),
+      (0, 0),
+      "Unloaded is graded against no spec at all — neither path"
+    );
+  }
+
+  // The hole grading-by-citation closes: `rfc1` holds these exact words, but
+  // the block cites `rfc2`, which does not — so this must FAIL, not silently
+  // pass the way the pre-citation any-spec match did (a sentence attributed to
+  // RFC 9110 passing because RFC 9112 happened to contain it too). The
+  // attribution is read, not just present. `rfc1` is what ANCHORS this span
+  // (Q1, yes); `rfc2` is what the block CITES, and Ruling 9 makes citation
+  // answer only Q2 once Q1 is already yes — this pins Row 3 of that table.
+  #[test]
+  fn a_quotation_attributed_to_the_wrong_loaded_spec_fails() {
+    let specs = [
+      test_spec(
+        "rfc1",
+        "the widget registry must reject a duplicate identifier",
+      ),
+      test_spec(
+        "rfc2",
+        "an unrelated spec discussing something else entirely",
+      ),
+    ];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
+    let graded = super::grade(
+      "the widget registry must reject a duplicate identifier",
+      Some(2),
+      &specs,
+      &mut checked,
+      &mut unattributable,
+      &mut narrow,
+      &mut fallback,
+    );
+    assert!(matches!(graded, Some(super::Grade::Reworded(spec, _)) if spec.name == "rfc2"));
+    assert_eq!(checked, 1);
+    assert_eq!(unattributable, 0);
+    assert_eq!(
+      (narrow, fallback),
+      (1, 0),
+      "graded against the cited spec specifically (rfc2), not any anchored spec"
+    );
+  }
+
+  // Ruling 9, Row 2: a prose-sized span that does not anchor to ANY loaded
+  // spec is not graded — even though its block cites one, and even though
+  // that cited spec IS loaded. This is the case the first version of this
+  // check got wrong: letting the citation alone decide "is this a quotation"
+  // graded the author's own rhetorical prose against whatever the block
+  // happened to cite nearby. Not a failure, but not silent either.
+  #[test]
+  fn an_unanchored_span_in_a_cited_block_is_not_graded() {
+    let specs = [test_spec(
+      "rfc1",
+      "completely unrelated spec text that shares no opening",
+    )];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
+    let graded = super::grade(
+      "did this head arm this connection and answer truthfully",
+      Some(1),
+      &specs,
+      &mut checked,
+      &mut unattributable,
+      &mut narrow,
+      &mut fallback,
+    );
+    assert!(
+      graded.is_none(),
+      "an unanchored span must not be graded, even in a cited block"
+    );
+    assert_eq!(checked, 0, "not graded means not counted as checked");
+    assert_eq!(unattributable, 1, "but it is not silent either");
+    assert_eq!((narrow, fallback), (0, 0), "not graded means neither path");
+  }
+
+  // Ruling 10a: an unanchored span in a block citing NOTHING is a different
+  // fact from one in a block citing a loaded spec, and gets a different
+  // answer — the original, silent `None`. Nobody had reason to expect a
+  // quotation here at all, so unlike the test above, this one is not counted
+  // anywhere: conflating "not my business" with "my business and I could not
+  // do it" would blur exactly the distinction `unattributable` exists to
+  // draw.
+  #[test]
+  fn an_unanchored_uncited_span_is_silently_not_this_checks_business() {
+    let specs = [test_spec(
+      "rfc1",
+      "completely unrelated spec text that shares no opening",
+    )];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
+    let graded = super::grade(
+      "some sentence in quotes that matches nothing loaded here at all",
+      None,
+      &specs,
+      &mut checked,
+      &mut unattributable,
+      &mut narrow,
+      &mut fallback,
+    );
+    assert!(graded.is_none());
+    assert_eq!(checked, 0);
+    assert_eq!(
+      unattributable, 0,
+      "cites nothing: never a candidate, not even counted in the backlog"
+    );
+    assert_eq!((narrow, fallback), (0, 0));
+  }
+
+  // Ruling 9, Row 4: a span that DOES anchor, in a block citing a spec this
+  // run has not loaded, falls back to the pre-existing any-spec anchored
+  // behaviour rather than reporting `Unloaded` — the anchor already found
+  // something checkable, so "unloaded" would be the wrong answer (it isn't
+  // that nothing could be checked; the citation just isn't the useful part
+  // here). Distinguishes this from `an_unloaded_citation_grades_as_unloaded`,
+  // where the anchor could not match anything because `specs` was empty.
+  #[test]
+  fn a_citation_to_an_unloaded_spec_falls_back_to_the_anchor_when_anchored() {
+    let specs = [test_spec(
+      "rfc1",
+      "the widget registry must reject a duplicate identifier",
+    )];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
+    let graded = super::grade(
+      "the widget registry must reject a duplicate identifier",
+      Some(9782),
+      &specs,
+      &mut checked,
+      &mut unattributable,
+      &mut narrow,
+      &mut fallback,
+    );
+    assert!(
+      graded.is_none(),
+      "verbatim in the anchored spec, so it passes via the fallback"
+    );
+    assert_eq!(checked, 1, "the anchored fallback still counts it");
+    assert_eq!(unattributable, 0);
+    assert_eq!(
+      (narrow, fallback),
+      (0, 1),
+      "the cited spec (9782) was never loaded, so this counts as fallback, not narrow"
+    );
+  }
+
+  // Ruling 11: `cited_rfc`'s "exactly one" rule makes a block naming TWO
+  // different RFCs just as uncited as one naming none — the ambiguous case
+  // falls all the way through to the any-spec fallback, even when the span
+  // anchors to (and verbatim-matches) one of the two cited specs. This is
+  // the split `narrow`/`fallback` exist to measure: a real quotation whose
+  // correct spec IS among the block's citations, graded via `fallback`
+  // rather than `narrow` only because the block also names something else.
+  #[test]
+  fn a_block_naming_two_rfcs_sends_a_correct_quotation_through_fallback() {
+    let specs = [
+      test_spec(
+        "rfc1",
+        "the widget registry must reject a duplicate identifier",
+      ),
+      test_spec(
+        "rfc2",
+        "an unrelated spec discussing something else entirely",
+      ),
+    ];
+    let mut checked = 0;
+    let mut unattributable = 0;
+    let mut narrow = 0;
+    let mut fallback = 0;
+    // `cited` is `None` here because this is exactly what `cited_rfc` would
+    // already have returned for a block naming both rfc1 and rfc2 — `grade`
+    // never sees "two citations", only the ambiguity's result.
+    let graded = super::grade(
+      "the widget registry must reject a duplicate identifier",
+      None,
+      &specs,
+      &mut checked,
+      &mut unattributable,
+      &mut narrow,
+      &mut fallback,
+    );
+    assert!(
+      graded.is_none(),
+      "verbatim in the anchored spec, so it passes via the fallback"
+    );
+    assert_eq!(checked, 1);
+    assert_eq!(
+      (narrow, fallback),
+      (0, 1),
+      "a real quotation of rfc1, but ambiguity sent it through fallback, not narrow"
+    );
   }
 }

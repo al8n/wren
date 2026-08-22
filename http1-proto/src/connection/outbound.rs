@@ -201,10 +201,10 @@ const ONE_REQUEST_AT_A_TIME: &str = "a request is already outstanding";
 /// arrived BEFORE this request would be written.
 ///
 /// Opening over them would have them parsed as this request's response, which is
-/// exactly what §9.2 forbids — "a client MUST NOT consider [data received on a
-/// connection with no outstanding request] to be a valid response". The idle path
-/// already diagnoses such bytes; the barrier is what keeps them ON that path
-/// instead of letting a new exchange adopt them.
+/// exactly what §9.2 forbids: a client that receives data on a connection with no
+/// outstanding request "MUST NOT consider that data to be a valid response". The
+/// idle path already diagnoses such bytes; the barrier is what keeps them ON that
+/// path instead of letting a new exchange adopt them.
 ///
 /// The cure is one more pump pass: offer the rest of the previous read and pull
 /// to `Ok(None)`. Only the pump can lift this, because only the pump sees the
@@ -356,8 +356,11 @@ pub(super) const REQUEST_NEEDS_HOST: &str = "an HTTP/1.1 request states its Host
 /// which is §11.2's primitive with the sender on this side of it.
 pub(super) const ONE_HOST_LINE: &str = "a request states exactly one Host field line";
 
-/// §3.2's third: a `Host` "with an invalid field value" is the same 400, and the
-/// same unqualified scope.
+// gate-exempt: validate::host_value_is_valid — names the RECEIVE-side
+// predicate this constant's message is the SEND-side counterpart of; the
+// constant is a string, and does not call the predicate itself.
+/// RFC 9112 §3.2's third: a `Host` "with an invalid field value" is the same
+/// 400, and the same unqualified scope.
 ///
 /// Checked against the value the RECIPIENT will read — OWS-trimmed, since
 /// RFC 9110 §5.5 makes the whitespace no part of the value — through
@@ -1454,6 +1457,7 @@ pub(super) struct Declared {
   /// RFC 9110 §10.1.1's `Expect`, accumulated across the section's field lines
   /// rather than checked one line at a time.
   ///
+  // gate-exempt: ext = value — a counterexample the field's production does not admit, not RFC 9110 grammar
   /// §5.2 makes those lines ONE value, so a legal `quoted-string` argument may
   /// span the join — and the per-line check this replaces refused one, while
   /// accepting `ext = value` and `ext;flag`, which the field's production does
@@ -1679,6 +1683,9 @@ pub(super) fn continue_needs_content(declared: &Declared, has_content: bool) -> 
 /// `open_connect` all write `HTTP/1.1` requests, so all three owe the same
 /// field under the same three rules.
 ///
+// gate-exempt: validate::host_value_is_valid — names where the value question
+// was already answered; this function only reads the resulting
+// `declared.host_invalid` flag, it does not call the predicate itself.
 /// The rules are the receive side's, in the order §3.2 states them and with the
 /// scopes it gives them — a MISSING `Host` is a fault of "any HTTP/1.1 request
 /// message" and the other two of "any request message". Every request this core

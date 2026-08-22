@@ -149,7 +149,7 @@ one that arrived on an exchange it opened for its own reasons.
 
   Every other 101 a General connection can receive is still a protocol error —
   every 101 at a server, at an unpermitted client, and at a permitted client
-  that offered nothing — because §7.8 makes switching to a protocol "not
+  that offered nothing — because RFC 9110 §7.8 makes switching to a protocol "not
   indicated by the client in the corresponding request's Upgrade header field" a
   server MUST NOT. Permission is not indication, and the gate reads the OFFER.
   The 101 it does accept is validated exactly as Tunnel validates the one it
@@ -1097,7 +1097,7 @@ inline 64-entry header table (~2 KB) is replaced by the borrowed `HeadView`.
 
 - **Interim 1xx responses are parsed instead of failing the handshake.** The old
   client mapped a `100 Continue` prefix to `UnexpectedStatus(100)`, which RFC
-  9110 §15.2.1 forbids: "a client MUST be able to parse one or more 1xx
+  9110 §15.2 forbids: "A client MUST be able to parse one or more 1xx
   responses received prior to a final response". `ClientProgress::Interim`
   reports which one arrived AND how far the buffer advanced past it — a driver
   told only that an interim arrived cannot advance, so it re-offers the same

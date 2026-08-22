@@ -365,10 +365,11 @@ pub enum ClientTunnelOutcome<'a> {
     /// The bytes after that head, verbatim: they are the new protocol's.
     leftover: &'a [u8],
   },
-  /// RFC 9110 §9.3.6: a 2xx to CONNECT, so "the connection will become a tunnel
-  /// immediately after the empty line that concludes the header fields". Any
-  /// `Content-Length` or `Transfer-Encoding` in that head is IGNORED, as §9.3.6
-  /// requires of a client — `leftover` is tunnel data, not content.
+  /// RFC 9112 §6.3 item 2: a 2xx to CONNECT, so "the connection will become a
+  /// tunnel immediately after the empty line that concludes the header
+  /// fields". Any `Content-Length` or `Transfer-Encoding` in that head is
+  /// IGNORED, as that item requires of a client — `leftover` is tunnel data,
+  /// not content.
   Tunneled {
     /// The 2xx head.
     head: HeadView<'a>,
@@ -520,6 +521,9 @@ pub(crate) enum TunnelPhase {
   /// The handshake is under way — a client is reading the response to its
   /// request, a server owes the answer to a request it has classified.
   Handshaking(Handshake),
+  // gate-exempt: validate::has_close_option — names the shared predicate EVERY takeover site below reads; this variant is a bare marker with no
+  // body of its own to read anything, and the table below names the actual sites. Placed here, not beside the table's row further down, so the
+  // `| corner |` table stays one continuous block for `doc-check`'s table-verdicts check.
   /// TERMINAL: the switch happened and the stream belongs to the next protocol.
   ///
   /// # The one-takeover-no-close invariant
@@ -598,9 +602,16 @@ pub(crate) enum TunnelPhase {
   /// - **GUARDED** — it asks the close question itself.
   /// - **GUARDED BY A CALLER** — an earlier gate makes the state unreachable, and
   ///   the site names which gate.
-  /// - **DELIBERATELY EXCLUDED** — with its reason recorded at the site.
+  /// - **STRUCTURALLY EXCLUDED** — the site cannot reach this state at all, and
+  ///   says what stops it.
   ///
   /// A site that is none of the three is a defect, not a judgement call.
+  ///
+  /// `cargo run -p xtask -- doc-check` checks this declaration against the
+  /// table below it: a bullet counts only in the exact shape `- **VERDICT**
+  /// — reason` (bold term, em dash, gloss). A bullet that reaches the dash
+  /// only mid-sentence, or uses a colon in its place, is not read as a
+  /// declaration at all.
   ///
   /// **Why the second axis exists.** The spatial rule enumerates sites by what
   /// they DO to a switch, and [`close`](Connection::close) does none of those
@@ -842,7 +853,7 @@ impl<Ro> Connection<Ro, Tunnel> {
   /// | EOF, then `handle_request` with a partial head | `CLOSED_MID_HEAD`, latched, and NO rejection owed — the same call General makes, for the same reason: a 400 describing a request nobody finished sending answers no message |
   /// | EOF, then `handle_request` with nothing buffered | [`ServerTunnelRequest::Closed`]: the peer closed at a boundary, which is a clean ending and not a fault |
   /// | EOF while a rejection is owed | `read_closed`; the obligation stands and [`reject`](Connection::reject) still writes it |
-  /// | EOF after the switch | `read_closed`; the bytes were the other protocol's already, and this core has nothing to say about their ending |
+  /// | EOF after the switch | inert: the call returns BEFORE the latch, so `read_closed` is left as it was — the bytes were the other protocol's already, and this core has nothing to say about their ending |
   /// | The same EOF reported twice | a no-op |
   ///
   /// Nothing here abandons a send, which is the one line General's `handle_eof`
@@ -1312,6 +1323,7 @@ impl Connection<Server, Tunnel> {
           // those ended just as cleanly.
           return Ok(ServerTunnelRequest::Closed);
         }
+        // gate-exempt: answerable = false — a Rust flag value, not RFC 9112 grammar
         // RFC 9112 §2.1 again, and through `fail` rather than `refuse`: a
         // truncated request creates NO answer to owe. That is the same call
         // General's `truncated` makes with `answerable = false`, and for the

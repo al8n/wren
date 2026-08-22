@@ -1,0 +1,19 @@
+name: Docs
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  quote-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # No paths-ignore on this workflow: the checks it runs are ABOUT
+      # documentation, so a change to a .md file is exactly when they matter.
+      # ci.yml ignores '**.md', which is correct for a compile-and-test
+      # workflow and is why these cannot live there.
+      - run: cargo run -p xtask -- quote-check --fetch
+      - run: cargo run -p xtask -- doc-check
