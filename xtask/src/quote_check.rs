@@ -119,6 +119,29 @@
 //! always that RFC's own prose, but a grammar RULE beside a citation is
 //! routinely shown for comparison with a different spec's.
 //!
+//! ## The forms neither extractor reaches
+//!
+//! Both extractors are shape-bound, and each shape leaves a form outside the
+//! check. Neither is a defect found and left; both are boundaries, and a
+//! boundary that no run states is the disease this command exists to remove.
+//!
+//! - **Grammar inside a FENCED block.** [`abnf_spans`] reads backticked
+//!   spans, and a fenced line is skipped before it ever runs — while a fence
+//!   is how this workspace transcribes most of its grammar, several
+//!   productions at a time, one rule per line. Those lines are COUNTED and
+//!   the count is printed on every run. They are not read: reaching into a
+//!   fence needs a rule for which fences hold grammar and which hold Rust
+//!   (this crate's doc comments are full of both), and inventing one to make
+//!   a number go up is how a shape-matcher stops matching the thing it was
+//!   built for. The count is what such a design would be weighed against.
+//! - **A quotation set as a BLOCKQUOTE.** [`quoted_spans`] pairs `"` marks,
+//!   so spec text quoted by indentation and a leading `>` instead carries
+//!   nothing for it to pair. That form is NOT counted, and the difference
+//!   from the one above is worth stating: a production has a shape to
+//!   recognise, while an indented paragraph of prose is indistinguishable
+//!   from any other indented paragraph. Counting it would mean counting
+//!   every blockquote in the workspace, which measures nothing.
+//!
 //! # What is normalised away on BOTH sides, and why
 //!
 //! Only differences a Rust comment cannot avoid, or the RFC's own typesetting:
@@ -200,6 +223,29 @@ type Spans = Vec<(usize, String)>;
 /// grading time: it is a property of the block the span was cut from, and the
 /// block is gone by the time `run` gets to grading.
 type QuotedSpans = Vec<(usize, String, Option<u32>)>;
+
+/// Everything one file's comments held for this check — what it can grade,
+/// and what it reached but cannot.
+///
+/// A struct rather than a tuple because two of the four are bare counts, and
+/// a caller reading `(spans, productions, 100, 14)` has no way to tell which
+/// boundary is which.
+struct Extracted {
+  /// Quoted spans, for [`grade`].
+  quoted: QuotedSpans,
+  /// Backticked ABNF production candidates whose block named one RFC, for
+  /// [`grade_production`].
+  productions: Spans,
+  /// Production-shaped backticked spans whose block named no RFC, or named
+  /// more than one: a candidate with no citation to grade it against.
+  uncited: usize,
+  /// Production-shaped lines inside a FENCED block, which this extractor does
+  /// not reach at all — see the module doc's boundary section, and
+  /// [`is_production`] for what "production-shaped" means. Counted so the
+  /// boundary is a number in the run's own output rather than a fact about
+  /// the code that only a reader of the code can find.
+  fenced: usize,
+}
 
 /// The default, gitignored cache directory, relative to the workspace root.
 pub const DEFAULT_DIR: &str = ".rfc-cache";
@@ -287,6 +333,10 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   let mut abnf_failures = 0usize;
   let mut abnf_skipped = 0usize;
   let mut abnf_exempt = 0usize;
+  // Production-shaped lines this extractor never reaches, because they sit
+  // inside a fenced block — the form this workspace transcribes most of its
+  // grammar in. Not a failure and not a candidate: a printed boundary.
+  let mut abnf_fenced = 0usize;
   // A quotation this reads as a deliberate historical citation rather than a
   // checkable claim against a loaded spec — same marker, same mechanism as
   // `abnf_exempt`, extended to quotations (Ruling 9).
@@ -294,8 +344,10 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = source.strip_prefix(&root).unwrap_or(source).display();
-    let (spans, productions, skipped_here) = spans_for(source, &text);
-    abnf_skipped += skipped_here;
+    let extracted = spans_for(source, &text);
+    let (spans, productions) = (extracted.quoted, extracted.productions);
+    abnf_skipped += extracted.uncited;
+    abnf_fenced += extracted.fenced;
     // Per-file: a marker in one file cannot exempt a span in another. Read
     // once and reused below for both quotations and productions.
     let exempt = exempted_spans(&text);
@@ -381,6 +433,17 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     "quote-check: {abnf_skipped} production-shaped spans skipped (no RFC cited), {abnf_exempt} \
      marked gate-exempt, {quote_exempt} quotations marked gate-exempt"
   );
+  // The boundary of the ABNF extractor itself, printed for the same reason
+  // the line above it is: this check reads backticked spans, and the grammar
+  // this workspace transcribes inside fenced blocks is outside it — in no
+  // other counter, and previously in no output at all. Whether to reach into
+  // a fence is a design question (which fences hold grammar and which hold
+  // Rust?), and this number is what such a design would have to be weighed
+  // against; it is deliberately not answered by widening the extractor here.
+  println!(
+    "quote-check: {abnf_fenced} production-shaped lines sit inside fenced blocks — UNREACHED \
+     (this check reads backticked spans only)"
+  );
   // Same shape, same reason: a span this is not silence either — it is what
   // Ruling 9 costs, stated as a number instead of merely being the case.
   // Narrowed to blocks citing a LOADED spec only (Ruling 10a): a block
@@ -434,7 +497,7 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
 /// anything else — in practice always `.rs`, since [`collect_sources`] hands
 /// this only `.rs` or `.md` paths — is read as `.rs`-style comments
 /// ([`quotations`]).
-fn spans_for(path: &Path, text: &str) -> (QuotedSpans, Spans, usize) {
+fn spans_for(path: &Path, text: &str) -> Extracted {
   if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
     markdown_quotations(text)
   } else {
@@ -707,10 +770,11 @@ fn exempted_spans(source: &str) -> HashSet<String> {
 /// exists to be asked. Every quoted span pulled from the same block carries
 /// the same citation, for the same reason: the block, not the line, is what
 /// was cited.
-fn quotations(source: &str) -> (QuotedSpans, Spans, usize) {
+fn quotations(source: &str) -> Extracted {
   let mut out: QuotedSpans = Vec::new();
   let mut productions = Vec::new();
   let mut skipped = 0usize;
+  let mut fenced_productions = 0usize;
   let mut block = String::new();
   // (byte offset into `block`, source line) for the start of each joined line.
   let mut marks: Vec<(usize, usize)> = Vec::new();
@@ -755,6 +819,12 @@ fn quotations(source: &str) -> (QuotedSpans, Spans, usize) {
         continue;
       }
       if fenced {
+        // Reached, not read: counted here and named in the module doc, since
+        // a boundary nobody is told about is the failure this whole command
+        // exists to remove.
+        if is_production(body) {
+          fenced_productions += 1;
+        }
         continue;
       }
     } else {
@@ -772,7 +842,12 @@ fn quotations(source: &str) -> (QuotedSpans, Spans, usize) {
     block.push_str(&mask_code_spans(body));
   }
   flush(&mut block, &mut marks, &mut pending);
-  (out, productions, skipped)
+  Extracted {
+    quoted: out,
+    productions,
+    uncited: skipped,
+    fenced: fenced_productions,
+  }
 }
 
 /// Every quotation in a Markdown file, with the line its opening quote is on
@@ -796,10 +871,11 @@ fn quotations(source: &str) -> (QuotedSpans, Spans, usize) {
 /// rather than joined — which is the safer of the two: a fence is far likelier
 /// to separate two unrelated paragraphs than a real quotation is to straddle
 /// one.
-fn markdown_quotations(source: &str) -> (QuotedSpans, Spans, usize) {
+fn markdown_quotations(source: &str) -> Extracted {
   let mut out: QuotedSpans = Vec::new();
   let mut productions = Vec::new();
   let mut skipped = 0usize;
+  let mut fenced_productions = 0usize;
   let mut block = String::new();
   let mut marks: Vec<(usize, usize)> = Vec::new();
   // ABNF production candidates seen in the block under construction, admitted
@@ -838,6 +914,10 @@ fn markdown_quotations(source: &str) -> (QuotedSpans, Spans, usize) {
       continue;
     }
     if fenced {
+      // Same boundary as `quotations` draws, for the same reason.
+      if is_production(raw.trim()) {
+        fenced_productions += 1;
+      }
       continue;
     }
     if raw.trim().is_empty() {
@@ -854,7 +934,12 @@ fn markdown_quotations(source: &str) -> (QuotedSpans, Spans, usize) {
     block.push_str(&mask_code_spans(raw));
   }
   flush(&mut block, &mut marks, &mut pending);
-  (out, productions, skipped)
+  Extracted {
+    quoted: out,
+    productions,
+    uncited: skipped,
+    fenced: fenced_productions,
+  }
 }
 
 /// The comment on one source line, and whether the line is nothing but that
@@ -1037,10 +1122,18 @@ fn abnf_spans(line: &str) -> Vec<String> {
 
 /// Whether `span` opens with an RFC 5234 rule name and a single `=`.
 ///
-/// `name ==` is a Rust comparison, not RFC 5234 assignment — requiring the
-/// character AFTER the `=` not to be a second `=` is what tells `` `need ==
-/// out.len()` `` from `` `rule = value` ``. `=/` (incremental alternatives)
-/// still counts: its second character is `/`, not `=`.
+/// Two Rust shapes reach the same first character and neither is assignment:
+/// a comparison (`need == out.len()`) and a match arm (`other => panic!()`).
+/// Requiring the character AFTER the `=` to be neither a second `=` nor a
+/// `>` is what excludes both, while `=/` — RFC 5234's incremental
+/// alternative — still counts, its second character being `/`.
+///
+/// The `=>` half arrived with the fenced-line count, which is where a match
+/// arm turns up: this workspace's two README fences each write one, and a
+/// Rust match arm counted as unreached GRAMMAR would misstate the very
+/// boundary that count exists to state. No BACKTICKED span in this workspace
+/// is production-shaped only through `=>` — checked before the rule narrowed
+/// — so no existing counter moved when it landed.
 fn is_production(span: &str) -> bool {
   let trimmed = span.trim_start();
   let name: String = trimmed
@@ -1051,7 +1144,7 @@ fn is_production(span: &str) -> bool {
     return false;
   }
   let mut after_name = trimmed[name.len()..].trim_start().chars();
-  after_name.next() == Some('=') && after_name.next() != Some('=')
+  after_name.next() == Some('=') && !matches!(after_name.next(), Some('=' | '>'))
 }
 
 /// The single RFC number `block` names, or `None` when it names zero or names
@@ -1383,7 +1476,7 @@ mod tests {
 
   fn spans(source: &str) -> Vec<String> {
     quotations(source)
-      .0
+      .quoted
       .into_iter()
       .map(|(_, s, _)| s)
       .collect()
@@ -1393,7 +1486,7 @@ mod tests {
   // function, because a `.md` file has no comment prefix to key off of.
   fn markdown_spans(source: &str) -> Vec<String> {
     markdown_quotations(source)
-      .0
+      .quoted
       .into_iter()
       .map(|(_, s, _)| s)
       .collect()
@@ -1503,18 +1596,18 @@ mod tests {
   #[test]
   fn spans_for_dispatches_by_extension() {
     let source = "See RFC 9112 §9.6: \"the server MUST NOT process\" further requests.\n";
-    let (quoted, productions, skipped) = spans_for(Path::new("notes.md"), source);
+    let md = spans_for(Path::new("notes.md"), source);
     // The span carries the block's own citation as its third element.
     assert_eq!(
-      quoted,
+      md.quoted,
       vec![(1, "the server MUST NOT process".to_string(), Some(9112))]
     );
-    assert!(productions.is_empty());
-    assert_eq!(skipped, 0);
-    let (quoted, productions, skipped) = spans_for(Path::new("notes.rs"), source);
-    assert!(quoted.is_empty());
-    assert!(productions.is_empty());
-    assert_eq!(skipped, 0);
+    assert!(md.productions.is_empty());
+    assert_eq!((md.uncited, md.fenced), (0, 0));
+    let rs = spans_for(Path::new("notes.rs"), source);
+    assert!(rs.quoted.is_empty());
+    assert!(rs.productions.is_empty());
+    assert_eq!((rs.uncited, rs.fenced), (0, 0));
   }
 
   // An ABNF production reaches neither existing path: `mask_code_spans` erases
@@ -1539,16 +1632,70 @@ mod tests {
   // `is_production` once saw only the FIRST character after `name`, so a Rust
   // equality check opened a production too. Requiring the SECOND character
   // not to be `=` closes that without rejecting `=/`, RFC 5234's
-  // incremental-alternative operator.
+  // incremental-alternative operator. A match arm's `=>` is rejected on the
+  // same grounds and for the same reason — it is Rust, not RFC 5234 — which
+  // is what keeps a README fence's match arm out of the fenced-line count.
   #[test]
   fn a_double_equals_is_not_a_production() {
     let line = "  // the EXACT fit, `need == out.len()`: the boundary between the two arms";
     assert!(super::abnf_spans(line).is_empty());
+    let arm = "  // `other => unreachable!()` is a match arm, not a rule";
+    assert!(super::abnf_spans(arm).is_empty());
     let incremental = "  // `rule =/ extra-alternative` still opens one";
     assert_eq!(
       super::abnf_spans(incremental),
       ["rule =/ extra-alternative"]
     );
+  }
+
+  // The boundary this extractor has always had, now counted: a fenced block
+  // is skipped before `abnf_spans` runs, and a fence is how this workspace
+  // transcribes most of its grammar. The count must move for a fenced
+  // production and must NOT move for the same line outside a fence (where the
+  // check reads it for real) or for fenced Rust that merely looks like one.
+  //
+  // Written as ONE source line with escaped newlines, not as a wrapped
+  // literal: a fixture spelled across real lines IS a fenced production to
+  // this file's own scanner, and the workspace count would then carry a
+  // transcription nobody made. The same reason
+  // `a_fenced_block_is_skipped_and_does_not_reach_past_code` is spelled this
+  // way.
+  #[test]
+  fn a_fenced_production_is_counted_as_unreached() {
+    let fenced =
+      "  /// RFC 9112 §7:\n  /// ```text\n  /// transfer-parameter = token BWS\n  /// ```\n";
+    let extracted = quotations(fenced);
+    assert_eq!(extracted.fenced, 1);
+    assert!(
+      extracted.productions.is_empty(),
+      "counted, deliberately not graded"
+    );
+
+    let outside = "  /// RFC 9112 §7: `transfer-parameter = token BWS`\n";
+    let read = quotations(outside);
+    assert_eq!(read.fenced, 0);
+    assert_eq!(read.productions.len(), 1, "the same line, read for real");
+
+    let rust = "  /// ```\n  /// let last = false;\n  ///   other => unreachable!(),\n  /// ```\n";
+    assert_eq!(quotations(rust).fenced, 0);
+  }
+
+  // A `.md` fence draws the same boundary, so the printed number is one rule
+  // over both kinds of file rather than a `.rs`-only figure wearing a
+  // workspace-wide label.
+  #[test]
+  fn a_fenced_production_in_markdown_is_counted_too() {
+    let source = "See RFC 9112 §7:\n\n```abnf\ntransfer-parameter = token BWS\n```\n";
+    assert_eq!(markdown_quotations(source).fenced, 1);
+  }
+
+  // The `=>` half of `is_production`, at the level the count is printed: a
+  // README fence full of Rust must contribute nothing, or the boundary this
+  // number states would be overstated by the code samples beside it.
+  #[test]
+  fn a_markdown_fence_of_rust_counts_nothing() {
+    let source = "```rust\nlet last = false;\nmatch outcome {\n  other => panic!(),\n}\n```\n";
+    assert_eq!(markdown_quotations(source).fenced, 0);
   }
 
   // A block naming exactly one RFC commits every production inside it to that
@@ -1587,23 +1734,20 @@ mod tests {
   // silently: each is counted as skipped rather than dropped without a trace.
   #[test]
   fn a_production_survives_only_in_a_single_rfc_block() {
-    let cited = "  /// RFC 6455 §9.1's `extension-param = token`\n";
-    let (_, productions, skipped) = quotations(cited);
+    let cited = quotations("  /// RFC 6455 §9.1's `extension-param = token`\n");
     assert_eq!(
-      productions,
+      cited.productions,
       vec![(1, "extension-param = token".to_string())]
     );
-    assert_eq!(skipped, 0);
+    assert_eq!(cited.uncited, 0);
 
-    let ambiguous = "  /// RFC 2616 and RFC 9110 both define `token = 1*tchar`\n";
-    let (_, productions, skipped) = quotations(ambiguous);
-    assert!(productions.is_empty());
-    assert_eq!(skipped, 1);
+    let ambiguous = quotations("  /// RFC 2616 and RFC 9110 both define `token = 1*tchar`\n");
+    assert!(ambiguous.productions.is_empty());
+    assert_eq!(ambiguous.uncited, 1);
 
-    let uncited = "  /// see `last = false` above\n";
-    let (_, productions, skipped) = quotations(uncited);
-    assert!(productions.is_empty());
-    assert_eq!(skipped, 1);
+    let uncited = quotations("  /// see `last = false` above\n");
+    assert!(uncited.productions.is_empty());
+    assert_eq!(uncited.uncited, 1);
   }
 
   // A production the citation gate would otherwise admit is withheld anyway
