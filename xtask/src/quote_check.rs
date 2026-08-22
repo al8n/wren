@@ -1146,7 +1146,7 @@ fn normalise(text: &str) -> String {
 /// `[…]` is the standard mark for an editorial insertion in a quotation, and
 /// the RFC's OWN prose uses it the same way for an inline `[RFC2616]`-style
 /// reference: RFC 6455 §4.1 reads "...the client handles the response per
-/// HTTP [RFC2616] procedures..." (`.rfc-cache/rfc6455.txt:1031`), while
+/// HTTP `[RFC2616]` procedures..." (`.rfc-cache/rfc6455.txt:1031`), while
 /// `websocket-proto/src/handshake/h1/client.rs`'s quotation of that sentence
 /// never spells the citation at all ("...per HTTP procedures..."). Stripping
 /// `[RFC2616]` from the spec's side — nothing needs stripping from the
