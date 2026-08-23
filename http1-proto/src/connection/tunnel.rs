@@ -613,6 +613,13 @@ pub(crate) enum TunnelPhase {
   /// only mid-sentence, or uses a colon in its place, is not read as a
   /// declaration at all.
   ///
+  /// The declared words are RESERVED to this table: `doc-check` fails any doc
+  /// comment elsewhere in the crate that writes one, so a site's verdict is
+  /// stated here or it is not stated. What that cannot see is a PARAPHRASE — a
+  /// comment contradicting a row without using one of the words — which is how
+  /// a doc calling the CONNECT corners "deliberately excluded" once stood
+  /// beside a table that excluded nothing.
+  ///
   /// **Why the second axis exists.** The spatial rule enumerates sites by what
   /// they DO to a switch, and [`close`](Connection::close) does none of those
   /// three things — it only moves the lifecycle, on a connection whose

@@ -1432,7 +1432,7 @@ fn websocket_request<'a>(
   // at all, which skips the policy entirely. A field this crate cannot
   // resolve is one it ANSWERS, exactly as it answers a duplicated key or
   // version, and the handshake stays reject-only so the driver still writes
-  // §4.2.1's "HTTP response with an appropriate error code".
+  // RFC 6455 §4.2.1's "HTTP response with an appropriate error code".
   if fields.origin().single().is_err() {
     return Err(ServerHandshakeError::DuplicateHeader);
   }

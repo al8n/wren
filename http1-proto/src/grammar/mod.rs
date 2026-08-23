@@ -559,7 +559,8 @@ pub(crate) fn is_sender_token_list(value: &[u8]) -> bool {
 /// ```text
 /// Expect      = #expectation
 /// expectation = token [ "=" ( token / quoted-string ) parameters ]
-/// parameters  = *( OWS ";" OWS [ parameter ] )        ; §5.6.6
+/// ; the two below are §5.6.6's, not §10.1.1's
+/// parameters  = *( OWS ";" OWS [ parameter ] )
 /// parameter   = parameter-name "=" parameter-value
 /// ```
 ///

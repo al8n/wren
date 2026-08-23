@@ -120,10 +120,7 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
   };
   // Printed on every real run, success included: a counted blind spot in the
   // tool's own output is the point, not a fact that only lives in a report.
-  let collision_note = format!(
-    "{} paths carry two items each — a loss on one of a pair is not visible here",
-    current.collisions
-  );
+  let collision_note = current.collision_note();
   if bless {
     let mut body = String::from(
       "# Documented items in http1-proto. Regenerate with:\n\
@@ -137,7 +134,7 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
     fs::write(&path, body)?;
     report.checked(format!(
       "doc-continuity: blessed {} documented items ({collision_note})",
-      current.paths.len()
+      current.items
     ));
     return Ok(());
   }
@@ -157,7 +154,7 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
   }
   report.checked(format!(
     "doc-continuity: {} documented items, {} lost ({collision_note})",
-    current.paths.len(),
+    current.items,
     lost.len()
   ));
   Ok(())
@@ -181,15 +178,55 @@ fn lost_docs(snapshot: &[impl AsRef<str>], current: &[impl AsRef<str>]) -> Vec<S
 struct DocumentedItems {
   /// Every documented item, as `path::to::item`, sorted and deduplicated.
   paths: Vec<String>,
-  /// How many of `paths` were reached by more than one distinct item id: a
-  /// private field beside its same-named accessor method, or the same
-  /// method name declared in two differently-parameterized impls (say,
-  /// `Connection<General>` and `Connection<Tunnel>`) — `walk_item` builds a
-  /// path from container *names*, not full type identity, so both collapse
-  /// onto one string. A doc lost from one half of such a pair is invisible
-  /// to `continuity`: the path stays in `paths` because its sibling still
-  /// has a doc, so nothing here can report it.
+  /// How many documented items there were BEFORE that deduplication — the
+  /// honest denominator, and the one [`continuity`] prints. It exceeds
+  /// `paths.len()` by exactly the number of items the snapshot cannot hold a
+  /// separate line for, so the two numbers printed together are the
+  /// collision count's own arithmetic rather than a claim to be taken on
+  /// faith.
+  items: usize,
+  /// How many of `paths` were reached by more than one distinct item id.
+  ///
+  /// [`walk_item`] spells a path from names and normalized impl arguments,
+  /// not from full type identity, so two items that differ only in something
+  /// the spelling drops still collapse onto one string. #62's two shapes — a
+  /// private field beside its same-named accessor, and one method name in two
+  /// differently-parameterized impls — are spelled apart now; what remains
+  /// is: two trait impls of one self type providing the same method name (the
+  /// trait is not in the path, so `<Foo as Display>::fmt` and
+  /// `<Foo as Debug>::fmt` are both `Foo::fmt`); two types with the same
+  /// final path segment used as impl arguments; an argument shape
+  /// [`type_name`] renders as `_`; and a module and a function sharing one
+  /// name in a parent module, which sit in different namespaces and so are
+  /// legal Rust.
+  ///
+  /// A doc lost from one member of such a group is invisible to
+  /// [`continuity`]: the path stays in `paths` because a sibling still has a
+  /// doc, so nothing here can report it. Which is why this is counted and
+  /// PRINTED rather than filed away — see
+  /// [`DocumentedItems::collision_note`].
   collisions: usize,
+}
+
+impl DocumentedItems {
+  /// The blind spot this run leaves, in the words [`continuity`] prints
+  /// beside its result — on success as much as on failure.
+  ///
+  /// Zero collisions gets a sentence of its own rather than an empty string.
+  /// A check that prints nothing when it found nothing reads exactly like a
+  /// check that never looked, and telling those two apart is the whole reason
+  /// this command exists; so the zero case still names the denominator it
+  /// compared and states, in as many words, that nothing collapsed.
+  fn collision_note(&self) -> String {
+    let paths = self.paths.len();
+    match self.collisions {
+      0 => format!("{paths} distinct paths, none reached by more than one item"),
+      collisions => format!(
+        "{paths} distinct paths, {collisions} reached by more than one item — a loss on one \
+         member of a group is not visible here"
+      ),
+    }
+  }
 }
 
 /// What one attempt to read rustdoc's JSON produced.
@@ -291,10 +328,18 @@ fn documented_items(root: &Path, crate_name: &str) -> Result<RustdocJson, Error>
 
   let mut documented: Vec<(u64, String)> = Vec::new();
   let mut visited = HashSet::new();
-  walk_item(root_id, "", index, &mut visited, &mut documented);
+  walk_item(
+    root_id,
+    "",
+    Join::Path,
+    index,
+    &mut visited,
+    &mut documented,
+  );
   documented.sort_by(|a, b| a.1.cmp(&b.1));
 
-  let mut paths = Vec::with_capacity(documented.len());
+  let items = documented.len();
+  let mut paths = Vec::with_capacity(items);
   let mut collisions = 0usize;
   for group in documented.chunk_by(|a, b| a.1 == b.1) {
     if group.len() > 1 {
@@ -302,7 +347,11 @@ fn documented_items(root: &Path, crate_name: &str) -> Result<RustdocJson, Error>
     }
     paths.push(group[0].1.clone());
   }
-  Ok(RustdocJson::Items(DocumentedItems { paths, collisions }))
+  Ok(RustdocJson::Items(DocumentedItems {
+    paths,
+    items,
+    collisions,
+  }))
 }
 
 /// Whether `cargo +nightly` runs at all in `root`.
@@ -354,6 +403,31 @@ fn target_dir(root: &Path) -> PathBuf {
   }
 }
 
+/// How a child's name attaches to the path of the item that contains it.
+///
+/// Two variants because two namespaces: a struct's field and a method of the
+/// same name are different items that Rust lets coexist, and joining both with
+/// `::` gave them one path — see [`walk_item`]'s "Two items, two paths".
+#[derive(Clone, Copy)]
+enum Join {
+  /// `container::name`: a module item, an associated item, an enum variant —
+  /// everything Rust itself reaches through `::`.
+  Path,
+  /// `container.name`: a field of a struct, union, or enum variant, written
+  /// the way Rust writes reading one. A tuple field keeps its numeric name,
+  /// so it comes out as `Head.0`, which is also how it is read.
+  Field,
+}
+
+impl Join {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::Path => "::",
+      Self::Field => ".",
+    }
+  }
+}
+
 /// Walks the item tree from `id`, recording `(id, path::to::item)` in
 /// `documented` for every item that has both a name and a non-empty doc
 /// comment. The id travels alongside the path so the caller can tell when
@@ -368,14 +442,42 @@ fn target_dir(root: &Path) -> PathBuf {
 /// which are exactly the two largest categories of undocumented items here.
 /// So the path is rebuilt by hand while walking the containment tree instead:
 /// a module, struct, enum, trait, or union contributes its own name to the
-/// prefix its children see; an impl block has no name of its own and passes
-/// its container's prefix straight through to its methods and associated
-/// items. A local trait implemented for a foreign type (reachable only via
-/// the trait's `implementations`, not via any local struct/enum's `impls`) is
-/// the one shape this does not reach; `http1-proto` has none today.
+/// prefix its children see; an impl block has no name of its own and
+/// contributes its self type's arguments in place of one. A local trait
+/// implemented for a foreign type (reachable only via the trait's
+/// `implementations`, not via any local struct/enum's `impls`) is the one
+/// shape this does not reach; `http1-proto` has none today.
+///
+/// # Two items, two paths
+///
+/// A path built from names alone is not an identity. Nine paths in
+/// `http1-proto` were reached by two documented items each (#62), and a doc
+/// comment deleted from one of a pair left the path in the regenerated set
+/// and failed nothing — the exact loss [`continuity`] exists to catch. Two
+/// spellings tell them apart, and both are applied UNCONDITIONALLY. A
+/// discriminator added only where a collision happens to exist today would
+/// re-spell a path the day a neighbouring item arrives, and the snapshot is
+/// compared line by line, so that re-spelling reads as documentation lost.
+///
+/// - **A field joins with `.`, everything else with `::`.** `BodyDecoder`'s
+///   private `limit` field and the `limit()` that returns it are two items in
+///   two namespaces; `BodyDecoder.limit` and `BodyDecoder::limit` are how
+///   Rust itself writes that difference, so a snapshot line says which one it
+///   means without a legend to look up. The item's kind is the
+///   discriminator; field-access syntax is only how it is spelled.
+/// - **An impl contributes its self type's arguments**, so
+///   `Connection<Server, General>::send_interim` and
+///   `Connection<Server, Tunnel>::send_interim` are two lines rather than
+///   one. Arguments come from the self type rather than from the impl's own
+///   generic parameters: `impl<Ro> Connection<Ro, Tunnel>` declares one
+///   parameter and applies two arguments, and it is the arguments that tell
+///   it from `impl<Ro> Connection<Ro, General>`. They are re-rendered by
+///   [`type_name`] and never passed through raw — see there for why the
+///   JSON's own spelling is not stable enough to commit to a snapshot.
 fn walk_item(
   id: u64,
   prefix: &str,
+  join: Join,
   index: &HashMap<String, json::Value>,
   visited: &mut HashSet<u64>,
   documented: &mut Vec<(u64, String)>,
@@ -399,7 +501,7 @@ fn walk_item(
   let name = item.get("name").and_then(Value::as_str);
   let path = match name {
     Some(name) if prefix.is_empty() => name.to_string(),
-    Some(name) => format!("{prefix}::{name}"),
+    Some(name) => format!("{prefix}{}{name}", join.as_str()),
     None => prefix.to_string(),
   };
   if name.is_some() {
@@ -420,25 +522,54 @@ fn walk_item(
   };
 
   match kind.as_str() {
-    "module" => walk_all(as_ids(body.get("items")), &path, index, visited, documented),
+    "module" => walk_all(
+      as_ids(body.get("items")),
+      &path,
+      Join::Path,
+      index,
+      visited,
+      documented,
+    ),
     "struct" => {
       let struct_kind = body.get("kind");
       let fields = struct_kind
         .and_then(|k| k.get("plain"))
         .and_then(|p| p.get("fields"))
         .or_else(|| struct_kind.and_then(|k| k.get("tuple")));
-      walk_all(as_ids(fields), &path, index, visited, documented);
-      walk_all(as_ids(body.get("impls")), &path, index, visited, documented);
+      walk_all(
+        as_ids(fields),
+        &path,
+        Join::Field,
+        index,
+        visited,
+        documented,
+      );
+      walk_all(
+        as_ids(body.get("impls")),
+        &path,
+        Join::Path,
+        index,
+        visited,
+        documented,
+      );
     }
     "enum" => {
       walk_all(
         as_ids(body.get("variants")),
         &path,
+        Join::Path,
         index,
         visited,
         documented,
       );
-      walk_all(as_ids(body.get("impls")), &path, index, visited, documented);
+      walk_all(
+        as_ids(body.get("impls")),
+        &path,
+        Join::Path,
+        index,
+        visited,
+        documented,
+      );
     }
     "variant" => {
       let variant_kind = body.get("kind");
@@ -447,20 +578,49 @@ fn walk_item(
           .and_then(|k| k.get("struct"))
           .and_then(|s| s.get("fields"))
       });
-      walk_all(as_ids(fields), &path, index, visited, documented);
-    }
-    "trait" => walk_all(as_ids(body.get("items")), &path, index, visited, documented),
-    "union" => {
       walk_all(
-        as_ids(body.get("fields")),
+        as_ids(fields),
         &path,
+        Join::Field,
         index,
         visited,
         documented,
       );
-      walk_all(as_ids(body.get("impls")), &path, index, visited, documented);
     }
-    "impl" => walk_all(as_ids(body.get("items")), &path, index, visited, documented),
+    "trait" => walk_all(
+      as_ids(body.get("items")),
+      &path,
+      Join::Path,
+      index,
+      visited,
+      documented,
+    ),
+    "union" => {
+      walk_all(
+        as_ids(body.get("fields")),
+        &path,
+        Join::Field,
+        index,
+        visited,
+        documented,
+      );
+      walk_all(
+        as_ids(body.get("impls")),
+        &path,
+        Join::Path,
+        index,
+        visited,
+        documented,
+      );
+    }
+    "impl" => walk_all(
+      as_ids(body.get("items")),
+      &format!("{path}{}", impl_arguments(body)),
+      Join::Path,
+      index,
+      visited,
+      documented,
+    ),
     // Everything else (function, constant, static, macro, assoc_const,
     // assoc_type, struct_field, use, …) is a leaf: it has no children of its
     // own for a doc comment to live on. `use` in particular is deliberately
@@ -472,17 +632,18 @@ fn walk_item(
   }
 }
 
-/// Walks every id in `ids`, threading the shared `path` prefix and the
-/// traversal state through each.
+/// Walks every id in `ids`, threading the shared `path` prefix, the way they
+/// attach to it, and the traversal state through each.
 fn walk_all(
   ids: Vec<u64>,
   path: &str,
+  join: Join,
   index: &HashMap<String, json::Value>,
   visited: &mut HashSet<u64>,
   documented: &mut Vec<(u64, String)>,
 ) {
   for id in ids {
-    walk_item(id, path, index, visited, documented);
+    walk_item(id, path, join, index, visited, documented);
   }
 }
 
@@ -495,6 +656,126 @@ fn as_ids(value: Option<&json::Value>) -> Vec<u64> {
     .unwrap_or_default()
 }
 
+/// The `<A, B>` an impl block contributes to the path of every item inside
+/// it, or `""` when its self type takes no type or const arguments.
+///
+/// Read off the impl's SELF TYPE, which is where the arguments that separate
+/// two impls of one type live; `body` is the `impl` object out of rustdoc's
+/// JSON. An impl whose self type is not a resolved path — `impl Trait for
+/// [u8]`, of which `http1-proto` has two — has no argument list to read and
+/// contributes nothing, exactly as before #62.
+fn impl_arguments(body: &json::Value) -> String {
+  arguments(
+    body
+      .get("for")
+      .and_then(|self_type| self_type.get("resolved_path"))
+      .and_then(|resolved| resolved.get("args")),
+  )
+}
+
+/// rustdoc's angle-bracketed argument list rendered as `<A, B>`, or `""` when
+/// there is none and when every argument in it is a lifetime.
+///
+/// Lifetimes are dropped rather than rendered. Two impls of one type cannot
+/// differ by lifetime alone, so a lifetime never discriminates anything here,
+/// and a lifetime's NAME is exactly the kind of detail an unrelated edit
+/// renames — which would re-spell a committed snapshot line into a loss that
+/// did not happen. `Items<'a, 'c>` therefore stays `Items::input`, and its
+/// accessor is told from the `input` field by [`Join`] instead.
+///
+/// A generic type parameter's name IS kept — `Connection<Ro, Mo>`,
+/// `ParameterisedList<I>` — and the paragraph above is the argument against
+/// keeping it, so here is why it loses. The hazard transfers whole: rename
+/// `Ro` and every path under every impl that names it re-spells, and
+/// [`continuity`] reports each one as a documentation loss that did not
+/// happen. Nor is the name load-bearing for telling two items apart. Two
+/// impls whose self types differ only in what their parameters are NAMED are
+/// one impl and Rust rejects the pair, exactly as for lifetimes, so rendering
+/// every parameter as `_` would hold the collision count at zero too.
+///
+/// What decides it is the other thing a path here has to be: readable by a
+/// human diagnosing a lost doc comment. `Connection<Ro, Mo>::poll_event`
+/// names the parameters the impl header names, so its reader lands on
+/// `impl<Ro, Mo> Connection<Ro, Mo>`; `Connection<_, _>::poll_event` sends the
+/// same reader to sort `Connection`'s impl blocks by hand. A lifetime buys
+/// nothing on that side of the scale — so it is pure churn and goes — and a
+/// parameter name buys the diagnosis. The two renames are not the same event
+/// either. A type parameter is renamed by a deliberate edit to a signature,
+/// and its bless diff moves every line under that impl in lockstep, which
+/// reads as the rename it is; `--bless` is the answer, and the failure message
+/// already says so. A lifetime name churns incidentally — elision, a
+/// `single_use_lifetimes` fix — with no such signal, and nothing would be the
+/// answer to that.
+fn arguments(args: Option<&json::Value>) -> String {
+  let Some(list) = args
+    .and_then(|args| args.get("angle_bracketed"))
+    .and_then(|angle| angle.get("args"))
+    .and_then(json::Value::as_array)
+  else {
+    return String::new();
+  };
+  let rendered: Vec<String> = list
+    .iter()
+    .filter_map(|arg| {
+      arg.get("type").map(type_name).or_else(|| {
+        arg.get("const").map(|value| {
+          value
+            .get("expr")
+            .and_then(json::Value::as_str)
+            .unwrap_or("_")
+            .to_string()
+        })
+      })
+    })
+    .collect();
+  if rendered.is_empty() {
+    String::new()
+  } else {
+    format!("<{}>", rendered.join(", "))
+  }
+}
+
+/// One generic argument, spelled for a human reading a snapshot line.
+///
+/// Only the FINAL segment of a resolved path is kept, because the JSON's own
+/// spelling is not stable enough to commit: rustdoc writes the same type as
+/// `crate::connection::Tunnel` in one impl of `Connection` and as `Tunnel` in
+/// the next, within one crate's output. The final segment is the item's own
+/// name, which is the part that does not vary with how rustdoc chose to
+/// qualify it — and it is also the part a reader of a failure message needs.
+///
+/// Deliberately narrow beyond that. `resolved_path` and `generic` are every
+/// shape `http1-proto`'s impl self types use today — read out of the JSON,
+/// not assumed — `primitive` is the obvious next one and one line, and every
+/// other shape renders as `_`. That fallback is not a silent loss: two
+/// arguments that both render `_` collapse onto one path, which is precisely
+/// what [`DocumentedItems::collisions`] counts and
+/// [`DocumentedItems::collision_note`] prints on every run. Reporting the
+/// blind spot is this command's rule; growing a renderer for shapes this
+/// workspace does not have is not.
+fn type_name(ty: &json::Value) -> String {
+  let Some((kind, body)) = ty.as_object().and_then(|shape| shape.iter().next()) else {
+    return "_".to_string();
+  };
+  match kind.as_str() {
+    "generic" | "primitive" => body.as_str().unwrap_or("_").to_string(),
+    "resolved_path" => {
+      let name = body
+        .get("path")
+        .and_then(json::Value::as_str)
+        .map_or("_", final_segment);
+      format!("{name}{}", arguments(body.get("args")))
+    }
+    _ => "_".to_string(),
+  }
+}
+
+/// The last `::`-separated segment of `path`, or all of it when there is no
+/// separator.
+fn final_segment(path: &str) -> &str {
+  path.rsplit_once("::").map_or(path, |(_, name)| name)
+}
+
 /// The header substring that marks a table as governed by its own
 /// declaration — the whole of this check's discovery rule, named once so
 /// [`verdicts`] and the test that pins the real table cannot drift apart.
@@ -503,7 +784,9 @@ const GOVERNED_HEADER: &str = "| corner |";
 /// Fails when an `http1-proto` table with a [`GOVERNED_HEADER`] header uses a
 /// verdict word its own declaration does not list, declares a word no row
 /// uses, or carries a row whose verdict cell yields no verdict at all — see
-/// [`verdict_problems`]. Fails, too, when NO governed table is found.
+/// [`verdict_problems`] — and when a doc comment anywhere else in the crate
+/// writes one of the words that declaration lists, see "The vocabulary is
+/// reserved to the table" below. Fails, too, when NO governed table is found.
 ///
 /// A declaration bullet is `- **VERDICT** — reason`: the bold term
 /// immediately followed by an em dash. A bullet that reaches an em dash only
@@ -544,23 +827,82 @@ const GOVERNED_HEADER: &str = "| corner |";
 /// self-policing closing sentence, a table of sites — earns the same header
 /// and is picked up here without a code change.
 ///
-/// **The rule from the design this does NOT implement.** §5.2 states three;
-/// the two above are rules 1 and 2. Rule 3 — no comment ELSEWHERE in the
-/// crate assigns a different verdict word to a site the table names — is not
-/// here and is not planned as a heuristic: matching a prose sentence to a
-/// table row needs a rule for when two texts name the same site, and a fuzzy
-/// one either misses the case it exists for or reports every neighbouring
-/// paragraph. It is deferred with that reasoning recorded, and named here
-/// rather than only in the ledger, because a reader of this check would
-/// otherwise take the vocabulary for policed everywhere it is written.
+/// # The vocabulary is reserved to the table
+///
+/// The design's §5.2 states three rules; the two above are rules 1 and 2.
+/// The third — no comment ELSEWHERE in the crate assigns a DIFFERENT verdict
+/// to a site the table names — is implemented here in its exclusive form:
+///
+/// > a declared verdict word written in a doc run that is not the governed
+/// > table's own is a failure.
+///
+/// No site matching, and none needed. If the vocabulary can appear only
+/// inside the table, then no comment outside it can assign a DIFFERENT
+/// verdict to a governed site, because no comment outside it can assign a
+/// verdict at all — which is also what makes rules 1 and 2 worth more than
+/// the table's own internal consistency.
+///
+/// Three properties of how the words are read, each load-bearing:
+///
+/// - **They come from the table, never from a constant here.** The
+///   vocabulary is whatever the declaration this run just parsed lists. A
+///   literal in `xtask` would mean a reworded declaration silently stops
+///   being enforced, which is the `tables == 0` defect one level in;
+///   `the_reserved_vocabulary_comes_from_the_table_not_a_constant` pins it.
+/// - **A caps run is matched WHOLE, never by substring.** `GUARDED` is a
+///   prefix of `GUARDED BY A CALLER`, so a substring search reports every
+///   legitimate long form as a bare `GUARDED`. [`caps_runs`] reads maximal
+///   runs of ALL-CAPS words — the shape [`leading_caps`] already reads a
+///   cell's verdict with — and a run has to EQUAL a declared word. The
+///   boundary that leaves, stated: a caps run carrying an extra word,
+///   `NOT GUARDED`, equals nothing and is not read as a verdict claim.
+/// - **The declaration bullets are exempt by construction**, not by a
+///   special case. They sit in the same doc run as the table they declare,
+///   and the whole of that run is what is skipped —
+///   `the_declaration_bullets_are_not_their_own_violation`.
+///
+/// ## Why not the comparison §5.2 states literally
+///
+/// Because its candidate set is empty. Measured over `http1-proto/src`
+/// before this was built — a census of the corpus on the day it was taken,
+/// not a rule, so recount both numbers before reversing the decision:
+///
+/// - The three declared words occur on exactly **11 lines**, every one of
+///   them `connection/tunnel.rs`'s own declaration and rows, and on ZERO
+///   lines anywhere else. A check that fires only when some other comment
+///   writes `STRUCTURALLY EXCLUDED` about a site the table names would
+///   therefore govern nothing — today, and on the #55 defect it would have
+///   been written for, where the contradicting comment used no vocabulary
+///   word at all.
+/// - Matching a row's SITE identifier instead widens the candidate set on
+///   the wrong side: the ten identifiers the table names appear in **56 doc
+///   comments** outside `tunnel.rs`, nearly all of them ordinary API
+///   cross-references, against roughly three that discuss the close
+///   invariant. Telling those apart is the fuzzy matching #63 asks a design
+///   for, and 56 against 3 is that design's answer — a hard gate on such a
+///   ratio reports neighbouring paragraphs and is blessed into silence
+///   inside a week.
+///
+/// ## What still slips through
+///
+/// A prose PARAPHRASE that contradicts a row without writing a vocabulary
+/// word. That is the shape #63 was filed for and this does NOT close it.
+/// #55's own defect is the worked example: `SWITCH_AFTER_CLOSE`'s doc
+/// described the CONNECT corners as "deliberately excluded because `close`
+/// there admits a benign reading a 101's cannot", while
+/// `TunnelPhase::Switched`'s table stated the invariant unqualified, with no
+/// such exclusion — two documents, one rule, opposite answers. Every word of
+/// that prose is lower case, so the reservation above passes over it in
+/// silence. A reader who takes this check for "the table and the crate
+/// cannot disagree" has been told more than it does.
 fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
   let dir = root.join("http1-proto/src");
   let mut files = Vec::new();
   collect_rs_files(&dir, &mut files)?;
   files.sort();
 
-  let mut tables = 0usize;
-  let mut problems = 0usize;
+  let mut governed: Vec<(String, DocRun)> = Vec::new();
+  let mut elsewhere: Vec<(String, DocRun)> = Vec::new();
   for file in &files {
     let text = fs::read_to_string(file)?;
     let display = file
@@ -569,16 +911,32 @@ fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
       .display()
       .to_string();
     for run in doc_runs(&text) {
-      if !run.contains(GOVERNED_HEADER) {
-        continue;
-      }
-      tables += 1;
-      for problem in verdict_problems(&run) {
-        problems += 1;
-        report.fail(format!("{display}: {problem}"));
+      if run.text.contains(GOVERNED_HEADER) {
+        governed.push((display.clone(), run));
+      } else {
+        elsewhere.push((display.clone(), run));
       }
     }
   }
+
+  let mut problems = 0usize;
+  let mut vocabulary: Vec<(String, String)> = Vec::new();
+  for (display, run) in &governed {
+    for problem in verdict_problems(&run.text) {
+      problems += 1;
+      report.fail(format!("{display}: {problem}"));
+    }
+    for (offset, verdict) in declarations(&run.text) {
+      if !vocabulary.iter().any(|(word, _)| word == verdict) {
+        vocabulary.push((
+          verdict.to_string(),
+          format!("{display}:{}", run.line + offset),
+        ));
+      }
+    }
+  }
+
+  let tables = governed.len();
   if tables == 0 {
     problems += 1;
     report.fail(format!(
@@ -592,8 +950,39 @@ fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
       dir.strip_prefix(root).unwrap_or(&dir).display()
     ));
   }
+
+  let mut carrying = 0usize;
+  for (display, run) in &elsewhere {
+    let mut carried = false;
+    for (offset, caps) in caps_runs(&run.text) {
+      let Some((_, declared_at)) = vocabulary.iter().find(|(word, _)| *word == caps) else {
+        continue;
+      };
+      carried = true;
+      problems += 1;
+      report.fail(format!(
+        "{display}:{}: the verdict `{caps}` is written in a doc comment outside \
+         the table that declares it ({declared_at}).\n  \
+         That vocabulary is reserved to the declaring table's own rows: written \
+         anywhere else it assigns a verdict to a site without being held to the \
+         declaration, which is how a comment comes to contradict the row for the \
+         same site.\n  \
+         Make this a row in that table, or reword it so it is not claiming a \
+         verdict.",
+        run.line + offset
+      ));
+    }
+    if carried {
+      carrying += 1;
+    }
+  }
+
   report.checked(format!(
-    "table-verdicts: {tables} table(s) checked, {problems} problem(s)"
+    "table-verdicts: {tables} table(s) checked, {problems} problem(s); {} declared \
+     verdict word(s) reserved to them, {} doc run(s) elsewhere scanned, {carrying} \
+     carried one",
+    vocabulary.len(),
+    elsewhere.len()
   ));
   Ok(())
 }
@@ -611,30 +1000,55 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
   Ok(())
 }
 
+/// One maximal doc-comment run, and the 1-based file line its first line
+/// sits on.
+///
+/// The line travels with the text because a failure about a doc comment owes
+/// its reader a place to open. A run is joined into one string for matching
+/// and is CONTIGUOUS by construction, so `line` plus a 0-based offset within
+/// the run is that offset's own file line — which is how [`caps_runs`] and
+/// [`declarations`] report positions without re-scanning the file.
+struct DocRun {
+  line: usize,
+  text: String,
+}
+
 /// Splits `text` into its maximal contiguous doc-comment runs — `///` or
-/// `//!` lines with the marker stripped, joined by `\n`. An ordinary `//`
-/// comment or a code line ends a run without starting one; the run it ends
-/// is kept and a run still open at EOF is kept too, but an empty run never
-/// is.
-fn doc_runs(text: &str) -> Vec<String> {
+/// `//!` lines with the marker stripped, joined by `\n`, each carrying the
+/// file line it starts on. An ordinary `//` comment or a code line ends a
+/// run without starting one; the run it ends is kept and a run still open at
+/// EOF is kept too, but an empty run never is.
+fn doc_runs(text: &str) -> Vec<DocRun> {
   let mut runs = Vec::new();
   let mut current: Vec<&str> = Vec::new();
-  for line in text.lines() {
-    let trimmed = line.trim_start();
+  let mut line = 0usize;
+  for (offset, raw) in text.lines().enumerate() {
+    let trimmed = raw.trim_start();
     let stripped = trimmed
       .strip_prefix("///")
       .or_else(|| trimmed.strip_prefix("//!"));
     match stripped {
-      Some(rest) => current.push(rest),
+      Some(rest) => {
+        if current.is_empty() {
+          line = offset + 1;
+        }
+        current.push(rest);
+      }
       None if !current.is_empty() => {
-        runs.push(current.join("\n"));
+        runs.push(DocRun {
+          line,
+          text: current.join("\n"),
+        });
         current.clear();
       }
       None => {}
     }
   }
   if !current.is_empty() {
-    runs.push(current.join("\n"));
+    runs.push(DocRun {
+      line,
+      text: current.join("\n"),
+    });
   }
   runs
 }
@@ -651,7 +1065,10 @@ fn doc_runs(text: &str) -> Vec<String> {
 /// collecting every bolded bullet without the guard reads the former as a
 /// verdict too, then reports it declared-but-unused: two failures about a
 /// sentence making no vocabulary claim at all. Pinned by
-/// `a_bold_bullet_that_is_not_a_definition_is_not_a_declared_verdict`.
+/// `a_bold_bullet_that_is_not_a_definition_is_not_a_declared_verdict`. The
+/// rule itself lives in [`declared_verdict`], because [`verdicts`] reserves
+/// the same vocabulary and the two must not be able to disagree about what
+/// declares it.
 ///
 /// **A row whose verdict cell yields no verdict is a problem, not a pass.**
 /// [`leading_caps`] reads only a LEADING run of ALL-CAPS words, so a cell
@@ -668,17 +1085,16 @@ fn doc_runs(text: &str) -> Vec<String> {
 /// rather than a verdict) out of the rule the header row would otherwise be
 /// the first to break.
 fn verdict_problems(doc: &str) -> Vec<String> {
-  let mut declared: Vec<String> = Vec::new();
+  let declared: Vec<String> = declarations(doc)
+    .into_iter()
+    .map(|(_, verdict)| verdict.to_string())
+    .collect();
   let mut used: Vec<String> = Vec::new();
   let mut problems = Vec::new();
   let mut in_body = false;
   for line in doc.lines() {
     let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix("- **")
-      && let Some(end) = rest.find("**")
-      && rest[end + 2..].trim_start().starts_with('—')
-    {
-      declared.push(rest[..end].to_string());
+    if declared_verdict(trimmed).is_some() {
       continue;
     }
     if trimmed.starts_with("|---") {
@@ -727,16 +1143,93 @@ fn verdict_problems(doc: &str) -> Vec<String> {
   problems
 }
 
+/// Every declaration bullet in `doc`, as the 0-based line offset within
+/// `doc` it sits on and the verdict it declares.
+fn declarations(doc: &str) -> Vec<(usize, &str)> {
+  doc
+    .lines()
+    .enumerate()
+    .filter_map(|(offset, line)| declared_verdict(line).map(|verdict| (offset, verdict)))
+    .collect()
+}
+
+/// The verdict `line` declares, or `None` when `line` is not a declaration
+/// bullet — see [`verdict_problems`] for the shape and why the em dash is
+/// part of it.
+///
+/// One matcher, two readers. [`verdict_problems`] collects the vocabulary a
+/// governed table declares; [`verdicts`] reserves that vocabulary to the run
+/// it was declared in. A second spelling of the rule in either place would
+/// let the two disagree about what a declaration IS, and the one that
+/// disagreed downward would stop enforcing without ever failing.
+fn declared_verdict(line: &str) -> Option<&str> {
+  let rest = line.trim().strip_prefix("- **")?;
+  let end = rest.find("**")?;
+  rest[end + 2..]
+    .trim_start()
+    .starts_with('—')
+    .then_some(&rest[..end])
+}
+
+/// Every maximal run of ALL-CAPS words in `doc`, each with the 0-based line
+/// offset within `doc` its first word sits on.
+///
+/// Runs rather than words, because half this vocabulary is multi-word and
+/// `GUARDED` is a PREFIX of `GUARDED BY A CALLER`: a caller that searched
+/// word by word would report every legitimate long form as a bare `GUARDED`.
+/// A run is handed back whole and compared for equality instead — the same
+/// answer [`leading_caps`] gives a table cell, reached the same way.
+///
+/// A word is stripped of surrounding markup before the test, since
+/// `` `GUARDED` ``, `**GUARDED**` and `EXCLUDED.` are one word wearing
+/// markdown or punctuation. `_` is deliberately NOT stripped and not a caps
+/// character, so a screaming-snake constant — `TAKEOVER_STATES_NO_CLOSE` —
+/// breaks a run rather than joining it. A line break does not break a run: a
+/// wrapped sentence still says what it says.
+fn caps_runs(doc: &str) -> Vec<(usize, String)> {
+  let mut runs = Vec::new();
+  let mut current: Vec<&str> = Vec::new();
+  let mut start = 0usize;
+  for (offset, line) in doc.lines().enumerate() {
+    for word in line.split_whitespace() {
+      let word =
+        word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+      if is_caps_word(word) {
+        if current.is_empty() {
+          start = offset;
+        }
+        current.push(word);
+      } else if !current.is_empty() {
+        runs.push((start, current.join(" ")));
+        current.clear();
+      }
+    }
+  }
+  if !current.is_empty() {
+    runs.push((start, current.join(" ")));
+  }
+  runs
+}
+
 /// The leading run of ALL-CAPS words in `cell`.
 fn leading_caps(cell: &str) -> String {
   cell
     .split_whitespace()
-    .take_while(|word| {
-      word.chars().any(|ch| ch.is_ascii_uppercase())
-        && word.chars().all(|ch| ch.is_ascii_uppercase() || ch == '-')
-    })
+    .take_while(|word| is_caps_word(word))
     .collect::<Vec<_>>()
     .join(" ")
+}
+
+/// Whether `word` is a single ALL-CAPS word: at least one upper-case letter,
+/// and nothing in it that is not one or a hyphen.
+///
+/// The one test behind both readings of the vocabulary — a table cell's
+/// leading verdict ([`leading_caps`]) and a verdict written loose in prose
+/// ([`caps_runs`]) — so a word cannot be a verdict on one side of the
+/// reservation and not the other.
+fn is_caps_word(word: &str) -> bool {
+  word.chars().any(|ch| ch.is_ascii_uppercase())
+    && word.chars().all(|ch| ch.is_ascii_uppercase() || ch == '-')
 }
 
 /// Fails when a `http1-proto` comment path-qualifies a callee — `` `module::
@@ -1672,6 +2165,87 @@ mod tests {
     assert!(super::lost_docs(&snapshot, &current).is_empty());
   }
 
+  // #62, as a fixture: `walk_item` gave a field and its accessor one path,
+  // and gave one method name declared in two differently-parameterized impls
+  // one path, so a doc deleted from either half failed nothing. The two impls
+  // below also spell the SAME types two ways — `crate::c::Server` in one and
+  // `Server` in the next — and carry a lifetime argument each, because
+  // rustdoc really does vary both within a single crate's JSON and a path
+  // that varied with it would fail the snapshot for no reason at all.
+  #[test]
+  fn a_field_its_accessor_and_an_impl_twin_are_three_paths() {
+    let value = super::json::parse(
+      r#"{
+        "root": 0,
+        "index": {
+          "0": {"crate_id": 0, "name": "c", "docs": "", "inner": {"module": {"items": [1]}}},
+          "1": {"crate_id": 0, "name": "S", "docs": "the struct",
+                "inner": {"struct": {"kind": {"plain": {"fields": [2]}}, "impls": [3, 5]}}},
+          "2": {"crate_id": 0, "name": "limit", "docs": "the field",
+                "inner": {"struct_field": {"primitive": "usize"}}},
+          "3": {"crate_id": 0, "name": null, "docs": "", "inner": {"impl": {
+                  "for": {"resolved_path": {"path": "crate::c::S", "args": {"angle_bracketed": {
+                    "args": [{"lifetime": "'a"},
+                             {"type": {"resolved_path": {"path": "crate::c::Server", "args": null}}},
+                             {"type": {"resolved_path": {"path": "General", "args": null}}}],
+                    "constraints": []}}}},
+                  "items": [4]}}},
+          "4": {"crate_id": 0, "name": "limit", "docs": "the accessor",
+                "inner": {"function": {}}},
+          "5": {"crate_id": 0, "name": null, "docs": "", "inner": {"impl": {
+                  "for": {"resolved_path": {"path": "S", "args": {"angle_bracketed": {
+                    "args": [{"lifetime": "'b"},
+                             {"type": {"resolved_path": {"path": "Server", "args": null}}},
+                             {"type": {"resolved_path": {"path": "crate::c::Tunnel", "args": null}}}],
+                    "constraints": []}}}},
+                  "items": [6]}}},
+          "6": {"crate_id": 0, "name": "limit", "docs": "the tunnel accessor",
+                "inner": {"function": {}}}
+        }
+      }"#,
+    )
+    .unwrap();
+    let index = value
+      .get("index")
+      .and_then(super::json::Value::as_object)
+      .unwrap();
+    let mut visited = std::collections::HashSet::new();
+    let mut documented = Vec::new();
+    super::walk_item(
+      0,
+      "",
+      super::Join::Path,
+      index,
+      &mut visited,
+      &mut documented,
+    );
+    let mut paths: Vec<String> = documented.into_iter().map(|(_, path)| path).collect();
+    paths.sort();
+    assert_eq!(
+      paths,
+      [
+        "c::S",
+        "c::S.limit",
+        "c::S<Server, General>::limit",
+        "c::S<Server, Tunnel>::limit",
+      ]
+    );
+  }
+
+  // A lifetime cannot be what separates two impls of one type, and its name is
+  // the kind of detail an unrelated edit renames, so an argument list holding
+  // nothing else contributes nothing — `Items<'a, 'c>`'s methods stay
+  // `Items::…` and are told from its fields by the field join instead.
+  #[test]
+  fn an_argument_list_of_only_lifetimes_contributes_nothing() {
+    let value = super::json::parse(
+      r#"{"angle_bracketed": {"args": [{"lifetime": "'a"}, {"lifetime": "'c"}],
+          "constraints": []}}"#,
+    )
+    .unwrap();
+    assert_eq!(super::arguments(Some(&value)), "");
+  }
+
   // The brief's own fixture for this test declared two verdicts and used
   // neither in a row, so — under the brief's own `verdict_problems`, run
   // verbatim before this file added rows for them — it failed its own
@@ -1899,6 +2473,45 @@ fn open_request(view: &HeadView<'_>) -> bool {
     ));
   }
 
+  // A governed run in the shape `verdicts` discovers one: the declaration
+  // bullets and the table they govern inside ONE doc run, which is what makes
+  // the bullets exempt from the reservation without a special case for them.
+  const GOVERNED: &str = "\
+/// - **GUARDED** — it asks the close question itself.
+/// - **GUARDED BY A CALLER** — an earlier gate makes the state unreachable.
+/// - **STRUCTURALLY EXCLUDED** — the site cannot reach this state at all.
+///
+/// | corner | site | verdict |
+/// |---|---|---|
+/// | originate | `open_request` | GUARDED — ok |
+/// | receive | `into_tunnel` | GUARDED BY A CALLER — ok |
+/// | emit | `send_response` | STRUCTURALLY EXCLUDED — a 101 is refused |
+fn switched() {}
+";
+
+  // `verdicts` reads the filesystem, so every test of it needs a crate root
+  // on disk. Removed before it is written as well as after: a run killed
+  // half way through must not leave a file behind that silently joins what
+  // the next run scans.
+  fn scratch_crate(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("xtask-{name}-{}", std::process::id()));
+    let src = root.join("http1-proto").join("src");
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&src).expect("a scratch crate root");
+    for (file, text) in files {
+      std::fs::write(src.join(file), text).expect("a source file");
+    }
+    root
+  }
+
+  fn verdicts_over(root: &std::path::Path) -> Report {
+    let mut report = Report::new();
+    let ran = super::verdicts(root, &mut report);
+    std::fs::remove_dir_all(root).ok();
+    ran.expect("the check itself runs");
+    report
+  }
+
   // The floor under discovery. Renaming one word of the header substring
   // un-governs the crate's only governed table, and every run after that
   // reports zero tables and zero problems and exits 0 — a check governing
@@ -1906,23 +2519,19 @@ fn open_request(view: &HeadView<'_>) -> bool {
   // so this hands it a crate root whose only table is not a governed one.
   #[test]
   fn a_run_that_governs_no_table_fails() {
-    let root = std::env::temp_dir().join(format!("xtask-verdicts-floor-{}", std::process::id()));
-    let src = root.join("http1-proto").join("src");
-    std::fs::create_dir_all(&src).expect("a scratch crate root");
-    std::fs::write(
-      src.join("lib.rs"),
-      "\
+    let root = scratch_crate(
+      "verdicts-floor",
+      &[(
+        "lib.rs",
+        "\
 /// | side | verdict |
 /// |---|---|
 /// | a | GUARDED |
 fn f() {}
 ",
-    )
-    .expect("a source file whose table is not governed");
-    let mut report = Report::new();
-    let ran = super::verdicts(&root, &mut report);
-    std::fs::remove_dir_all(&root).ok();
-    ran.expect("the check itself runs");
+      )],
+    );
+    let report = verdicts_over(&root);
     assert_eq!(report.failures.len(), 1);
     assert!(
       report.failures[0].contains("governed nothing"),
@@ -1948,7 +2557,8 @@ fn f() {}
     let text = std::fs::read_to_string(&path).expect("http1-proto's tunnel.rs");
     let governed: Vec<String> = super::doc_runs(&text)
       .into_iter()
-      .filter(|run| run.contains(super::GOVERNED_HEADER))
+      .filter(|run| run.text.contains(super::GOVERNED_HEADER))
+      .map(|run| run.text)
       .collect();
     assert_eq!(
       governed.len(),
@@ -1960,6 +2570,185 @@ fn f() {}
       "the governed run must be the one carrying the verdict declaration"
     );
     assert!(super::verdict_problems(&governed[0]).is_empty());
+
+    // The LIVE declaration bullets would each be matched by the reservation,
+    // and are spared only because they share this run with the table they
+    // declare. Read off the real file rather than asserted in the abstract:
+    // a declaration reworded into a shape `caps_runs` no longer sees would
+    // leave the exemption exempting nothing, with nothing to notice it.
+    let caps: Vec<String> = super::caps_runs(&governed[0])
+      .into_iter()
+      .map(|(_, run)| run)
+      .collect();
+    for (_, verdict) in super::declarations(&governed[0]) {
+      assert!(
+        caps.iter().any(|run| run == verdict),
+        "the live declaration of `{verdict}` must be a caps run the reservation would match"
+      );
+    }
+  }
+
+  // Rule 3 in the exclusive form, over a crate root: the vocabulary is the
+  // table's, so writing one of its words in any other doc run is a failure.
+  // The claim sits on the run's THIRD line and the run opens on line 4, so
+  // the reported line pins the offset arithmetic and not just the run's own
+  // start — a failure naming the wrong line sends its reader to a comment
+  // that does not say what it was told.
+  #[test]
+  fn a_verdict_written_outside_the_governed_table_is_a_failure() {
+    let root = scratch_crate(
+      "verdicts-reserved",
+      &[
+        ("tunnel.rs", GOVERNED),
+        (
+          "outbound.rs",
+          "\
+// not a doc comment
+fn head() {}
+
+/// The 101 branch this mode never takes.
+///
+/// `send_response` is STRUCTURALLY EXCLUDED — a 101 is refused outright.
+fn send_response() {}
+",
+        ),
+      ],
+    );
+    let report = verdicts_over(&root);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+      report.failures[0].starts_with(
+        "http1-proto/src/outbound.rs:6: the verdict `STRUCTURALLY EXCLUDED` is written"
+      ),
+      "{}",
+      report.failures[0]
+    );
+    assert!(
+      report.failures[0].contains("reword it so it is not claiming a"),
+      "the failure must say what to do instead: {}",
+      report.failures[0]
+    );
+    assert!(
+      report.lines[0].contains(
+        "3 declared verdict word(s) reserved to them, 1 doc run(s) elsewhere scanned, 1 carried one"
+      ),
+      "{}",
+      report.lines[0]
+    );
+  }
+
+  // `GUARDED` is a prefix of `GUARDED BY A CALLER`, and a substring search
+  // would report every legitimate long form as a bare `GUARDED` — naming a
+  // word the comment does not say and a rule it does not break.
+  #[test]
+  fn the_long_verdict_is_named_whole_not_as_its_prefix() {
+    let root = scratch_crate(
+      "verdicts-prefix",
+      &[
+        ("tunnel.rs", GOVERNED),
+        (
+          "mod.rs",
+          "\
+/// `into_tunnel` is GUARDED BY A CALLER — `commit_head` takes it out of `Open`.
+fn into_tunnel() {}
+",
+        ),
+      ],
+    );
+    let report = verdicts_over(&root);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+      report.failures[0].contains("the verdict `GUARDED BY A CALLER` is written"),
+      "{}",
+      report.failures[0]
+    );
+    assert!(
+      !report.failures[0].contains("the verdict `GUARDED` is written"),
+      "the long form must not be reported as its own prefix: {}",
+      report.failures[0]
+    );
+  }
+
+  // The bullets declaring the vocabulary sit in the governed run, so the
+  // whole-run exemption covers them and no special case is needed. The
+  // printed line is pinned entire here because this is the shape a real run
+  // has: zero findings, and a denominator that says so out loud rather than
+  // leaving "checked" indistinguishable from "never looked".
+  #[test]
+  fn the_declaration_bullets_are_not_their_own_violation() {
+    let root = scratch_crate("verdicts-exempt", &[("tunnel.rs", GOVERNED)]);
+    let report = verdicts_over(&root);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+      report.lines[0],
+      "table-verdicts: 1 table(s) checked, 0 problem(s); 3 declared verdict word(s) \
+       reserved to them, 0 doc run(s) elsewhere scanned, 0 carried one"
+    );
+  }
+
+  // The reserved words are the ones the table declares, not a literal in
+  // `xtask`: this crate root declares `FENCED` and never `GUARDED`, so
+  // `FENCED` outside the table is the failure and `GUARDED` outside it is
+  // not. Hard-coding the live vocabulary here would invert both, and a
+  // reworded declaration would stop being enforced without failing anything.
+  #[test]
+  fn the_reserved_vocabulary_comes_from_the_table_not_a_constant() {
+    let root = scratch_crate(
+      "verdicts-vocabulary",
+      &[
+        (
+          "tunnel.rs",
+          "\
+/// - **FENCED** — it asks the close question itself.
+///
+/// | corner | site | verdict |
+/// |---|---|---|
+/// | originate | `open_request` | FENCED — ok |
+fn switched() {}
+",
+        ),
+        (
+          "mod.rs",
+          "\
+/// `open_request` is FENCED, and its neighbour is GUARDED.
+fn open_request() {}
+",
+        ),
+      ],
+    );
+    let report = verdicts_over(&root);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+      report.failures[0].contains("the verdict `FENCED` is written"),
+      "{}",
+      report.failures[0]
+    );
+  }
+
+  // The two decisions inside `caps_runs` a later edit could quietly reverse.
+  // Markup and trailing punctuation are not part of a word, so a verdict in
+  // backticks or ending a sentence still matches; `_` is, so a
+  // screaming-snake constant breaks a run instead of joining the verdict
+  // beside it into a run that matches nothing.
+  #[test]
+  fn caps_runs_strips_markup_and_breaks_on_a_constant() {
+    assert_eq!(
+      super::caps_runs(
+        "a `GUARDED` cell\nand STRUCTURALLY EXCLUDED.\nthen GUARDED TAKEOVER_STATES_NO_CLOSE BY A CALLER"
+      ),
+      vec![
+        (0, "GUARDED".to_string()),
+        (1, "STRUCTURALLY EXCLUDED".to_string()),
+        (2, "GUARDED".to_string()),
+        (2, "BY A CALLER".to_string()),
+      ]
+    );
+    // And a line break is not a word boundary the vocabulary respects: a
+    // wrapped verdict is still the verdict it spells.
+    assert_eq!(
+      super::caps_runs("is GUARDED BY A\nCALLER — the gate is upstream."),
+      vec![(0, "GUARDED BY A CALLER".to_string())]
+    );
   }
 
   // A cell that opens in lower case yields no verdict, so before this rule it

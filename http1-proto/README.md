@@ -38,6 +38,10 @@ The scope is a complete HTTP/1.1 **message and connection** layer:
 - **Semantics** (RFC 9112 §3.2, §6.1, §6.3): the `Host` rule, `Content-Length`
   and `Transfer-Encoding` validation, and the §6.3 body-length decision list
   applied branch-for-branch **in its stated order**.
+- **Media** (RFC 9110 §8.3.1, §12.5.1): a `Content-Type` value's `type/subtype`
+  and parameters, and an `Accept` field's ranges, walked over the same §5.6.6
+  parameter grammar; a candidate is matched against those ranges by composing
+  §12.5.1's precedence with the §12.4.2 `qvalue` weight.
 - **Bodies**: counted, chunked (RFC 9112 §7.1, with bounded `chunk-ext` and a
   trailer section), read-to-close, and none.
 - **Encoders**: validated request/status heads and chunk framing, written into a
@@ -148,9 +152,14 @@ example below; the seventh is the error path, and it is the second example.
    transport and nothing else — it cannot see your buffer, so it never concludes
    that a message was truncated. An **empty slice** is a sufficient offer, and is
    what resolves the EOF when your buffer is already empty.
-7. On `Err` from `Items::next` (or from `handle_eof`) the connection has
-   **latched**: the violation is handed back exactly once and nothing more will
-   parse. A *server* whose response has not started going out is left owing
+7. `Err` from `Items::next` (or from `handle_eof`) is not one outcome but two.
+   `Error::Protocol` **latches** the connection: the violation is handed back
+   exactly once, nothing more will parse, and `transport()` now reads `Failed`.
+   `Error::Refused` does **not** latch — this end's own policy closed the
+   exchange, not a wire fault — so `transport()` reads `Ending` instead.
+   `transport()` is the authority on what to do with the transport; ask it
+   rather than inferring from which error came back. A *server* whose response
+   has not started going out is left owing
    exactly one answer — `is_awaiting_send()` reports it — so read
    `Error::suggested_status()`, write it with `send_error_response()`, and close
    the transport. Everything else (a client, or a server whose response is
