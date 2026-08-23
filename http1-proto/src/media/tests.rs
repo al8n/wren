@@ -95,9 +95,13 @@ fn media_type_refuses_what_is_not_type_solidus_subtype() {
     b"application".as_slice(), // no solidus
     b"/json",                  // empty type
     b"application/",           // empty subtype
-    b"/",                      // both halves empty at once
-    b"appli cation/json",      // space is not a tchar
-    b"application/js/on",      // two solidi: the second is not a tchar
+    // Pinned as the shortest input's own answer, not as coverage of a
+    // distinct path: under the natural mutation of the code this guards,
+    // `/json` above already fails first, so this row's own assertion never
+    // fires alone.
+    b"/",                 // both halves empty at once
+    b"appli cation/json", // space is not a tchar
+    b"application/js/on", // two solidi: the second is not a tchar
   ] {
     assert_eq!(media_type(bad), Err(MediaError::NotAMediaType), "{:?}", bad);
   }
@@ -994,6 +998,16 @@ fn a_candidate_past_the_tracking_bound_is_refused_not_mis_ranked() {
   assert_eq!(
     weight_for(&seventeen, [b"text/plain;p1=1;q=0.7".as_slice()]),
     Ok(Weight(700))
+  );
+  // A range parameter whose only match sits at the candidate's 17th instance
+  // (index 16): the walk exhausts the tracking bound before it ever reaches
+  // that instance, so this takes the same `TooManyParameters` arm the
+  // no-match case above does, not a distinct code path. It pins that the
+  // sharp edge sits at 16, and that overflowing it is reported as a refusal
+  // rather than as a silent non-match.
+  assert_eq!(
+    weight_for(&seventeen, [b"text/plain;p17=17;q=0.7".as_slice()]),
+    Err(MediaError::TooManyParameters)
   );
 }
 

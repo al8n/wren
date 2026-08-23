@@ -2353,15 +2353,15 @@ pub(crate) const fn body_refused(recv: &RecvState, exchange: &Option<Exchange>) 
 /// A client that refuses the RESPONSE it is reading has decided not to read the
 /// rest of it, so under §9.3's second sentence this connection cannot be
 /// reused; a request body still going out serves no exchange that can complete,
-/// and §9.5 lets this end "close the connection at any time". `abandon_send` is
-/// therefore right here — but §9.5's other sentence, "If the client sees a
-/// response that indicates the server does not wish to receive the message body
-/// and is closing the connection, the client SHOULD immediately cease
-/// transmitting the body and close its side of the connection", is NOT the
-/// authority for it: that one governs a client reacting to a server's refusal
-/// of the client's REQUEST body, and no such response exists here. The
-/// citation is recorded because `xtask quote-check` proves a quotation
-/// verbatim and says nothing about whether it governs.
+/// and §9.5 lets this end "close the transport connection at any time".
+/// `abandon_send` is therefore right here — but §9.5's other sentence, "If the
+/// client sees a response that indicates the server does not wish to receive
+/// the message body and is closing the connection, the client SHOULD
+/// immediately cease transmitting the body and close its side of the
+/// connection", is NOT the authority for it: that one governs a client
+/// reacting to a server's refusal of the client's REQUEST body, and no such
+/// response exists here. The citation is recorded because `xtask quote-check`
+/// proves a quotation verbatim and says nothing about whether it governs.
 ///
 /// # After it
 ///
