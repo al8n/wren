@@ -244,6 +244,12 @@ impl Weight {
 /// `None` for anything else, INCLUDING a value that is a perfectly good
 /// `parameter` value — `q=blah`, `q=1.5`, `q=0.5000`. Note that `0.` and `1.`
 /// ARE valid: `[ "." 0*3DIGIT ]` admits zero digits after the dot.
+///
+/// Crate-private: [`weight_for`] is the public derivation §12.5.1 and §12.4.2
+/// settle between them, and a caller reading a bare `q` parameter out of a
+/// field it walked itself is reading one member of a list this module already
+/// walks. The link-time panic proof reaches it through
+/// `__no_panic_internals`, which is what keeps it from having to be `pub`.
 pub(crate) fn parse_qvalue(v: &[u8]) -> Option<Weight> {
   let (first, rest) = v.split_first()?;
   let one = match *first {
@@ -496,9 +502,8 @@ where
 /// `text/plain` spend no slot, so they keep matching a candidate with any
 /// number of parameters.
 ///
-/// A parse-constant like [`MAX_HEADERS`](crate::MAX_HEADERS), not a
-/// [`Limits`](crate::Limits) knob: the storage is in the binary, so a caller
-/// cannot raise it.
+/// A parse-constant rather than a caller-set knob: the storage is in the
+/// binary, so a caller cannot raise it.
 pub const MAX_TRACKED_PARAMS: usize = 16;
 
 /// Whether two parameter values are the same value, folding ASCII case when
@@ -801,7 +806,7 @@ where
 /// a second reader of the same field, deciding differently.
 ///
 /// ```
-/// use http1_proto::media::{media_type, weight_for, weight_for_with, Weight};
+/// use http_semantics::media::{media_type, weight_for, weight_for_with, Weight};
 ///
 /// let candidate = media_type(b"application/eat+cwt;eat_profile=\"tag:evidence.example,2022\"")?;
 /// let field = b"application/eat+cwt;eat_profile=\"TAG:EVIDENCE.EXAMPLE,2022\";q=0, */*;q=1";
@@ -816,7 +821,7 @@ where
 ///     && name.eq_ignore_ascii_case(b"eat_profile")
 /// })?;
 /// assert_eq!(weight, Weight::ZERO);
-/// # Ok::<(), http1_proto::media::MediaError>(())
+/// # Ok::<(), http_semantics::media::MediaError>(())
 /// ```
 ///
 /// # Errors

@@ -9,7 +9,7 @@
 //! [`Negotiated`] is `Copy` and fully available on the bare `no_std` tier.
 
 use derive_more::{IsVariant, TryUnwrap};
-use http1_proto::grammar::{is_token, is_token_byte, list_elements, trim_ows};
+use http_semantics::grammar::{is_token, is_token_byte, list_elements, trim_ows};
 
 /// Maximum retained subprotocol length, on every tier. Longer offers are
 /// rejected as [`NegotiationError::InvalidSubprotocol`].
@@ -493,11 +493,12 @@ fn parse_param(param: &[u8]) -> Result<(&[u8], ExtensionValue<'_>), Malformed> {
 /// 7692 §7 makes a grant the client will not accept fail the connection, so
 /// there it refuses a conforming handshake.
 ///
-/// # Why not `http1_proto::grammar::parameterised_list`
+/// # Why not `http_semantics::grammar::parameterised_list`
 ///
 /// Because §9.1's grammar is not RFC 9110 §5.6.6's, and the two disagree in
 /// BOTH directions:
 ///
+// gate-exempt: x = 1 — an INSTANCE the imported RFC 2616 rule admits, not a production; no spec spells this string
 /// - §9.1 states its ABNF in RFC 2616's syntax "including the 'implied *LWS
 ///   rule'", so `x = 1` is a conforming `extension-param` there. §5.6.6 removed
 ///   that rule, and the walker implements §5.6.6 — deliberately, because that is
@@ -627,7 +628,7 @@ fn unescaped_is_token(interior: &[u8]) -> bool {
 mod deflate {
   use super::{ExtensionParams, ExtensionValue, NegotiationError, extension_list};
   use crate::{error::BufferTooSmallDetail, handshake::WriteCursor};
-  use http1_proto::grammar::is_token;
+  use http_semantics::grammar::is_token;
 
   /// How large a buffer holds any `Sec-WebSocket-Extensions` value this crate
   /// RENDERS — [`DeflateOffer::write`] and [`DeflateResponse::write`], and the

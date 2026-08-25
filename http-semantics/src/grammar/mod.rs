@@ -322,7 +322,7 @@ fn valid_pq_bytes(bytes: impl Iterator<Item = u8>, mut in_query: bool) -> bool {
 
 /// Skips RFC 9110 §5.6.3 `OWS` (and `BWS`, which §5.6.3 defines as the same
 /// bytes) from `at`, returning where the next element begins.
-pub(crate) fn skip_ows(value: &[u8], at: usize) -> usize {
+pub fn skip_ows(value: &[u8], at: usize) -> usize {
   let mut at = at;
   while matches!(value.get(at), Some(b' ' | b'\t')) {
     at = at.saturating_add(1);
@@ -332,7 +332,7 @@ pub(crate) fn skip_ows(value: &[u8], at: usize) -> usize {
 
 /// The end of the RFC 9110 §5.6.2 `token` starting at `at`, or `None` when there
 /// is not one — `token = 1*tchar`, so an empty run is not a token.
-pub(crate) fn token_end(value: &[u8], at: usize) -> Option<usize> {
+pub fn token_end(value: &[u8], at: usize) -> Option<usize> {
   let mut end = at;
   while value.get(end).copied().is_some_and(is_token_byte) {
     end = end.saturating_add(1);
@@ -349,7 +349,7 @@ pub(crate) fn token_end(value: &[u8], at: usize) -> Option<usize> {
 /// scanner that restarted at each physical line would call that value
 /// unterminated and derive the wrong facts from it.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum QuotedScan {
+pub enum QuotedScan {
   /// The string closed; the offset is just past its DQUOTE.
   Closed(usize),
   /// The input ended with the string still open.
@@ -389,7 +389,7 @@ const JOIN: &[u8] = b",";
 /// Written as a scan of the actual separator rather than as the constant it
 /// works out to, so the reasoning is not something a later reader has to
 /// reconstruct — and so it stays correct if `JOIN` ever changes.
-pub(crate) fn scan_quoted_after_join(value: &[u8], escape: bool) -> QuotedScan {
+pub fn scan_quoted_after_join(value: &[u8], escape: bool) -> QuotedScan {
   match scan_quoted(JOIN, 0, escape) {
     // The only reachable arm: one comma is data inside a quoted-string whether
     // or not an escape was pending, so the string is still open at the start of
@@ -413,7 +413,7 @@ pub(crate) fn scan_quoted_after_join(value: &[u8], escape: bool) -> QuotedScan {
 /// reached only through its own arm: `"a\"b"` is ONE string containing a quote,
 /// and a reader that stopped at the second DQUOTE would resume parsing inside
 /// quoted data.
-pub(crate) fn scan_quoted(value: &[u8], at: usize, escape: bool) -> QuotedScan {
+pub fn scan_quoted(value: &[u8], at: usize, escape: bool) -> QuotedScan {
   let mut at = at;
   let mut escape = escape;
   loop {
@@ -483,7 +483,7 @@ pub(crate) fn list_element_end(value: &[u8], at: usize) -> Option<usize> {
 /// reported an unterminated quote as §5.6.1.1's empty element, which named a
 /// rule the caller had not broken.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ListShape {
+pub enum ListShape {
   /// `1#element` with every element present.
   Sendable,
   /// A leading comma, a trailing one, two in a row, or an empty value: RFC 9110
@@ -508,7 +508,7 @@ pub(crate) enum ListShape {
 ///
 /// This checks the list's SHAPE. What each element must BE is the field's own
 /// grammar, checked beside it.
-pub(crate) fn sender_list_shape(value: &[u8]) -> ListShape {
+pub fn sender_list_shape(value: &[u8]) -> ListShape {
   let mut at = 0usize;
   loop {
     let Some(end) = list_element_end(value, at) else {
@@ -531,7 +531,7 @@ pub(crate) fn sender_list_shape(value: &[u8]) -> ListShape {
 /// parameter and no quoted-string, so anything else means the value is not a
 /// `Connection` header — and this core will not write one whose meaning a
 /// recipient cannot read.
-pub(crate) fn is_sender_token_list(value: &[u8]) -> bool {
+pub fn is_sender_token_list(value: &[u8]) -> bool {
   let mut at = 0usize;
   let mut named = false;
   loop {
@@ -584,7 +584,7 @@ pub(crate) fn is_sender_token_list(value: &[u8]) -> bool {
 /// member parsed is what let `Expect: 100-continue, @` — a value that fails the
 /// field's grammar — still deliver the ask.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) struct Expectations {
+pub struct Expectations {
   /// A `quoted-string` still open when the last field line ended, carrying the
   /// escape state §5.2's join comma will be fed through.
   open: Option<bool>,
@@ -620,16 +620,23 @@ enum Params {
 }
 
 impl Default for Expectations {
-  /// The `Default` a `KeyFields` derives, which is [`new`](Self::new) rather
-  /// than a field-wise zero: `expecting` starts TRUE, and a derived default
-  /// would start the parse in the middle of a list it has not seen.
+  /// What a `#[derive(Default)]` on any struct holding one of these gets,
+  /// which is [`new`](Self::new) rather than a field-wise zero: `expecting`
+  /// starts TRUE, and a field-wise zero would start the parse in the middle of
+  /// a list it has not seen.
   fn default() -> Self {
     Self::new()
   }
 }
 
 impl Expectations {
-  pub(crate) const fn new() -> Self {
+  /// An accumulator no field line has been pushed into yet.
+  ///
+  /// Not a field-wise zero, and `expecting` is the difference: an RFC 9110
+  /// §5.6.1 `#element` list begins where an element may appear, so the parse
+  /// starts positioned there rather than in the middle of a list it has not
+  /// seen. [`Default`] is this, for that reason.
+  pub const fn new() -> Self {
     Self {
       open: None,
       bare: false,
@@ -649,13 +656,13 @@ impl Expectations {
   ///
   /// A string still open when the LAST line ended is not parsed either: §5.2 has
   /// no further line to continue it with.
-  pub(crate) const fn parsed(&self) -> bool {
+  pub const fn parsed(&self) -> bool {
     !self.malformed && self.open.is_none()
   }
 
   /// RFC 9110 §10.1.1's one defined expectation, derived only from a value that
   /// parsed whole.
-  pub(crate) const fn expects_continue(&self) -> bool {
+  pub const fn expects_continue(&self) -> bool {
     self.parsed() && self.bare
   }
 
@@ -665,13 +672,13 @@ impl Expectations {
   /// A value that did not parse counts as one: §10.1.1 makes an unrecognised
   /// expectation a 417 rather than a framing fault, so a recipient answers
   /// rather than failing the connection.
-  pub(crate) const fn has_other(&self) -> bool {
+  pub const fn has_other(&self) -> bool {
     !self.parsed() || self.other
   }
 
   /// SENDER side: the field is present and some element of it is empty
   /// (§5.6.1.1), counting a value that names nothing at all.
-  pub(crate) const fn empty_element(&self) -> bool {
+  pub const fn empty_element(&self) -> bool {
     // `parsed` first: an element BOUNDARY is a fact about a value that parsed,
     // and a value ending inside an open `quoted-string` has none to call empty.
     // Reporting one as §5.6.1.1's empty element named a rule the caller had not
@@ -680,12 +687,12 @@ impl Expectations {
   }
 
   /// SENDER side: the field is present and did not parse.
-  pub(crate) const fn grammar_fault(&self) -> bool {
+  pub const fn grammar_fault(&self) -> bool {
     self.present && !self.parsed()
   }
 
   /// Folds one `Expect` field line into the value.
-  pub(crate) fn push(&mut self, value: &[u8]) {
+  pub fn push(&mut self, value: &[u8]) {
     if self.malformed {
       // Nothing further may be derived from a value that did not parse.
       return;
@@ -860,7 +867,7 @@ impl Expectations {
 /// tolerant. The two are not an inconsistency: §5.6.1.1 and §5.6.1.2 are
 /// adjacent sections stating opposite MUSTs for the two roles, and this core
 /// implements both.
-pub(crate) fn is_protocol_list(value: &[u8]) -> bool {
+pub fn is_protocol_list(value: &[u8]) -> bool {
   let mut named = false;
   for element in list_elements(value) {
     if !is_protocol(element) {
@@ -886,7 +893,7 @@ pub(crate) fn is_protocol_list(value: &[u8]) -> bool {
 /// §5.6.1.2 says why: "A recipient MUST parse and ignore a reasonable number of
 /// empty list elements", which [`list_elements`] does by dropping them — while a
 /// NON-empty element that is not a `protocol` still fails the list.
-pub(crate) fn lists_a_protocol<'a>(values: impl Iterator<Item = &'a [u8]>) -> bool {
+pub fn lists_a_protocol<'a>(values: impl Iterator<Item = &'a [u8]>) -> bool {
   let mut named = false;
   for value in values {
     for element in list_elements(value) {
@@ -940,6 +947,22 @@ pub enum ListError {
   /// member's boundaries are still correct; only this value is unreadable.
   #[error("quoted value spans a field-line join and is not one contiguous slice")]
   ValueSpansFieldLines,
+}
+
+/// The caller-supplied output slice was smaller than the call needed.
+///
+/// [`ParamValue::unescape_into`]'s only failure. It is stated at this layer
+/// because the replacement that call performs is RFC 9110 §5.6.4's and every
+/// HTTP version inherits it, so the one way it can refuse is not any protocol
+/// crate's to own. A crate carrying a buffer error of its own converts at its
+/// own boundary rather than making this type carry a shape it cannot know.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("output buffer too small: need {need}, have {have}")]
+pub struct BufferTooSmall {
+  /// Bytes the call needed to write.
+  pub need: usize,
+  /// Bytes the destination had available.
+  pub have: usize,
 }
 
 /// A parameter's value: a bare token, or the CONTENT of a quoted-string with
@@ -1033,12 +1056,11 @@ impl<'a> ParamValue<'a> {
   ///
   /// # Errors
   ///
-  /// [`crate::Error::BufferTooSmall`] when `out` is shorter than the
-  /// unescaped value.
-  pub fn unescape_into(self, out: &mut [u8]) -> Result<usize, crate::Error> {
+  /// [`BufferTooSmall`] when `out` is shorter than the unescaped value.
+  pub fn unescape_into(self, out: &mut [u8]) -> Result<usize, BufferTooSmall> {
     let need = self.unescaped().count();
     if need > out.len() {
-      return Err(crate::Error::BufferTooSmall {
+      return Err(BufferTooSmall {
         need,
         have: out.len(),
       });

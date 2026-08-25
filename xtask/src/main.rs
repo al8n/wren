@@ -2,6 +2,9 @@ mod doc_check;
 mod handshake_diff;
 mod qpack_data;
 mod quote_check;
+mod report;
+mod shim_check;
+mod symbols;
 
 use std::{
   collections::BTreeMap,
@@ -93,6 +96,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       }
       doc_check::run(require_all, bless)?;
     }
+    "shim-check" => {
+      if args.next().is_some() {
+        return Err("shim-check takes no arguments".into());
+      }
+      shim_check::run()?;
+    }
     "-h" | "--help" | "help" => print_help(),
     other => return Err(format!("unknown command: {other}").into()),
   }
@@ -109,6 +118,7 @@ Usage:
   cargo run -p xtask -- handshake-diff <base-rev> [head-rev]
   cargo run -p xtask -- quote-check [--fetch] [--include-ignored] [<spec-dir>]
   cargo run -p xtask -- doc-check [--require-all] [--bless]
+  cargo run -p xtask -- shim-check
 
 `handshake-diff` runs `handshake-corpus` against two revisions of
 `websocket-proto` and reports the verdicts that moved, grouped by
@@ -131,13 +141,30 @@ default because they exist on a developer's disk and not in CI.
 
 `doc-check` is `quote-check`'s sibling: checks over what this workspace's
 documentation CLAIMS rather than quotes — doc continuity, table-verdict
-vocabulary, and path-qualified callee assertions. One needs rustdoc's JSON
-output, which is nightly-only; the other two run on any toolchain. A check
-that cannot run on the current toolchain says so by name instead of silently
-not running. `--require-all` turns a SKIPPED check into a failure, which is
+vocabulary, path-qualified callee assertions, and that every committed
+documented-items snapshot is still claimed by a gated crate. One needs
+rustdoc's JSON output, which is nightly-only; the other three run on any
+toolchain. A check that cannot run on the current toolchain says so by name
+instead of silently not running. `--require-all` turns a SKIPPED check into a failure, which is
 what CI's nightly job passes so an edit to that job cannot quietly drop a
 check while the report still exits 0. `--bless` lets a check rewrite what it
 flags instead of only reporting it, where the check supports it.
+
+`shim-check` guards the `no-panic` link proofs from going vacuous, and asks its
+two questions where each one's answer lives. How a shim is WRITTEN it reads out
+of the source: every `#[no_panic]` shim in a `tests/no_panic.rs` passes each
+argument through `core::hint::black_box` and has its answer consumed, without
+which the shim is compiled over literals, the panic edge it exists to catch is
+pruned as dead, and the proof reports success over nothing. Whether a shim was
+INSTANTIATED it asks the LINKER: it runs each crate's release `--no-run` build
+and requires a symbol per declared shim in the test binary. That half used to
+read the source too and was bypassed four times — a call inside `debug_assert!`,
+one under a `#[cfg]` release turns off, one in a helper nothing reaches, one
+spelled inside a raw string. CI's must-fail lie-check sees none of it:
+`shim_lie` is its own subject, so it keeps reddening on its own build while
+every real shim goes vacuous. This prints how many shims it examined, how many
+the linker instantiated and over how many symbols, so a green run is
+distinguishable from a run that never looked.
 ",
     quote_check::DEFAULT_DIR
   );

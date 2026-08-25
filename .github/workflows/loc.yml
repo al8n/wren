@@ -40,12 +40,23 @@ jobs:
       - name: Count lines of code (workspace total + each crate)
         run: |
           set -euo pipefail
+          # The ONE list. It was two — this loop and a literal array in the
+          # upload step — and a crate added to the workspace reached neither,
+          # so the report published a smaller number than the workspace had
+          # and nothing in a green run said so. The upload step now reads the
+          # names out of `loc-crates.txt` instead of restating them.
+          #
+          # PUBLISHED crates only: `xtask` and `handshake-corpus` are dev-only
+          # workspace members and are counted in the `wren` total, not
+          # separately.
+          crates="websocket-proto http-semantics http1-proto http3-proto wren-trace wren-compio wren-reactor"
           tokeit
           mv tokeit.json loc-wren.json
-          for c in websocket-proto http1-proto http3-proto wren-trace wren-compio wren-reactor; do
+          for c in $crates; do
             ( cd "$c" && tokeit )
             mv "$c/tokeit.json" "loc-$c.json"
           done
+          printf 'wren %s\n' "$crates" > loc-crates.txt
       # Publish only from main: PR runs would overwrite the badge gist with
       # branch stats, and fork PRs have no GIST_PAT secret at all. Every file
       # goes in ONE gist PATCH — per-crate requests trip GitHub's secondary
@@ -62,13 +73,15 @@ jobs:
             // rest are per-crate. A name here is the `…/raw/<name>` a LoC badge
             // would point at — `websocket-proto` and the workspace total are the
             // two that have one today, and the other entries are published so a
-            // README that adds one has a file to point at. Must stay in step
-            // with the shell loop above: a name here with no `loc-<name>.json`
-            // beside it fails the whole PATCH.
-            const crates = ['websocket-proto', 'http1-proto', 'http3-proto', 'wren-trace', 'wren-compio', 'wren-reactor'];
-            const files = {
-              wren: { content: fs.readFileSync('loc-wren.json', 'utf8') },
-            };
+            // README that adds one has a file to point at.
+            //
+            // The names are READ from the file the step above wrote, never
+            // restated here: this was a second copy of that list, and a second
+            // copy is a list that can be forgotten. A name with no
+            // `loc-<name>.json` beside it still fails the whole PATCH, which is
+            // now only reachable if the step above wrote one and moved neither.
+            const crates = fs.readFileSync('loc-crates.txt', 'utf8').trim().split(/\s+/);
+            const files = {};
             for (const c of crates) {
               files[c] = { content: fs.readFileSync(`loc-${c}.json`, 'utf8') };
             }

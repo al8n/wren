@@ -1,12 +1,21 @@
 //! Checks over the claims this workspace's documentation makes.
 //!
 //! `quote-check`'s sibling, and split from it at the toolchain seam rather than
-//! by subject: one of these three needs rustdoc's JSON output, which is
-//! nightly-only, and the other two are source scanning that any toolchain can
-//! do. Running the two it can and SAYING it skipped the third is this crate's
-//! rule applied to the command itself — a check that cannot examine something
-//! must say so by name.
-use crate::Error;
+//! by subject: one of these four needs rustdoc's JSON output, which is
+//! nightly-only, and the other three are source and directory scanning that any
+//! toolchain can do. Running the three it can and SAYING it skipped the fourth
+//! is this crate's rule applied to the command itself — a check that cannot
+//! examine something must say so by name.
+//!
+//! The fourth is [`unclaimed_snapshots`], and it is the one that watches the
+//! other three's SUBJECT rather than their content: every check here iterates
+//! [`GATED_CRATES`], so a name deleted from that list deletes the iteration
+//! that would have examined it, and the run gets shorter and stays green. A
+//! directory walk is the only set that edit cannot shrink.
+use crate::{
+  Error,
+  report::{self, Report},
+};
 use std::{
   collections::{HashMap, HashSet},
   env, fs,
@@ -14,82 +23,155 @@ use std::{
   process::Command,
 };
 
-/// What one run examined, could not examine, and found.
-#[derive(Clone, Default)]
-pub struct Report {
-  lines: Vec<String>,
-  skipped: Vec<String>,
-  failures: Vec<String>,
-}
-
-impl Report {
-  pub fn new() -> Self {
-    Self::default()
-  }
-
-  // `checked`, `skip`, and `fail` are this Report's whole recording surface.
-  // `continuity` and `verdicts` (below) between them call all three —
-  // `checked` and `fail` from either, `skip` only from `continuity`, on a
-  // toolchain that lacks nightly rustdoc's JSON output — so none of them
-  // needs a dead-code allow now that this module wires them in.
-
-  /// Records what one check examined — its denominator.
-  pub fn checked(&mut self, line: impl Into<String>) {
-    self.lines.push(line.into());
-  }
-
-  /// Records a check that did not run, and why.
-  pub fn skip(&mut self, check: &str, why: &str) {
-    self.skipped.push(format!("{check}: SKIPPED ({why})"));
-  }
-
-  /// Records a violation found by the check that is running.
-  pub fn fail(&mut self, what: impl Into<String>) {
-    self.failures.push(what.into());
-  }
-
-  /// Prints the run and decides it.
-  ///
-  /// A skip is a printed boundary by default and an error under `require_all`.
-  /// CI passes `require_all`, so the nightly-only check cannot be quietly lost
-  /// by an edit to the workflow that runs it.
-  pub fn finish(self, require_all: bool) -> Result<(), Error> {
-    for line in &self.lines {
-      println!("doc-check: {line}");
-    }
-    for line in &self.skipped {
-      println!("doc-check: {line}");
-    }
-    for failure in &self.failures {
-      println!("{failure}");
-    }
-    if !self.failures.is_empty() {
-      return Err(format!("doc-check: {} failures", self.failures.len()).into());
-    }
-    if require_all && !self.skipped.is_empty() {
-      return Err(
-        format!(
-          "doc-check: {} check(s) skipped under --require-all",
-          self.skipped.len()
-        )
-        .into(),
-      );
-    }
-    Ok(())
-  }
-}
-
 /// Runs every documentation check.
 pub fn run(require_all: bool, bless: bool) -> Result<(), Error> {
-  let mut report = Report::new();
+  let mut report = Report::new("doc-check");
   let root = crate::workspace_root()?;
-  continuity(&root, bless, &mut report)?;
+  unclaimed_snapshots(&root, GATED_CRATES, &mut report)?;
+  for name in GATED_CRATES {
+    continuity(&root, name, bless, &mut report)?;
+  }
   verdicts(&root, &mut report)?;
   callees(&root, &mut report)?;
   report.finish(require_all)
 }
 
-/// Fails when a `http1-proto` item that had a doc comment no longer does.
+/// The crates whose documented-item sets are compared against a committed
+/// snapshot, one snapshot per crate at
+/// `xtask/snapshots/<crate>-documented.txt`.
+///
+/// A LIST rather than a directory walk: a crate added to the workspace and
+/// forgotten here would be silently ungated, and a walk would hide that by
+/// making the set look automatic. Adding a crate is a deliberate edit, and
+/// `the_gated_crate_list_names_every_crate_with_a_snapshot` fails when its
+/// snapshot is missing.
+///
+/// REMOVING one is not a free edit either, and that is the harder direction to
+/// hold: any assertion written over this list shrinks along with it, so a check
+/// that iterates these names cannot notice a name that is gone. The same test
+/// therefore also walks `xtask/snapshots/` — a set this list cannot shorten —
+/// and fails on any snapshot no crate here claims, which is exactly what a
+/// dropped crate leaves behind.
+///
+/// [`verdicts`] and [`callees`] scan this same set, so a crate named here is
+/// gated by all three checks at once rather than by whichever one its author
+/// remembered.
+const GATED_CRATES: &[&str] = &["http1-proto", "http-semantics"];
+
+/// Fails when `xtask/snapshots/` holds a snapshot no crate in `gated` claims.
+///
+/// This is [`GATED_CRATES`]'s own doc comment made executable, and the
+/// direction it names as the harder one: every other check in this command
+/// ITERATES that list, so deleting an entry deletes the iteration that would
+/// have examined it. The crate silently loses [`continuity`], [`verdicts`]
+/// and [`callees`] at once — three checks — its snapshot stays committed and
+/// unread, and the run still prints success over the shorter set. A directory
+/// walk is the only set an edit to the list cannot shrink, so the walk is
+/// what asks the question.
+///
+/// `the_gated_crate_list_names_every_crate_with_a_snapshot` asserts the same
+/// thing over the real tree, and that is not this being written twice. The
+/// test fails in `cargo test -p xtask`; this fails in the BINARY, which is
+/// what the docs workflow runs and what a developer runs by hand. A gate
+/// audible only from a different job is one whose message never reaches the
+/// person who broke it, and the removal it catches is exactly the edit that
+/// makes every list-driven assertion get shorter and stay green.
+///
+/// Recorded on `report` rather than returned as an `Err`, for the reason
+/// [`gated_files`] gives: an `Err` here would discard the whole report,
+/// including whatever [`continuity`] has to say about the same
+/// misconfiguration. It fails under `--bless` too — blessing writes a
+/// snapshot for a gated crate and cannot delete one for a crate that is no
+/// longer gated, so it is not a way past this.
+///
+/// `gated` is a parameter rather than [`GATED_CRATES`] read directly, so a
+/// test can hand it a list it controls. Reading the constant here would make
+/// every test of this function a test of the live workspace, which is the
+/// one thing it must not need in order to fail.
+fn unclaimed_snapshots(root: &Path, gated: &[&str], report: &mut Report) -> Result<(), Error> {
+  let dir = root.join("xtask/snapshots");
+  let entries = match fs::read_dir(&dir) {
+    Ok(entries) => entries,
+    Err(err) => {
+      report.fail(format!(
+        "doc-snapshots: could not read {}: {err}.\n  \
+         That directory is where every gated crate's committed snapshot lives, \
+         so a run that cannot read it has not checked the continuity of any of \
+         them — `continuity` will say so per crate, and this says the set \
+         itself was unreachable.",
+        dir.display()
+      ));
+      return Ok(());
+    }
+  };
+  // Both failure shapes below feed `unclaimed`, because both are the same
+  // fact about the file: nothing in `gated` reads it. An orphan is not read
+  // because its crate left the list; a misnamed file is not read because no
+  // crate name spells that path. One counter, one meaning.
+  let (mut found, mut unclaimed) = (0usize, 0usize);
+  for entry in entries {
+    // Recorded rather than returned, exactly as the failures below are: an
+    // `Err` out of this loop would discard the whole report over one
+    // unreadable directory entry.
+    let path = match entry {
+      Ok(entry) => entry.path(),
+      Err(err) => {
+        unclaimed += 1;
+        report.fail(format!(
+          "doc-snapshots: an entry of {} could not be read: {err}.\n  \
+           An entry this walk cannot see is one it cannot say is claimed, so \
+           it is counted with the unclaimed rather than passed over.",
+          dir.display()
+        ));
+        continue;
+      }
+    };
+    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("txt") {
+      continue;
+    }
+    found += 1;
+    let stem = path
+      .file_stem()
+      .and_then(std::ffi::OsStr::to_str)
+      .unwrap_or_default()
+      .to_owned();
+    let Some(name) = stem.strip_suffix("-documented") else {
+      unclaimed += 1;
+      report.fail(format!(
+        "doc-snapshots: {} is not named `<crate>-documented.txt`.\n  \
+         `continuity` builds a snapshot path from a crate name, so a file \
+         spelled any other way is never read by anything — it is a snapshot \
+         nobody compares against, which is the same defect as an orphan with \
+         a tidier name.",
+        path.display()
+      ));
+      continue;
+    };
+    if gated.contains(&name) {
+      continue;
+    }
+    unclaimed += 1;
+    report.fail(format!(
+      "doc-snapshots: `{name}` has a committed snapshot at {} that no crate in \
+       `GATED_CRATES` claims.\n  \
+       A crate dropped from that list keeps its snapshot and stops being read \
+       against it, losing doc-continuity, table-verdicts and path-qualified \
+       callee in one edit — and every check that iterates the list simply gets \
+       shorter, so nothing else in this command would have said a word.\n  \
+       Either put `{name}` back in `GATED_CRATES`, or delete that snapshot \
+       along with it.",
+      path.display()
+    ));
+  }
+  report.checked(format!(
+    "doc-snapshots: {found} committed snapshot(s), {unclaimed} claimed by no \
+     crate in GATED_CRATES ({})",
+    gated.join(", ")
+  ));
+  Ok(())
+}
+
+/// Fails when an item in `crate_name` that had a doc comment no longer does.
 ///
 /// Compares the currently-documented set against a committed snapshot rather
 /// than requiring every item to be documented: `http1-proto` has a real
@@ -98,6 +180,10 @@ pub fn run(require_all: bool, bless: bool) -> Result<(), Error> {
 /// one" — and the snapshot puts the loss in the diff, where a reviewer sees
 /// it without running anything.
 ///
+/// One call per crate in [`GATED_CRATES`], each naming its crate in every
+/// line it prints, so a failure says which snapshot moved and a run that
+/// examined one crate cannot be read as having examined both.
+///
 /// What this does NOT detect: a doc comment that got shorter, wrong, or had
 /// a paragraph cut out of it while at least one line survives. The
 /// comparison is presence/absence of `docs` on an item, not a text diff —
@@ -105,12 +191,19 @@ pub fn run(require_all: bool, bless: bool) -> Result<(), Error> {
 /// multi-line doc comment left `docs` non-empty and produced no failure, and
 /// only removing an item's entire doc block did. A doc that is damaged
 /// rather than gone is invisible here.
-fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error> {
-  let path = root.join("xtask/snapshots/http1-proto-documented.txt");
-  let current = match documented_items(root, "http1-proto")? {
+fn continuity(
+  root: &Path,
+  crate_name: &str,
+  bless: bool,
+  report: &mut Report,
+) -> Result<(), Error> {
+  let path = root
+    .join("xtask/snapshots")
+    .join(format!("{crate_name}-documented.txt"));
+  let current = match documented_items(root, crate_name)? {
     RustdocJson::Items(items) => items,
     RustdocJson::Unavailable(why) => {
-      report.skip("doc-continuity", &why);
+      report.skip(&format!("doc-continuity[{crate_name}]"), &why);
       return Ok(());
     }
     RustdocJson::Failed(what) => {
@@ -122,10 +215,10 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
   // tool's own output is the point, not a fact that only lives in a report.
   let collision_note = current.collision_note();
   if bless {
-    let mut body = String::from(
-      "# Documented items in http1-proto. Regenerate with:\n\
+    let mut body = format!(
+      "# Documented items in {crate_name}. Regenerate with:\n\
        #   cargo run -p xtask -- doc-check --bless\n\
-       # A line REMOVED by --bless means this change dropped documentation.\n",
+       # A line REMOVED by --bless means this change dropped documentation.\n"
     );
     for item in &current.paths {
       body.push_str(item);
@@ -133,16 +226,40 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
     }
     fs::write(&path, body)?;
     report.checked(format!(
-      "doc-continuity: blessed {} documented items ({collision_note})",
+      "doc-continuity[{crate_name}]: blessed {} documented items ({collision_note})",
       current.items
     ));
     return Ok(());
   }
-  let snapshot: Vec<String> = fs::read_to_string(&path)?
+  let snapshot: Vec<String> = fs::read_to_string(&path)
+    .map_err(|err| {
+      format!(
+        "doc-continuity[{crate_name}] could not read {}: {err}.\n  \
+         A gated crate with no snapshot yet is blessed into one with \
+         `cargo run -p xtask -- doc-check --bless`.",
+        path.display()
+      )
+    })?
     .lines()
     .filter(|line| !line.starts_with('#') && !line.is_empty())
     .map(str::to_string)
     .collect();
+  // The snapshot is this check's SUBJECT, and an empty one is not an empty
+  // result — it is no subject at all. `lost_docs` is one-directional, so a
+  // snapshot truncated to nothing reports zero lost items over however many the
+  // crate currently documents, and the line below would print a healthy
+  // denominator for a comparison against nothing. The same shape as
+  // `verdicts`'s `tables == 0` floor, one file over.
+  if snapshot.is_empty() {
+    report.fail(format!(
+      "doc-continuity[{crate_name}]: {} holds no items.\n  \
+       A gated crate's snapshot is what this check compares against; empty, it \
+       can lose nothing, and every later run reports zero lost over whatever \
+       the crate documents today. Restore it, or bless a fresh one with \
+       `cargo run -p xtask -- doc-check --bless`.",
+      path.display()
+    ));
+  }
   let lost = lost_docs(&snapshot, &current.paths);
   for item in &lost {
     report.fail(format!(
@@ -153,8 +270,10 @@ fn continuity(root: &Path, bless: bool, report: &mut Report) -> Result<(), Error
     ));
   }
   report.checked(format!(
-    "doc-continuity: {} documented items, {} lost ({collision_note})",
+    "doc-continuity[{crate_name}]: {} documented items against {} snapshotted, \
+     {} lost ({collision_note})",
     current.items,
+    snapshot.len(),
     lost.len()
   ));
   Ok(())
@@ -781,12 +900,19 @@ fn final_segment(path: &str) -> &str {
 /// [`verdicts`] and the test that pins the real table cannot drift apart.
 const GOVERNED_HEADER: &str = "| corner |";
 
-/// Fails when an `http1-proto` table with a [`GOVERNED_HEADER`] header uses a
-/// verdict word its own declaration does not list, declares a word no row
-/// uses, or carries a row whose verdict cell yields no verdict at all — see
-/// [`verdict_problems`] — and when a doc comment anywhere else in the crate
-/// writes one of the words that declaration lists, see "The vocabulary is
+/// Fails when a table with a [`GOVERNED_HEADER`] header uses a verdict word
+/// its own declaration does not list, declares a word no row uses, or carries
+/// a row whose verdict cell yields no verdict at all — see
+/// [`verdict_problems`] — and when a doc comment anywhere else in the scanned
+/// set writes one of the words that declaration lists, see "The vocabulary is
 /// reserved to the table" below. Fails, too, when NO governed table is found.
+///
+/// The scanned set is the `src` of every crate in [`GATED_CRATES`], not one
+/// crate: the reservation is about a vocabulary, and a vocabulary a second
+/// crate may write freely is not reserved. `http1-proto` holds the only
+/// governed table today; a crate joining the list is held to it from its
+/// first file, which is why the set is widened here rather than a second
+/// per-crate copy of this check being written.
 ///
 /// A declaration bullet is `- **VERDICT** — reason`: the bold term
 /// immediately followed by an em dash. A bullet that reaches an em dash only
@@ -801,12 +927,13 @@ const GOVERNED_HEADER: &str = "| corner |";
 /// checked, 0 problem(s)` and exits 0 — `--require-all` included, since that
 /// flag gates skips and this check never skips. A check whose subject can
 /// silently cease to exist is the class this whole command was built to
-/// remove, so the floor is here and
+/// remove, so the floor is under the WHOLE scanned set — zero governed tables
+/// across all of [`GATED_CRATES`], not zero in some one crate — and
 /// `the_real_switched_table_is_discovered` pins the live table as well: the
 /// rename fails the suite instead of emptying the check.
 ///
 /// Scoped to that one header shape rather than every markdown table in the
-/// crate. SIX other tables live in `http1-proto/src` today —
+/// scanned set. SIX other tables live in `http1-proto/src` today —
 /// `connection/outbound.rs`'s RFC-9112-rule table, three in
 /// `connection/mod.rs` (`handle_eof`'s disposition, its EOF-ordering
 /// companion, `refuse`'s call/consult table), `media/mod.rs`'s
@@ -820,9 +947,12 @@ const GOVERNED_HEADER: &str = "| corner |";
 /// defect in that table — it is this check reaching past its own subject.
 /// That census is a count of files on disk, not a rule, so recount it rather
 /// than trusting this sentence: from the workspace root,
-/// `grep -rn -- "|---" http1-proto/src` lists every table, governed one
-/// included. It has been wrong twice by being written from memory.
-/// `| corner | site | verdict |` is, today, unique to `tunnel.rs`; a second
+/// `grep -rn -- "|---" http1-proto/src http-semantics/src` — the `src` of
+/// each crate in [`GATED_CRATES`] — lists every table in the scanned set,
+/// governed one included. It has been wrong twice by being written from
+/// memory.
+/// `| corner | site | verdict |` is, today, unique to `http1-proto`'s
+/// `tunnel.rs`; a second
 /// table that states an invariant the same way — declared bullets, a
 /// self-policing closing sentence, a table of sites — earns the same header
 /// and is picked up here without a code change.
@@ -896,20 +1026,13 @@ const GOVERNED_HEADER: &str = "| corner |";
 /// silence. A reader who takes this check for "the table and the crate
 /// cannot disagree" has been told more than it does.
 fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
-  let dir = root.join("http1-proto/src");
-  let mut files = Vec::new();
-  collect_rs_files(&dir, &mut files)?;
-  files.sort();
+  let (files, census) = gated_files(root, "table-verdicts", report)?;
 
   let mut governed: Vec<(String, DocRun)> = Vec::new();
   let mut elsewhere: Vec<(String, DocRun)> = Vec::new();
   for file in &files {
     let text = fs::read_to_string(file)?;
-    let display = file
-      .strip_prefix(root)
-      .unwrap_or(file)
-      .display()
-      .to_string();
+    let display = report::site(file.strip_prefix(root).unwrap_or(file));
     for run in doc_runs(&text) {
       if run.text.contains(GOVERNED_HEADER) {
         governed.push((display.clone(), run));
@@ -940,14 +1063,16 @@ fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
   if tables == 0 {
     problems += 1;
     report.fail(format!(
-      "table-verdicts governed nothing: no doc comment under {} carries the \
-       `{GOVERNED_HEADER}` header this check discovers a governed table by.\n  \
-       `TunnelPhase::Switched` in `connection/tunnel.rs` is the one this crate \
-       has. If its header was reworded, restore it (or move the wording here); \
-       if the table was deliberately removed, remove this check with it.\n  \
+      "table-verdicts governed nothing: no doc comment under the `src` of {} \
+       carries the `{GOVERNED_HEADER}` header this check discovers a governed \
+       table by.\n  \
+       `TunnelPhase::Switched` in `http1-proto/src/connection/tunnel.rs` is the \
+       one this workspace has. If its header was reworded, restore it (or move \
+       the wording here); if the table was deliberately removed, remove this \
+       check with it.\n  \
        A run reporting zero tables and zero problems is this check governing \
        nothing while still reporting success.",
-      dir.strip_prefix(root).unwrap_or(&dir).display()
+      GATED_CRATES.join(", ")
     ));
   }
 
@@ -980,7 +1105,7 @@ fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
   report.checked(format!(
     "table-verdicts: {tables} table(s) checked, {problems} problem(s); {} declared \
      verdict word(s) reserved to them, {} doc run(s) elsewhere scanned, {carrying} \
-     carried one",
+     carried one; files scanned: {census}",
     vocabulary.len(),
     elsewhere.len()
   ));
@@ -988,9 +1113,19 @@ fn verdicts(root: &Path, report: &mut Report) -> Result<(), Error> {
 }
 
 /// Every `.rs` file under `dir`, recursively.
+///
+/// Every io error names the directory it came from. A Rust io error carries no
+/// path, so the bare `?` this used to be surfaced `No such file or directory
+/// (os error 2)` as the command's ENTIRE output — a message that cannot be
+/// acted on, from a check whose whole subject is saying what it could not
+/// reach.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
-  for entry in fs::read_dir(dir)? {
-    let path = entry?.path();
+  let entries =
+    fs::read_dir(dir).map_err(|err| format!("could not read {}: {err}", dir.display()))?;
+  for entry in entries {
+    let path = entry
+      .map_err(|err| format!("could not read an entry of {}: {err}", dir.display()))?
+      .path();
     if path.is_dir() {
       collect_rs_files(&path, out)?;
     } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
@@ -998,6 +1133,58 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
     }
   }
   Ok(())
+}
+
+/// The `.rs` files of every crate in [`GATED_CRATES`], sorted, beside the
+/// per-crate census its caller prints.
+///
+/// **The census is the point, not a decoration.** [`verdicts`] and [`callees`]
+/// are per-FILE checks over a SET of crates, and a single merged denominator
+/// cannot tell a crate that was scanned and held nothing from a crate that was
+/// never reached — the one distinction this whole command exists to print.
+/// Reverting the loop below to a single hardcoded directory moves a total no
+/// reader has memorised and changes nothing else a green run says; naming each
+/// crate beside its own count is what makes that edit visible, and
+/// `every_gated_crate_is_scanned_and_counted_by_name` is what makes it fail.
+///
+/// A crate whose `src` is not there is recorded on `report` as a failure and
+/// counted `UNREACHED`, rather than returned as an `Err`. [`Report::finish`]
+/// prints nothing until every check has run, so an `Err` from here would
+/// discard the whole report — including the message [`continuity`] has already
+/// recorded about that same misconfigured crate, which is the one that names
+/// the crate and says the snapshot could not be read. Losing a good message to
+/// a worse one is the opposite of what a `--require-all` run is for. The scan
+/// continues over the crates that ARE there, the run still fails (a recorded
+/// failure fails [`Report::finish`]), and the census shows the hole rather
+/// than silently shrinking the total.
+fn gated_files(
+  root: &Path,
+  check: &str,
+  report: &mut Report,
+) -> Result<(Vec<PathBuf>, String), Error> {
+  let mut files = Vec::new();
+  let mut census: Vec<String> = Vec::new();
+  for name in GATED_CRATES {
+    let dir = root.join(name).join("src");
+    if !dir.is_dir() {
+      report.fail(format!(
+        "{check}: `{name}` is gated but has no `src` directory at {}.\n  \
+         A gated crate with no source is a BROKEN gate, not an empty one: every \
+         file this check would have read is missing, and a per-crate count is \
+         the only thing in a green run that would have said so.\n  \
+         Either the crate moved and this path is stale, or it belongs in \
+         `GATED_CRATES` no longer.",
+        dir.display()
+      ));
+      census.push(format!("{name} UNREACHED"));
+      continue;
+    }
+    let before = files.len();
+    collect_rs_files(&dir, &mut files)?;
+    census.push(format!("{name} {}", files.len() - before));
+  }
+  files.sort();
+  Ok((files, census.join(", ")))
 }
 
 /// One maximal doc-comment run, and the 1-based file line its first line
@@ -1232,9 +1419,10 @@ fn is_caps_word(word: &str) -> bool {
     && word.chars().all(|ch| ch.is_ascii_uppercase() || ch == '-')
 }
 
-/// Fails when a `http1-proto` comment path-qualifies a callee — `` `module::
-/// name` `` — ON AN ASSERTIVE SENTENCE, that the item it documents never
-/// uses, or that the named module does not hold; see [`callee_problems`].
+/// Fails when a comment in the `src` of any crate in [`GATED_CRATES`]
+/// path-qualifies a callee — `` `module::name` `` — ON AN ASSERTIVE SENTENCE,
+/// that the item it documents never uses, or that the named module does not
+/// hold; see [`callee_problems`].
 ///
 /// BOTH halves of the path are verified, because both halves are claimed.
 /// `module::name` asserts two things — that `name` is what runs here, and
@@ -1258,7 +1446,7 @@ fn is_caps_word(word: &str) -> bool {
 ///   same `ends_persistence`" — no module, so [`qualified_final_segment`]
 ///   never sees a `::` and this check passes over it in silence.
 /// - A **path-qualified mention on a sentence with none of
-///   [`ASSERTIVE_VERBS`]** (Ruling 13). Most of this crate's cross-referential
+///   [`ASSERTIVE_VERBS`]** (Ruling 13). Most of these crates' cross-referential
 ///   prose — a shared-invariant paragraph, a send/receive counterpart, a note
 ///   to a field's future writer — path-qualifies a name without one of these
 ///   verbs, and is invisible here by design: it is a "see also", not a claim
@@ -1270,10 +1458,7 @@ fn is_caps_word(word: &str) -> bool {
 /// narrower rule is what ships, with both misses named here rather than left
 /// for a reader to assume "comment names the wrong callee" is fully covered.
 fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
-  let dir = root.join("http1-proto/src");
-  let mut files = Vec::new();
-  collect_rs_files(&dir, &mut files)?;
-  files.sort();
+  let (files, census) = gated_files(root, "path-qualified callee", report)?;
   let modules = module_index(&files)?;
 
   let mut mentions = 0usize;
@@ -1281,11 +1466,7 @@ fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
   let mut unresolved = 0usize;
   for file in &files {
     let text = fs::read_to_string(file)?;
-    let display = file
-      .strip_prefix(root)
-      .unwrap_or(file)
-      .display()
-      .to_string();
+    let display = report::site(file.strip_prefix(root).unwrap_or(file));
     for item in items_in(&text) {
       let (comments, _) = split_comments(&item);
       for (path, _) in assertive_mentions(&comments) {
@@ -1303,18 +1484,23 @@ fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
   }
   report.checked(format!(
     "path-qualified callee: {mentions} mentions checked, {exempt} exempt, \
-     {unresolved} whose module half is not this crate's to resolve"
+     {unresolved} whose module half is none of the scanned crates' to resolve; \
+     files scanned: {census}"
   ));
   Ok(())
 }
 
-/// Every module `http1-proto/src` declares as a FILE, by leaf name, beside
-/// that file's text.
+/// Every module the scanned crates — the `src` of each of [`GATED_CRATES`] —
+/// declare as a FILE, by leaf name, beside that file's text.
 ///
-/// `foo.rs` and `foo/mod.rs` are both module `foo`; `lib.rs` is the crate root
+/// `foo.rs` and `foo/mod.rs` are both module `foo`; `lib.rs` is a crate root
 /// and names no module. Two files that land on the same leaf name — every
-/// `tests.rs` in the crate — are joined, which errs towards a false PASS, the
-/// direction every judgement in this check errs.
+/// `tests.rs` in the set, and now any leaf two of the scanned crates both
+/// spell — are joined, which errs towards a false PASS, the direction every
+/// judgement in this check errs. One index across crates rather than one per
+/// crate is that same direction taken deliberately: a mention resolves
+/// against a module of the same leaf name in a sibling crate, so the widening
+/// can only turn a failure into a pass, never the reverse.
 ///
 /// A file, not the rustdoc JSON `continuity` reads: this check runs on stable
 /// too, and it would be an odd trade to make the cheapest of the three
@@ -1340,11 +1526,11 @@ fn module_index(files: &[PathBuf]) -> Result<HashMap<String, String>, Error> {
 /// What [`module_index`] can say about the module half of a path-qualified
 /// mention.
 enum ModuleHalf {
-  /// The module this crate declares under that name does name the item.
+  /// The module the scanned set declares under that name does name the item.
   Holds,
   /// It exists, and never names the item — the claim is checkable and false.
   Absent,
-  /// No module of this crate answers to that name, so nothing here can
+  /// No module of the scanned set answers to that name, so nothing here can
   /// settle it: `core::str`'s modules, a `crate`/`self`/`super` prefix, a
   /// module of another crate. Counted by [`callees`] rather than passed over
   /// in silence — the mention is checked on its final segment and NOT on its
@@ -1705,15 +1891,17 @@ fn is_lint_namespace(span: &str) -> bool {
   )
 }
 
-/// Every `mod NAME` this crate declares under `http1-proto/src`, leaf name
-/// only (no path) — see [`qualified_final_segment`].
+/// Every `mod NAME` the scanned crates declare — the `src` of each of
+/// [`GATED_CRATES`] — leaf name only (no path); see
+/// [`qualified_final_segment`].
 ///
 /// A fixed list, not a scan: keeping [`qualified_final_segment`] free of
 /// filesystem access is what keeps it a pure function a unit test can call on
 /// a literal string, the same way [`KNOWN_MODULES`]'s sibling exclusion
-/// ([`is_lint_namespace`]) is. Regenerate by reviewing, from the workspace
-/// root:
-/// `grep -rhoE '(^|[[:space:]])mod [a-z_][a-z0-9_]*' http1-proto/src | awk '{print $NF}' | sort -u`
+/// ([`is_lint_namespace`]) is. The cost of the fixed list is that a crate
+/// joining [`GATED_CRATES`] brings modules this list does not know, so
+/// regenerate it over the WHOLE set — reviewing, from the workspace root:
+/// `grep -rhoE '(^|[[:space:]])mod [a-z_][a-z0-9_]*' http1-proto/src http-semantics/src | awk '{print $NF}' | sort -u`
 const KNOWN_MODULES: &[&str] = &[
   "__no_panic_internals",
   "body",
@@ -2140,10 +2328,84 @@ mod tests {
   // in one CI job cannot disappear the day that job is edited.
   #[test]
   fn a_skip_is_tolerated_alone_and_fatal_under_require_all() {
-    let mut report = Report::new();
+    let mut report = Report::new("doc-check");
     report.skip("doc-continuity", "requires nightly rustdoc");
     assert!(report.clone().finish(false).is_ok());
     assert!(report.finish(true).is_err());
+  }
+
+  // Task 1's contract: `continuity` names the crate and the snapshot it
+  // compares, so a second crate is a second call rather than a second copy of
+  // the function. Without this the crate list is a comment, and a crate
+  // dropped from it is invisible.
+  //
+  // The name of this test says SNAPSHOT -> GATED, and that is the direction
+  // that catches a drop, so it is asserted first and the crate list is not
+  // what it iterates. An assertion driven by `GATED_CRATES` cannot see a
+  // removal at all: deleting an entry deletes the iteration that would have
+  // examined it, so the check gets shorter and stays green while the crate
+  // loses continuity, verdicts and callees at once and its snapshot sits in
+  // the tree unread. `xtask/snapshots/` is the set an edit to that list cannot
+  // shrink, so it is the one to walk.
+  //
+  // GATED -> SNAPSHOT stays too, below: it is what the constant's own doc
+  // promises, and it is the half that catches the opposite edit, a crate named
+  // in the list with nothing committed for it to be compared against.
+  //
+  // `unclaimed_snapshots` now asks the SNAPSHOT -> GATED half inside the
+  // binary as well, and the overlap is deliberate rather than a duplicate:
+  // this fails in `cargo test -p xtask`, that one fails in `doc-check` itself
+  // — the command the docs workflow runs and the one a developer runs by
+  // hand. Deleting either leaves the removal audible from one place only.
+  #[test]
+  fn the_gated_crate_list_names_every_crate_with_a_snapshot() {
+    let root = crate::workspace_root().unwrap();
+    let dir = root.join("xtask/snapshots");
+
+    let mut orphaned: Vec<String> = Vec::new();
+    let mut claimed = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("the snapshot directory") {
+      let path = entry.expect("a snapshot directory entry").path();
+      if path.extension().and_then(std::ffi::OsStr::to_str) != Some("txt") {
+        continue;
+      }
+      let stem = path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("a snapshot file name")
+        .to_owned();
+      let name = stem.strip_suffix("-documented").unwrap_or_else(|| {
+        panic!("{stem}.txt is in xtask/snapshots but is not named `<crate>-documented.txt`")
+      });
+      if super::GATED_CRATES.contains(&name) {
+        claimed += 1;
+      } else {
+        orphaned.push(name.to_owned());
+      }
+    }
+
+    assert!(
+      orphaned.is_empty(),
+      "{orphaned:?} has a committed snapshot in {} that no crate in GATED_CRATES claims — \
+       a crate dropped from that list keeps its snapshot, stops being compared against \
+       it, and loses table-verdicts and path-qualified callee along with it",
+      dir.display()
+    );
+
+    for name in super::GATED_CRATES {
+      let snapshot = dir.join(format!("{name}-documented.txt"));
+      assert!(
+        snapshot.exists(),
+        "{name} is gated but has no snapshot at {}",
+        snapshot.display()
+      );
+    }
+
+    assert_eq!(
+      claimed,
+      super::GATED_CRATES.len(),
+      "one snapshot per gated crate, and no gated crate reading a snapshot twice"
+    );
   }
 
   // The hazard: `///` attaches to the NEXT item and Rust has no notion of a
@@ -2493,23 +2755,155 @@ fn switched() {}
   // on disk. Removed before it is written as well as after: a run killed
   // half way through must not leave a file behind that silently joins what
   // the next run scans.
-  fn scratch_crate(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+  //
+  // EVERY gated crate gets its `src`, not just the ones the fixture writes
+  // files into: `verdicts` scans the whole set, and a crate with no `src` is
+  // a reported FAILURE (`gated_files`), so a fixture holding only
+  // `http1-proto` would fail every test of this check for that reason instead
+  // of the one it was written for.
+  fn scratch_crates(name: &str, files: &[(&str, &str, &str)]) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("xtask-{name}-{}", std::process::id()));
-    let src = root.join("http1-proto").join("src");
     std::fs::remove_dir_all(&root).ok();
-    std::fs::create_dir_all(&src).expect("a scratch crate root");
-    for (file, text) in files {
-      std::fs::write(src.join(file), text).expect("a source file");
+    for gated in super::GATED_CRATES {
+      std::fs::create_dir_all(root.join(gated).join("src")).expect("a scratch crate root");
+    }
+    for (crate_name, file, text) in files {
+      std::fs::write(root.join(crate_name).join("src").join(file), text).expect("a source file");
     }
     root
   }
 
+  // The single-crate spelling, for the tests whose subject is one file's
+  // content rather than the crate set.
+  fn scratch_crate(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let spread: Vec<(&str, &str, &str)> = files
+      .iter()
+      .map(|(file, text)| ("http1-proto", *file, *text))
+      .collect();
+    scratch_crates(name, &spread)
+  }
+
   fn verdicts_over(root: &std::path::Path) -> Report {
-    let mut report = Report::new();
+    let mut report = Report::new("doc-check");
     let ran = super::verdicts(root, &mut report);
     std::fs::remove_dir_all(root).ok();
     ran.expect("the check itself runs");
     report
+  }
+
+  // Task 1's OTHER contract, and the one no other test in this file bites on:
+  // `verdicts` and `callees` scan a SET of crates. Both halves are asserted
+  // here, because either alone leaves the same hole in the other:
+  //
+  // - that a doc run in a crate after the first is REACHED at all — the
+  //   `elsewhere` count; and
+  // - that each report line SAYS which crate each file came from — the
+  //   census. A merged total cannot distinguish a crate that was scanned and
+  //   held nothing from a crate that was never reached, so without the census
+  //   a reader has nothing to check and this assertion has nothing to read.
+  //
+  // Written over `GATED_CRATES` rather than over two literal names, so a
+  // crate added to that list is scanned by this test too instead of quietly
+  // sitting outside it.
+  //
+  // Generality over that list has a floor, and it is asserted rather than
+  // assumed: with ONE gated crate the loop below writes no second crate, the
+  // `elsewhere` count reduces to `0` compared against `0`, and both halves
+  // above pass while testing nothing. A test that goes quiet when its subject
+  // disappears is the failure this file exists to prevent, so the shrunken
+  // list is a loud failure here instead — the fixture cannot be built from a
+  // one-crate list, and saying so is more use than a green run over it.
+  #[test]
+  fn every_gated_crate_is_scanned_and_counted_by_name() {
+    assert!(
+      super::GATED_CRATES.len() >= 2,
+      "both halves of this test need a crate AFTER the first and GATED_CRATES holds {}: \
+       the fixture loop below would write one crate, `elsewhere scanned` would read 0 \
+       against 0, and the whole test would pass with no second crate to reach",
+      super::GATED_CRATES.len()
+    );
+
+    let mut files: Vec<(&str, &str, &str)> = vec![(super::GATED_CRATES[0], "tunnel.rs", GOVERNED)];
+    for name in &super::GATED_CRATES[1..] {
+      files.push((
+        name,
+        "lib.rs",
+        "/// A doc run this scan has to reach.\nfn f() {}\n",
+      ));
+    }
+    let root = scratch_crates("gated-set", &files);
+
+    let mut report = Report::new("doc-check");
+    let ran = super::verdicts(&root, &mut report).and_then(|()| super::callees(&root, &mut report));
+    std::fs::remove_dir_all(&root).ok();
+    ran.expect("both checks run");
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let census = super::GATED_CRATES
+      .iter()
+      .map(|name| format!("{name} 1"))
+      .collect::<Vec<_>>()
+      .join(", ");
+    for line in &report.lines {
+      assert!(
+        line.contains(&format!("files scanned: {census}")),
+        "every per-file check must name each gated crate beside its own file count: {line}"
+      );
+    }
+    assert!(
+      report.lines[0].contains(&format!(
+        "{} doc run(s) elsewhere scanned",
+        super::GATED_CRATES.len() - 1
+      )),
+      "a doc run in each crate after the first must be reached: {}",
+      report.lines[0]
+    );
+  }
+
+  // A gated crate with no `src` is a broken gate, and the report has to
+  // SURVIVE saying so. `Report::finish` prints nothing until every check has
+  // run, so an `Err` out of `verdicts` would discard the whole report —
+  // including `continuity`'s own message about the same misconfigured crate,
+  // which is the one that names it. The check's own line stays, with the hole
+  // in its census, rather than a total that quietly shrank.
+  //
+  // Its floor is asserted BEFORE the fixture is written, and as a check rather
+  // than as an index: `GATED_CRATES[1]` on a one-crate list is a bounds panic
+  // whose message names neither this test's subject nor the edit that broke
+  // it, and it would leave the scratch tree behind on the way out.
+  #[test]
+  fn a_gated_crate_with_no_src_is_reported_and_the_rest_of_the_run_survives() {
+    let missing = *super::GATED_CRATES.get(1).unwrap_or_else(|| {
+      panic!(
+        "this test breaks a gated crate OTHER than the one holding its fixture file, \
+         and GATED_CRATES holds {} — with one crate there is no other crate to break",
+        super::GATED_CRATES.len()
+      )
+    });
+
+    let root = scratch_crates(
+      "gated-missing-src",
+      &[(super::GATED_CRATES[0], "tunnel.rs", GOVERNED)],
+    );
+    std::fs::remove_dir_all(root.join(missing).join("src")).expect("the second crate's src");
+
+    let mut report = Report::new("doc-check");
+    let ran = super::verdicts(&root, &mut report);
+    std::fs::remove_dir_all(&root).ok();
+    ran.expect("the check itself still runs rather than throwing");
+
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+      report.failures[0].contains(&format!("`{missing}` is gated but has no `src` directory")),
+      "the failure must name the crate and what is missing: {}",
+      report.failures[0]
+    );
+    assert_eq!(report.lines.len(), 1, "the check's own line must survive");
+    assert!(
+      report.lines[0].contains(&format!("{missing} UNREACHED")),
+      "the census must show the hole rather than a smaller total: {}",
+      report.lines[0]
+    );
   }
 
   // The floor under discovery. Renaming one word of the header substring
@@ -2616,6 +3010,18 @@ fn send_response() {}
     );
     let report = verdicts_over(&root);
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    // First, and by name. Both locations in the sentence below — the offending
+    // run's and the declaring table's — are IDENTIFIERS a reader greps, pastes
+    // into a review, or diffs against another machine's run, so both are
+    // `/`-spelled wherever this runs. On Windows they were not, and the
+    // literal assertion that follows failed on
+    // `http1-proto\src\outbound.rs:6` with a string mismatch naming no rule.
+    // Asserted ahead of it so the rule is what a reader is told.
+    assert!(
+      !report.failures[0].contains('\\'),
+      "a finding spells a source location the same on every platform: {}",
+      report.failures[0]
+    );
     assert!(
       report.failures[0].starts_with(
         "http1-proto/src/outbound.rs:6: the verdict `STRUCTURALLY EXCLUDED` is written"
@@ -2626,6 +3032,11 @@ fn send_response() {}
     assert!(
       report.failures[0].contains("reword it so it is not claiming a"),
       "the failure must say what to do instead: {}",
+      report.failures[0]
+    );
+    assert!(
+      report.failures[0].contains("(http1-proto/src/tunnel.rs:3)"),
+      "the failure must name where the verdict was declared: {}",
       report.failures[0]
     );
     assert!(
@@ -2674,15 +3085,32 @@ fn into_tunnel() {}
   // printed line is pinned entire here because this is the shape a real run
   // has: zero findings, and a denominator that says so out loud rather than
   // leaving "checked" indistinguishable from "never looked".
+  //
+  // That includes the per-crate census, and the ZERO in it is the half worth
+  // pinning: this fixture writes into the first gated crate only, so every
+  // other crate is scanned and holds nothing — which the line has to say in
+  // as many words, because it is the exact reading a merged total cannot tell
+  // apart from never having looked there.
   #[test]
   fn the_declaration_bullets_are_not_their_own_violation() {
     let root = scratch_crate("verdicts-exempt", &[("tunnel.rs", GOVERNED)]);
     let report = verdicts_over(&root);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let census = std::iter::once(format!("{} 1", super::GATED_CRATES[0]))
+      .chain(
+        super::GATED_CRATES[1..]
+          .iter()
+          .map(|name| format!("{name} 0")),
+      )
+      .collect::<Vec<_>>()
+      .join(", ");
     assert_eq!(
       report.lines[0],
-      "table-verdicts: 1 table(s) checked, 0 problem(s); 3 declared verdict word(s) \
-       reserved to them, 0 doc run(s) elsewhere scanned, 0 carried one"
+      format!(
+        "table-verdicts: 1 table(s) checked, 0 problem(s); 3 declared verdict word(s) \
+         reserved to them, 0 doc run(s) elsewhere scanned, 0 carried one; files \
+         scanned: {census}"
+      )
     );
   }
 
@@ -2817,13 +3245,13 @@ fn f(bytes: &[u8]) {
   // without --require-all.
   #[test]
   fn a_rustdoc_failure_is_fatal_where_a_toolchain_skip_is_not() {
-    let mut skipped = Report::new();
+    let mut skipped = Report::new("doc-check");
     skipped.skip(
       "doc-continuity",
       "requires nightly rustdoc --output-format json",
     );
     assert!(skipped.finish(false).is_ok());
-    let mut failed = Report::new();
+    let mut failed = Report::new("doc-check");
     failed.fail("doc-continuity could not run: the crate did not build");
     assert!(failed.finish(false).is_err());
   }
@@ -2842,5 +3270,117 @@ fn f(bytes: &[u8]) {
     let tail = super::indented_tail(&long);
     assert_eq!(tail.lines().count(), 12);
     assert!(tail.starts_with("    line 8"));
+  }
+
+  // `unclaimed_snapshots` reads a directory, so its tests need one — and a
+  // list of gated names they control, which is why the function takes that
+  // list rather than reading `GATED_CRATES`. Removed before it is written as
+  // well as after, matching `scratch_crates`: a run killed half way through
+  // must not leave a snapshot behind that silently joins the next run.
+  fn scratch_snapshots(name: &str, files: &[&str]) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("xtask-{name}-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let dir = root.join("xtask/snapshots");
+    std::fs::create_dir_all(&dir).expect("a scratch snapshot directory");
+    for file in files {
+      std::fs::write(dir.join(file), "# a snapshot\n").expect("a snapshot file");
+    }
+    root
+  }
+
+  fn snapshots_over(root: &std::path::Path, gated: &[&str]) -> Report {
+    let mut report = Report::new("doc-check");
+    let ran = super::unclaimed_snapshots(root, gated, &mut report);
+    std::fs::remove_dir_all(root).ok();
+    ran.expect("the check itself runs");
+    report
+  }
+
+  // The subject: dropping a crate from `GATED_CRATES` costs it three checks
+  // and orphans its snapshot, and until this existed the binary exited 0 —
+  // `--require-all` included, because nothing was SKIPPED, only shortened.
+  // The failure has to name the crate AND what it lost, since the reader is
+  // someone who does not yet know the list changed.
+  #[test]
+  fn a_snapshot_no_gated_crate_claims_fails_the_run() {
+    let root = scratch_snapshots(
+      "unclaimed-snapshot",
+      &["kept-documented.txt", "dropped-documented.txt"],
+    );
+    let report = snapshots_over(&root, &["kept"]);
+
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+      report.failures[0].contains("`dropped` has a committed snapshot"),
+      "{}",
+      report.failures[0]
+    );
+    let lost = "doc-continuity, table-verdicts and path-qualified callee";
+    assert!(
+      report.failures[0].contains(lost),
+      "the message must say what the crate LOST, not only that it is unclaimed: {}",
+      report.failures[0]
+    );
+    assert!(
+      report.lines[0].contains("2 committed snapshot(s), 1 claimed by no crate"),
+      "{}",
+      report.lines[0]
+    );
+    assert!(
+      report.finish(false).is_err(),
+      "an orphan fails without --require-all too: it is a defect found, not a check skipped"
+    );
+  }
+
+  // The clean tree: every snapshot claimed, no failure, and a census line that
+  // still states the denominator. Without this half the test above passes on a
+  // check that fails on everything.
+  #[test]
+  fn every_claimed_snapshot_passes_and_is_counted() {
+    let root = scratch_snapshots(
+      "claimed-snapshot",
+      &["kept-documented.txt", "also-documented.txt"],
+    );
+    let report = snapshots_over(&root, &["kept", "also"]);
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(
+      report.lines[0].contains("2 committed snapshot(s), 0 claimed by no crate"),
+      "{}",
+      report.lines[0]
+    );
+  }
+
+  // A snapshot spelled any other way is read by nothing, because `continuity`
+  // builds its path from a crate name. Same defect, different spelling — and
+  // it must not be quietly skipped on the way to counting the orphans.
+  #[test]
+  fn a_snapshot_not_named_for_a_crate_fails_too() {
+    let root = scratch_snapshots("misnamed-snapshot", &["kept-documented.txt", "notes.txt"]);
+    let report = snapshots_over(&root, &["kept"]);
+
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+      report.failures[0].contains("is not named `<crate>-documented.txt`"),
+      "{}",
+      report.failures[0]
+    );
+  }
+
+  // The opposite edit keeps its OWN message: a crate named in the list with no
+  // snapshot committed is `continuity`'s failure, not this one's, and this
+  // check must stay silent about it rather than reporting the absence twice
+  // under a name that would send the reader to delete the wrong thing.
+  #[test]
+  fn a_gated_crate_with_no_snapshot_is_not_this_checks_failure() {
+    let root = scratch_snapshots("missing-snapshot", &["kept-documented.txt"]);
+    let report = snapshots_over(&root, &["kept", "ungated-and-unsnapshotted"]);
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(
+      report.lines[0].contains("1 committed snapshot(s), 0 claimed by no crate"),
+      "{}",
+      report.lines[0]
+    );
   }
 }

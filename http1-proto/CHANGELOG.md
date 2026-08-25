@@ -310,9 +310,11 @@ its own.
 ### Tooling
 
 - **no-panic link test** (`tests/no_panic.rs`): `#[no_panic]` shims prove
-  `find_head_end`, `parse_status_line`, `parse_chunk_size` and
-  `parameterised_list` compile to panic-free code at link time, plus four
-  release smokes over the deeper paths.
+  `find_head_end`, `parse_status_line` and `parse_chunk_size` compile to
+  panic-free code at link time, plus four release smokes over the deeper paths.
+  The RFC 9110 §5.6.6 parameterised-list walk, the §12.4.2 `qvalue` reader and
+  the §12.5.1 weight selection are link-checked too, in `http-semantics`, which
+  is where that code lives and where its shims now sit.
   Requires `--release` **and fat LTO** (`CARGO_PROFILE_RELEASE_LTO=fat`) — the
   shims call across the crate boundary, so without it every one false-positives.
   Every argument goes through `core::hint::black_box`: a shim called with

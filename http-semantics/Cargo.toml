@@ -1,0 +1,42 @@
+[package]
+name = "http-semantics"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+license = "MIT OR Apache-2.0"
+description = "Version-independent HTTP semantics (RFC 9110): field grammar, media types, dates. no_std, no_alloc capable, panic-free."
+repository = "https://github.com/al8n/websockit"
+readme = "README.md"
+keywords = ["http", "rfc9110", "no-std", "sans-io", "parser"]
+categories = ["network-programming", "no-std", "embedded", "web-programming"]
+
+[features]
+default = ["std"]
+std = ["thiserror/default"]
+alloc = []
+no-atomic = []
+# Internal: exposes leaf hot paths for `tests/no_panic.rs`. Implies `std`.
+test-no-panic = ["std"]
+# Internal, and MUST-FAIL by design: adds one `#[no_panic]` shim to
+# `tests/no_panic.rs` whose body contains a reachable panic, so building that
+# test in RELEASE has to fail to LINK. It is the permanent check that the link
+# proof is not vacuous — a shim whose call the optimizer folded away, or a build
+# without fat LTO, would let every real shim "pass" with an empty proof, and
+# nothing in a green run would say so. CI asserts the failure; see the `no-panic`
+# job in `.github/workflows/ci.yml`. In debug the guard is off (the test's own
+# `cfg_attr`), so `cargo hack --each-feature` and miri build and run this like
+# any other test.
+test-no-panic-lie = ["test-no-panic"]
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+no-panic = "0.1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

@@ -114,7 +114,7 @@ your limits forbid; deciding *what to do* with a well-framed message is yours.
 
 | Feature | Default | Enables |
 |---------|:-------:|---------|
-| `std` | ✅ | `thiserror/std` |
+| `std` | ✅ | `thiserror/std`, `http-semantics/std` |
 | `alloc` | | heap tier without `std` (a storage-tier marker for now) |
 | `no-atomic` | | heap tier without `std` and without native atomic CAS |
 
@@ -126,8 +126,8 @@ names the heap tier for cores with **no native atomic CAS** (Cortex-M0+ /
 than accompanying it.
 
 The bare `no_std`, no-`alloc` tier compiles with `--no-default-features`. The
-only external dependencies on that tier are `thiserror` (with `std` off) and
-`derive_more`.
+only external dependencies on that tier are `http-semantics`, `thiserror` (with
+`std` off on both) and `derive_more`.
 
 ## The driver loop
 

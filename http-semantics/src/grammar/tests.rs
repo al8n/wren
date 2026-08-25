@@ -192,7 +192,7 @@ fn unescape_into_writes_nothing_when_the_slice_is_short() {
   let mut out = [0xAAu8; 2];
   assert_eq!(
     v.unescape_into(&mut out),
-    Err(crate::Error::BufferTooSmall { need: 3, have: 2 })
+    Err(BufferTooSmall { need: 3, have: 2 })
   );
   assert_eq!(out, [0xAA, 0xAA], "a failed call must not have written");
 

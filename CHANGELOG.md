@@ -1,5 +1,497 @@
 # UNRELEASED
 
+## A fourth bypass of one gate, and the redesign that ends the series
+
+### Tooling
+
+- **`shim-check` no longer decides REACHABILITY by reading Rust source. It asks
+  the linker.** The check now has two halves, each asking its question where
+  that question's answer lives.
+
+  The fourth bypass is what made the split necessary rather than tidy. Its
+  comment-and-literal blanker knew ordinary `"…"` and not raw strings, so in
+  `r#""assert!(shim_x(black_box(…)));""#` the quotes INSIDE the literal ended
+  and restarted the blanking and handed the call scanner string data as code.
+  Measured on `http3-proto`: `shim_varint_decode`'s whole `#[test]` body
+  replaced by that one line left `shim-check` exiting 0 over 139 "rooted" call
+  sites, `cargo test -p http3-proto --release --features test-no-panic` ok on 5
+  tests, the lie-check still red on `shim_lie` — and `nm` over that binary
+  finding no `shim_varint_decode` at all. Round two of the same review had
+  closed three others: a call inside `debug_assert!`, a call under a `#[cfg]`
+  release turns off, and a call in a helper nothing reaches. Patching the fourth
+  corner buys the fifth; a lexical scanner over Rust source has an unbounded
+  supply of them, and `xtask` takes no dependencies, so no real lexer is
+  available to it.
+
+  **What moved.** "Was this shim instantiated" is now read out of the ARTIFACT:
+  per crate, `cargo test --release --features test-no-panic --test no_panic
+  --no-run --message-format=json` — the build the `no-panic` job already does,
+  so the link steps below become cache hits — then the test binary's own symbol
+  table, and, for every declared shim, a DEFINED FUNCTION symbol whose mangled
+  path is the test crate followed by that shim. It does not read Rust, so it has
+  no corners. All five mutations above red on it, and three of the
+  five are invisible to the source half entirely, including one no lexical
+  checker could ever see: a lexically perfect call inside `if NEVER { … }`.
+
+  **What stayed lexical.** `black_box` at every argument and a live answer are
+  properties of how a shim is WRITTEN, and a symbol table cannot see an
+  argument. They are still read from the source, and the module says in as many
+  words which half answers which question. The blanker was fixed anyway — every
+  raw, raw-byte and C-string form, any hash count — and it now REFUSES a literal
+  or block comment it cannot finish reading instead of guessing where it ended.
+
+  **Two declaration changes make a symbol mean what the check reads it as.**
+  `#[inline(never)]` on `no_panic_shim!`, because a private `fn` with one call
+  site is inlined into its `#[test]` and leaves no symbol at all — measured:
+  before it, `nm` over these binaries found no `shim_*` whatever. And
+  `black_box` around each shim's own answer, because a body the optimizer can
+  prove pure and trivial is forwarded to its callers and deleted even though it
+  IS called: `http1-proto`'s `shim_widen` wraps `u64::try_from(usize)`, the
+  identity on a 64-bit target, and this check's first run over the live files
+  found it missing. Deleted-because-trivial and deleted-because-uncalled are one
+  silence in a symbol table, and the alternative to telling them apart is a list
+  of excused shims, which is a bypass with a name. Neither change weakens the
+  proof — the leaves still inline INTO the body, which is what the fat-LTO steps
+  are for — and both were measured: all four real steps still link clean, all
+  four lie-checks still refuse to link naming `shim_lie`.
+
+  **It fails closed on every way it can fail to know.** A binary that did not
+  build, a `cargo` JSON reporting other than exactly one `no_panic` executable,
+  an object format the reader does not read, a stripped table with no symbols in
+  it, a shim under a `#[cfg]` the build does not enable — each is a named
+  failure rather than a shim counted as fine. The one exemption is the
+  lie-control, and it is tied to both the name `shim_lie` and the gate
+  `feature = "test-no-panic-lie"`, at most one per file, so it cannot be spread
+  over a real shim. The symbol reader is written rather than shelled to `nm`:
+  a check whose answer depends on whether a tool is installed has a second way
+  to go quiet. It reads ELF64 and 64-bit Mach-O, with its own tests over
+  hand-built files of each.
+
+  The line a run prints now carries both denominators — `written — 24 shim(s) in
+  4 file(s), 149 call site(s), 239 argument(s) through black_box; 0 span(s) this
+  check could not analyse` and `instantiated — 20 of 24 declared shim(s) are
+  DEFINED, as a function whose mangled path is no_panic::<shim>, in the release
+  test binary their no-panic step links; over 6840 symbol(s) read, 4668 of them
+  defined functions; 4 lie-control shim(s) excluded`.
+
+- **The symbol reader now requires the shim's whole PATH and the symbol's kind,
+  and honours every extent the object file declares.** Two findings of the same
+  shape from the round that reviewed the reader above: the gate could pass while
+  the property it names was false.
+
+  **A name is not an identity.** The verdict accepted any symbol containing the
+  shim's name as a mangled path component, and never checked the `no_panic`
+  test-crate path its own constant documented. An executable carries every
+  dependency's symbols and every symbol it merely REFERENCES, so a dead local
+  `shim_decode` was satisfied by `elsewhere::shim_decode`, by
+  `no_panic::inner::shim_decode`, by a `static` of that name, or by an undefined
+  entry — no forgery required, an ordinary dependency collision does it — and
+  combined with a textually valid but compiled-away call, both halves passed
+  over an empty proof. The rule is now a DEFINED FUNCTION whose mangled path is
+  `no_panic::<shim>`, read anchored in both mangling schemes, and the failure
+  names the symbol that spelled it so a collision reads as one. The doc that
+  described the requirement the code did not perform is now the doc of the
+  requirement it does.
+
+  **A truncated string table could still yield a passing name.** The ELF reader
+  followed a symbol table's `sh_link` without checking that section's type or
+  size, and its `cstr` scanned to end-of-file and treated a missing NUL as a
+  terminator; the Mach-O path ignored `strsize`. A table shortened by one byte,
+  with a shim's spelling in the bytes that follow it, was therefore read as
+  CONTAINING that shim. Every lookup is now bounded by the extent the file
+  declares — `sh_link`'s type, each section's size, `sizeofcmds`, each
+  `cmdsize`, `nsyms`, `strsize` — and a name with no terminator inside its table,
+  or an offset outside it, is REFUSED by name rather than improvised over. The
+  reader was checked against real ELF64 and Mach-O artifacts of both mangling
+  schemes, not only its hand-built fixtures.
+
+  Three name matches of the same shape were tightened with them: the test
+  binary's own target name (`no_panic_extra-…` passed a `starts_with`), the
+  `no_panic_shim!` invocation, and the `macro_rules! no_panic_shim` definition
+  whose exemption a `no_panic_shim_other` could take.
+
+## Three adversarial-review findings: a rule that could not be stated, a permissive sender, and a gate with a bypass
+
+### `http-semantics`
+
+- **BREAKING (unreleased): `parse_http_date_from` takes a reference INSTANT,
+  not a reference year.**
+
+  ```rust
+  pub fn parse_http_date_from(v: &[u8], now_unix_seconds: i64) -> Result<HttpDate, DateError>;
+  ```
+
+  RFC 9110 §5.6.7 has a recipient "interpret a timestamp that appears to be
+  more than 50 years in the future as representing the most recent year in the
+  past that had the same last two digits". Both sides of that comparison are
+  timestamps — the value's, and fifty years past the recipient's own instant —
+  and a `u16` of years can represent neither. A recipient whose clock reads
+  2026-01-01 must read `Friday, 31-Dec-76 00:00:00 GMT` as 1976, because its
+  fifty-year anniversary is 2076-01-01 and that value is most of a year past
+  it; the same recipient on 2026-12-31 must read it as 2076. Handed only the
+  year 2026, the window could not tell the two apart, and answered 2076 for
+  both. The rule is now applied where it is stated: the candidate timestamp
+  against the exact fifty-year anniversary of `now_unix_seconds`, to the
+  second.
+
+  **Seconds since the POSIX epoch rather than an `HttpDate`**, because seconds
+  since the epoch is what a clock answers. `SystemTime`'s duration since
+  `UNIX_EPOCH`, a POSIX `time_t` and an embedded RTC's counter are this number
+  already; an `HttpDate` would put the civil-calendar conversion this module
+  owns on every caller, or make the crate publish a second constructor whose
+  only purpose is to feed the first. It is also what `HttpDate::unix_seconds`
+  answers, so a `Date` field this parser has read is a legal reference for the
+  next call. Every `i64` is an instant, so the argument has no malformed value
+  and adds no refusal of its own.
+
+  `parse_http_date`'s anchor moves with it: `REFERENCE_INSTANT` is
+  2026-01-01T00:00:00Z, whose anniversary is 2076-01-01T00:00:00Z. `94` still
+  reads as 1994; `76` now reads as 1976 for every timestamp of that year except
+  the one that IS the anniversary, which is what a recipient with a real 2026
+  clock answers and what the year-wide window could not.
+
+  Two private helpers arrive with it: `civil_from_days`, Hinnant's exact
+  inverse of the `days_from_civil` already here — the anniversary needs the
+  month and day the caller's instant falls on, and seconds since the epoch does
+  not carry them — and `seconds_since_midnight`, one definition of "how far
+  into the day" shared by `HttpDate::unix_seconds` and the window, so the two
+  cannot disagree about the instant the rule turns on. `DateError` is unchanged
+  in this direction: `FiftyYearWindow` still names a year no `u16` holds, and
+  where each band begins is now a function of the candidate's own month, day
+  and time of day as well as of the clock, which is the point.
+
+- **BREAKING (unreleased): `format_imf_fixdate` refuses a year below 1900, as
+  the new `DateError::YearBefore1900`. The parser still accepts one.** RFC 9110
+  §5.6.7 gives `year` the semantics of the Internet Message Format construct of
+  that name, and RFC 5322 §3.3 says "The year is any numeric year 1900 or
+  later". This crate reasoned earlier that the bound does not bind at all,
+  because §3.3's conformance sentence enumerates four constituents and `year`
+  is not among them, and because §5.6.7 re-spells the production as
+  `year = 4DIGIT` where RFC 5322 has `4*DIGIT`. That reasoning holds for the
+  READER and not for the writer. §5.6.7 tells a recipient to "be robust in
+  parsing timestamps", and a year below 1900 is an unambiguous instant every
+  recipient reads alike — but robustness is not an argument available to a
+  sender, who commits the fault instead of carrying it. Every other clause of
+  §3.3 is already discharged here at the sender, `day-name` included; this one
+  now is too.
+
+  Its own variant rather than `DateError::Year`, under this crate's
+  one-variant-per-rule convention. The two refuse at the two ends of one field
+  for two different reasons: above 9999 there is no column in `date1`'s
+  `year = 4DIGIT` to write the digits in, while 1899 has four digits and a
+  column for each and is refused for what the year means. Folding them together
+  would leave a test unable to say which end refused, and would let a writer
+  that had lost the `4DIGIT` ceiling pass the test written for the 1900 floor.
+
+  It is a real asymmetry and not a hypothetical one: `Sat, 01 Jan 0000
+  00:00:00 GMT` parses and will not be written back, and so does an
+  `rfc850-date` whose fifty-year window lands before 1900 — `99` measured from
+  an 1860 clock is 1899. The round trip was never total; it now costs one more
+  input, and `grammar`'s own `list_elements` / `sender_list_shape` pair states
+  the same doctrine one module over: recipient tolerance is not a licence to
+  emit.
+
+- **The fifty-year rule's tests are graded by §5.6.7's sentence, not by the
+  implementation's model.** The exhaustive test that shipped last round
+  computed its expected value as `horizon = reference_year + 50`,
+  `want = horizon - horizon % 100 + two_digits` — the implementation's own
+  model, spelled a second time. It walked all 6_553_600 argument pairs and
+  every one agreed, because a wrong model checked against itself agrees
+  everywhere; the year-versus-timestamp defect above sat inside the model both
+  halves shared, so no amount of coverage could reach it.
+
+  The oracle is now built from the section's sentence and shares nothing with
+  the code it grades. Its calendar is a day-of-year table plus a leap-year
+  count where the module runs Hinnant's March-based 400-year eras, and the two
+  are pinned against each other — in both directions, `civil_from_days`
+  included — over every month boundary of every year a `u16` holds. It applies
+  the rule by SEARCH, enumerating the years ending in the given two digits and
+  keeping the most recent whose timestamp is not past the anniversary, where
+  the module computes one candidate from a century and conditionally steps it
+  back.
+
+  The reference-year sweep stays exhaustive, so nothing the old test covered is
+  lost, and a second sweep covers the dimension it could not express at all:
+  every month, every day column the grammar admits and five times of day around
+  the anniversary, for all hundred two-digit years. Beside them are the named
+  boundaries — the anniversary to the second in each of month, day, hour,
+  minute and second; the leap-day anniversary, which never lands on a leap day
+  and falls on 1 March; and the century the rule picks deciding whether
+  `29-Feb-00` is a date at all.
+
+### Tooling
+
+- **`shim-check` no longer accepts a call site the release build removes.**
+  `debug_assert`, `debug_assert_eq` and `debug_assert_ne` were on its
+  accepted-consumer list, and those macros delete their expression when
+  `debug_assertions` is off — which is the `--release` every `no-panic` step
+  builds in. Replacing a real shim's calls with
+  `debug_assert_eq!(shim_x(black_box(…)), …)` therefore passed: the arguments
+  were opaque, the lexical call was there, the answer was consumed, and the
+  linker saw no call at all. The real step linked clean over an empty proof
+  while the crate's `shim_lie` still failed on its own, so both CI controls
+  stayed green — the same defect this check exists to report, arriving through
+  the check itself.
+
+  A call site now counts only when it is REACHED: a `#[test]` in the same file
+  must reach it, directly or through other functions of that file, under `cfg`
+  predicates the shim itself carries. That closes all three routes — a
+  `debug_assert`, a `#[cfg]` on the test that the shim does not have, and a
+  helper nothing calls — and admits the lie-check's own shape, where shim and
+  `#[test]` sit under one `feature = "test-no-panic-lie"`. Each route has a
+  negative test, and each of those reds when the rule behind it is disarmed.
+
+  **What a lexical checker cannot reach is now stated and counted rather than
+  assumed harmless.** `cfg` predicates are compared as written and never
+  evaluated; only top-level items are read; the call graph stops at the file;
+  and a call through a function pointer is not found at all. A `cfg` inside a
+  function body and a call in no top-level `fn` are each reported as a span the
+  check could not analyse — failed, not skipped — and the count is on the line
+  every run prints, which now reads `24 shim(s) in 4 file(s), 149 call site(s)
+  — 149 rooted in a release-enabled #[test], 0 not; 239 argument(s) through
+  black_box; 0 span(s) this check could not analyse and did not assume
+  harmless`. The exact answer is the linker's, and the module names it as the
+  open follow-up: read the release test binary's symbol table and require a
+  symbol per declared shim, which costs no extra build and needs a stable
+  name-to-symbol mapping this check does not have.
+
+  Its test module now drives `check_file` itself instead of a second copy of
+  the per-file body. The copy shared the helpers but not the composition, so a
+  rule added to the command and not to the copy was a rule no test exercised —
+  and a rule deleted from the command left every test green on the copy. The
+  rooting rules above were added under exactly that hazard.
+
+## Two adversarial-review findings: a control with no subject, and a clamp with no caller
+
+### Tooling
+
+- **`cargo run -p xtask -- shim-check`: the structural half of the `no-panic`
+  link proofs.** The four `test-no-panic-lie` controls prove that `no-panic`,
+  the selected profile and `black_box` still work — for `shim_lie`, which is
+  their own subject and nobody else's. Put one real shim's call site back to
+  bare literals and nothing in CI moves: measured on `websocket-proto` with
+  `FrameHeader::encode`'s high-bit-length call, the real step still linked clean
+  and reported `ok` on 6 tests while the lie step still exited 101 on the marker
+  naming `shim_lie`. Both green, that crate's proof empty.
+
+  The new check reads the source instead of building it. Every `#[no_panic]`
+  shim declared through `no_panic_shim!` must have at least one call site; every
+  argument at every call site must be a whole `core::hint::black_box(…)` call;
+  and every call's answer must feed an assertion or be wrapped in `black_box` —
+  or, for a shim answering `()`, be held by an opaque `&mut` it writes through.
+  It also floors its own discovery: a file whose macro stopped applying the
+  attribute, a shim declared by writing `#[no_panic::no_panic]` outside that
+  macro, a `no_panic_shim!` block it cannot read, a claimed crate with no proof
+  file, and a `tests/no_panic.rs` no entry of `SHIMMED_CRATES` claims are each a
+  failure. It prints its denominator — 24 shims in 4 files, 149 call sites, 239
+  arguments today — so a green run is distinguishable from a run that never
+  looked. (A call site's REACHABILITY became part of the same check in the
+  round above.) It runs first in the `no-panic` job, in milliseconds, where the
+  alternative was one must-fail release build per shim.
+
+- **`doc-check` reports the size of the snapshot it compared against, and fails
+  on an empty one.** `lost_docs` is one-directional, so a `-documented.txt`
+  truncated to nothing loses nothing and every later run printed a healthy
+  `N documented items, 0 lost` for a comparison against no subject at all. The
+  line now reads `N documented items against M snapshotted, K lost`, and `M = 0`
+  for a gated crate is a failure — the same floor `verdicts` puts under
+  `tables == 0`, one file over.
+
+### `http-semantics`
+
+- **BREAKING (unreleased): an `rfc850-date` whose fifty-year year this parser
+  cannot represent is now refused, as the new `DateError::FiftyYearWindow`,
+  instead of parsed with a clamped year.** §5.6.7's rule is measured from a
+  reference year the caller supplies, so it can name a year outside `u16` at
+  either end. Those two ends saturated — at `u16::MAX` above and at year 0
+  below — and a clamp there is not a narrower answer but a wrong one that
+  arrives as `Ok`: `(36, 65486)` denotes 65536 and parsed as year 65535, a value
+  that does not even end in the `36` the sender wrote, with `unix_seconds()`
+  describing the wrong instant. The earlier reasoning for keeping the clamp was
+  that a clamped bound "reads as a clamp"; it does not — a caller holding an
+  `HttpDate` cannot tell a clamped year from a written one. Only a refusal is
+  visible, so both ends refuse and they refuse alike: it is one rule, §5.6.7's
+  fifty-year rule, naming a year this module cannot hold.
+
+  Its own variant rather than `DateError::Year`, under this crate's one-variant-
+  per-rule convention: `Year` is about the LITERAL not being the digits its
+  format spells, and here the two digits are digits — what failed is the rule
+  computed from them, and its cause is the caller's `reference_year` rather than
+  the input bytes. A test can now assert which of the two refused.
+
+  Nothing a real clock can reach changes: the refusing bands are 1225 argument
+  pairs (reference years 0 through 48) and 1275 (65486 through 65535) out of
+  6_553_600. `format_imf_fixdate`'s `DateError::Year` for a year past four
+  digits is untouched and still reachable.
+
+  (The `reference_year` this entry names became a reference INSTANT in the round
+  above, which moves where each band begins; the refusal and its variant are
+  unchanged.)
+
+- **The exhaustive window test is now two-directional.** It used to assert that
+  the clamped bands came back clamped — a successful parse of 65535 for a rule
+  that named 65536 was what it REQUIRED, which is what let the defect through.
+  It now requires every `Ok` to equal the unclamped `i32` oracle AND to end in
+  the two digits supplied, and every `Err` to be a pair whose oracle no `u16`
+  holds, so it fails both on a wrong answer and on a refusal that was not owed.
+  Reverted to the shipped arithmetic it reds three tests, the exhaustive one
+  reporting `(51, 0) -> 0, but the rule names -49, which no u16 holds`.
+
+  (Two-directional and still blind: the `i32` oracle named here restated the
+  implementation's own year-only model, which is the finding the round above
+  fixes.)
+
+## `websocket-proto` and `http3-proto` — the two link proofs get something that can falsify them
+
+### Tooling
+
+- **Every shim argument now goes through `core::hint::black_box`, and each crate
+  carries a must-fail `test-no-panic-lie` control.** Both crates publish
+  `panic-free` in their `Cargo.toml` description and in their README, and both
+  already carried a `tests/no_panic.rs` with a CI step behind it — but neither
+  file used `black_box` anywhere, and neither had a lie control. Nothing in
+  either crate could report the proof going empty.
+
+  It had gone empty in places, and that is measured rather than inferred. A
+  reachable panic put on `FrameHeader::encode`'s 63-bit-length refusal arm — the
+  arm a caller reaches by asking to encode a length with the high bit set —
+  linked CLEAN and the test reported `ok`, because the two lengths the file
+  passed were `5` and `70_000`, so LLVM proved the arm dead and the shim proved
+  nothing about it. The same in `http3-proto`: replacing
+  `frame::decode_header`'s `input.get(n0..).unwrap_or(&[])` with a bare index
+  linked clean, because every input was a literal whose length the optimizer
+  could count against the `n0` it folded out of the first varint. With every
+  argument through `black_box`, both injections red the link, naming
+  `shim_encode` and `shim_frame_decode`. What the proofs already bit on is
+  unchanged — injections into `frame::mask`, the base64 encoder and
+  `varint::decode` reddened before this change and still do; the sweep pins a
+  property that until now held by how those particular call sites happened to
+  lower.
+
+  Slices are wrapped as slices (`black_box(bytes.as_slice())`,
+  `black_box(&mut buf[..])`) rather than as arrays, because
+  `black_box(&[1, 2, 3])` hides the pointer and leaves the LENGTH a compile-time
+  constant — the half of a bounds check that matters. Every call now feeds an
+  assertion or is itself wrapped, so no shim can be deleted whole for having an
+  unused answer, and the smokes are wrapped too: a smoke folded away stops
+  running the code it exists to run.
+
+  Neither crate's CI step uses fat LTO, unlike `http1-proto`'s and
+  `http-semantics`' — their shimmed leaves are `#[inline]`, so they inline into
+  the shim under the default profile. That is why the lie-check greps for
+  `no-panic`'s own link-error marker: with no LTO there is no second,
+  profile-shaped reason the lie build could fail for, so the marker is the whole
+  control rather than a check on top of one.
+
+- **The four lie-checks are one CI step, not four.** `ci.yml`'s `no-panic` job
+  would have carried four hand-copied must-fail blocks — four places for one to
+  be weakened without the others disagreeing. They are now one `lie_check` shell
+  function called once per crate. Nothing is pooled but the assertion: each call
+  builds its own crate under its own profile (fat LTO for `http1-proto` and
+  `http-semantics`, the default for the two above), captures its own log,
+  asserts a non-zero exit AND the marker naming `shim_lie`, and names its own
+  crate in the `::error::` it raises.
+
+## `http-semantics` — a new crate for the half of HTTP no version owns
+
+New in this unreleased cycle. `http-semantics` holds the version-independent
+half of HTTP — RFC 9110's §5.6 field grammar, its §8.3.1/§12 media and `Accept`
+machinery, and its §5.6.7 `HTTP-date` — which `http1-proto` re-exports at their
+existing paths. It depends on no protocol crate, which is the whole reason it
+exists: `http1-proto`, `http3-proto` and anything later reach the same rules
+without reaching through each other. `no_std` and no-alloc capable, panic-free,
+on the same `std` / `alloc` / `no-atomic` tiers its siblings run.
+
+### Added
+
+- **`grammar` and `media` live here now, and every path a caller writes is
+  unchanged.** `http1-proto` re-exports both modules whole
+  (`pub use http_semantics::grammar;`, `pub use http_semantics::media;`), so
+  `http1_proto::grammar::…` and `http1_proto::media::…` resolve exactly as
+  before. The move is a relocation and not a rewrite: no runtime behaviour
+  changed.
+
+  Both modules were version-independent by RFC 9110's own construction, and
+  `media` had been in the wrong crate from the day it was written: nothing
+  inside `http1-proto` ever called it, so it was a module that crate carried in
+  order to re-export. `grammar` is the opposite case and the load-bearing one —
+  `http1-proto` imports it into ten of its own files, and `websocket-proto`
+  imports eight of its predicates, so a second consumer already existed before
+  there was a crate for the two to share it through.
+
+  One type's home crate moved with them, in an API that is not yet published:
+  `ParamValue::unescape_into` now returns `grammar::BufferTooSmall` rather than
+  `http1_proto::Error::BufferTooSmall`. Same fields, same `Display`.
+
+- **`date` — RFC 9110 §5.6.7 `HTTP-date`, read in three formats and written in
+  one.** `parse_http_date` accepts `IMF-fixdate`, `rfc850-date` and
+  `asctime-date`, because §5.6.7 requires a recipient to accept all three;
+  `format_imf_fixdate` writes `IMF-fixdate` and nothing else, because the same
+  section requires a sender to generate that one. No argument selects an output
+  format, so a caller of this crate cannot use it to break the second rule.
+
+  ```rust
+  pub fn parse_http_date(v: &[u8]) -> Result<HttpDate, DateError>;
+  pub fn parse_http_date_from(v: &[u8], now_unix_seconds: i64) -> Result<HttpDate, DateError>;
+  pub fn format_imf_fixdate(date: &HttpDate, out: &mut [u8]) -> Result<usize, DateError>;
+  pub const IMF_FIXDATE_LEN: usize = 29;
+  impl HttpDate {
+    pub const fn year(&self) -> u16;
+    pub const fn unix_seconds(&self) -> i64;
+  }
+  ```
+
+  **The recipient's clock is an argument, not state this crate holds.**
+  §5.6.7's fifty-year rule for a two-digit `rfc850-date` year is measured
+  against the recipient's clock, and a clock is an I/O capability the caller
+  owns — so `parse_http_date_from` takes the instant to measure from, and
+  `parse_http_date` is that call with this crate's own anchor and nothing else.
+  The reference instant reaches exactly one of the three formats: `rfc850-date`
+  is the only one whose year is two digits, and the other two readers are never
+  handed it, which is checkable from the three-arm match rather than from a
+  comment.
+
+  **A refusal names the rule that refused it.** Seven of `DateError`'s nine
+  variants are the reading side — `Length`, `DayName`, `Month`, `Year`,
+  `TimeOfDay`, `Separator`, `NotGmt`, and `FiftyYearWindow` — one per rule that
+  can refuse, so a test asserts the REASON rather than the refusal. The writing
+  side has two of its own, `BufferTooSmall` and `YearBefore1900`, and neither
+  is folded into a reading-side variant: an output buffer too short for
+  twenty-nine bytes broke no rule the input broke, and a year RFC 5322 §3.3
+  forbids a sender is not a year the input spelled wrongly.
+
+  **The `day-name` a sender writes is derived, never echoed.** §5.6.7 gives the
+  semantics of five constituents to RFC 5322 §3.3, which requires the
+  day-of-week to be the day the date implies — so `format_imf_fixdate` computes
+  it. `HttpDate` carries no day-name field at all, which is what makes echoing
+  one structurally inexpressible rather than merely avoided.
+
+  Everything above is `no_std`, allocation-free, clock-free, and covered by the
+  link proof below.
+
+### Tooling
+
+- **The crate has its own `no-panic` link proof, and its own must-fail lie
+  control.** `tests/no_panic.rs` link-checks five leaves behind the internal
+  `test-no-panic` feature — the §5.6.6 parameterised-list walk, the §12.4.2
+  `qvalue` reader, the §12.5.1 weight selection, and §5.6.7's two halves, the
+  date reader and the `IMF-fixdate` writer — while `test-no-panic-lie` adds one
+  shim whose reachable panic must FAIL the link. CI runs both under
+  `CARGO_PROFILE_RELEASE_LTO=fat` and asserts the second's failure by
+  `no-panic`'s own link-error marker rather than by its exit code alone, which
+  is what keeps the first from passing with an empty proof.
+
+  Three of the five came from `http1-proto/tests/no_panic.rs`, where they had
+  been working: with fat LTO, a panic injected into `media::parse_qvalue`
+  reddened that crate's link naming two shims, and one injected into
+  `grammar::is_token` named two more. They moved for three other reasons — the
+  proof belongs beside the code it covers; it lets `media::parse_qvalue` go back
+  to `pub(crate)` instead of being `pub` to serve another crate's test (it is no
+  longer reachable as `http1_proto::media::parse_qvalue` either); and coverage
+  held in another crate's test file lasts only as long as that file chooses to
+  carry it, with no gate of this crate's own to report the loss. The other two
+  arrived with `date`, in the same crate as the code they cover.
+
 ## `http1-proto` — cycle 6 (opportunistic upgrade on an ordinary exchange)
 
 Issue #44. A client could state RFC 9110 §7.8's `Upgrade` offer only by building
@@ -398,11 +890,14 @@ weight applies and nothing about what to serve.
 ### Internals
 
 - **The §12.4.2 `qvalue` reader and the §12.5.1 weight selection join the
-  link-time `no-panic` proof**, bringing it to eleven link-checked leaves. The
-  `qvalue` reader carries the feature's only checked accumulation; the weight
-  shim is driven over a field's LINES rather than one value, so §5.2's join
-  branches stay live rather than being pruned as visibly dead before the guard
-  can act on them.
+  link-time `no-panic` proof.** The `qvalue` reader carries the feature's only
+  checked accumulation; the weight shim is driven over a field's LINES rather
+  than one value, so §5.2's join branches stay live rather than being pruned as
+  visibly dead before the guard can act on them. Both shims, and the §5.6.6
+  list-walk shim beside them, moved to `http-semantics` later in this same
+  unreleased cycle, with the code they cover — see that crate's section above.
+  Thirteen leaves are link-checked across the two crates either way; eight of
+  them are `http1-proto`'s.
 
 ## `http1-proto` — cycle 6 (the General ↔ Tunnel mode edges)
 
