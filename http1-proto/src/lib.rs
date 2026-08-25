@@ -53,16 +53,23 @@ pub mod error;
 /// connection's messages, the borrowed inbound items a connection hands out,
 /// and the owned notices it queues.
 pub mod event;
-/// RFC 9110 §5.6 field grammar over raw byte values, plus the RFC 3986 target
-/// validators.
-pub mod grammar;
+/// RFC 9110 field grammar, re-exported from [`http_semantics`].
+///
+/// The items live in `http-semantics` because their rules are RFC 9110's and
+/// every HTTP version inherits them; this crate re-exports them because its own
+/// documentation and README reference `grammar::` throughout and its public
+/// story is a complete HTTP/1.1 core. **`http-semantics` is where the
+/// documentation and the RFC citations for these items live** — a change to
+/// what any of them means is made there, and this path follows it.
+pub use http_semantics::grammar;
 /// The message head: the RFC 9112 §3 request-line, the §4 status-line, the
 /// bounded scanner over the field lines that follow, and the lazy view of a
 /// scanned head.
 pub mod head;
-/// The RFC 9110 §8.3.1 media type and §12.5.1 `Accept` range: `Content-Type`
-/// parsing, range walking with q-values, and the §12.5.1 weight selection.
-pub mod media;
+/// RFC 9110 media types and `Accept` ranges, re-exported from
+/// [`http_semantics`]. See [`grammar`] for why this is a re-export and where
+/// the documentation for these items lives.
+pub use http_semantics::media;
 /// Role-aware semantics over a scanned head: the RFC 9112 §3.2 `Host` and
 /// target rules, the §6.3 body-framing decision, and the connection directives
 /// a head carries.

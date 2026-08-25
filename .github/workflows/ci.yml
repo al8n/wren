@@ -61,6 +61,11 @@ jobs:
       - run: cargo clippy -p websocket-proto --no-default-features --features alloc -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features deflate -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features no-atomic -- -D warnings
+      # http-semantics carries the same three tier features http1-proto and
+      # websocket-proto forward to it, so it meets the same lint wall on each.
+      - run: cargo clippy -p http-semantics --no-default-features -- -D warnings
+      - run: cargo clippy -p http-semantics --no-default-features --features alloc -- -D warnings
+      - run: cargo clippy -p http-semantics --no-default-features --features no-atomic -- -D warnings
       - run: cargo clippy -p http1-proto --no-default-features -- -D warnings
       - run: cargo clippy -p http1-proto --no-default-features --features alloc -- -D warnings
       # http1-proto carries websocket-proto's `no-atomic` tier (http3-proto has
@@ -95,6 +100,8 @@ jobs:
           tool: cargo-hack
       - run: cargo hack build -p websocket-proto --each-feature
       - run: cargo hack test -p websocket-proto --each-feature
+      - run: cargo hack build -p http-semantics --each-feature
+      - run: cargo hack test -p http-semantics --each-feature
       - run: cargo hack build -p http1-proto --each-feature
       - run: cargo hack test -p http1-proto --each-feature
       - run: cargo hack build -p http3-proto --each-feature
@@ -109,6 +116,13 @@ jobs:
 
   test:
     strategy:
+      # The one job here that runs on more than one runner, and the only place
+      # a cancellation can hide a result. A Windows failure cancelled ubuntu
+      # and macos mid-run, so the log said which platform broke and nothing at
+      # all about whether the other two would have passed — one platform's
+      # failure standing in for every platform's answer. Let all three finish
+      # and report their own.
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -120,11 +134,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p websocket-proto --all-features
+      - run: cargo test -p http-semantics --all-features
       - run: cargo test -p http1-proto --all-features
       - run: cargo test -p http3-proto --all-features
       - run: cargo test -p wren-trace --all-features
       - run: cargo test -p wren-compio --all-features
       - run: cargo test -p wren-reactor --all-features
+      # The gates' own suite. `doc-check` runs in the `doc` job above and
+      # `quote-check` in `docs.yml`, but until this step existed nothing in CI
+      # ran the tests that check THEM — so a gate that had stopped biting still
+      # exited 0 and no job disagreed. It is the same failure those gates exist
+      # to catch, one level up. `xtask` has no dependencies and no features, so
+      # this runs on all three runners like the steps above it.
+      - run: cargo test -p xtask
 
   no-std:
     runs-on: ubuntu-latest
@@ -149,6 +171,22 @@ jobs:
       # combo — deflate's `alloc` dependency drags the atomic-CAS backends in,
       # defeating the tier. lib.rs raises a compile_error!; pin that it fires.
       - run: "! cargo check -p websocket-proto --no-default-features --features no-atomic,deflate 2>/dev/null"
+      # http-semantics bare tier: no std, no alloc. It is the crate the protocol
+      # cores reach RFC 9110's rules THROUGH, so it is checked on every tier they
+      # are checked on. `grammar` and `media` live here now, so these steps build
+      # the §5.6.6 list walk and the §12.5.1 selection on the embedded targets
+      # rather than an empty crate root — the tier this job reports is the tier
+      # it tested.
+      - run: cargo check -p http-semantics --no-default-features --target thumbv7em-none-eabihf
+      - run: cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi
+      - run: cargo check -p http-semantics --no-default-features --features alloc --target thumbv7em-none-eabihf
+      - run: cargo check -p http-semantics --no-default-features --features alloc --target wasm32-unknown-unknown
+      # The `no-atomic` tier on the core that motivates it, mirroring the two
+      # crates that forward this feature down to it.
+      - run: cargo check -p http-semantics --no-default-features --features no-atomic --target thumbv6m-none-eabi
+      # Bare tier on the host (x86_64), the same reason as http1-proto below: a
+      # cross-compiled target cannot execute tests in CI without QEMU.
+      - run: cargo test -p http-semantics --no-default-features
       # http1-proto bare tier: no std, no alloc — the start-line codecs, the head
       # scanner, the body/chunked decoders and the Connection state machine must
       # compile without an allocator. The `const _: () = assert!(…)` size bounds
@@ -177,7 +215,7 @@ jobs:
       # without panics (cross-compiled targets cannot run tests in CI without QEMU).
       - run: cargo test -p http3-proto --no-default-features --test tiers
 
-  # Proto only: the driver crates do real socket IO, which miri cannot
+  # Pure crates only: the driver crates do real socket IO, which miri cannot
   # interpret (and their unsafe surface is empty regardless).
   miri:
     runs-on: ubuntu-latest
@@ -198,6 +236,16 @@ jobs:
           # (committed in-tree), which needs `getcwd` + file IO — host
           # syscalls miri's isolation rejects. Disabling isolation permits
           # them; UB detection is unaffected.
+          MIRIFLAGS: -Zmiri-disable-isolation
+      # http-semantics holds `grammar` and `media` now, so this step runs their
+      # unit suites through the interpreter — and, under `--all-features`, the
+      # `test-no-panic` shims too, which in debug are plain functions (the link
+      # guard is release-only). The two env vars match its siblings' shape: both
+      # are inert while the crate has no proptest suite, and both are what that
+      # suite will need when it arrives.
+      - run: cargo miri test -p http-semantics --all-features
+        env:
+          PROPTEST_CASES: 8
           MIRIFLAGS: -Zmiri-disable-isolation
       - run: cargo miri test -p http1-proto --all-features
         env:
@@ -257,17 +305,75 @@ jobs:
   # run in release (the optimizer has to prune dead panic branches first; in
   # debug the check is disabled and would false-positive).
   #
-  # There is deliberately NO release-symbol panic *scan*: on current toolchains
-  # a `pub fn` with a guaranteed panic emits no symbols into the rlib at all
-  # (codegen is deferred to downstream binaries) and `cargo bloat` cannot read
-  # rlib-only crates, so symbol-grepping either artifact is silently blind. The
-  # `no-panic` link test acts at final-binary link time where codegen happens.
+  # There is deliberately NO release-symbol panic *scan* over a LIBRARY: on
+  # current toolchains a `pub fn` with a guaranteed panic emits no symbols into
+  # the rlib at all (codegen is deferred to downstream binaries) and `cargo
+  # bloat` cannot read rlib-only crates, so symbol-grepping either artifact is
+  # silently blind. The `no-panic` link test acts at final-binary link time
+  # where codegen happens — and that is also where the first step below reads
+  # the symbols it reads. A TEST BINARY is not an rlib, so the blindness above
+  # is not a reason against reading one; it is the reason the link proof works
+  # there in the first place.
   no-panic:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # FIRST, because it is the only step here that can tell a real proof from
+      # an empty one — and because it BUILDS what the steps below then run, so
+      # its cost is theirs and not an addition to them.
+      #
+      # `no-panic` proves a shim by failing the LINK, so a shim never
+      # instantiated over opaque input passes with an EMPTY proof: LLVM
+      # constant-folds a call made with literals, the body is never compiled for
+      # unknown input, and the symbol whose presence would fail the link is
+      # never emitted. `core::hint::black_box` at every argument is what stops
+      # that, and a consumed answer is what stops the whole call being deleted.
+      #
+      # The lie-checks below do NOT cover this, and that is measured rather than
+      # argued. Put `FrameHeader::encode`'s high-bit-length call site back to
+      # bare literals — the exact edit whose reachable panic used to hide — and
+      # websocket-proto's real step still links clean and reports `ok` on 6
+      # tests, while its lie step still exits 101 on the marker naming
+      # `shim_lie`. Both steps green, the crate's proof empty. `shim_lie` is its
+      # own subject: it proves that `no-panic`, the profile and `black_box` work
+      # FOR IT, and nothing about any real shim. This step is what reds on that
+      # edit, naming the shim and the line.
+      #
+      # It asks TWO questions from two places, and the split is why it is worth
+      # a step of its own. How each shim is WRITTEN it reads out of the source,
+      # because a symbol table cannot see an argument. Whether each shim was
+      # INSTANTIATED it asks the LINKER: it runs each crate's release
+      # `--no-run` build — the same invocation, feature and profile as the
+      # steps below, so those become cache hits — and requires, per declared
+      # shim, a DEFINED FUNCTION symbol whose mangled path is
+      # `no_panic::<shim>` in the test binary cargo reports. The whole path and
+      # the symbol's kind, not its name: an executable carries every
+      # dependency's symbols and every symbol it merely references, so a name
+      # alone is spelled by anything in the link. That second half used to
+      # be read out of the source too, and it was bypassed four separate times:
+      # a call inside `debug_assert!`, a call under a `#[cfg]` release turns
+      # off, a call in a helper nothing reaches, and a call spelled inside a raw
+      # string literal. Each left both controls in this job green. Reading the
+      # artifact has no fifth corner, because it does not read Rust at all.
+      #
+      # A must-fail mutation per real shim would prove the same thing and cost
+      # twenty-four release builds, four of them fat-LTO, growing with every
+      # shim added. This costs the four builds the job already does, and prints
+      # how many shims it examined, how many the linker instantiated and over
+      # how many symbols — so a green run here is distinguishable from a run
+      # that never looked.
+      - name: no-panic shim structure and instantiation — written opaque, and actually linked
+        run: cargo run -p xtask -- shim-check
+      # These two run WITHOUT fat LTO, unlike the two steps below, and that is a
+      # property of their shims rather than an oversight: the leaves they wrap
+      # are `#[inline]`, so they inline into the shim under the default profile
+      # and `no-panic` sees the whole body across the crate boundary. Do NOT add
+      # `CARGO_PROFILE_RELEASE_LTO: fat` here to "match" the steps below — the
+      # profile these were verified under is the one that should keep running
+      # them. What the missing LTO costs lands on their lie-checks, and is
+      # recorded with those.
       - name: no-panic link-time verification (release)
         run: |
           cargo test -p websocket-proto --release --features test-no-panic --test no_panic
@@ -285,46 +391,104 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_LTO: fat
         run: cargo test -p http1-proto --release --features test-no-panic --test no_panic
-      # MUST-FAIL, and it is what makes the step above mean anything. `no-panic`
-      # proves a shim panic-free by failing the LINK, so a shim that was never
-      # instantiated over opaque input passes with an EMPTY proof and nothing in
-      # a green run says so — LLVM constant-folds a call made with literals, the
-      # body is never compiled for unknown input, and the symbol whose presence
-      # would fail the link is never emitted. (Measured: a shim whose body is a
-      # guaranteed out-of-bounds index linked clean and reported "ok" until every
-      # argument was wrapped in `core::hint::black_box`.)
+      # http-semantics needs fat LTO for the same reason http1-proto does, and
+      # its steps are a gate the crate did not have rather than a repair of a
+      # broken one. Three of the shims here — the RFC 9110 §5.6.6 list walk, the
+      # §12.4.2 `qvalue` reader, the §12.5.1 weight selection — used to live in
+      # http1-proto's file and proved perfectly well from there across the crate
+      # boundary: measured, a panic injected into `media::parse_qvalue` reddened
+      # that link naming two shims. They moved so that a change to `grammar` or
+      # `media` and the proof covering it land in one crate, and so that
+      # `media::parse_qvalue` could stop being `pub` to serve another crate's
+      # test. And they moved because the coverage was CONTINGENT: it belonged
+      # to another crate's test file, and deleting those three shims there would
+      # have been a green diff in a crate that owes `http-semantics` nothing,
+      # with no gate of this crate's own reporting the loss. `http-semantics`
+      # publishes `panic-free` in its own description and README, as its three
+      # siblings do, and each of them owns its proof; this step and its entry in
+      # the lie-check below are how this one does. §5.6.7's two halves — the
+      # `HTTP-date` reader and the IMF-fixdate writer — joined them later and
+      # were measured the same way: with one bounds check replaced by an index,
+      # this step reds naming that shim and only that shim.
+      - name: no-panic link-time verification — http-semantics (release + fat LTO)
+        env:
+          CARGO_PROFILE_RELEASE_LTO: fat
+        run: cargo test -p http-semantics --release --features test-no-panic --test no_panic
+      # MUST-FAIL, and it is what makes every step above mean anything.
+      # `no-panic` proves a shim panic-free by failing the LINK, so a shim that
+      # was never instantiated over opaque input passes with an EMPTY proof and
+      # nothing in a green run says so — LLVM constant-folds a call made with
+      # literals, the body is never compiled for unknown input, and the symbol
+      # whose presence would fail the link is never emitted.
       #
-      # `test-no-panic-lie` adds exactly one such shim, with a reachable panic
-      # and its argument fed through `black_box` like every real one, and the
-      # build has to FAIL. A green run here reports that the link proof has gone
-      # vacuous — a dropped `black_box`, a profile without fat LTO, a `no-panic`
-      # release that stopped emitting the symbol — not that anything is fine.
+      # Not hypothetical, and measured three times in this repository now. Once
+      # on a shim whose body was a guaranteed out-of-bounds index, which linked
+      # clean and reported "ok" until every argument was wrapped in
+      # `core::hint::black_box`. And once on each of the two crates whose steps
+      # run above without LTO: with their call sites still carrying bare
+      # literals, a reachable panic injected into `FrameHeader::encode`'s
+      # 63-bit-length refusal arm (websocket-proto) and one replacing
+      # `frame::decode_header`'s guarded re-slice with a bare index
+      # (http3-proto) BOTH linked clean and reported "ok". With every argument
+      # fed through `black_box` the same two injections red, naming
+      # `shim_encode` and `shim_frame_decode` respectively.
+      #
+      # `test-no-panic-lie` adds exactly one such shim to a crate's
+      # `tests/no_panic.rs` — a reachable panic, its argument through
+      # `black_box` like every real one — and the build has to FAIL. A green run
+      # for a crate here reports that ITS link proof has gone vacuous: a dropped
+      # `black_box`, a step that lost its fat LTO, a `no-panic` release that
+      # stopped emitting the symbol. It does not report that anything is fine.
       #
       # The failure is checked for its REASON, not merely for its exit code. "It
       # did not build" is satisfied by a typo, a renamed feature, a dependency
       # that stopped resolving, or any unrelated breakage in the crate — all of
       # which would turn this step green while proving nothing, which is the same
-      # vacuity one layer up. So the output is captured and matched against
-      # `no-panic`'s own link-error marker naming the shim.
+      # vacuity one layer up. So each build's output is captured and matched
+      # against `no-panic`'s own link-error marker naming the shim.
+      #
+      # For websocket-proto and http3-proto that grep is the WHOLE control
+      # rather than an extra check on top of one. Their steps carry no fat LTO,
+      # so there is no second, profile-shaped reason their lie build could fail
+      # for; drop the grep and nothing stands behind it.
+      #
+      # ONE assertion over FOUR subjects, deliberately. Four hand-copied copies
+      # of a must-fail check are four places for one to be weakened without the
+      # others disagreeing. Nothing is pooled but the assertion itself: each
+      # call runs its own crate under its own profile, captures its own log, and
+      # names its own crate in the `::error::` it raises — the checks are
+      # sequential, so the first crate to fail stops the step exactly as four
+      # separate steps would.
       #
       # Two shell notes, both load-bearing. `set -e` does NOT fire on a command
       # whose status is inverted with `!` (POSIX: the errexit exemption list), so
       # the negation needs its own `||` guard or a lie-check that BUILT would sail
       # past. And stderr is redirected into the log rather than to /dev/null,
       # because the marker is on it.
-      - name: no-panic lie-check — the link proof must not be vacuous (MUST FAIL)
-        env:
-          CARGO_PROFILE_RELEASE_LTO: fat
+      - name: no-panic lie-checks — the four link proofs must not be vacuous (MUST FAIL)
         run: |
-          log="$(mktemp)"
-          ! cargo test -p http1-proto --release --features test-no-panic-lie \
-            --test no_panic >"$log" 2>&1 || {
-            echo "::error::the lie-check BUILT — the no-panic link proof is vacuous"
-            exit 1
+          # $1 is the crate; anything after it is an env assignment for that
+          # crate's build, which is how the fat-LTO pair keeps the profile its
+          # real step above was verified under.
+          lie_check() {
+            local crate="$1"
+            shift
+            local log
+            log="$(mktemp)"
+            ! env "$@" cargo test -p "$crate" --release --features test-no-panic-lie \
+              --test no_panic >"$log" 2>&1 || {
+              echo "::error::$crate's lie-check BUILT — its no-panic link proof is vacuous"
+              exit 1
+            }
+            grep -q 'ERROR\[no-panic\]: detected panic in function `shim_lie`' "$log" || {
+              echo "::error::$crate's lie-check failed to build, but not with no-panic's link error"
+              cat "$log"
+              exit 1
+            }
+            echo "$crate: lie-check refused to link, for the right reason"
           }
-          grep -q 'ERROR\[no-panic\]: detected panic in function `shim_lie`' "$log" || {
-            echo "::error::the lie-check failed to build, but not with no-panic's link error"
-            cat "$log"
-            exit 1
-          }
-          echo "lie-check refused to link, for the right reason"
+
+          lie_check websocket-proto
+          lie_check http3-proto
+          lie_check http1-proto CARGO_PROFILE_RELEASE_LTO=fat
+          lie_check http-semantics CARGO_PROFILE_RELEASE_LTO=fat

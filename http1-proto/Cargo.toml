@@ -12,13 +12,13 @@ categories = ["network-programming", "no-std", "embedded", "web-programming"]
 
 [features]
 default = ["std"]
-std = ["thiserror/default"]
+std = ["thiserror/default", "http-semantics/std"]
 # Heap-tier markers. PR1's outbound path is encode-into-caller-slice on every
 # tier, so no heap storage backend exists yet — these features carry the tier
 # SEMANTICS (and websocket-proto will forward them 1:1 in PR2) but currently
 # enable no deps. When a transmit queue / owned body backend lands, `bytes`
 # (alloc/std) and `portable-atomic-util` (no-atomic) attach HERE.
-alloc = []
+alloc = ["http-semantics/alloc"]
 # `no-atomic`: the heap tier for cores WITHOUT native atomic CAS (Cortex-M0+ /
 # thumbv6m / RP2040). It STANDS IN for `alloc` on such a core rather than
 # accompanying it — that is the tier it names, not a constraint anything
@@ -27,7 +27,7 @@ alloc = []
 # deps there is nothing for a combination to contradict. Whether the combination
 # becomes a `compile_error!` is a decision for the change that attaches the
 # backends above, not a claim to make ahead of it.
-no-atomic = []
+no-atomic = ["http-semantics/no-atomic"]
 # Internal: exposes leaf hot paths for `tests/no_panic.rs`. Implies `std`.
 test-no-panic = ["std"]
 # Internal, and MUST-FAIL by design: adds one `#[no_panic]` shim to
@@ -42,6 +42,7 @@ test-no-panic = ["std"]
 test-no-panic-lie = ["test-no-panic"]
 
 [dependencies]
+http-semantics.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true
 

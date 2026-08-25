@@ -76,10 +76,10 @@ use crate::{
   negotiation::{Negotiated, NegotiationError},
 };
 use derive_more::{IsVariant, TryUnwrap};
+use http_semantics::grammar::{is_token, token_list_contains};
 use http1_proto::{
   Connection, HeadBinding, HeadView, Headers, RequestLine, Server, ServerTunnelRequest, Target,
   Tunnel, Version,
-  grammar::{is_token, token_list_contains},
 };
 
 /// The budget the borrowing view exists to hold: the view BORROWS the head

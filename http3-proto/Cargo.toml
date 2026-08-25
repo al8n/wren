@@ -35,6 +35,18 @@ slab = ["dep:slab"]
 # in `#[no_panic]` shims. Implies `std` (the test driver is std-only). Not for
 # downstream use — the re-exports are doc-hidden and unstable.
 test-no-panic = ["std"]
+# Internal, and MUST-FAIL by design: adds one `#[no_panic]` shim to
+# `tests/no_panic.rs` whose body contains a reachable panic, so building that
+# test in RELEASE has to fail to LINK. It is the permanent check that the link
+# proof is not vacuous — a shim whose call the optimizer folded away would let
+# every real shim "pass" with an empty proof, and nothing in a green run would
+# say so. Measured on this crate: before every argument went through
+# `black_box`, a reachable panic injected into `frame::decode_header`'s guarded
+# re-slice linked CLEAN and the test reported `ok`. CI asserts the failure; see
+# the `no-panic` job in `.github/workflows/ci.yml`. In debug the guard is off
+# (the test's own `cfg_attr`), so `cargo hack --each-feature` and miri build and
+# run this like any other test.
+test-no-panic-lie = ["test-no-panic"]
 
 [dependencies]
 thiserror.workspace = true

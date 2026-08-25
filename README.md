@@ -23,10 +23,12 @@ HTTP/3). Drivers follow.
 
 ## The family
 
-The crates split protocol logic from I/O, mirroring the `quinn` layering:
+The crates split protocol logic from I/O, mirroring the `quinn` layering, over
+one shared base of HTTP rules that belong to no single version:
 
 | Crate | Role |
 |-------|------|
+| [`http-semantics`](http-semantics) | Version-independent HTTP semantics — RFC 9110 field grammar, media types, `HTTP-date` (`no_std`-capable, panic-free) |
 | [`websocket-proto`](websocket-proto) | Sans-I/O protocol state machines (`no_std`-capable, panic-free) |
 | [`http1-proto`](http1-proto) | Sans-I/O HTTP/1.1 connection state machine — RFC 9110 / 9112 (`no_std`-capable, panic-free) |
 | [`http3-proto`](http3-proto) | Sans-I/O HTTP/3 Extended-CONNECT tunnel core — RFC 9114 / 9204 / 9220 (`no_std`-capable, panic-free) |

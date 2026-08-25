@@ -42,10 +42,10 @@ use crate::{
   negotiation::{Negotiated, NegotiationError},
 };
 use derive_more::{Display, IsVariant, TryUnwrap};
-use http1_proto::{
-  Client, ClientTunnelOutcome, Connection, Headers, Target, Tunnel,
-  grammar::{is_token, is_valid_authority, is_valid_path_and_query, token_list_contains},
+use http_semantics::grammar::{
+  is_token, is_valid_authority, is_valid_path_and_query, token_list_contains,
 };
+use http1_proto::{Client, ClientTunnelOutcome, Connection, Headers, Target, Tunnel};
 use rand_core::Rng as RngCore;
 
 /// The most the comma-joined `Sec-WebSocket-Protocol` request value may measure,

@@ -1,6 +1,6 @@
 //! Extra (caller-supplied) handshake headers, shared by both roles.
 
-use http1_proto::grammar::is_token;
+use http_semantics::grammar::is_token;
 
 /// A borrowed list of additional handshake headers (`(name, value)` pairs):
 /// request headers for the client (auth, origin, cookies) and response headers

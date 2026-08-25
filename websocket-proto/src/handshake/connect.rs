@@ -15,7 +15,7 @@ use crate::{
   negotiation::{Negotiated, NegotiationError},
 };
 use derive_more::{Display, IsVariant, TryUnwrap};
-use http1_proto::grammar::{
+use http_semantics::grammar::{
   eq_ignore_ascii, is_token, is_valid_authority, is_valid_path_and_query,
 };
 

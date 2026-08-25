@@ -275,6 +275,12 @@ crate-wide clippy panic-freedom lint wall (`unwrap_used` / `indexing_slicing` /
 because its call-tree depth prevents full inlining into a single shim across
 the crate boundary.
 
+Every argument at every call site goes through `core::hint::black_box`, and CI
+asserts a must-fail `test-no-panic-lie` build on top. Both are what keep the
+proof from being empty rather than true: before the opaque inputs, a reachable
+panic injected into `frame::decode_header`'s guarded re-slice linked clean and
+the test reported `ok`.
+
 Four fuzz targets under `fuzz/fuzz_targets/` cover the same paths plus the
 full `Connection` receive machine with arbitrary byte streams.
 

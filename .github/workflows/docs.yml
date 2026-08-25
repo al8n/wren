@@ -16,4 +16,20 @@ jobs:
       # ci.yml ignores '**.md', which is correct for a compile-and-test
       # workflow and is why these cannot live there.
       - run: cargo run -p xtask -- quote-check --fetch
+      # Deliberately WITHOUT `--require-all`, and this is the one place that
+      # absence is explained rather than merely being the case. That flag
+      # turns a SKIPPED check into a failure; `doc-continuity` needs
+      # `cargo +nightly rustdoc --output-format json` and this job installs
+      # stable only, so the skip here is legitimate and the flag would red the
+      # job on every run for a reason unrelated to any documentation drift.
+      # The run that carries the flag is ci.yml's `doc` job, which installs
+      # nightly precisely so the skip cannot happen there — that is where "a
+      # check cannot be quietly lost" is enforced, and it is why this job does
+      # not need to enforce it a second time in a place it cannot.
+      #
+      # What this stable run DOES still enforce is every check that needs no
+      # nightly: table-verdicts, path-qualified callee, and `doc-snapshots` —
+      # the last of which fails on a committed snapshot no crate in
+      # `GATED_CRATES` claims. None of them is a skip, so none of them depends
+      # on the flag that is missing here.
       - run: cargo run -p xtask -- doc-check

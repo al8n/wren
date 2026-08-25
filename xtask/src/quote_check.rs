@@ -268,11 +268,13 @@ struct Extracted {
   /// Quoted spans, for [`grade`].
   quoted: QuotedSpans,
   /// ABNF production candidates for [`grade_production`]: a backticked span
-  /// whose block named one RFC, and a production-shaped line inside a fence
-  /// [`fence_holds_grammar`] admitted.
+  /// whose block named at least one RFC, and a production-shaped line inside
+  /// a fence [`fence_holds_grammar`] admitted.
   productions: Spans,
-  /// Production-shaped backticked spans whose block named no RFC, or named
-  /// more than one: a candidate with no citation to grade it against.
+  /// Production-shaped backticked spans whose block named no RFC at all:
+  /// prose that made no claim about any spec, so there is nothing here for
+  /// this check to grade. A block naming SEVERAL is no longer among them —
+  /// see [`cited_rfcs`] for what counting it as one cost, measured.
   uncited: usize,
   /// Fenced blocks whose info string [`fence_holds_grammar`] admitted.
   fences_read: usize,
@@ -299,7 +301,9 @@ pub const DEFAULT_DIR: &str = ".rfc-cache";
 /// quoting a dead spec a live one now governs, or a deliberate historical
 /// note; either way, adding an obsolete RFC to make a production pass is the
 /// same shape of bending this gate as loosening the extractor would be.
-const FETCHED: &[u32] = &[3986, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220];
+const FETCHED: &[u32] = &[
+  3986, 5322, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220,
+];
 
 /// How much of a span must be found in a spec for the span to be treated as a
 /// quotation OF that spec.
@@ -418,7 +422,7 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   let mut quote_exempt = 0usize;
   for source in &sources {
     let text = fs::read_to_string(source)?;
-    let shown = source.strip_prefix(&root).unwrap_or(source).display();
+    let shown = crate::report::site(source.strip_prefix(&root).unwrap_or(source));
     let extracted = spans_for(source, &text);
     let (spans, productions) = (extracted.quoted, extracted.productions);
     abnf_skipped += extracted.uncited;
@@ -525,9 +529,19 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   // historical citation of an obsolete spec whose successor does not carry
   // the same words, so there is no loaded spec left to grade it against —
   // `negotiation.rs`'s RFC 2616 "implied *LWS rule" quote is the first one.
+  //
+  // The parenthesis is the whole reason now, and it was not before. This
+  // number used to hold two different things under one label: a block citing
+  // NOTHING, and a block citing SEVERAL — 125 spans, of which 48 were the
+  // second kind, and calling them "no RFC cited" was false of every one of
+  // them. `cited_rfcs`'s doc comment carries what admitting the second kind
+  // bought. What remains here is the first kind alone, and the reason it is
+  // unreached is the reason printed: nobody wrote a spec's name near it, so
+  // there is no claim to hold it to.
   println!(
-    "quote-check: {abnf_skipped} production-shaped spans skipped (no RFC cited), {abnf_exempt} \
-     marked gate-exempt, {quote_exempt} quotations marked gate-exempt"
+    "quote-check: {abnf_skipped} production-shaped spans in blocks citing no RFC — nothing to \
+     grade them against, {abnf_exempt} marked gate-exempt, {quote_exempt} quotations marked \
+     gate-exempt"
   );
   // The fence rule's own denominator, printed for the same reason the line
   // above it is. Both halves are here on purpose: a run that only announced
@@ -586,7 +600,7 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
 
 /// Every quotation and candidate ABNF production `path`'s contents holds,
 /// dispatched by extension, as `(quoted, productions, skipped)` — each
-/// `quoted` span carrying the single RFC its own block cited, if any.
+/// `quoted` span carrying every RFC its own block cited.
 ///
 /// `.md` is read as one long comment block ([`markdown_quotations`]);
 /// anything else — in practice always `.rs`, since [`collect_sources`] hands
@@ -878,10 +892,12 @@ fn excerpt(text: &str, from: usize, len: usize) -> String {
 /// a quoted SENTENCE inside a citing block is almost certainly that RFC's
 /// own, but a grammar RULE beside a citation is often shown for contrast.
 /// [`cited_rfcs`] still decides whether a span is a candidate at all — a
-/// block naming no RFC makes no checkable claim, and the gate that reads that
-/// answer still wants EXACTLY one — it just no longer decides which spec the
-/// candidate is graded against. That gate is the one reader of `cited_rfcs`
-/// Ruling 12 deliberately left alone; see that function's doc comment.
+/// block naming no RFC makes no checkable claim — but that is now the WHOLE
+/// of what it decides for a production: the gate reads the set for
+/// EMPTINESS, not for length, and it never decided which spec the candidate
+/// is graded against. Requiring exactly one had it grading FEWER productions
+/// the more accurate a comment's citations became; see `cited_rfcs`'s doc
+/// comment for what it cost, measured.
 ///
 /// On failure the first spec is named, same as [`grade`] falls back to when a
 /// quotation's anchor does not narrow it — arbitrarily, since nothing here
@@ -1017,12 +1033,12 @@ fn exempted_spans_for(path: &Path, source: &str) -> HashSet<String> {
 }
 
 /// Every quoted span in `source`'s comments, with the line its opening quote
-/// is on and the single RFC its own block cited (if any) — beside every ABNF
-/// production candidate: a backticked one whose block names a single RFC, and
-/// a production-shaped line inside a fence [`fence_holds_grammar`] admits.
+/// is on and every RFC its own block cited — beside every ABNF production
+/// candidate: a backticked one whose block names any RFC at all, and a
+/// production-shaped line inside a fence [`fence_holds_grammar`] admits.
 /// [`Extracted::uncited`] counts the production-shaped BACKTICKED spans found
-/// in a block that named no RFC, or named more than one — a candidate this
-/// check has no citation to grade, not a failure.
+/// in a block that named no RFC — prose with no claim in it for this check to
+/// grade, not a failure.
 ///
 /// Consecutive comment lines are one block and are joined before the quotes are
 /// paired, so a quotation wrapped across lines is one span rather than several.
@@ -1069,11 +1085,11 @@ fn quotations(source: &str) -> Extracted {
           .map_or(0, |(_, line)| *line);
         out.push((line, span.to_string(), cited.clone()));
       }
-      if cited.len() == 1 {
-        productions.append(pending);
-      } else {
+      if cited.is_empty() {
         skipped += pending.len();
         pending.clear();
+      } else {
+        productions.append(pending);
       }
       block.clear();
       marks.clear();
@@ -1145,8 +1161,8 @@ fn quotations(source: &str) -> Extracted {
 }
 
 /// Every quotation in a Markdown file, with the line its opening quote is on
-/// and the single RFC its own block cited (if any), beside every ABNF
-/// production candidate — see [`quotations`] for which spans become one, what
+/// and every RFC its own block cited, beside every ABNF production
+/// candidate — see [`quotations`] for which spans become one, what
 /// [`Extracted::uncited`] counts and why, and for the citation this mirrors.
 ///
 /// A `.md` file is comment text throughout, so there is no comment prefix to
@@ -1198,11 +1214,11 @@ fn markdown_quotations(source: &str) -> Extracted {
           .map_or(0, |(_, line)| *line);
         out.push((line, span.to_string(), cited.clone()));
       }
-      if cited.len() == 1 {
-        productions.append(pending);
-      } else {
+      if cited.is_empty() {
         skipped += pending.len();
         pending.clear();
+      } else {
+        productions.append(pending);
       }
       block.clear();
       marks.clear();
@@ -1501,13 +1517,26 @@ fn is_production(span: &str) -> bool {
 /// A production read this way is admitted WITHOUT the citation [`cited_rfcs`]
 /// requires of a backticked one, and that asymmetry is the point. The
 /// citation is what tells [`exempted_spans`]'s backticked Rust value from a
-/// grammar rule; the info string answers that earlier and more directly,
-/// so requiring both would be requiring one piece of evidence twice. It would
-/// also cost most of the reading: of this workspace's fourteen fenced
-/// productions, nine sit under prose naming several RFCs or none, which is
-/// what prose around a transcription usually does. Nothing is lost in
-/// grading, because [`grade_production`] never used the citation to pick a
-/// spec — an admitted production is checked against every loaded one.
+/// grammar rule; the info string answers that earlier and more directly, so
+/// requiring both would be requiring one piece of evidence twice.
+///
+/// What requiring it would COST is now a small number rather than most of
+/// the reading, and the two halves of that figure have different standing.
+/// The denominator is printed by every run: 32 fenced productions read
+/// today. The split inside it is not printed and was measured by
+/// instrumenting this extractor — 3 of the 32 sit under prose naming no RFC
+/// at all, so a citation requirement would withhold exactly those three. It
+/// was 27 of 32 while the backticked gate demanded EXACTLY one citation, 24
+/// of these productions sitting under prose that names four RFCs; that
+/// collapse is the backticked gate's widening, not a change on this path.
+/// An earlier revision of this sentence read "fourteen fenced productions,
+/// nine" — true of the workspace it was written against — so treat the
+/// unprinted half as of its measurement and re-measure before leaning on it,
+/// exactly as `doc-check`'s table census says of its own count.
+///
+/// Nothing is lost in grading either way, because [`grade_production`] never
+/// used the citation to pick a spec — an admitted production is checked
+/// against every loaded one.
 fn fence_holds_grammar(info: &str) -> bool {
   info.trim() == "text"
 }
@@ -1527,15 +1556,38 @@ fn fence_holds_grammar(info: &str) -> bool {
 ///
 /// - [`grade`] takes the whole set: a quotation is that block's business
 ///   when the block names ANY spec this run loaded.
-/// - The production gate in [`quotations`] still admits a candidate only from
-///   a block naming EXACTLY ONE. A bare `name =` cannot say which spec it is
-///   a claim about — a production is too short to anchor on the way [`grade`]
-///   anchors a quotation on its own opening characters — so the surrounding
-///   prose says it instead, and a block naming several leaves it unclear
-///   which. That gate is not an oversight left behind by this function's
-///   widening: an admitted production is graded against every loaded spec by
-///   [`grade_production`], so widening the gate would only admit more
-///   candidates, which is a different question from the one this set answers.
+/// - The production gate in [`quotations`] asks only whether the set is
+///   EMPTY. It is an ADMISSION test and nothing more: a block naming no RFC
+///   makes no claim for this check to grade, and a production-shaped span
+///   there is not its business. WHICH spec an admitted production is held to
+///   is not this set's answer at all — [`grade_production`] searches every
+///   loaded spec regardless — so a block naming four RFCs is exactly as
+///   admissible as one naming a single RFC.
+///
+///   Requiring EXACTLY one, which this gate did until it was measured, made
+///   the check grade FEWER productions the more accurate a citation became:
+///   adding a correct second RFC to a doc block un-graded every
+///   production-shaped span already in it, untouched — including spans the
+///   edit never went near. It withheld 48 of this workspace's backticked
+///   candidates; 44 of those clear [`grade_production`]'s three-word floor,
+///   and 43 are verbatim in a loaded spec — among them
+///   `chunk-size = 1*HEXDIG`, `HTTP-name = %s"HTTP"`, and
+///   `field-line = field-name ":" OWS field-value OWS`. The 44th is
+// gate-exempt: x = 1 — the same instance the sentence below names, quoted here to name it; this file is inside its own corpus
+///   `websocket-proto/src/negotiation.rs`'s `x = 1`, an INSTANCE quoted from
+///   RFC 6455 §9.1's prose rather than a rule, and it carries a
+///   `gate-exempt:` marker ([`exempted_spans`]) — the mechanism this
+///   workspace already has for a production-shaped non-production, and the
+///   only one available, since nothing here may be keyed on a production's
+///   right-hand side. Suppressing one false positive by withholding 43 real
+///   checks is the trade this gate was making.
+///
+///   The run's own last line is where that is recountable rather than
+///   asserted: it read `100 ABNF productions verbatim` before the widening
+///   and `146` after. 43 of the 46 are the widening; the other three are the
+///   productions this very paragraph quotes as examples, which is this file
+///   being inside the corpus it scans.
+///
 ///   See [`grade_production`]'s doc comment for why that path is the
 ///   asymmetric one.
 fn cited_rfcs(block: &str) -> Vec<u32> {
@@ -1767,7 +1819,8 @@ fn missing_specs(dir: &Path, why: &str) -> Error {
 /// Downloads the cited specs into `dir` with `curl`.
 ///
 /// `curl` rather than an HTTP dependency: this runs by hand, once, and an xtask
-/// that pulls a TLS stack in to fetch six text files has bought nothing.
+/// that pulls a TLS stack in to fetch a handful of text files has bought
+/// nothing. Spelled without a count so adding one does not date the sentence.
 fn fetch_specs(dir: &Path) -> Result<(), Error> {
   fs::create_dir_all(dir)?;
   for rfc in FETCHED {
@@ -2106,10 +2159,12 @@ mod tests {
   }
 
   // The citation gate is the BACKTICKED path's, and a fenced production does
-  // not inherit it: `fence_holds_grammar` is the evidence there, and prose
-  // around a transcription names several RFCs or none far more often than it
-  // names exactly one. `uncited` must stay untouched, or the same line would
-  // be counted as skipped and read at once.
+  // not inherit it: `fence_holds_grammar` is the evidence there, so requiring
+  // a citation as well would be requiring one piece of evidence twice. Both
+  // halves of the backticked gate are exercised here — a block naming several
+  // and a block naming none — because a fenced production is admitted under
+  // either. `uncited` must stay untouched, or the same line would be counted
+  // as skipped and read at once.
   #[test]
   fn a_text_fenced_production_needs_no_citation() {
     let many = "  /// RFC 9110 and RFC 9112 both:\n  /// ```text\n  /// transfer-parameter = token BWS\n  /// ```\n";
@@ -2187,8 +2242,9 @@ mod tests {
     assert_eq!(markdown_quotations(source).fenced, 0);
   }
 
-  // A block naming exactly one RFC commits every production inside it to that
-  // spec — the citation IS the anchor a bare `name =` cannot carry alone.
+  // A block naming an RFC at all is what admits a production inside it: the
+  // citation is the evidence that a bare `name =` is a grammar claim rather
+  // than a Rust value, which is all the production gate reads it for.
   #[test]
   fn a_block_naming_one_rfc_is_cited() {
     let block = "RFC 6455 §9.1's extension-param = token [ \"=\" (token | quoted-string) ]";
@@ -2196,8 +2252,8 @@ mod tests {
   }
 
   // The same RFC named twice is still one spec, not two entries: `grade`
-  // would grade against it twice, and the production gate below counts the
-  // set's length.
+  // would otherwise grade against it twice, and a reader of a failure message
+  // would meet one citation twice over.
   #[test]
   fn a_block_naming_the_same_rfc_twice_is_still_one() {
     let block = "RFC 6455 §9.1's grammar, restated at RFC 6455 §1.3 for the reader";
@@ -2231,12 +2287,14 @@ mod tests {
     );
   }
 
-  // The gate is applied to the WHOLE block, not the line: a production
-  // reached through `quotations` is a CANDIDATE only when its block names
-  // exactly one RFC. Ambiguous and uncited blocks both withhold theirs — not
-  // silently: each is counted as skipped rather than dropped without a trace.
+  // The gate is applied to the WHOLE block, not the line, and what it asks
+  // of the block is that it name SOME RFC. The middle case is the one that
+  // moved: a block naming two used to withhold its productions, which made
+  // the check grade fewer of them the more citations a comment correctly
+  // carried. A block naming NONE still withholds, and not silently — it is
+  // counted as skipped rather than dropped without a trace.
   #[test]
-  fn a_production_survives_only_in_a_single_rfc_block() {
+  fn a_production_survives_in_any_citing_block() {
     let cited = quotations("  /// RFC 6455 §9.1's `extension-param = token`\n");
     assert_eq!(
       cited.productions,
@@ -2244,9 +2302,13 @@ mod tests {
     );
     assert_eq!(cited.uncited, 0);
 
-    let ambiguous = quotations("  /// RFC 2616 and RFC 9110 both define `token = 1*tchar`\n");
-    assert!(ambiguous.productions.is_empty());
-    assert_eq!(ambiguous.uncited, 1);
+    let several = quotations("  /// RFC 2616 and RFC 9110 both define `token = 1*tchar`\n");
+    assert_eq!(
+      several.productions,
+      vec![(1, "token = 1*tchar".to_string())],
+      "two citations are two attributions, not an absent one"
+    );
+    assert_eq!(several.uncited, 0);
 
     let uncited = quotations("  /// see `last = false` above\n");
     assert!(uncited.productions.is_empty());

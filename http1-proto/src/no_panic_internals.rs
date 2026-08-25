@@ -3,12 +3,18 @@
 //! Gated behind `test-no-panic`, doc-hidden, and exempt from semver: these
 //! `pub` forwarders expose the crate's leaf entry points so the test can wrap
 //! them in `#[no_panic]` shims — `find_head_end`, `parse_status_line`,
-//! `parse_chunk_size`, `parse_qvalue`, `head_digest` and the body budget's four
-//! leaves (`overruns`, `charge`, `widen`, `headroom`) — or run them as plain
-//! smoke tests, which is what `parse_request_line`, `encode_request_head` and
+//! `parse_chunk_size`, `head_digest` and the body budget's four leaves
+//! (`overruns`, `charge`, `widen`, `headroom`) — or run them as plain smoke
+//! tests, which is what `parse_request_line`, `encode_request_head` and
 //! `scan_head` get. The test file records why each of those three cannot be
 //! link-checked; the reasons are properties of `no-panic` and of the call
 //! trees, not of the code's panic-freedom.
+//!
+//! No `parse_qvalue` forwarder: the §12.4.2 `qvalue` reader lives in
+//! `http-semantics` and is link-checked by that crate's own
+//! `tests/no_panic.rs`, through a forwarder of the same shape there. Its
+//! absence here is what lets `http_semantics::media::parse_qvalue` be
+//! `pub(crate)` rather than `pub`.
 //!
 //! A `pub use` of a `pub(crate)` item is illegal (E0364/E0365), so these are
 //! thin forwarders rather than re-exports. Being `#[inline]` keeps the
@@ -54,17 +60,6 @@ pub fn parse_status_line(line: &[u8]) -> Result<StatusLine<'_>, H1Error> {
 #[inline]
 pub fn parse_chunk_size(line: &[u8]) -> Result<(u64, usize), H1Error> {
   crate::body::chunked::parse_chunk_size(line)
-}
-
-/// Forwards to `crate::media::parse_qvalue` — the RFC 9110 §12.4.2 `qvalue`
-/// reader, whose digit accumulation is the media feature's only CHECKED one.
-///
-/// Not the whole of its arithmetic: `matched_instances` and `weight_for` both
-/// carry saturating arithmetic of their own, which the `weight_for` shim
-/// covers.
-#[inline]
-pub fn parse_qvalue(v: &[u8]) -> Option<crate::Weight> {
-  crate::media::parse_qvalue(v)
 }
 
 /// Forwards to `crate::head::encode::encode_request_head`, monomorphized over

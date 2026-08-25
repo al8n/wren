@@ -12,22 +12,26 @@
 //! `no-panic` error naming the symbol.
 //!
 //! Coverage: `find_head_end`, `parse_status_line`, `parse_chunk_size`,
-//! `parameterised_list`, `parse_qvalue`, `weight_for`, `head_digest` and the
-//! inbound body budget's four leaves — `overruns`, `charge`, `widen` and
-//! `headroom` — are each link-checked via `#[no_panic]` shims: the
-//! head-terminator scan, the §4 status-line codec, the `1*HEXDIG` reader whose
-//! checked accumulation is the framing path's one arithmetic overflow risk, the
-//! join-aware RFC 9110 §5.6.6 list walk, whose cursors run over borrowed field
-//! lines the caller supplies and whose member boundaries cross the §5.2 join,
-//! the §12.4.2 `qvalue` reader, whose position-scaled accumulation is the media
-//! feature's only checked accumulation, the §12.5.1 weight selection, driven
-//! over the whole walk (the field's lines and the §5.2 join between them, the
-//! range iterator, each range's parameter walk and the candidate's, and the
-//! bounded per-instance match between the two), the FNV-1a
-//! head fold, whose XOR and wrapping multiply run once per byte of a block up
-//! to `MAX_HEAD_BYTES` long, and the four pure functions that carry the whole
-//! of the body bound's arithmetic — `charge` in particular runs once per
-//! payload item the crate hands over.
+//! `head_digest` and the inbound body budget's four leaves — `overruns`,
+//! `charge`, `widen` and `headroom` — are each link-checked via `#[no_panic]`
+//! shims: the head-terminator scan, the §4 status-line codec, the `1*HEXDIG`
+//! reader whose checked accumulation is the framing path's one arithmetic
+//! overflow risk, the FNV-1a head fold, whose XOR and wrapping multiply run
+//! once per byte of a block up to `MAX_HEAD_BYTES` long, and the four pure
+//! functions that carry the whole of the body bound's arithmetic — `charge` in
+//! particular runs once per payload item the crate hands over.
+//!
+//! Three shims are NOT here any more: the RFC 9110 §5.6.6 parameterised-list
+//! walk, the §12.4.2 `qvalue` reader and the §12.5.1 weight selection went to
+//! `http-semantics/tests/no_panic.rs` with the `grammar` and `media` code they
+//! prove, under that crate's own must-fail lie control. Nothing was weakened by
+//! the move, and the reason is worth being exact about, because it is NOT that
+//! a cross-crate shim proves nothing: from this file, with fat LTO, a panic
+//! injected into `http_semantics::media::parse_qvalue` reddened the link naming
+//! two shims and one injected into `http_semantics::grammar::is_token`
+//! reddened it naming two more. What changed is which crate owns the proof, not
+//! whether one exists. The `fn`-pointer hazard those three carry travelled with
+//! them and is documented where they now live.
 //!
 //! Three paths are exercised as **smoke tests only** (NOT link-checked), each
 //! for a reason recorded at its own section: `parse_request_line` and
@@ -59,44 +63,6 @@
 //! the `no-panic` job), so a future change that disarms the guard — a dropped
 //! `black_box`, a profile without LTO, a `no-panic` release that stops
 //! emitting the symbol — turns that step green and reds the build.
-//!
-//! # Two shims may not share one `fn`-pointer instantiation
-//!
-//! The other way a shim here stops being provable, and unlike the one above it
-//! fails LOUDLY — on a shim you did not touch.
-//!
-//! A generic walk that takes its behaviour as a `fn(&[u8]) -> bool` POINTER
-//! rather than as a type parameter monomorphizes ONCE per iterator type, no
-//! matter how many different predicates are passed to it.
-//! `grammar::parameterised_list` and the
-//! `parameterised_list_with(…, is_media_name)` behind `media::accept` are that
-//! case: driven from the same adapter they are one and the same
-//! `ParameterisedList<…>`. Two `#[no_panic]` shims reaching that single
-//! instantiation with two different predicate VALUES leave the pointer
-//! un-constant-foldable — LLVM cannot devirtualize it, the indirect call
-//! survives, and the unwind edge it carries empties BOTH proofs at once.
-//!
-//! So the link reds naming BOTH of them, and nothing in either body says why.
-//! Giving [`shim_weight_for`] a field's LINES to walk is what reds
-//! [`shim_parameterised_list`] beside it; that is how this was found. A shim
-//! your change never touched appearing in the failure is EXPECTED here rather
-//! than a second bug, and the shim you just edited is not necessarily the
-//! cause: the fault belongs to the PAIR, not to either one. Removing either of
-//! the two named shims makes the whole build link clean again — measured both
-//! ways round, and it is the confirmation that this is what you are looking at.
-//!
-//! The remedy is ONE ADAPTER TYPE PER SHIM, so each gets its own instantiation
-//! and each devirtualizes its own predicate: [`shim_parameterised_list`] drives
-//! the walk through `Copied`, [`shim_weight_for`] through `Map`. A third shim
-//! over one of those walks needs a third. The mechanism, the measurement behind
-//! it, and the `clippy::map_clone` allow that stops the difference being tidied
-//! back into `copied()` are recorded on [`shim_weight_for`] itself.
-//!
-//! Making the name rule a type parameter would remove the hazard by
-//! monomorphizing per predicate. It is deliberately not done: it changes the
-//! walker's signature with the crate built on it, and costs code size on
-//! exactly the no-alloc tier this crate exists for. Filed as a follow-up rather
-//! than owed — this subsection is what states the problem it would solve.
 //!
 //! # Running it
 //!
@@ -131,7 +97,24 @@ macro_rules! no_panic_shim {
   ($(#[$meta:meta])* fn $name:ident ($($arg:tt)*) $(-> $ret:ty)? $body:block) => {
     $(#[$meta])*
     #[cfg_attr(not(debug_assertions), no_panic::no_panic)]
-    fn $name($($arg)*) $(-> $ret)? $body
+    // Two things `shim-check`'s artifact half depends on, and neither is an
+    // optimization. `#[inline(never)]` keeps the shim a symbol of its own
+    // instead of vanishing into the `#[test]` that calls it; the `black_box`
+    // around its ANSWER keeps a body the optimizer can prove pure and trivial
+    // from being forwarded to its callers and deleted whole. Together they
+    // make "this binary defines `no_panic::<shim>`, as a function" mean "this
+    // shim was called", which is the question that check asks the linker — and
+    // an uncalled shim and a deleted one are otherwise the same silence.
+    //
+    // Neither weakens what `no-panic` proves. The leaves still inline INTO the
+    // body, which is what the fat-LTO steps are for; the body is compiled once,
+    // standalone, over input `black_box` keeps opaque, which is the shape this
+    // module doc already describes. The measurements behind both, and what
+    // reads the symbol, are in `xtask/src/shim_check.rs`.
+    #[inline(never)]
+    fn $name($($arg)*) $(-> $ret)? {
+      ::core::hint::black_box($body)
+    }
   };
 }
 
@@ -140,11 +123,9 @@ use core::hint::black_box;
 use http1_proto::{
   __no_panic_internals::{
     charge, encode_request_head, find_head_end, head_digest, headroom, overruns, parse_chunk_size,
-    parse_qvalue, parse_request_line, parse_status_line, scan_head, widen,
+    parse_request_line, parse_status_line, scan_head, widen,
   },
   MAX_HEAD_BYTES, Target,
-  grammar::{ParamValue, parameterised_list},
-  media_type, weight_for,
 };
 
 // ── head-terminator scan ──────────────────────────────────────────────────────
@@ -238,334 +219,6 @@ fn parse_chunk_size_is_panic_free() {
   assert!(!shim_parse_chunk_size(black_box(b"")));
   assert!(!shim_parse_chunk_size(black_box(b"g")));
   assert!(!shim_parse_chunk_size(black_box(b" 1")));
-}
-
-// ── parameterised-list walk ───────────────────────────────────────────────────
-
-no_panic_shim! {
-  /// Shim over `grammar::parameterised_list` — the RFC 9110 §5.6.6 list walk,
-  /// driven through BOTH its levels, since the member iterator hands its work
-  /// to a `ParamIter` the caller drives separately.
-  ///
-  /// Returns the bytes it read, so nothing here can be optimized out as
-  /// unused: a call whose result is dead takes the shim's body with it and
-  /// proves nothing.
-  fn shim_parameterised_list(lines: &[&[u8]]) -> usize {
-    let mut seen = 0usize;
-    for member in parameterised_list(lines.iter().copied()) {
-      let Ok(member) = member else { break };
-      seen = seen.wrapping_add(member.name().len());
-      for param in member.params() {
-        let Ok((name, value)) = param else { break };
-        seen = seen.wrapping_add(name.len());
-        seen = seen.wrapping_add(match value {
-          ParamValue::Token(bytes) | ParamValue::Quoted(bytes) => bytes.len(),
-          // `#[non_exhaustive]`: `None` carries no bytes, and neither does a
-          // variant this file has not been taught yet.
-          _ => 0,
-        });
-      }
-    }
-    seen
-  }
-}
-
-#[test]
-fn parameterised_list_is_panic_free() {
-  // One line, with a quoted comma and a quoted semicolon that are data.
-  assert!(
-    shim_parameterised_list(black_box(&[
-      b"permessage-deflate; client_max_window_bits=10, x-private; note=\"a,b;c\"".as_slice(),
-    ]))
-      > 0
-  );
-  // A value that spans the §5.2 join, and the member behind it.
-  assert!(shim_parameterised_list(black_box(&[b"ext; q=\"a".as_slice(), b"b\", other"])) > 0);
-  // The same string left open when the LAST line ends.
-  assert!(shim_parameterised_list(black_box(&[b"ext; q=\"a".as_slice(), b"b"])) > 0);
-  // Empty elements, empty lines, and OWS-only lines.
-  assert!(
-    shim_parameterised_list(black_box(&[
-      b", ext ,, other,".as_slice(),
-      b"",
-      b" ",
-      b"last"
-    ]))
-      > 0
-  );
-  // A name that is not a token, a forbidden byte inside a quoted-string, no
-  // lines at all, an empty line, and garbage: Err or nothing, never a panic.
-  assert_eq!(
-    shim_parameterised_list(black_box(&[b"ext@1".as_slice()])),
-    0
-  );
-  assert_eq!(
-    shim_parameterised_list(black_box(&[b"ext; q=\"a\x00b\"".as_slice()])),
-    0
-  );
-  assert_eq!(shim_parameterised_list(black_box(&[])), 0);
-  assert_eq!(shim_parameterised_list(black_box(&[b"".as_slice()])), 0);
-  assert_eq!(
-    shim_parameterised_list(black_box(&[[0xff, 0xfe, 0x00].as_slice()])),
-    0
-  );
-}
-
-// ── qvalue reader ─────────────────────────────────────────────────────────────
-
-no_panic_shim! {
-  /// Shim over `media::parse_qvalue` — the `qvalue` reader whose digit
-  /// accumulation is the media feature's only CHECKED accumulation.
-  fn shim_parse_qvalue(v: &[u8]) -> u16 {
-    match parse_qvalue(v) {
-      Some(w) => w.thousandths(),
-      None => 0,
-    }
-  }
-}
-
-#[test]
-fn parse_qvalue_is_panic_free() {
-  // The accumulation itself: three places, each scaled by its position, and
-  // the largest and smallest sums the grammar admits.
-  assert_eq!(shim_parse_qvalue(black_box(b"0.999".as_slice())), 999);
-  assert_eq!(shim_parse_qvalue(black_box(b"0.001".as_slice())), 1);
-  assert_eq!(shim_parse_qvalue(black_box(b"1.000".as_slice())), 1000);
-  // `[ "." 0*3DIGIT ]` admits zero digits after the dot, and the bare forms
-  // never enter the loop at all.
-  assert_eq!(shim_parse_qvalue(black_box(b"0.".as_slice())), 0);
-  assert_eq!(shim_parse_qvalue(black_box(b"1.".as_slice())), 1000);
-  assert_eq!(shim_parse_qvalue(black_box(b"1".as_slice())), 1000);
-  // Refusals, each reaching a different exit: a fourth digit, a byte ABOVE
-  // `9`, a byte BELOW `0` (the checked subtraction's own edge), a first byte
-  // that is neither `0` nor `1`, empty input, and a non-ASCII digit position.
-  assert_eq!(shim_parse_qvalue(black_box(b"0.5000".as_slice())), 0);
-  assert_eq!(shim_parse_qvalue(black_box(b"0.abc".as_slice())), 0);
-  assert_eq!(shim_parse_qvalue(black_box(b"0.!!".as_slice())), 0);
-  assert_eq!(shim_parse_qvalue(black_box(b"2".as_slice())), 0);
-  assert_eq!(shim_parse_qvalue(black_box(b"".as_slice())), 0);
-  assert_eq!(
-    shim_parse_qvalue(black_box([0x30u8, 0x2e, 0xff].as_slice())),
-    0
-  );
-}
-
-// ── Accept weight selection ───────────────────────────────────────────────────
-
-no_panic_shim! {
-  /// Shim over `media::weight_for` — the §12.5.1 selection, driven over the
-  /// whole walk: the range iterator, each range's parameter walk, and the
-  /// candidate's, plus the per-instance match between them.
-  ///
-  /// Takes the field's LINES rather than one value, for the same reason
-  /// `shim_parameterised_list` does: fixing the count at one monomorphizes
-  /// `accept` over `[&[u8]; 1]` and leaves RFC 9110 §5.2's join branches —
-  /// `ValueSpansFieldLines`, the after-join quoted scan — visibly dead, so the
-  /// optimizer prunes the very code the proof is meant to cover.
-  ///
-  /// Returns the weight so nothing here is optimized out as unused.
-  ///
-  /// `map(|line| *line)` where `copied()` reads better, and clippy says so —
-  /// hence the `allow`, which is the guardrail rather than an untidiness. The
-  /// walker carries its member-name rule as a `fn(&[u8]) -> bool` POINTER, not
-  /// as a generic parameter, so `parameterised_list(lines.iter().copied())` and
-  /// the `parameterised_list_with(…, is_media_name)` behind `accept` are the
-  /// SAME `ParameterisedList<Copied<Iter<'_, &[u8]>>>` instantiation. Two
-  /// `#[no_panic]` shims reaching one instantiation with two different
-  /// predicate values leave the pointer un-constant-foldable: LLVM keeps the
-  /// indirect call, its unwind edge survives, and BOTH shims fail to link —
-  /// `shim_parameterised_list` included, which is how this was found. A
-  /// distinct adapter type gives each shim its own instantiation, the predicate
-  /// devirtualizes in each, and both prove. Between the two shims `Copied` and
-  /// `Map` are both covered, so nothing is lost by the split. Measured, not
-  /// assumed: with `copied()` here the fat-LTO link fails naming both shims.
-  #[allow(clippy::map_clone)]
-  fn shim_weight_for(candidate: &[u8], lines: &[&[u8]]) -> u16 {
-    match media_type(candidate) {
-      Ok(m) => match weight_for(&m, lines.iter().map(|line| *line)) {
-        Ok(w) => w.thousandths(),
-        Err(_) => 0,
-      },
-      Err(_) => 0,
-    }
-  }
-}
-
-#[test]
-fn weight_for_is_panic_free() {
-  // §12.5.1's precedence over a field carrying both shapes, and over the §5.2
-  // join: one repeated field is one comma-joined value, so the two ranges here
-  // straddle a member boundary the walk has to reconstruct.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"text/html;q=0.5".as_slice(), b"*/*;q=0.1"])
-    ),
-    500
-  );
-  // The same field with an empty line between: §5.6.1.2 has the walk skip the
-  // empty element the join produces.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"text/html;q=0.5".as_slice(), b"", b"*/*;q=0.1"])
-    ),
-    500
-  );
-  // A quoted value OPENED on one line and CLOSED on the next: well formed, not
-  // one contiguous slice, and the branch a single-line fixture cannot reach.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"text/html;boundary=\"a".as_slice(), b"b\";q=0.5"])
-    ),
-    0
-  );
-  // The same string left OPEN when the last line ends.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"text/html;boundary=\"a".as_slice(), b"b"])
-    ),
-    0
-  );
-  // No lines at all is §12.4.1's ABSENCE, which short-circuits before the walk
-  // and answers §12.4.2's default weight; one empty line is a field that WAS
-  // sent, naming an empty list, which walks and matches nothing. Two inputs,
-  // two answers, and the early return is a branch of its own to prove clean.
-  assert_eq!(
-    shim_weight_for(black_box(b"text/html".as_slice()), black_box(&[])),
-    1000
-  );
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"".as_slice()])
-    ),
-    0
-  );
-  // Each wildcard shape reached on its own.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"application/json".as_slice()),
-      black_box(&[b"*/*;q=0.25".as_slice()])
-    ),
-    250
-  );
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/plain".as_slice()),
-      black_box(&[b"text/*;q=0.75".as_slice()])
-    ),
-    750
-  );
-  // Nothing matched: §12.4.3's unacceptable, which is `Weight::ZERO`.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"image/png".as_slice()),
-      black_box(&[b"text/html".as_slice()])
-    ),
-    0
-  );
-  // The per-instance parameter match, over a quoted range value and over a
-  // `quoted-pair` inside one — both reach `unescape_into`'s two passes and the
-  // unescaped comparison.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html;charset=utf-8".as_slice()),
-      black_box(&[b"text/html;charset=\"utf-8\";q=0.8".as_slice()])
-    ),
-    800
-  );
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html;charset=utf-8".as_slice()),
-      black_box(&[b"text/html;charset=\"ut\\f-8\";q=0.8".as_slice()])
-    ),
-    800
-  );
-  // A doubled parameter on both sides: the `taken` record has to spend two
-  // distinct slots rather than the same one twice.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html;a=1;a=2".as_slice()),
-      black_box(&[b"text/html;a=1;a=2;q=0.9".as_slice()])
-    ),
-    900
-  );
-  // The weight's own eight-byte unescape buffer: a quoted `qvalue` that fits,
-  // and one longer than the buffer, which is `BufferTooSmall` lifted to
-  // `BadWeight` rather than a write past the end.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"text/html;q=\"0.6\"".as_slice()])
-    ),
-    600
-  );
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"text/html;q=\"000000000000\"".as_slice()])
-    ),
-    0
-  );
-  // Past `MAX_TRACKED_PARAMS` candidate instances, with a range parameter that
-  // matches none of them, so the walk runs off the end of the record: refused,
-  // never answered wrongly.
-  assert_eq!(
-    shim_weight_for(
-      black_box(
-        b"text/html;a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=10;k=11;l=12;m=13;n=14;o=15;p=16;r=17"
-          .as_slice()
-      ),
-      black_box(&[b"text/html;zz=1;q=0.4".as_slice()])
-    ),
-    0
-  );
-  // Faults on either side: a valueless range parameter, an unterminated
-  // quoted-string, and a candidate that is a list.
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"text/html;q".as_slice()])
-    ),
-    0
-  );
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[b"text/html;charset=\"ab".as_slice()])
-    ),
-    0
-  );
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html, text/plain".as_slice()),
-      black_box(&[b"*/*".as_slice()])
-    ),
-    0
-  );
-  // Empty input on both sides, then garbage on each side in turn, so neither
-  // half can hide behind the other's refusal.
-  assert_eq!(
-    shim_weight_for(black_box(b"".as_slice()), black_box(&[b"".as_slice()])),
-    0
-  );
-  assert_eq!(
-    shim_weight_for(
-      black_box([0xffu8, 0xfe, 0x00].as_slice()),
-      black_box(&[b"*/*".as_slice()])
-    ),
-    0
-  );
-  assert_eq!(
-    shim_weight_for(
-      black_box(b"text/html".as_slice()),
-      black_box(&[[0x2cu8, 0xff, 0x3b, 0x00].as_slice(), [0xfe].as_slice()])
-    ),
-    0
-  );
 }
 
 // ── head digest ───────────────────────────────────────────────────────────────

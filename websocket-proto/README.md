@@ -358,6 +358,11 @@ facade are separate crates, mirroring the `quinn` layering:
 A [`no-panic`] link-time test (`tests/no_panic.rs`) proves the core codec leaf
 paths (frame decode/encode, masking, UTF-8 validation, base64) compile to
 panic-free code, complementing the crate-wide clippy panic-freedom lint wall.
+Every argument at every call site goes through `core::hint::black_box`, and CI
+asserts a must-fail `test-no-panic-lie` build on top. Both are what keep the
+proof from being empty rather than true: before the opaque inputs, a reachable
+panic injected into `FrameHeader::encode`'s 63-bit-length refusal arm linked
+clean and the test reported `ok`.
 
 The [Autobahn TestSuite](https://github.com/crossbario/autobahn-testsuite) is
 run by the opt-in `autobahn` CI workflow (manual + weekly): the dockerized
