@@ -750,7 +750,7 @@ pub struct ServerHandshake {
   /// `Err` it must not send. Latching here keeps the retry writing both heads
   /// in RFC 9110 §7.8's order instead of dropping the 100 on the floor.
   continue_owed: bool,
-  /// The answer [`validate_accept`](Self::validate_accept) settled against the
+  /// The answer [`validate_accept`](PendingUpgrade::validate_accept) settled against the
   /// request this handshake classified, and the only one
   /// [`encode_response`](Self::encode_response) will write. `None` until one is
   /// validated — a handshake that never was cannot accept.

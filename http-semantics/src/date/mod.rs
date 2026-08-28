@@ -395,7 +395,28 @@ pub enum DateError {
 ///
 /// Every field is in range by construction: the only thing that builds one is
 /// [`parse_http_date`], through the one constructor that range-checks.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+///
+/// `Ord` and `PartialOrd` compare in **civil order** — year, month, day, hour,
+/// minute, then second — not [`unix_seconds`](Self::unix_seconds) order: a
+/// leap second (`23:59:60`) sorts strictly before the midnight that follows
+/// it, even though the two share a `unix_seconds` value.
+// `Ord` is DERIVED, and the field order below is what makes that correct: the
+// declaration runs year, month, day, hour, minute, second, so the derived
+// lexicographic comparison IS civil order. It must not be written over
+// [`unix_seconds`](Self::unix_seconds) instead — a leap second shares that
+// value with the midnight that follows it, so an instant-ordering would answer
+// `Equal` for two values structural `Eq` calls unequal, which is an unlawful
+// `Ord`. Civil order also sorts `23:59:60` strictly before the following
+// midnight, which is the true UTC order. Reordering the fields below silently
+// breaks the comparison; they are declared coarsest-first for this reason.
+//
+// Two tests defend this — `ordering_is_civil_and_agrees_with_equality` and
+// `the_leap_second_precedes_the_midnight_it_shares_an_instant_with` — but both
+// compare through `<`/`>`, which resolve to `PartialOrd`; a hand-written `Ord`
+// over `unix_seconds` with `PartialOrd` left derived passes both, silently
+// mismatched, and only clippy's deny-by-default `derive_ord_xor_partial_ord`
+// catches it. An `#[allow]` on that lint is the tests' blind spot.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct HttpDate {
   year: u16,
   month: u8,

@@ -190,7 +190,7 @@ impl<'s, 'a> ExtraHeaders<'s, 'a> {
   /// (minus `exempt`, ASCII case-insensitive). A colliding extra would put
   /// bytes on the wire that contradict the machine's own negotiation state —
   /// e.g. an extra `Sec-WebSocket-Extensions` granting deflate the returned
-  /// [`Negotiated`] knows nothing about.
+  /// [`Negotiated`](crate::Negotiated) knows nothing about.
   pub(crate) fn validate_no_managed_collision(&self, exempt: &[&str]) -> Result<(), &'static str> {
     for (name, _) in self.entries {
       let managed = MANAGED.iter().any(|m| name.eq_ignore_ascii_case(m));

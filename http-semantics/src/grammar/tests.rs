@@ -71,8 +71,9 @@ fn parameterised_list_refuses_what_does_not_parse() {
       .unwrap()
       .params()
       .next()
-      .unwrap(),
-    Err(ListError::UnterminatedQuotedString)
+      .unwrap()
+      .unwrap_err(),
+    ListError::UnterminatedQuotedString
   );
   // A parameter name that is not a token.
   assert_eq!(
@@ -82,8 +83,9 @@ fn parameterised_list_refuses_what_does_not_parse() {
       .unwrap()
       .params()
       .next()
-      .unwrap(),
-    Err(ListError::NotAToken)
+      .unwrap()
+      .unwrap_err(),
+    ListError::NotAToken
   );
 }
 
@@ -101,8 +103,8 @@ fn a_quoted_value_that_crosses_the_join_and_never_closes_is_unterminated() {
   // The boundary scan did cross the join: both lines are still ONE member.
   assert_eq!(member.name(), b"ext");
   assert_eq!(
-    member.params().next().unwrap(),
-    Err(ListError::UnterminatedQuotedString)
+    member.params().next().unwrap().unwrap_err(),
+    ListError::UnterminatedQuotedString
   );
   assert!(members.next().is_none());
 }
@@ -117,10 +119,10 @@ fn an_empty_parameter_is_skipped_not_a_violation() {
     .unwrap()
     .unwrap();
   let mut params = member.params();
-  assert_eq!(
+  assert!(matches!(
     params.next().unwrap(),
-    Ok((b"q".as_slice(), ParamValue::Token(b"1")))
-  );
+    Ok((b"q", ParamValue::Token(b"1")))
+  ));
   assert!(params.next().is_none());
 
   let member = parameterised_list([b"ext;;".as_slice()])
@@ -154,10 +156,10 @@ fn a_supplied_predicate_admits_a_name_is_token_refuses() {
     .expect("the predicate admits it");
   assert_eq!(member.name(), b"application/json");
   let mut params = member.params();
-  assert_eq!(
+  assert!(matches!(
     params.next().expect("one parameter").expect("well formed"),
-    (b"charset".as_slice(), ParamValue::Token(b"utf-8"))
-  );
+    (b"charset", ParamValue::Token(b"utf-8"))
+  ));
   assert!(params.next().is_none());
   assert!(walk.next().is_none());
 }
@@ -165,7 +167,10 @@ fn a_supplied_predicate_admits_a_name_is_token_refuses() {
 #[test]
 fn parameterised_list_still_refuses_a_non_token_name() {
   let mut walk = parameterised_list([b"application/json".as_slice()]);
-  assert_eq!(walk.next(), Some(Err(ListError::NotAToken)));
+  assert_eq!(
+    walk.next().expect("one member").unwrap_err(),
+    ListError::NotAToken
+  );
 }
 
 #[test]
@@ -218,6 +223,110 @@ fn eq_unescaped_answers_the_charset_question_without_a_buffer() {
   assert!(!ParamValue::None.eq_unescaped_ignore_ascii_case("x"));
 }
 
+// RFC 9110 §7.8's `Upgrade = #protocol` asked of a SENDER, which §5.6.1.1
+// makes a stricter question than the same production asked of a recipient: "In
+// any production that uses the list construct, a sender MUST NOT generate empty
+// list elements". The three shapes an empty element takes — leading, trailing
+// and doubled — are each refused, and each of them passed while this walk took
+// its elements from `list_elements`.
+#[test]
+fn a_sender_may_not_generate_an_empty_protocol_list_element() {
+  for bad in [
+    &b""[..],
+    b",",
+    b",websocket",
+    b"websocket,",
+    b"a,,b",
+    b"websocket, ,h2c",
+  ] {
+    assert!(!is_protocol_list(bad), "{bad:?} must not be sendable");
+  }
+  for good in [&b"websocket"[..], b"a,b", b"websocket, h2c", b"HTTP/1.1"] {
+    assert!(is_protocol_list(good), "{good:?} must be sendable");
+  }
+}
+
+// The RECIPIENT half of the same production, and the asymmetry is normative:
+// §5.6.1.2 has a recipient "parse and ignore a reasonable number of empty list
+// elements", so the values above that a sender may not write are values a
+// recipient must still read.
+#[test]
+fn a_recipient_reads_the_empty_elements_a_sender_may_not_write() {
+  for tolerated in [&b",websocket"[..], b"websocket,", b"a,,b"] {
+    assert!(
+      lists_a_protocol([tolerated].into_iter()),
+      "{tolerated:?} must be readable"
+    );
+    assert!(!is_protocol_list(tolerated), "and not writable");
+  }
+  // What tolerance does NOT extend to: a non-empty element that is not a
+  // `protocol`, and a value that names no protocol at all.
+  assert!(!lists_a_protocol([&b"web socket"[..]].into_iter()));
+  assert!(!lists_a_protocol([&b","[..]].into_iter()));
+}
+
+// The comparison `ParamValue` does not derive, written the way its own doc
+// directs a caller — beside `MediaType`'s and `MediaRange`'s equivalents in
+// `media::tests`, and for the same reason. RFC 9110 §5.6.6: "A parameter value
+// that matches the token production can be transmitted either as a token or
+// within a quoted-string.  The quoted and unquoted values are equivalent." The
+// derive answered `false` for exactly the spellings that sentence equates.
+#[test]
+fn one_parameter_value_written_two_ways_is_compared_unescaped() {
+  fn value(field: &[u8]) -> ParamValue<'_> {
+    parameterised_list([field])
+      .next()
+      .expect("one member")
+      .expect("well formed")
+      .params()
+      .next()
+      .expect("one parameter")
+      .expect("well formed")
+      .1
+  }
+
+  // §5.6.6's own equivalence: one value, as a `token` and inside a
+  // `quoted-string`. Two variants, which is half of what the derive compared.
+  let token = value(b"ext; charset=utf-8");
+  let quoted = value(b"ext; charset=\"utf-8\"");
+  assert!(matches!(token, ParamValue::Token(b"utf-8")));
+  assert!(matches!(quoted, ParamValue::Quoted(b"utf-8")));
+  assert!(token.unescaped().eq(quoted.unescaped()));
+
+  // §5.6.4's `quoted-pair` MUST spells the same value a third way, and this
+  // pair differs in the BYTES the derive compared rather than in the variant.
+  let escaped = value(b"ext; charset=\"utf\\-8\"");
+  assert!(matches!(escaped, ParamValue::Quoted(b"utf\\-8")));
+  assert!(escaped.unescaped().eq(token.unescaped()));
+  assert!(escaped.unescaped().eq(quoted.unescaped()));
+}
+
+// And the comparison `ListMember` does not derive. `params` is the untrimmed
+// remainder after the member's first `;`, so the `OWS` §5.6.6's
+// `parameters = *( OWS ";" OWS [ parameter ] )` puts around that `;` sat in the
+// bytes the derive compared, and these two members differ in nothing else.
+#[test]
+fn one_list_member_written_two_ways_is_compared_by_its_pieces() {
+  fn member(field: &[u8]) -> ListMember<'_> {
+    parameterised_list([field])
+      .next()
+      .expect("one member")
+      .expect("well formed")
+  }
+
+  let tight = member(b"ext;q=1");
+  let spaced = member(b"ext;  q=1");
+  assert!(tight.name().eq_ignore_ascii_case(spaced.name()));
+  for (a, b) in tight.params().zip(spaced.params()) {
+    let (a_name, a_value) = a.expect("well formed");
+    let (b_name, b_value) = b.expect("well formed");
+    assert!(a_name.eq_ignore_ascii_case(b_name));
+    assert!(a_value.unescaped().eq(b_value.unescaped()));
+  }
+  assert_eq!(tight.params().count(), 1);
+  assert_eq!(tight.params().count(), spaced.params().count());
+}
+
 /// Tests that collect into a `Vec`: gated to the tiers that have a heap, since
 /// the bare `no_std` tier has neither an allocator nor the `alloc as std` alias.
 #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
@@ -248,16 +357,13 @@ mod heap {
     assert_eq!(members[1].name(), b"x-private");
 
     let p0: Vec<_> = members[0].params().map(|p| p.unwrap()).collect();
-    assert_eq!(
-      p0,
-      [(
-        b"client_max_window_bits".as_slice(),
-        ParamValue::Token(b"10")
-      )]
-    );
+    assert!(matches!(
+      p0[..],
+      [(b"client_max_window_bits", ParamValue::Token(b"10"))]
+    ));
 
     let p1: Vec<_> = members[1].params().map(|p| p.unwrap()).collect();
-    assert_eq!(p1, [(b"note".as_slice(), ParamValue::Quoted(b"a,b;c"))]);
+    assert!(matches!(p1[..], [(b"note", ParamValue::Quoted(b"a,b;c"))]));
   }
 
   // RFC 9110 §5.6.4: a backslash escapes the next character inside a
@@ -267,7 +373,7 @@ mod heap {
     let v = b"ext; q=\"a\\\"b\"";
     let m = parameterised_list([v.as_slice()]).next().unwrap().unwrap();
     let p: Vec<_> = m.params().map(|p| p.unwrap()).collect();
-    assert_eq!(p, [(b"q".as_slice(), ParamValue::Quoted(b"a\\\"b"))]);
+    assert!(matches!(p[..], [(b"q", ParamValue::Quoted(b"a\\\"b"))]));
   }
 
   // RFC 9110 §5.6.1.2: a recipient ignores empty list elements.
@@ -309,7 +415,7 @@ mod heap {
     assert_eq!(members[0].as_ref().unwrap().name(), b"ext");
     assert_eq!(members[1].as_ref().unwrap().name(), b"other");
     let p = members[0].unwrap().params().next().unwrap();
-    assert_eq!(p, Err(ListError::ValueSpansFieldLines));
+    assert_eq!(p.unwrap_err(), ListError::ValueSpansFieldLines);
   }
 
   #[test]

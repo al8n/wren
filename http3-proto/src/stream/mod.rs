@@ -473,10 +473,10 @@ where
 {
   /// Decodes the completed, already-validated HEADERS field section sitting in the
   /// FSM-owned `hdr_acc[..acc_end]` (the section [`advance`](Self::advance) reported as
-  /// [`Advanced::Headers`]). This is the FRESH yield decode: [`advance`] has already
-  /// run the throwaway validation pass that propagates any QPACK error up front, so
-  /// this second decode over the same owned bytes is what the caller drains, using the
-  /// caller's `scratch` purely as Huffman-output space. The `hdr_acc` (immutable) and
+  /// [`Advanced::Headers`]). This is the FRESH yield decode: [`advance`](Self::advance)
+  /// has already run the throwaway validation pass that propagates any QPACK error up
+  /// front, so this second decode over the same owned bytes is what the caller drains,
+  /// using the caller's `scratch` purely as Huffman-output space. The `hdr_acc` (immutable) and
   /// `scratch` borrows are disjoint, so the yielded [`HeaderSet`] may tie to both.
   pub(crate) fn decode_buffered_headers(
     &mut self,

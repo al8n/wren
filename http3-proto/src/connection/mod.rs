@@ -1095,11 +1095,13 @@ impl<ReqBuf, EventBuf> RequestFrames<'_, '_, '_, ReqBuf, EventBuf> {
   ///
   /// - **SERVER + `General`** — a normal request body follows the request HEADERS BEFORE
   ///   the server responds (RFC 9114 §4.1: `HEADERS DATA*`). The gate is the recv FSM's
-  ///   LEADING section having completed ([`Items::leading_complete`] — the FSM left
-  ///   `Phase::Headers` via `complete_leading` on the request), NOT `established` (which
-  ///   the server only sets in `send_response`). An interim-only state never reaches this
-  ///   arm (the server is the request RECEIVER), and the FSM still rejects DATA before any
-  ///   HEADERS, so a leading-complete request body is legitimate, not premature.
+  ///   LEADING section having completed
+  ///   ([`Items::leading_complete`](crate::stream::Items::leading_complete) — the FSM
+  ///   left `Phase::Headers` via `complete_leading` on the request), NOT `established`
+  ///   (which the server only sets in `send_response`). An interim-only state never
+  ///   reaches this arm (the server is the request RECEIVER), and the FSM still rejects
+  ///   DATA before any HEADERS, so a leading-complete request body is legitimate, not
+  ///   premature.
   /// - **SERVER + `Tunnel`** — no tunnel DATA before the 2xx (`accept_with` commits it):
   ///   gate on `established` (set on the single establish transition). A peer that
   ///   coalesces the CONNECT request HEADERS and DATA in one read is premature (RFC 9114
@@ -3265,8 +3267,8 @@ where
 
   /// The classified [`UniRole`] of inbound uni stream `id`, if it is tracked AND
   /// already classified. A still-`Pending` stream returns `None` (its bytes flow
-  /// back into [`classify_uni`] to continue the type varint), so its continuation
-  /// is never routed to a handler before its type is known.
+  /// back into [`classify_uni`](Self::classify_uni) to continue the type varint), so its
+  /// continuation is never routed to a handler before its type is known.
   fn uni_role_of(&self, id: StreamId) -> Option<UniRole>
   where
     UniBuf: AsRef<[UniSlot]>,

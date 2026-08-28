@@ -5,8 +5,9 @@
 //! value and §5.3 lets a sender split a list across them; RFC 6455 §9.1 says so
 //! again in its own words ("this header field MAY be split or combined across
 //! multiple lines") and works the example. RFC 2616 §2.1's `#rule` — the ABNF
-//! RFC 6455 states its grammars in — adds that "null elements are allowed, but
-//! do not contribute to the count of elements present", which RFC 9110 §5.6.1.2
+//! RFC 6455 states its grammars in, and RFC 822 §2.7's wording verbatim — adds
+//! that "null elements are allowed, but do not contribute to the count of
+//! elements present", which RFC 9110 §5.6.1.2
 //! restates as a recipient MUST "parse and ignore a reasonable number of empty
 //! list elements".
 //!
@@ -66,7 +67,8 @@ pub(crate) fn two(a: &str, b: &str) -> Vec<Vec<String>> {
 /// Every spelling of a field that is PRESENT and names nothing.
 ///
 /// A different logical value from an absent field and from any list above:
-/// RFC 2616 §2.1 requires "at least one non-null element" wherever a `1#`
+/// RFC 2616 §2.1 — RFC 822 §2.7's `#rule`, verbatim — requires "at least one
+/// non-null element" wherever a `1#`
 /// appears, and RFC 9110 §5.6.1.2 gives `""`, `","` and `",   ,"` as its own
 /// examples of values that do not satisfy one.
 pub(crate) fn nothing() -> Vec<Vec<String>> {

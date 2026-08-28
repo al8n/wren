@@ -12,7 +12,9 @@
 //! `no-panic` error naming the symbol.
 //!
 //! Coverage: `parameterised_list`, `parse_qvalue`, `weight_for`,
-//! `parse_http_date` and `format_imf_fixdate` are each link-checked via
+//! `parse_http_date`, `format_imf_fixdate`, `EntityTag::parse`,
+//! `TagList::parse`, `RangesSpecifier::parse`, `RangesSpecifier::resolve`,
+//! `ContentRange::parse` and `ContentRange::encode` are each link-checked via
 //! `#[no_panic]` shims — the join-aware RFC 9110 §5.6.6 list walk, whose
 //! cursors run over borrowed field lines the caller supplies and whose member
 //! boundaries cross the §5.2 join; the §12.4.2 `qvalue` reader, whose
@@ -187,6 +189,8 @@ use http_semantics::{
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
   grammar::{ParamValue, parameterised_list},
   media::{media_type, weight_for},
+  range::{ContentRange, RangesSpecifier, Resolved},
+  validator::{EntityTag, TagList},
 };
 
 // ── parameterised-list walk ───────────────────────────────────────────────────
@@ -707,6 +711,340 @@ fn format_imf_fixdate_is_panic_free() {
     shim_format_imf_fixdate(black_box(&before_1900), black_box(&mut out[..])),
     0
   );
+}
+
+// ── §13's validators, and §14's ranges ───────────────────────────────────────
+
+no_panic_shim! {
+  /// Shim over `validator::EntityTag::parse` — RFC 9110 §8.8.3's `entity-tag`,
+  /// the leaf every conditional field's tag path bottoms out in.
+  ///
+  /// Returns the opaque tag's length with the weak flag folded in, so nothing
+  /// here is optimized out as unused and neither accessor can be dropped.
+  fn shim_entity_tag(value: &[u8]) -> usize {
+    match EntityTag::parse(value) {
+      Ok(tag) => tag
+        .opaque_tag()
+        .len()
+        .wrapping_add(usize::from(tag.is_weak())),
+      Err(_) => 0,
+    }
+  }
+}
+
+#[test]
+fn entity_tag_is_panic_free() {
+  // §8.8.3's own two forms, and the shortest tag the grammar admits.
+  assert!(shim_entity_tag(black_box(br#""xyzzy""#.as_slice())) > 0);
+  assert!(shim_entity_tag(black_box(br#"W/"xyzzy""#.as_slice())) > 0);
+  assert_eq!(shim_entity_tag(black_box(br#""""#.as_slice())), 0);
+  // Each refusal on its own: no marks, one mark, a lone `W/`, a lowercase `w/`
+  // (`weak = %s"W/"` is case-SENSITIVE), a byte outside `etagc`, and a
+  // `quoted-string`-style escape, which an `entity-tag` does not admit.
+  for refused in [
+    b"xyzzy".as_slice(),
+    br#""xyzzy"#,
+    b"W/",
+    br#"w/"xyzzy""#,
+    b"\"xy\x7fzy\"",
+    br#""xy\"zy""#,
+    b"",
+    &[0xffu8, 0x22, 0x00],
+  ] {
+    assert_eq!(shim_entity_tag(black_box(refused)), 0);
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `validator::TagList::parse` — §13.1.1's and §13.1.2's
+  /// `"*" / #entity-tag`, driven through the accessor walk as well, since the
+  /// slots are read back one index at a time.
+  ///
+  /// Returns the bytes it read, so nothing here is optimized out as unused.
+  fn shim_tag_list(value: &[u8]) -> usize {
+    let Ok(list) = TagList::parse(value) else {
+      return 0;
+    };
+    if list.is_star() {
+      return 1;
+    }
+    let mut seen = 0usize;
+    // One past the end as well: `get` answers `None` there, and an index the
+    // caller chose is exactly the shape a bounds check has to survive.
+    for index in 0..=list.len() {
+      if let Some(tag) = list.get(index) {
+        seen = seen.wrapping_add(tag.opaque_tag().len());
+      }
+    }
+    seen
+  }
+}
+
+#[test]
+fn tag_list_is_panic_free() {
+  // §13.1.1's own three examples.
+  assert!(shim_tag_list(black_box(br#""xyzzy""#.as_slice())) > 0);
+  assert!(shim_tag_list(black_box(br#""xyzzy", "r2d2xxxx", "c3piozzzz""#.as_slice())) > 0);
+  assert_eq!(shim_tag_list(black_box(b"*".as_slice())), 1);
+  // §5.6.1.2's empty elements, which spend no slot, and the empty list the
+  // grammar still admits.
+  assert!(shim_tag_list(black_box(br#", ,"xyzzy", ,"#.as_slice())) > 0);
+  assert_eq!(shim_tag_list(black_box(b"".as_slice())), 0);
+  // Exactly `MAX_TAGS`, and one past it: the second is the refusal that
+  // constant documents, and it is the loop's own boundary.
+  let mut full = std::vec::Vec::new();
+  for _ in 0..http_semantics::validator::MAX_TAGS {
+    full.extend_from_slice(br#""a","#);
+  }
+  full.pop();
+  assert!(shim_tag_list(black_box(full.as_slice())) > 0);
+  full.extend_from_slice(br#","a""#);
+  assert_eq!(shim_tag_list(black_box(full.as_slice())), 0);
+  // A member that is not an `entity-tag`, `*` beside another value (§13.1.1's
+  // own closing note), and bytes that are not ASCII at all.
+  for refused in [
+    b"not-a-tag".as_slice(),
+    br#""a", *"#,
+    b"*, *",
+    &[0xffu8, 0x2c, 0x22],
+  ] {
+    assert_eq!(shim_tag_list(black_box(refused)), 0);
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `range::RangesSpecifier::parse` — §14.1.1's grammar with
+  /// §14.1.2's digit-string validity, the deepest arithmetic-free walk this
+  /// cycle adds.
+  ///
+  /// Returns the range-spec count so nothing here is optimized out as unused,
+  /// with the non-`bytes` set's length folded in so `other_range_set` is
+  /// reached too — a specifier under another unit holds no specs at all, and a
+  /// count alone would report it as a refusal.
+  fn shim_ranges_specifier(value: &[u8]) -> usize {
+    match RangesSpecifier::parse(value) {
+      Ok(spec) => spec
+        .len()
+        .wrapping_add(spec.other_range_set().map_or(0, <[u8]>::len))
+        .wrapping_add(spec.unit().len()),
+      Err(_) => 0,
+    }
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `range::RangesSpecifier::resolve` — §14.1.2's satisfiability and
+  /// its two normalisations, which are this crate's only new checked
+  /// arithmetic. Separate from the parse above so that each fails for the code
+  /// it names.
+  ///
+  /// `complete_length` and the index both arrive opaque, so neither
+  /// `checked_sub` nor the slot lookup is a constant here — the length is the
+  /// whole of `u64` rather than a plausible representation size, and the index
+  /// runs past the end.
+  ///
+  /// Returns the resolved positions so nothing here is optimized out as unused.
+  fn shim_resolve(value: &[u8], index: usize, complete_length: u64) -> u64 {
+    let Ok(spec) = RangesSpecifier::parse(value) else {
+      return 0;
+    };
+    match spec.resolve(index, complete_length) {
+      Some(Resolved::Range(first, last)) => first.wrapping_add(last).wrapping_add(1),
+      Some(Resolved::EmptyRepresentation) => 2,
+      Some(Resolved::Unsatisfiable) => 3,
+      None => 0,
+    }
+  }
+}
+
+#[test]
+fn ranges_specifier_is_panic_free() {
+  // §14.1.1's own example, both forms of `range-spec`, and a unit that is not
+  // `bytes` — which is the one input that reaches `other_range_set`.
+  assert!(shim_ranges_specifier(black_box(b"bytes=0-499".as_slice())) > 0);
+  assert!(shim_ranges_specifier(black_box(b"bytes=0-499, -500, 9500-".as_slice())) > 0);
+  assert!(shim_ranges_specifier(black_box(b"exampleunit=1.2-4.3".as_slice())) > 0);
+  // Erratum 7306's OWS after the `=`, which belongs to neither side.
+  assert!(shim_ranges_specifier(black_box(b"bytes=  0-499".as_slice())) > 0);
+  // Exactly `MAX_RANGE_SPECS`, then one past it.
+  assert!(shim_ranges_specifier(black_box(b"bytes=0-,1-,2-,3-,4-,5-,6-,7-".as_slice())) > 0);
+  assert_eq!(
+    shim_ranges_specifier(black_box(b"bytes=0-,1-,2-,3-,4-,5-,6-,7-,8-".as_slice())),
+    0
+  );
+  // A numeral past `u64::MAX` is NOT a refusal here, unlike in a
+  // `Content-Range`: §14.1.2's "recipients MUST anticipate potentially large
+  // decimal numerals and prevent parsing errors due to integer conversion
+  // overflows" is met by `Pos::Beyond`, a position above every length, so the
+  // specifier parses and `resolve` below is where it settles.
+  assert!(shim_ranges_specifier(black_box(b"bytes=18446744073709551616-".as_slice())) > 0);
+  // Each refusal on its own: no `=`, a unit that is not a token, an empty
+  // range-set under `bytes` and under another unit, a spec that is neither
+  // form, and bytes that are not ASCII.
+  for refused in [
+    b"0-499".as_slice(),
+    b"by tes=0-499",
+    b"bytes=",
+    b"bytes=,,",
+    b"exampleunit=",
+    b"bytes=abc",
+    b"",
+    &[0xffu8, 0x3d, 0x2d],
+  ] {
+    assert_eq!(shim_ranges_specifier(black_box(refused)), 0);
+  }
+
+  // §14.1.2's three answers, and the arithmetic under each. The length runs to
+  // both ends of `u64` and the index past the last slot, because every one of
+  // those is a value a caller may pass.
+  for &(value, index, length) in &[
+    // An int-range inside, at, and past the length; a last-pos at and past it.
+    (b"bytes=0-499".as_slice(), 0usize, 10_000u64),
+    (b"bytes=9500-", 0, 10_000),
+    (b"bytes=0-99999", 0, 10_000),
+    (b"bytes=10000-", 0, 10_000),
+    (b"bytes=0-499", 0, 0),
+    (b"bytes=0-499", 1, 10_000),
+    // A first-pos and a last-pos no `u64` holds — `Pos::Beyond` on each side.
+    (b"bytes=18446744073709551616-", 0, 10_000),
+    (b"bytes=0-18446744073709551616", 0, 10_000),
+    // Every suffix-range shape: zero, shorter than the length, longer than it,
+    // past `u64`, and each against a zero length.
+    (b"bytes=-0", 0, 10_000),
+    (b"bytes=-500", 0, 10_000),
+    (b"bytes=-99999", 0, 10_000),
+    (b"bytes=-18446744073709551616", 0, 10_000),
+    (b"bytes=-500", 0, 0),
+    (b"bytes=-0", 0, 0),
+    (b"bytes=-500", 0, u64::MAX),
+    (b"bytes=0-499", 0, u64::MAX),
+    // Nothing to resolve: another unit's set, and a value that did not parse.
+    (b"exampleunit=1.2-4.3", 0, 10_000),
+    (b"bytes=abc", 0, 10_000),
+  ] {
+    let _ = black_box(shim_resolve(
+      black_box(value),
+      black_box(index),
+      black_box(length),
+    ));
+  }
+  // The two answers a zero length separates, asserted rather than merely run.
+  assert_eq!(
+    shim_resolve(
+      black_box(b"bytes=-500".as_slice()),
+      black_box(0),
+      black_box(0)
+    ),
+    2
+  );
+  assert_eq!(
+    shim_resolve(
+      black_box(b"bytes=0-499".as_slice()),
+      black_box(0),
+      black_box(0)
+    ),
+    3
+  );
+}
+
+no_panic_shim! {
+  /// Shim over `range::ContentRange::parse` — §14.4's `range-resp`,
+  /// `unsatisfied-range` and the `other-range-resp` span it hands back unread,
+  /// plus §14.4's own two validity rules, which the constructor applies.
+  ///
+  /// Returns the positions it read so nothing here is optimized out as unused.
+  fn shim_content_range_parse(value: &[u8]) -> u64 {
+    let Ok(range) = ContentRange::parse(value) else {
+      return 0;
+    };
+    let (first, last) = range.incl_range().unwrap_or((0, 0));
+    first
+      .wrapping_add(last)
+      .wrapping_add(range.complete_length().unwrap_or(0))
+      .wrapping_add(range.unit().len() as u64)
+      .wrapping_add(range.other_range_resp().map_or(0, <[u8]>::len) as u64)
+      .wrapping_add(u64::from(range.is_unsatisfied()))
+      .wrapping_add(1)
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `range::ContentRange::encode` — §14.4's writing half, whose one
+  /// size test stands between a caller's buffer and the value.
+  ///
+  /// The value arrives as an opaque REFERENCE and the buffer as an opaque
+  /// slice, so neither the digits it spells nor the length it checks them
+  /// against is a constant here. Reading is left OUT of this shim, for the
+  /// reason `shim_format_imf_fixdate` states: a shim should fail for the code
+  /// it names.
+  ///
+  /// Returns the byte count so nothing here is optimized out as unused.
+  fn shim_content_range_encode(range: &ContentRange<'_>, out: &mut [u8]) -> usize {
+    range.encode(out).unwrap_or_default()
+  }
+}
+
+#[test]
+fn content_range_is_panic_free() {
+  // §14.4's own printed examples: a `range-resp` with a known length, one with
+  // an unknown one, and an `unsatisfied-range`.
+  for accepted in [
+    b"bytes 42-1233/1234".as_slice(),
+    b"bytes 42-1233/*",
+    b"bytes */1234",
+    b"bytes 0-0/1",
+    // §14.6's own `other-range-resp`, which the digits do not admit and which
+    // is handed back unread.
+    b"exampleunit 1.2-4.3/25",
+  ] {
+    assert!(shim_content_range_parse(black_box(accepted)) > 0);
+  }
+  // Each refusal on its own: no `SP`, a unit that is not a token, a second `SP`
+  // in another unit's span, an empty span, `*/​*` (neither alternative), a
+  // last-pos below the first (§14.4's first validity rule), a range at or past
+  // the complete length (its second), a numeral past `u64::MAX`, and non-ASCII.
+  for refused in [
+    b"bytes42-1233/1234".as_slice(),
+    b"by tes 42-1233/1234",
+    b"exampleunit 1.2 4.3/25",
+    b"exampleunit ",
+    b"bytes */*",
+    b"bytes 1233-42/1234",
+    b"bytes 42-1233/1000",
+    b"bytes 42-18446744073709551616/*",
+    b"bytes */18446744073709551616",
+    b"bytes 42-1233",
+    b"",
+    &[0xffu8, 0x20, 0x2f],
+  ] {
+    assert_eq!(shim_content_range_parse(black_box(refused)), 0);
+  }
+
+  // The writer, over every form it spells, and over every buffer length up to
+  // the exact one — `len` is opaque, so the size test is compiled rather than
+  // folded.
+  let mut out = [0u8; 64];
+  for value in [
+    b"bytes 42-1233/1234".as_slice(),
+    b"bytes 42-1233/*",
+    b"bytes */1234",
+    b"bytes */18446744073709551615",
+    b"exampleunit 1.2-4.3/25",
+  ] {
+    let range = ContentRange::parse(value).expect("a value this test supplies");
+    let written = black_box(shim_content_range_encode(
+      black_box(&range),
+      black_box(&mut out[..]),
+    ));
+    assert!(written > 0);
+    for len in 0..written {
+      let mut short = [0u8; 64];
+      assert_eq!(
+        shim_content_range_encode(black_box(&range), black_box(&mut short[..len])),
+        0
+      );
+    }
+  }
 }
 
 // ── the lie-check: this file's own guard against going vacuous ────────────────

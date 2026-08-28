@@ -141,10 +141,13 @@ default because they exist on a developer's disk and not in CI.
 
 `doc-check` is `quote-check`'s sibling: checks over what this workspace's
 documentation CLAIMS rather than quotes — doc continuity, table-verdict
-vocabulary, path-qualified callee assertions, and that every committed
-documented-items snapshot is still claimed by a gated crate. One needs
-rustdoc's JSON output, which is nightly-only; the other three run on any
-toolchain. A check that cannot run on the current toolchain says so by name
+vocabulary, path-qualified callee assertions, that every committed
+documented-items snapshot is still claimed by a gated crate, and that every
+intra-doc link resolves on PRIVATE items as well as public ones. That last one
+is not covered by the workspace's `-Dwarnings` doc build: `cargo doc` documents
+no private item, so it resolves no private item's links, and most of these
+crates are private. One needs rustdoc's JSON output, which is nightly-only;
+the other four run on any toolchain. A check that cannot run on the current toolchain says so by name
 instead of silently not running. `--require-all` turns a SKIPPED check into a failure, which is
 what CI's nightly job passes so an edit to that job cannot quietly drop a
 check while the report still exits 0. `--bless` lets a check rewrite what it

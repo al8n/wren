@@ -4,7 +4,8 @@
 <div align="center">
 
 Version-independent HTTP semantics — the rules RFC 9110 states once and every
-wire format inherits: field grammar, media types, dates.
+wire format inherits: field grammar, media types, dates, validators,
+conditional requests, range requests, and the status vocabulary they answer in.
 
 `no_std`, no-alloc capable, panic-free.
 
@@ -44,6 +45,15 @@ An item belongs here when BOTH hold:
   state this crate holds.
 
 An item satisfying neither is a defect here, not a judgement call.
+
+An item satisfying exactly ONE of the two is neither admitted nor excluded by
+that rule, and it stays only with the exception written at its own site:
+`Status::FieldsTooLarge` is this crate's one resident of that band — RFC 6585
+§5's rule, which RFC 9110 §19.2 lists as an informative reference rather than a
+specification it builds on, while its answer is a function of the input like
+every other member — and the `status` module doc and the variant both say so.
+This is an exception class, not a third clause: an item in the band that names
+no such exception is still a defect.
 
 The second clause is where the boundary actually falls. Computing an
 `Accept` weight belongs here because RFC 9110 §12.5.1 and §12.4.2 settle that

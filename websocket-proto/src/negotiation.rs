@@ -27,14 +27,25 @@ pub const MAX_SUBPROTOCOL_LEN: usize = 64;
 /// thousands of two-byte offers and buys millions of byte steps, while extended
 /// CONNECT hands the same function a header slice with no length of its own.
 ///
-/// A bound is what the field grammar's own recipient rules ask for. RFC 9110
-/// §5.6.1.2: a recipient "MUST parse and ignore a reasonable number of empty
-/// list elements: enough to handle common mistakes by senders that merge
-/// values, **but not so much that they could be used as a denial-of-service
-/// mechanism**". And §5.4: "A server that receives a request header field line,
-/// field value, or set of fields larger than it wishes to process MUST respond
-/// with an appropriate 4xx (Client Error) status code" — which is exactly what
-/// a reject-only handshake does with the refusal.
+/// **The clause that licenses this bound is RFC 9110 §5.4**, which is about
+/// the size of what a server agrees to process: "A server that receives a
+/// request header field line, field value, or set of fields larger than it
+/// wishes to process MUST respond with an appropriate 4xx (Client Error) status
+/// code". A field value carrying more offers than this is one larger than this
+/// crate wishes to process, and the 4xx is exactly what a reject-only handshake
+/// writes.
+///
+/// **§5.6.1.2 is not that clause.** Its
+/// "not so much that they could be used as a denial-of-service mechanism"
+/// closes a sentence about EMPTY list elements — the ones
+/// [`http_semantics::grammar::list_elements`] drops before an offer is ever
+/// counted, and which this constant therefore does not bound at all
+/// (`the_offer_list_is_bounded` pins that: a value padded with commas still
+/// conforms). What §5.6.1.2 does say about real elements is the opposite
+/// direction of the same distinction — "Empty elements do not contribute to the
+/// count of elements present" — which is why the count below is a count of
+/// offers rather than of commas. [`http_semantics::validator::MAX_TAGS`] draws
+/// the same distinction for the bound it states.
 ///
 /// # Why 64
 ///
@@ -347,7 +358,8 @@ impl<'a, I: Iterator<Item = &'a [u8]>> Iterator for ExtensionList<'a, I> {
         None => self.line = None,
       }
       if element.is_empty() {
-        // RFC 2616 §2.1's `#rule`, which is what `1#extension` is written in:
+        // RFC 2616 §2.1's `#rule` — RFC 822 §2.7's wording verbatim — which is
+        // what `1#extension` is written in:
         // "null elements are allowed, but do not contribute to the count of
         // elements present". (RFC 9110 §5.6.1.2 says the same in the modern
         // spelling: "A recipient MUST parse and ignore a reasonable number of
@@ -554,7 +566,8 @@ pub fn extension_list_conforms<'a>(lines: impl IntoIterator<Item = &'a [u8]>) ->
     }
   }
   // `extension-list = 1#extension`, read with the `#rule` of RFC 2616 §2.1 —
-  // the ABNF §9.1 imports: "null elements are allowed, but do not contribute to
+  // the ABNF §9.1 imports, and RFC 822 §2.7's wording apart from the capitalised
+  // MUST: "null elements are allowed, but do not contribute to
   // the count of elements present … where at least one element is required, at
   // least one non-null element MUST be present". (RFC 9110 §5.6.1.2 restates it,
   // with `""`, `","` and `",   ,"` as its examples of values that do not
@@ -1338,7 +1351,8 @@ where
 /// preference:
 ///
 /// - `Sec-WebSocket-Protocol-Client = 1#token` (RFC 6455 §11.3.4). Read with the
-///   `#rule` of RFC 2616 §2.1 — the ABNF RFC 6455 states its grammars in:
+///   `#rule` of RFC 2616 §2.1 — the ABNF RFC 6455 states its grammars in, and
+///   RFC 822 §2.7's wording apart from the capitalised MUST:
 ///   "null elements are allowed, but do not contribute to the count of elements
 ///   present … where at least one element is required, at least one non-null
 ///   element MUST be present". So a field that is PRESENT and names nothing —
@@ -2144,11 +2158,12 @@ mod tests {
   /// The offer list is bounded, and the bound is what keeps the uniqueness
   /// proof from being an unauthenticated peer's to make expensive.
   ///
-  /// RFC 9110 §5.6.1.2 asks for exactly this: a recipient parses "a reasonable
-  /// number of empty list elements … but not so much that they could be used as
-  /// a denial-of-service mechanism", and §5.4 lets a server refuse a "field
-  /// value … larger than it wishes to process" with a 4xx — which is what a
-  /// reject-only handshake writes.
+  /// RFC 9110 §5.4 is the clause: a server refuses a "request header field
+  /// line, field value, or set of fields larger than it wishes to process" with
+  /// a 4xx, which is what a reject-only handshake writes. §5.6.1.2's
+  /// denial-of-service sentence is NOT the clause — it governs empty elements,
+  /// and the padded case below is this test's own evidence that they are
+  /// unbounded here.
   #[test]
   fn the_offer_list_is_bounded() {
     let names: Vec<String> = (0..=MAX_SUBPROTOCOL_OFFERS)

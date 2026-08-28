@@ -1039,7 +1039,7 @@ pub(crate) const DRAINED: &str = "connection is draining";
 /// handed its one violation back, a drained one is past RFC 9112 §9.6's point of
 /// no return — and two statements of it would be free to drift apart while
 /// nothing made them. That is the failure this crate's own
-/// [`peer_close_effects`] records twice.
+/// `peer_close_effects` records twice.
 ///
 /// POLICY decides it and the transport fact deliberately does not appear: the
 /// peer shutting its WRITE side says nothing about whether it is still reading
@@ -2322,7 +2322,7 @@ pub(crate) const fn body_refused(recv: &RecvState, exchange: &Option<Exchange>) 
 
 /// Everything that follows from "this end refused the body it was being sent".
 ///
-/// ONE routine, deliberately shaped like [`peer_close_effects`], so a
+/// ONE routine, deliberately shaped like `peer_close_effects`, so a
 /// consequence added later is added once. Every step reuses an existing
 /// single-writer routine rather than re-deriving its rule.
 ///

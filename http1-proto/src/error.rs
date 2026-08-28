@@ -36,64 +36,12 @@ impl MalformedDetail {
   }
 }
 
-/// Status a server driver is advised to answer with for a given violation.
+/// The status vocabulary, under the name this crate has always used.
 ///
-/// Advisory only: the core never writes a response itself, so a driver is free
-/// to answer differently (or to close the connection without answering).
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SuggestedStatus {
-  /// `400 Bad Request` (RFC 9110 §15.5.1).
-  BadRequest,
-  /// `414 URI Too Long` (RFC 9110 §15.5.15). RFC 9112 §3 makes this the MUST
-  /// answer for a request-target longer than the server will parse.
-  UriTooLong,
-  /// `431 Request Header Fields Too Large` (RFC 6585 §5 — not an RFC 9110
-  /// code).
-  FieldsTooLarge,
-  /// `501 Not Implemented` (RFC 9110 §15.6.2).
-  NotImplemented,
-  /// `505 HTTP Version Not Supported` (RFC 9110 §15.6.6).
-  VersionNotSupported,
-  /// `413 Content Too Large` (RFC 9110 §15.5.14): the content is larger than
-  /// this end is willing to process.
-  ContentTooLarge,
-}
-
-impl SuggestedStatus {
-  /// The three-digit status code.
-  #[inline(always)]
-  pub const fn code(self) -> u16 {
-    match self {
-      Self::BadRequest => 400,
-      Self::ContentTooLarge => 413,
-      Self::UriTooLong => 414,
-      Self::FieldsTooLarge => 431,
-      Self::NotImplemented => 501,
-      Self::VersionNotSupported => 505,
-    }
-  }
-
-  /// The RFC 9110 §15 reason phrase for this status (RFC 6585 §5 for 431).
-  ///
-  /// Exists to retire a defect class rather than for convenience. A driver that
-  /// maps a suggested status through `match code { Some(414) => …, _ => … }`
-  /// silently degrades every variant added afterwards; with this the mapping is
-  /// `(s.code(), s.reason())` and no variant can degrade. The phrase is
-  /// advisory either way — RFC 9112 §4 makes `reason-phrase` optional and
-  /// unexamined by the client.
-  #[inline(always)]
-  pub const fn reason(self) -> &'static str {
-    match self {
-      Self::BadRequest => "Bad Request",
-      Self::ContentTooLarge => "Content Too Large",
-      Self::UriTooLong => "URI Too Long",
-      Self::FieldsTooLarge => "Request Header Fields Too Large",
-      Self::NotImplemented => "Not Implemented",
-      Self::VersionNotSupported => "HTTP Version Not Supported",
-    }
-  }
-}
+/// The type lives in `http-semantics` as `Status`, because RFC 9110's rules are
+/// version-independent and every HTTP version's crate needs the same codes. The
+/// alias keeps every call site here unchanged.
+pub use http_semantics::status::Status as SuggestedStatus;
 
 /// A LOCAL policy limit refused a message the peer framed correctly.
 ///

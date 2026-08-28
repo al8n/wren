@@ -52,10 +52,10 @@ fn a_media_type_parses_to_its_two_tokens_and_its_parameters() {
   assert_eq!(m.ty(), "application");
   assert_eq!(m.subtype(), "graphql-response+json");
   let mut params = m.params();
-  assert_eq!(
+  assert!(matches!(
     params.next().expect("one").expect("well formed"),
-    (b"charset".as_slice(), ParamValue::Token(b"utf-8"))
-  );
+    (b"charset", ParamValue::Token(b"utf-8"))
+  ));
   assert!(params.next().is_none());
 }
 
@@ -65,12 +65,15 @@ fn content_type_refuses_a_comma_outside_a_quoted_string() {
   // taking "the last syntactically valid member of the list" causes
   // "potential interoperability and security issues"; refusal cannot diverge.
   assert_eq!(
-    media_type(b"text/plain, text/html"),
-    Err(MediaError::NotASingleton)
+    media_type(b"text/plain, text/html").unwrap_err(),
+    MediaError::NotASingleton
   );
   // A trailing comma too: member-counting would call this singular, because
   // §5.6.1.2 has the walk skip empty elements.
-  assert_eq!(media_type(b"text/plain,"), Err(MediaError::NotASingleton));
+  assert_eq!(
+    media_type(b"text/plain,").unwrap_err(),
+    MediaError::NotASingleton
+  );
   // Inside a quoted-string the comma is data.
   let m = media_type(b"multipart/form-data;boundary=\"a,b\"").expect("valid");
   assert_eq!(m.subtype(), "form-data");
@@ -83,10 +86,10 @@ fn a_parameter_named_q_is_ordinary_in_a_content_type() {
   // media type with an oddly named parameter.
   let m = media_type(b"text/html;q=blah").expect("valid");
   assert_eq!(m.ty(), "text");
-  assert_eq!(
+  assert!(matches!(
     m.params().next().expect("one").expect("well formed"),
-    (b"q".as_slice(), ParamValue::Token(b"blah"))
-  );
+    (b"q", ParamValue::Token(b"blah"))
+  ));
 }
 
 #[test]
@@ -103,15 +106,20 @@ fn media_type_refuses_what_is_not_type_solidus_subtype() {
     b"appli cation/json", // space is not a tchar
     b"application/js/on", // two solidi: the second is not a tchar
   ] {
-    assert_eq!(media_type(bad), Err(MediaError::NotAMediaType), "{:?}", bad);
+    assert_eq!(
+      media_type(bad).unwrap_err(),
+      MediaError::NotAMediaType,
+      "{:?}",
+      bad
+    );
   }
 }
 
 #[test]
 fn a_valueless_parameter_is_refused_by_the_media_grammar() {
   assert_eq!(
-    media_type(b"text/html;charset"),
-    Err(MediaError::ValuelessParameter)
+    media_type(b"text/html;charset").unwrap_err(),
+    MediaError::ValuelessParameter
   );
 }
 
@@ -132,10 +140,10 @@ fn a_range_yields_its_shape_its_weight_and_its_parameters() {
   assert_eq!(r.subtype(), Some("html"));
   assert_eq!(r.weight(), Weight(700));
   let mut params = r.params();
-  assert_eq!(
+  assert!(matches!(
     params.next().expect("one").expect("well formed"),
-    (b"level".as_slice(), ParamValue::Token(b"3"))
-  );
+    (b"level", ParamValue::Token(b"3"))
+  ));
   assert!(
     params.next().is_none(),
     "q is weight, not a range parameter"
@@ -185,8 +193,8 @@ fn a_q_that_is_not_a_qvalue_ends_the_walk() {
     b"text/html;q=0.5000",
   ] {
     assert_eq!(
-      accept([bad]).next(),
-      Some(Err(MediaError::BadWeight)),
+      accept([bad]).next().expect("one").unwrap_err(),
+      MediaError::BadWeight,
       "{:?}",
       bad
     );
@@ -197,7 +205,10 @@ fn a_q_that_is_not_a_qvalue_ends_the_walk() {
 fn the_walk_stops_at_the_first_faulting_member() {
   let mut it = accept([b"text/html, not-a-media-type, text/plain".as_slice()]);
   assert!(it.next().expect("first").is_ok());
-  assert_eq!(it.next(), Some(Err(MediaError::NotAMediaType)));
+  assert_eq!(
+    it.next().expect("one").unwrap_err(),
+    MediaError::NotAMediaType
+  );
   assert!(it.next().is_none(), "later members are unreachable");
 }
 
@@ -243,7 +254,7 @@ fn a_fault_found_reading_the_member_stops_the_walk_too() {
     while matches!(item, Some(Ok(_))) {
       item = it.next();
     }
-    assert_eq!(item, Some(Err(want)), "{field:?}");
+    assert_eq!(item.expect("one").unwrap_err(), want, "{field:?}");
     assert!(
       it.next().is_none(),
       "{field:?}: later members are unreachable"
@@ -264,7 +275,10 @@ fn a_value_spanning_the_join_stops_the_walk_too() {
     b"text/html;boundary=\"a".as_slice(),
     b"b\", text/plain".as_slice(),
   ]);
-  assert_eq!(it.next(), Some(Err(MediaError::ValueSpansFieldLines)));
+  assert_eq!(
+    it.next().expect("one").unwrap_err(),
+    MediaError::ValueSpansFieldLines
+  );
   assert!(it.next().is_none(), "later members are unreachable");
   assert!(it.next().is_none(), "the stop is latched");
 }
@@ -280,14 +294,20 @@ fn a_value_spanning_the_join_is_lifted_to_its_own_variant() {
   // isolates whether the span itself is lifted to its own variant rather than
   // nested inside `Parameters`.
   let mut it = accept([b"text/html;boundary=\"a".as_slice(), b"b\"".as_slice()]);
-  assert_eq!(it.next(), Some(Err(MediaError::ValueSpansFieldLines)));
+  assert_eq!(
+    it.next().expect("one").unwrap_err(),
+    MediaError::ValueSpansFieldLines
+  );
 }
 
 #[test]
 fn a_valueless_parameter_is_refused_in_a_range_too() {
   assert_eq!(
-    accept([b"text/html;charset".as_slice()]).next(),
-    Some(Err(MediaError::ValuelessParameter))
+    accept([b"text/html;charset".as_slice()])
+      .next()
+      .expect("one")
+      .unwrap_err(),
+    MediaError::ValuelessParameter
   );
 }
 
@@ -298,14 +318,20 @@ fn a_valueless_q_is_a_grammar_fault_not_a_bad_weight() {
   // question at all. This pins the ordering: the valueless check runs before
   // the `q`-name check.
   assert_eq!(
-    accept([b"text/html;q".as_slice()]).next(),
-    Some(Err(MediaError::ValuelessParameter))
+    accept([b"text/html;q".as_slice()])
+      .next()
+      .expect("one")
+      .unwrap_err(),
+    MediaError::ValuelessParameter
   );
   // A valueless parameter that is NOT `q`, alongside a well-formed `q`:
   // this is "refuses valueless", not "refuses anything near a `q`".
   assert_eq!(
-    accept([b"text/html;charset;q=0.5".as_slice()]).next(),
-    Some(Err(MediaError::ValuelessParameter))
+    accept([b"text/html;charset;q=0.5".as_slice()])
+      .next()
+      .expect("one")
+      .unwrap_err(),
+    MediaError::ValuelessParameter
   );
 }
 
@@ -437,6 +463,290 @@ fn matched_count_outranks_field_order() {
   ] {
     assert_eq!(weight_for(&m, [field]), Ok(Weight(700)), "{:?}", field);
   }
+}
+
+// ── RFC 822's lexical classes, asked of the walk that uses them ──────────────
+
+// The three RFC 822 productions the MIME parameter walk is built on — `qtext`,
+// `ctext` and `quoted-pair` — driven through `mime_content_type` rather than
+// through a body part, because the body-part
+// reader refuses a CR or an LF in a header line BEFORE this walk sees one. Two
+// independent rules land on the same input there, and a test that only went
+// through the reader would pin whichever fired first and say nothing about the
+// other. `a_bare_line_break_octet_belongs_to_no_rfc_822_field` in `range::tests`
+// is the reader's half; this is the lexis's.
+#[test]
+fn the_mime_lexis_is_rfc_822s_and_not_rfc_9110s() {
+  // `qtext` takes exactly three characters out of `CHAR`, so every other
+  // US-ASCII octet stands unescaped inside a `quoted-string` — DEL and the CTLs
+  // included, which is where §5.6.4's `qdtext` and this part company.
+  for interior in [&b"a\x7fb"[..], b"a\x01b", b"a\x00b", b"a\nb", b"a\tb"] {
+    let mut value = [0u8; 64];
+    let value = write_value(&mut value, b"text/plain;charset=\"", interior, b"\"");
+    let media = mime_content_type(value).expect("RFC 822 `qtext` admits every CHAR but three");
+    assert!(
+      matches!(
+        media.params().next().unwrap().unwrap(),
+        (b"charset", ParamValue::Quoted(got)) if got == interior
+      ),
+      "{interior:?}"
+    );
+  }
+
+  // `quoted-pair` puts no set at all on the character behind the backslash,
+  // where §5.6.4's names four. The escape is left in the interior, as the HTTP
+  // walk leaves its own.
+  for interior in [&b"a\\\x7fb"[..], b"a\\\x01b", b"a\\\rb", b"a\\\"b"] {
+    let mut value = [0u8; 64];
+    let value = write_value(&mut value, b"text/plain;charset=\"", interior, b"\"");
+    let media = mime_content_type(value).expect("`quoted-pair` is a backslash and any CHAR");
+    assert!(
+      matches!(
+        media.params().next().unwrap().unwrap(),
+        (b"charset", ParamValue::Quoted(got)) if got == interior
+      ),
+      "{interior:?}"
+    );
+  }
+
+  // And the exclusions, each of which is a refusal this walk owes to one of the
+  // three productions rather than to the reader above it.
+  for (value, why) in [
+    // `qtext` excludes the CR by name.
+    (
+      &b"text/plain;charset=\"a\rb\""[..],
+      "a bare CR is no `qtext`",
+    ),
+    // `ctext` excludes it by name too, which a comment walk that only looks for
+    // the closing paren ignores.
+    (b"text/plain (a\rb)", "a bare CR is no `ctext`"),
+    (b"text/plain;charset=us-ascii (a\rb)", "the same, trailing"),
+    // `CHAR` is US-ASCII 0-127, so `obs-text` is outside all three productions —
+    // the one direction in which RFC 822 is the NARROWER grammar, since
+    // §5.6.4's `qdtext` admits `%x80-FF`.
+    (b"text/plain;charset=\"a\x80b\"", "%x80 is no `CHAR`"),
+    (b"text/plain (a\x80b)", "nor inside a comment"),
+    (b"text/plain;charset=\"a\\\x80b\"", "nor behind a backslash"),
+    // The string and the comment that never close.
+    (b"text/plain;charset=\"a", "unterminated `quoted-string`"),
+    (b"text/plain;charset=\"a\\", "a dangling `quoted-pair`"),
+    (b"text/plain (a", "unterminated comment"),
+  ] {
+    assert!(mime_content_type(value).is_none(), "{why}: {value:?}");
+  }
+}
+
+// The same octets in an HTTP field section, where §5.6.4 is the grammar in force
+// and this crate's answer must not have moved. The separation is the whole point
+// of two parsers: `media_type` is byte for byte what it was.
+#[test]
+fn the_http_quoted_string_alphabet_did_not_move() {
+  for value in [
+    &b"text/plain;charset=\"a\x7fb\""[..],
+    b"text/plain;charset=\"a\x01b\"",
+    b"text/plain;charset=\"a\\\x01b\"",
+  ] {
+    assert_eq!(
+      media_type(value).unwrap_err(),
+      MediaError::Parameters(crate::grammar::ListError::InvalidQuotedByte),
+      "{value:?}"
+    );
+  }
+  // And `obs-text`, which §5.6.4 admits and RFC 822's `CHAR` does not: the one
+  // value the HTTP parser takes and the MIME parser refuses.
+  let obs = media_type(b"text/plain;charset=\"a\x80b\"").expect("obs-text is `qdtext`");
+  assert!(matches!(
+    obs.params().next().unwrap().unwrap(),
+    (b"charset", ParamValue::Quoted(b"a\x80b"))
+  ));
+  assert!(mime_content_type(b"text/plain;charset=\"a\x80b\"").is_none());
+}
+
+// RFC 2045 §5.1 offers `x-token` at THREE productions — `type` and `subtype`
+// through `extension-token`, and §6.1's `mechanism` — so a copy of the rule at
+// one of them leaves the other two admitting `x-/plain` and `text/x-`, each of
+// which is a `token` in the position it sits in and is no `x-token`: §5.1
+// spells that one as "The two characters "X-" or "x-" followed, with no
+// intervening white space, by any token", whose tail is `token` and therefore
+// `1*<…>`.
+//
+// Neither registry alternative can take them either, so they match nothing at
+// all. RFC 2046 §6: "A media type value beginning with the characters "X-" is a
+// private value, to be used by consenting systems by mutual agreement." and
+// "publicly specified values shall never begin with "X-"".
+#[test]
+fn a_bare_x_names_no_type_and_no_subtype() {
+  for value in [
+    // The two verified inputs, in both spellings §5.1 gives the prefix.
+    &b"x-/plain"[..],
+    b"X-/plain",
+    b"text/x-",
+    b"text/X-",
+    // Both halves at once, and the RFC 822 comments and white space §5.1 admits
+    // around each — stripping a comment must not leave an empty `x-token`
+    // looking like a longer one.
+    b"x-/x-",
+    b"x- / plain",
+    b"text / x-",
+    b"(c) x- /plain",
+    b"text/x-(c)",
+  ] {
+    assert!(mime_content_type(value).is_none(), "{value:?}");
+  }
+
+  // The differential partner of each: one byte more and the value IS an
+  // `x-token` in that position, which §5.1 admits as an `extension-token`.
+  for (value, ty, subtype) in [
+    (&b"x-a/plain"[..], "x-a", "plain"),
+    (b"text/x-a", "text", "x-a"),
+    (b"X-a/X-b", "X-a", "X-b"),
+    // And the tail is a whole `token` rather than its first byte: `{` and `}`
+    // are `token` characters here, which the module table's fifth row pins.
+    (b"application/x-{foo}", "application", "x-{foo}"),
+  ] {
+    let media = mime_content_type(value).expect("an x-token is an extension-token");
+    assert_eq!(media.ty(), ty, "{value:?}");
+    assert_eq!(media.subtype(), subtype, "{value:?}");
+  }
+
+  // The prefix is BOTH characters. `x` and `xy` are outside the namespace, so
+  // each position takes the other alternative — an `ietf-token` or an
+  // `iana-token`, as far as bytes can tell — and the differential is between two
+  // answers rather than between a refusal and itself.
+  for value in [&b"x/plain"[..], b"xy/plain", b"text/x", b"text/xy"] {
+    assert!(mime_content_type(value).is_some(), "{value:?}");
+  }
+
+  // And RFC 9110 §8.3.1 has not moved, because it has no `extension-token` at
+  // all: it spells `type = token` and `subtype = token`, and `x-` is a `token`.
+  // The two grammars disagree here on purpose, which is why the refusal for a
+  // BODY PART belongs to `encode_part_header` rather than to this parser.
+  for value in [&b"x-/plain"[..], b"text/x-"] {
+    assert!(media_type(value).is_ok(), "{value:?}");
+  }
+}
+
+/// Lays `head`, `middle` and `tail` end to end in `out`, for the fixtures whose
+/// middle is a byte string a Rust literal cannot hold beside its neighbours.
+fn write_value<'b>(out: &'b mut [u8], head: &[u8], middle: &[u8], tail: &[u8]) -> &'b [u8] {
+  let mut at = 0;
+  for piece in [head, middle, tail] {
+    out[at..at + piece.len()].copy_from_slice(piece);
+    at += piece.len();
+  }
+  &out[..at]
+}
+
+// ── The equality that was never right ────────────────────────────────────────
+
+// A `PartialEq` derived over the bytes as written answers `false` for all three
+// probes below, each of which names one media type. There is no derive rather
+// than a repaired one: media-type equivalence needs answers
+// this crate does not have — parameter order, duplicate parameters, which
+// parameter values are case-sensitive — and RFC 9110 §5.6.6 settles only the
+// first of those three, saying that "Parameter names are case-insensitive.
+// Parameter values might or might not be case-sensitive, depending on the
+// semantics of the parameter name."
+//
+// So what a caller asks is a question it can state, and this is that question:
+// the two tokens compared as §8.3.1 says to compare them ("The type and subtype
+// tokens are case-insensitive."), and the parameters walked under the caller's
+// own rule. `ContentRange` is the precedent — no derive, for the same reason,
+// over §14.1's case-insensitive `range-unit`.
+#[test]
+fn one_media_type_written_two_ways_is_compared_by_its_pieces() {
+  // Probe one: case. §8.3.1's own sentence, and the derive said `false`.
+  let lower = media_type(b"text/plain").expect("valid");
+  let upper = media_type(b"TEXT/PLAIN").expect("valid");
+  assert!(
+    lower.ty().eq_ignore_ascii_case(upper.ty())
+      && lower.subtype().eq_ignore_ascii_case(upper.subtype()),
+    "one media type, two spellings of its tokens"
+  );
+  // And the crate's own comparison over the same bytes, since that is what a
+  // `no_std` caller holding `&[u8]` reaches for.
+  assert!(crate::grammar::eq_ignore_ascii(
+    upper.ty().as_bytes(),
+    lower.ty()
+  ));
+
+  // Probe two: the `OWS` §5.6.6 puts around a parameter's `;`. One media type
+  // with one parameter, twice; the derive said `false` because the members'
+  // bytes differ.
+  let tight = media_type(b"text/plain;charset=utf-8").expect("valid");
+  let spaced = media_type(b"text/plain; charset=utf-8").expect("valid");
+  for (a, b) in tight.params().zip(spaced.params()) {
+    // `ParamValue` derives no equality either, and for a reason of its own that
+    // its doc gives: §5.6.6 makes a `token` and a `quoted-string` spelling of
+    // one value equivalent and leaves the CASE question to the parameter's own
+    // name. So the parameter is compared as that section makes it comparable —
+    // "Parameter names are case-insensitive." for the name, and the value with
+    // the quoted-string's spelling taken back out of it.
+    let (a_name, a_value) = a.expect("well formed");
+    let (b_name, b_value) = b.expect("well formed");
+    assert!(a_name.eq_ignore_ascii_case(b_name));
+    assert!(a_value.unescaped().eq(b_value.unescaped()));
+  }
+  assert_eq!(tight.params().count(), 1);
+  assert_eq!(tight.params().count(), spaced.params().count());
+
+  // Probe three, the one the MIME parser added: the same value read in the two
+  // grammars. `range::multipart`'s reader is where a MIME-parsed `MediaType`
+  // comes from, and `a_mime_read_content_type_re_frames_through_the_writer` is
+  // where the pair is measured end to end; here it is enough that the pieces are
+  // what the comparison is made of, whichever parser produced them.
+  assert_eq!((tight.ty(), tight.subtype()), (lower.ty(), lower.subtype()));
+}
+
+// A derived `Eq`/`PartialEq` on `MediaRange` compares the same bytes it would
+// on `MediaType`, so removing one derive and keeping the other answers a type
+// rather than the claim underneath. Same two probes as
+// `one_media_type_written_two_ways_is_compared_by_its_pieces`, same result,
+// over `accept`'s output instead of `media_type`'s.
+#[test]
+fn one_media_range_written_two_ways_is_compared_by_its_pieces() {
+  // Probe one: case. §8.3.1's tokens, reused by `media-range` (§12.5.1).
+  let lower = accept([b"text/html".as_slice()])
+    .next()
+    .expect("one")
+    .expect("valid");
+  let upper = accept([b"TEXT/HTML".as_slice()])
+    .next()
+    .expect("one")
+    .expect("valid");
+  assert!(
+    lower
+      .ty()
+      .expect("not a wildcard")
+      .eq_ignore_ascii_case(upper.ty().expect("not a wildcard"))
+      && lower
+        .subtype()
+        .expect("not a wildcard")
+        .eq_ignore_ascii_case(upper.subtype().expect("not a wildcard")),
+    "one media range, two spellings of its tokens"
+  );
+
+  // Probe two: the `OWS` §5.6.6 puts around a parameter's `;`. One range with
+  // one parameter, twice; the derive said `false` because the members' bytes
+  // differ.
+  let tight = accept([b"text/html;level=3".as_slice()])
+    .next()
+    .expect("one")
+    .expect("valid");
+  let spaced = accept([b"text/html; level=3".as_slice()])
+    .next()
+    .expect("one")
+    .expect("valid");
+  for (a, b) in tight.params().zip(spaced.params()) {
+    // Compared the way the media-type test above compares them, and for the
+    // same reason.
+    let (a_name, a_value) = a.expect("well formed");
+    let (b_name, b_value) = b.expect("well formed");
+    assert!(a_name.eq_ignore_ascii_case(b_name));
+    assert!(a_value.unescaped().eq(b_value.unescaped()));
+  }
+  assert_eq!(tight.params().count(), 1);
+  assert_eq!(tight.params().count(), spaced.params().count());
 }
 
 #[test]
