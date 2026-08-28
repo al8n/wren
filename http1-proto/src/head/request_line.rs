@@ -26,6 +26,29 @@ use crate::{
 /// asterisk-form` — so a fifth variant would be a change to HTTP/1.1 rather than
 /// to this crate. A consumer matches all four exhaustively and gets a compile
 /// error if it forgets one, which is what routing code wants.
+///
+/// # The derived equality compares SPELLINGS, and RFC 9110 §4.2.3 does not
+///
+/// `Eq`/`PartialEq` here compare the target as the sender wrote it, byte for
+/// byte. That is not URI equivalence, and §4.2.3 is the section it disagrees
+/// with: scheme-based normalization omits a port equal to the scheme's
+/// default, makes an empty path equivalent to `/` outside an OPTIONS target,
+/// and equates an unreserved character with its percent-encoded octet. On case
+/// it is explicit — "The scheme and host are case-insensitive and normally
+/// provided in lowercase; all other components are compared in a
+/// case-sensitive manner." The section then prints three URIs it calls
+/// equivalent — `http://example.com:80/~smith/home.html`,
+/// `http://EXAMPLE.com/%7Esmith/home.html` and
+/// `http://EXAMPLE.com:/%7esmith/home.html` — and this derive answers `false`
+/// for every pair of them.
+///
+/// The derive is kept, and what it is FOR is the narrow question: whether two
+/// requests carried the same bytes in the same form. §4.2.3 leaves the
+/// comparison open — "HTTP does not require the use of a specific method for
+/// determining equivalence." — and a normalising `PartialEq` would have to
+/// pick one, over a `&str` this crate parses and does not decode. A caller
+/// deciding that two requests address the same resource normalizes first, on
+/// §4.2.3's rules, and does not ask `==`.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Target<'a> {
   /// §3.2.1 `origin-form`: absolute path plus optional query, the form of an

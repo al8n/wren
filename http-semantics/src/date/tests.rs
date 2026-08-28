@@ -1168,3 +1168,71 @@ fn a_short_buffer_outranks_both_year_rules() {
     Err(DateError::BufferTooSmall)
   );
 }
+
+// RFC 9110 §13.1.3 and §13.1.4 compare an `HTTP-date` earlier-or-equal, which
+// needs an ordering. It is DERIVED, not written over `unix_seconds`: the leap
+// second collides there, and an `Ord` that answers `Equal` where `Eq` answers
+// `false` is unsound.
+#[test]
+fn ordering_is_civil_and_agrees_with_equality() {
+  let earlier = parse_http_date(b"Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+  let later = parse_http_date(b"Sun, 06 Nov 1994 08:49:38 GMT").unwrap();
+  assert!(earlier < later);
+  assert!(later > earlier);
+  assert_eq!(earlier.cmp(&earlier), core::cmp::Ordering::Equal);
+
+  // Across every field boundary, coarsest first.
+  let cases: [(&[u8], &[u8]); 5] = [
+    (
+      b"Fri, 31 Dec 1999 23:59:59 GMT",
+      b"Sat, 01 Jan 2000 00:00:00 GMT",
+    ),
+    (
+      b"Tue, 31 Jan 1995 23:59:59 GMT",
+      b"Wed, 01 Feb 1995 00:00:00 GMT",
+    ),
+    (
+      b"Sun, 06 Nov 1994 23:59:59 GMT",
+      b"Mon, 07 Nov 1994 00:00:00 GMT",
+    ),
+    (
+      b"Sun, 06 Nov 1994 08:59:59 GMT",
+      b"Sun, 06 Nov 1994 09:00:00 GMT",
+    ),
+    (
+      b"Sun, 06 Nov 1994 08:49:59 GMT",
+      b"Sun, 06 Nov 1994 08:50:00 GMT",
+    ),
+  ];
+  for (lo, hi) in cases {
+    let (lo, hi) = (parse_http_date(lo).unwrap(), parse_http_date(hi).unwrap());
+    assert!(lo < hi, "{lo:?} must precede {hi:?}");
+  }
+}
+
+// The reason the ordering is not written over `unix_seconds`. A leap second and
+// the midnight after it share a `unix_seconds` value, so an instant-ordering
+// would call them `Equal` while `Eq` calls them different — an unlawful `Ord`.
+// The derived order sorts the leap second strictly first, which is also the true
+// UTC order.
+//
+// The date picked is not a real IERS leap second (the nearby real ones are
+// 30 Jun 1994 and 31 Dec 1995) — the constructor range-checks `second <= 60`
+// unconditionally, so any date works, and 30 Jun 1995 is a Friday, which is
+// what `imf-fixdate`'s day-name check requires it to be.
+#[test]
+fn the_leap_second_precedes_the_midnight_it_shares_an_instant_with() {
+  let leap = parse_http_date(b"Fri, 30 Jun 1995 23:59:60 GMT").unwrap();
+  let midnight = parse_http_date(b"Sat, 01 Jul 1995 00:00:00 GMT").unwrap();
+
+  assert_eq!(
+    leap.unix_seconds(),
+    midnight.unix_seconds(),
+    "the collision this test exists for"
+  );
+  assert_ne!(leap, midnight, "`Eq` is structural, so they differ");
+  assert!(
+    leap < midnight,
+    "and `Ord` must agree with `Eq`, not with the instant"
+  );
+}

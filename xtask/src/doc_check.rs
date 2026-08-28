@@ -1,17 +1,24 @@
 //! Checks over the claims this workspace's documentation makes.
 //!
 //! `quote-check`'s sibling, and split from it at the toolchain seam rather than
-//! by subject: one of these four needs rustdoc's JSON output, which is
-//! nightly-only, and the other three are source and directory scanning that any
-//! toolchain can do. Running the three it can and SAYING it skipped the fourth
-//! is this crate's rule applied to the command itself — a check that cannot
-//! examine something must say so by name.
+//! by subject: one of these five needs rustdoc's JSON output, which is
+//! nightly-only, and the other four run on any toolchain. Running the four it
+//! can and SAYING it skipped the fifth is this crate's rule applied to the
+//! command itself — a check that cannot examine something must say so by name.
 //!
-//! The fourth is [`unclaimed_snapshots`], and it is the one that watches the
-//! other three's SUBJECT rather than their content: every check here iterates
-//! [`GATED_CRATES`], so a name deleted from that list deletes the iteration
-//! that would have examined it, and the run gets shorter and stays green. A
-//! directory walk is the only set that edit cannot shrink.
+//! [`unclaimed_snapshots`] is the one that watches the others' SUBJECT rather
+//! than their content: [`continuity`], [`verdicts`] and [`callees`] each
+//! iterate [`GATED_CRATES`], so a name deleted from that list deletes the
+//! iteration that would have examined it, and the run gets shorter and stays
+//! green. A directory walk is the only set that edit cannot shrink.
+//!
+//! [`intra_doc_links`] is the newest and takes no list at all, for that same
+//! reason one step further: it runs rustdoc over `--workspace` with
+//! `--document-private-items`, which is the set no edit here can narrow. It
+//! exists because the workspace's `-Dwarnings` doc build denies
+//! `rustdoc::broken_intra_doc_links` on the PUBLIC surface only — `cargo doc`
+//! documents no private item, so it resolves no private item's links — and
+//! this crate is mostly private.
 use crate::{
   Error,
   report::{self, Report},
@@ -33,6 +40,7 @@ pub fn run(require_all: bool, bless: bool) -> Result<(), Error> {
   }
   verdicts(&root, &mut report)?;
   callees(&root, &mut report)?;
+  intra_doc_links(&root, &mut report)?;
   report.finish(require_all)
 }
 
@@ -505,6 +513,200 @@ fn indented_tail(text: &str) -> String {
     .join("\n")
 }
 
+/// The rustdoc flags [`intra_doc_links`]'s pass runs under, set rather than
+/// inherited.
+///
+/// SET, because the ambient value is what hid the defect this check exists
+/// for: `RUSTDOCFLAGS` leaking out of a shell was the only reason the dangling
+/// link was ever seen, and a gate whose answer depends on the caller's
+/// environment is not a gate. `Command::env` replaces the variable for the
+/// child, so this run asks the same question from CI, from a developer's
+/// shell, and from a shell that happens to export something else.
+///
+/// ONE lint rather than `-Dwarnings`, and the boundary is deliberate. rustdoc
+/// has other lints that fire on private items and each is its own backlog with
+/// its own argument: run this same pass with `RUSTDOCFLAGS` set to
+/// `-W rustdoc::all` and `redundant_explicit_link` alone warns twelve times, plus one
+/// `missing_crate_level_docs`. This check's name is the whole of what it
+/// denies, so a green run here says exactly one thing and does not imply the
+/// others.
+const PRIVATE_DOC_RUSTDOCFLAGS: &str = "-D rustdoc::broken_intra_doc_links";
+
+/// Fails when an intra-doc link does not resolve — over the workspace's
+/// PRIVATE items as well as its public ones.
+///
+/// # The hole this closes
+///
+/// CI already documents the workspace under `RUSTDOCFLAGS: --cfg docsrs
+/// -Dwarnings`, so `rustdoc::broken_intra_doc_links` is denied there. But
+/// `cargo doc` does not document PRIVATE items, and rustdoc resolves links
+/// only in the items it documents — so that denial covers the public surface
+/// and nothing else. A dangling `[is_mechanism]` written onto a private item
+/// in `http-semantics/src/range/multipart.rs` — a file that is almost entirely
+/// private, as much of that crate is — passed that build, and was seen only
+/// because an ambient `RUSTDOCFLAGS` leaked into [`documented_items`]'s own
+/// `--document-private-items` pass. The green was narrower than the name: "no
+/// broken doc links" meant "no broken doc links where a doc link was
+/// documented".
+///
+/// Turning it on found sixteen, in five of the workspace's nine crates.
+///
+/// # Why not [`documented_items`]'s pass, which already carries the flag
+///
+/// It was the cheaper place and it is the wrong one, for three reasons that
+/// each show up in the numbers above. That pass iterates [`GATED_CRATES`], two
+/// crates holding three of the sixteen; the other thirteen are outside it and
+/// a lint carried there would still be green on them. It needs nightly
+/// and SKIPS without it, so the stable `docs.yml` job would carry none of this.
+/// And its failure arm says "The crate most likely does not build" — a true
+/// sentence about a build failure and a false one about a lint, which is one
+/// exit code standing for two different facts, the shape this command exists
+/// to remove.
+///
+/// # What decides it, and what only describes it
+///
+/// The VERDICT is `cargo`'s exit status and nothing else. [`unresolved_links`]
+/// reads rustdoc's wording to name the sites, and a matcher over another
+/// tool's output is a guess — the same argument [`nightly_runs`] makes. So a
+/// rustdoc that reworded its diagnostic costs this check its per-site
+/// messages and cannot cost it the failure: a non-zero exit with nothing
+/// matched is reported as a failure that names what it could not parse, never
+/// as a pass.
+///
+/// `--keep-going` so one crate's denied lint does not stop the workspace and
+/// leave the rest unexamined; the run reports every site it found rather than
+/// the first crate's.
+fn intra_doc_links(root: &Path, report: &mut Report) -> Result<(), Error> {
+  let members = workspace_members(root)?;
+  let output = Command::new("cargo")
+    .current_dir(root)
+    .env("RUSTDOCFLAGS", PRIVATE_DOC_RUSTDOCFLAGS)
+    .args([
+      "doc",
+      "--workspace",
+      "--all-features",
+      "--no-deps",
+      "--document-private-items",
+      "--keep-going",
+    ])
+    .output()
+    .map_err(|err| format!("could not run cargo doc: {err}"))?;
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  let found = unresolved_links(&stderr);
+  for (site, link) in &found {
+    report.fail(format!(
+      "{site}: unresolved intra-doc link to `{link}`.\n  \
+       Give it a path that resolves (`Self::name`, `module::name`, \
+       `crate::path::Name`), or escape the brackets as `\\[` and `\\]` where the \
+       text is a citation rather than a link."
+    ));
+  }
+  if !output.status.success() && found.is_empty() {
+    report.fail(format!(
+      "doc-links: `cargo doc --document-private-items` failed and named no \
+       unresolved link.\n  \
+       That is NOT this check's finding: it denies one lint, and a failure it \
+       cannot attribute to that lint is a build failure or a rustdoc whose \
+       diagnostic no longer reads the way this parses. Either way the run is \
+       reported rather than passed.\n  \
+       What it printed:\n{}",
+      indented_tail(&stderr)
+    ));
+  }
+  report.checked(format!(
+    "doc-links: {} workspace crate(s) documented with `--document-private-items` \
+     under `{PRIVATE_DOC_RUSTDOCFLAGS}`, {} unresolved link(s)",
+    members.len(),
+    found.len()
+  ));
+  Ok(())
+}
+
+/// What [`unresolved_links`] reports in place of a `file:line` rustdoc did not
+/// print — see that function for why it is not guessed.
+const NO_LOCATION: &str = "<rustdoc printed no location>";
+
+/// Every `(site, link)` pair rustdoc named in `stderr`.
+///
+/// rustdoc prints the diagnostic and the location on two separate lines —
+/// ``error: unresolved link to `name` `` then `  --> path:line:col` — so the
+/// pair is assembled across them. A diagnostic whose location line never
+/// arrives (rustdoc omits it for a doc comment whose span it cannot map, which
+/// happens where an outer `///` on a `mod` declaration merges with the file's
+/// own `//!`) is still reported, under [`NO_LOCATION`] in place of a site,
+/// because a finding this cannot place is still a finding — and a site GUESSED
+/// from the last `Documenting <crate>` line cargo printed would be a wrong
+/// `file:line` under `--keep-going`'s interleaving, which is worse than none.
+///
+/// It matches the diagnostic at BOTH levels, `error` and `warning`, though
+/// this command only ever runs the lint denied. A pass that ran it as a
+/// warning would otherwise report nothing at all and read as clean.
+fn unresolved_links(stderr: &str) -> Vec<(String, String)> {
+  const HEAD: &str = "unresolved link to `";
+  let mut found: Vec<(String, String)> = Vec::new();
+  for line in stderr.lines() {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed
+      .strip_prefix("error: ")
+      .or_else(|| trimmed.strip_prefix("warning: "))
+      .and_then(|rest| rest.strip_prefix(HEAD))
+      && let Some(link) = rest.strip_suffix('`')
+    {
+      found.push((NO_LOCATION.to_string(), link.to_string()));
+      continue;
+    }
+    if let Some(site) = trimmed.strip_prefix("--> ")
+      && let Some(last) = found.last_mut()
+      && last.0 == NO_LOCATION
+    {
+      last.0 = site.trim().to_string();
+    }
+  }
+  found
+}
+
+/// The workspace's own packages, by name, asked of `cargo` rather than read
+/// off a list in this file.
+///
+/// This check's denominator, and the reason it is not a constant: every other
+/// check here iterates [`GATED_CRATES`], and [`unclaimed_snapshots`] exists
+/// because an edit to that list silently shrinks what a run examines. A gate
+/// added to close a too-narrow green must not be given a set that can be
+/// narrowed the same way, so the set is `--workspace`'s own and the count is
+/// cargo's answer about it.
+fn workspace_members(root: &Path) -> Result<Vec<String>, Error> {
+  let output = Command::new("cargo")
+    .current_dir(root)
+    .args(["metadata", "--no-deps", "--format-version", "1"])
+    .output()
+    .map_err(|err| format!("could not run cargo metadata: {err}"))?;
+  if !output.status.success() {
+    return Err(
+      format!(
+        "`cargo metadata --no-deps` failed:\n{}",
+        indented_tail(&String::from_utf8_lossy(&output.stderr))
+      )
+      .into(),
+    );
+  }
+  let text = String::from_utf8_lossy(&output.stdout);
+  let value = json::parse(&text).map_err(|err| format!("could not parse cargo metadata: {err}"))?;
+  let packages = value
+    .get("packages")
+    .and_then(json::Value::as_array)
+    .ok_or("cargo metadata has no `packages` array")?;
+  let mut names: Vec<String> = packages
+    .iter()
+    .filter_map(|package| package.get("name").and_then(json::Value::as_str))
+    .map(str::to_string)
+    .collect();
+  names.sort();
+  if names.is_empty() {
+    return Err("cargo metadata named no workspace package".into());
+  }
+  Ok(names)
+}
+
 /// Where `cargo` writes build artifacts for `root`'s workspace:
 /// `$CARGO_TARGET_DIR` (resolved against `root` when it is relative, matching
 /// Cargo's own rule), or `root/target` when the variable is unset.
@@ -617,7 +819,38 @@ fn walk_item(
     return;
   }
 
-  let name = item.get("name").and_then(Value::as_str);
+  // Read BEFORE the name, because for one kind of item the name is inside it.
+  let Some(inner) = item.get("inner").and_then(Value::as_object) else {
+    return;
+  };
+  let Some((kind, body)) = inner.iter().next() else {
+    return;
+  };
+
+  // A re-export carries `name: null`, and the name it is imported UNDER lives
+  // in `inner.use.name` — the alias for `pub use X as Y`, and `X`'s own last
+  // segment otherwise. Guarding the push on the top-level `name` alone
+  // therefore made every documented re-export invisible to this gate, and
+  // `http1-proto`'s `pub use http_semantics::status::Status as SuggestedStatus`
+  // is the one that found it: turning a documented enum into a documented
+  // re-export moved its six-line doc comment out of the snapshot without
+  // removing a line from it, so that prose could be deleted and nothing here
+  // would fire. Before the move the same doc surface WAS gated, as
+  // `http1_proto::error::SuggestedStatus`, which is the path it is gated under
+  // again.
+  //
+  // A GLOB re-export (`pub use foo::*`) spells its MODULE there rather than any
+  // imported name, so its path would name an item that does not exist. Nothing
+  // is done about that here: this workspace's only globs are the private
+  // `use super::*` in test modules, which carry no doc comment and so never
+  // reach the push below. A documented glob is the shape to revisit this for,
+  // and a rule written for one that does not exist would be untested.
+  let name = item.get("name").and_then(Value::as_str).or_else(|| {
+    (kind == "use")
+      .then(|| body.get("name"))
+      .flatten()?
+      .as_str()
+  });
   let path = match name {
     Some(name) if prefix.is_empty() => name.to_string(),
     Some(name) => format!("{prefix}{}{name}", join.as_str()),
@@ -632,13 +865,6 @@ fn walk_item(
       documented.push((id, path.clone()));
     }
   }
-
-  let Some(inner) = item.get("inner").and_then(Value::as_object) else {
-    return;
-  };
-  let Some((kind, body)) = inner.iter().next() else {
-    return;
-  };
 
   match kind.as_str() {
     "module" => walk_all(
@@ -743,10 +969,12 @@ fn walk_item(
     // Everything else (function, constant, static, macro, assoc_const,
     // assoc_type, struct_field, use, …) is a leaf: it has no children of its
     // own for a doc comment to live on. `use` in particular is deliberately
-    // not followed to its target: rustdoc keys a `use` item with no name of
-    // its own (the imported name lives inside `inner.use`, not at the item's
-    // top level), and `--document-private-items` already makes the target
-    // reachable through the module that actually declares it.
+    // not FOLLOWED to its target, which is a different thing from not being
+    // read: its own doc comment is collected above, under the name
+    // `inner.use.name` gives it, while `--document-private-items` already makes
+    // the TARGET reachable through the module that actually declares it.
+    // Following it as well would push the target's items a second time under
+    // the importing module's path.
     _ => {}
   }
 }
@@ -2310,7 +2538,7 @@ mod json {
 
 #[cfg(test)]
 mod tests {
-  use super::Report;
+  use super::{NO_LOCATION, Report, unresolved_links};
   use std::collections::HashMap;
 
   // The module half `callee_problems` now resolves, as a literal: the crate's
@@ -2321,6 +2549,62 @@ mod tests {
       .iter()
       .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
       .collect()
+  }
+
+  // A documented re-export is a documented item, and rustdoc does not put its
+  // name where every other item's name is: `name` is null and the name it is
+  // imported UNDER lives in `inner.use.name`. Guarding the push on `name` alone
+  // made `http1-proto`'s `pub use … as SuggestedStatus` and its doc comment
+  // invisible here, so that prose could be deleted with nothing failing.
+  //
+  // The CONTROL is the half that makes this test mean something: a second `use`
+  // with an empty `docs` must NOT be collected. Without it a walk that pushed
+  // every item it reached would pass, and the assertion would be about the
+  // fixture rather than about the rule.
+  #[test]
+  fn a_documented_re_export_is_collected_under_its_imported_name() {
+    use super::{Join, json, walk_item};
+    use std::collections::HashSet;
+
+    let value = json::parse(
+      r#"{
+        "root": 1,
+        "index": {
+          "1": {"crate_id": 0, "name": "krate", "docs": "",
+                "inner": {"module": {"items": [2, 3]}}},
+          "2": {"crate_id": 0, "name": null, "docs": "The status vocabulary.",
+                "inner": {"use": {"name": "Alias", "id": 9, "is_glob": false}}},
+          "3": {"crate_id": 0, "name": null, "docs": "",
+                "inner": {"use": {"name": "Undocumented", "id": 9, "is_glob": false}}}
+        }
+      }"#,
+    )
+    .expect("a fixture this test supplies");
+    let index = value
+      .get("index")
+      .and_then(json::Value::as_object)
+      .expect("the fixture has an index");
+
+    let mut documented = Vec::new();
+    walk_item(
+      1,
+      "",
+      Join::Path,
+      index,
+      &mut HashSet::new(),
+      &mut documented,
+    );
+
+    let paths: Vec<&str> = documented.iter().map(|(_, path)| path.as_str()).collect();
+    assert!(
+      paths.contains(&"krate::Alias"),
+      "a documented `pub use X as Alias` joins under its alias: {paths:?}"
+    );
+    assert!(
+      !paths.contains(&"krate::Undocumented"),
+      "an UNdocumented re-export is not collected, so this cannot pass by \
+       collecting everything: {paths:?}"
+    );
   }
 
   // The spine, as a unit: a skip is a printed boundary on a developer's
@@ -3382,5 +3666,97 @@ fn f(bytes: &[u8]) {
       "{}",
       report.lines[0]
     );
+  }
+
+  // rustdoc's own shape, verbatim from a real `--document-private-items` run:
+  // the diagnostic and its location are two lines, and the location is indented
+  // and carries a column. `unresolved_links` only DESCRIBES a failure the exit
+  // status has already decided, so what these pin is the message, not the
+  // verdict.
+  #[test]
+  fn a_diagnostic_and_its_location_are_read_as_one_finding() {
+    let stderr = "\
+ Documenting http-semantics v0.1.0 (/w/http-semantics)
+error: unresolved link to `RFC2046`
+    --> http-semantics/src/media/mod.rs:1299:6
+     |
+1299 | /// [RFC2046], Section 4.1.2\".
+     |      ^^^^^^^ no item named `RFC2046` in scope
+";
+
+    assert_eq!(
+      unresolved_links(stderr),
+      vec![(
+        "http-semantics/src/media/mod.rs:1299:6".to_string(),
+        "RFC2046".to_string()
+      )]
+    );
+  }
+
+  // The lint at warn level, which no run of this command produces and a hand
+  // run easily does. Matching only `error:` would print nothing over a
+  // warn-level pass and read exactly like a clean one.
+  #[test]
+  fn a_warning_level_diagnostic_is_read_too() {
+    let stderr = "warning: unresolved link to `advance`\n  --> a/src/lib.rs:1:1\n";
+
+    assert_eq!(
+      unresolved_links(stderr),
+      vec![("a/src/lib.rs:1:1".to_string(), "advance".to_string())]
+    );
+  }
+
+  // rustdoc omits the location for a doc comment whose span it cannot map — an
+  // outer `///` on a `mod` declaration merged with the file's own `//!` is the
+  // case in this workspace. The finding is still reported: dropping it would
+  // hand the reader a failure count that does not match the failures printed.
+  #[test]
+  fn a_diagnostic_with_no_location_is_still_a_finding() {
+    let stderr = "\
+warning: unresolved link to `FieldValue`
+  |
+  = note: the link appears in this line:
+  = note: no item named `FieldValue` in scope
+";
+
+    assert_eq!(
+      unresolved_links(stderr),
+      vec![(NO_LOCATION.to_string(), "FieldValue".to_string())]
+    );
+  }
+
+  // The location of the NEXT diagnostic must not be attached to a previous
+  // finding that never got one, which is what a plain "fill the last empty
+  // site" rule does. Two findings, and the located one is the second.
+  #[test]
+  fn a_location_attaches_to_its_own_diagnostic_and_not_the_one_before() {
+    let stderr = "\
+warning: unresolved link to `FieldValue`
+  = note: no item named `FieldValue` in scope
+warning: unresolved link to `poll_flush`
+  --> wren-reactor/src/conn/mod.rs:251:9
+";
+
+    assert_eq!(
+      unresolved_links(stderr),
+      vec![
+        (NO_LOCATION.to_string(), "FieldValue".to_string()),
+        (
+          "wren-reactor/src/conn/mod.rs:251:9".to_string(),
+          "poll_flush".to_string()
+        ),
+      ]
+    );
+  }
+
+  // A `-->` line belongs to whatever diagnostic printed it, and this command's
+  // pass is not the only thing that emits one: any other rustdoc or cargo
+  // diagnostic in the same log carries the same arrow. One that follows no
+  // unresolved-link line must not become a finding.
+  #[test]
+  fn a_location_with_no_diagnostic_before_it_is_not_a_finding() {
+    let stderr = "warning: redundant explicit link target\n  --> a/src/lib.rs:9:9\n";
+
+    assert!(unresolved_links(stderr).is_empty());
   }
 }

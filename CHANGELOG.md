@@ -1,5 +1,533 @@
 # UNRELEASED
 
+## A fifth gate whose green was narrower than its name, and a vocabulary that is not closed
+
+### Tooling
+
+- **`doc-check` lints intra-doc links on PRIVATE items now, across the whole
+  workspace.** The workspace already denies `rustdoc::broken_intra_doc_links`:
+  CI's doc job runs `cargo doc --workspace --all-features --no-deps` under
+  `RUSTDOCFLAGS: --cfg docsrs -Dwarnings`. But `cargo doc` documents no private
+  item, and rustdoc resolves links only in the items it documents, so that
+  denial covered the public surface and nothing else — while
+  `http-semantics/src/range/multipart.rs`, where the defect was found, is
+  almost entirely private.
+
+  Measured both ways, on the exact input that motivated this. Put a dangling
+  `[is_mechanism]` back on the private `is_mime_token` and the CI doc step
+  above exits 0; the new check exits 1 naming
+  `http-semantics/src/range/multipart.rs:2281:7: unresolved intra-doc link to
+  is_mechanism`. It was only ever seen at all because an ambient
+  `RUSTDOCFLAGS` leaked into `doc-continuity`'s own `--document-private-items`
+  pass.
+
+  **Turning it on found sixteen dangling links, in five of the nine workspace
+  crates** — `wren-reactor` 6, `http3-proto` 4, `websocket-proto` 3,
+  `http1-proto` 2, `http-semantics` 1 — every one of them on an item `cargo
+  doc` does not document. All sixteen are fixed in this commit; the gate is
+  green over the workspace, so nothing is left on a backlog.
+
+  **Not folded into `doc-continuity`'s pass, which already carries
+  `--document-private-items`.** That was the cheaper place and the wrong one:
+  it iterates `GATED_CRATES`, which holds three of the sixteen and none of the
+  other thirteen; it needs nightly and SKIPS without it, so the stable docs
+  workflow would carry none of it; and its failure arm says *the crate most
+  likely does not build*, which is true of a build failure and false of a lint
+  — one exit code standing for two facts, which is the shape this command
+  exists to remove. The new check takes no crate list at all: `--workspace` is
+  a set no edit to `xtask` can narrow.
+
+  **One lint, named, rather than `-Dwarnings`.** Run the same pass with
+  `RUSTDOCFLAGS` set to `-W rustdoc::all` and `redundant_explicit_link` warns twelve
+  times, plus one `missing_crate_level_docs`; each is its own backlog with its
+  own argument, and a green run here says exactly one thing. The VERDICT is
+  cargo's exit status alone — rustdoc's wording is read only to NAME the sites,
+  so a reworded diagnostic costs the per-site messages and can never turn a
+  failure into a pass.
+
+### `http-semantics`
+
+- **BREAKING (unreleased): `PartEncoding` is `#[non_exhaustive]`.** It gained a
+  variant twice already — `Undecoded`, when a mechanism this
+  crate can name but does not perform stopped being a malformed body, and
+  `Unrecognised`, when RFC 2045 §6.4's `application/octet-stream` fallback
+  stopped being a refusal — and each would have broken a downstream exhaustive
+  `match` on what is otherwise a bug-fix release. The enum is not RFC 2045
+  §6.1's five mechanism names, which ARE a closed list; it is the set of
+  distinct readings a receiver owes a part's `Content-Transfer-Encoding`, and
+  §6.3 leaves the vocabulary those readings range over open at both ends —
+  standardised names arrive by standards-track RFC, private ones by an
+  `x-token` needing nobody's permission. The type's doc names what would close
+  it: a snapshot of that vocabulary which this crate tracks and updates.
+
+  Nothing inside the crate needed a wildcard arm — `#[non_exhaustive]` binds a
+  downstream `match` only, and the two `match`es here stay exhaustive as
+  written. Construction is untouched: the variants stay public.
+
+## `http-semantics` — conditional requests, Range, and the equalities that compared spellings
+
+RFC 9110 §8.8's validators, §13's conditional requests and §14's range requests
+join the §5.6 field grammar, the §8.3.1/§12 media machinery and the §5.6.7
+`HTTP-date` this crate already held, and `http1-proto`'s status vocabulary moves
+in beside them. Four modules arrive — `conditional`, `validator`, `range` and
+`status` — and the one that moved is re-exported under its old name, so no call
+site changed.
+
+`xtask/snapshots/http-semantics-documented.txt` gains 378 lines and loses none:
+`grep -vc '^#'` counts 194 documented items on it at `fc30179` and 572 here.
+`cargo test -p http-semantics --all-features` reports 298 unit tests passing,
+beside the no-panic harness's ten and one doctest. The crate is still
+`no_std`, allocation-free, clock-free and panic-free, on the same `std` /
+`alloc` / `no-atomic` tiers its siblings run.
+
+### Added
+
+- **`conditional` — RFC 9110 §13's five conditional fields and §14.2's `Range`,
+  accumulated one field at a time and settled only once the walk is over.**
+
+  ```rust
+  impl<'a> Preconditions<'a> {
+    pub const fn new(now_unix_seconds: i64) -> Self;
+    pub fn push(&mut self, name: &[u8], value: &'a [u8]);
+    pub const fn refusal(&self) -> Option<PreconditionRefusal>;
+    pub fn evaluate(&self, selected: &Selected<'_>, method: Method, recipient: Recipient) -> Verdict;
+  }
+  ```
+
+  `push` reports nothing, and that is §13.2.2's order rather than a taste for
+  accumulators. That algorithm reaches `If-Unmodified-Since` only "When
+  recipient is the origin server, If-Match is not present, and
+  If-Unmodified-Since is present", so whether one field's step runs at all turns
+  on a field that may still be several lines away: nothing can be committed
+  while the header section is still arriving, and a walk over one should not
+  branch per line. `grammar::Expectations::push` has the same signature for the
+  same reason. What a value could not settle is read back afterwards, through
+  `refusal`, `range_ignored` or a `DateField`.
+
+  **A date field has three states, because ignoring and failing are different
+  answers.** RFC 9110 §13.1.3 and §13.1.4 each MUST-ignore their field for
+  several reasons and do not agree on how many — four and three, the whole
+  difference being that only `If-Modified-Since` carries a rule about the
+  request method — and exactly one of those reasons is a fact about the VALUE.
+  So a value is `Usable`, `PresentUnusable` or `Absent`: the sibling entity-tag
+  field, the method, and whether the resource has a modification date at all are
+  the evaluation's, and an `If-Unmodified-Since` against a representation with
+  no `Last-Modified` SKIPS its step rather than failing it. A value carrying two
+  dates needs no rule of its own, §13.1.4 having folded it into the same one —
+  "A recipient MUST ignore the If-Unmodified-Since header field if the received
+  field value is not a valid HTTP-date (including when the field value appears
+  to be a list of dates)" — and none of §5.6.7's three formats can absorb the
+  extra bytes anyway.
+
+  **Two fields refuse an unreadable value and three do not, and only the first
+  pair departs from the RFC.** The two entity-tag lists guard against lost
+  updates, and a guard the recipient quietly dropped is the failure they exist
+  to prevent, so a value neither list can read stops the request through
+  `refusal`. That is a departure taken deliberately rather than a gap in the
+  specification: RFC 9110 §13.1.1's and §13.1.2's evaluation lists each close
+  with a total step, so the RFC does have an answer, and this crate declines it.
+  `If-Range` does not refuse, because §13.1.5 makes it the opposite of a
+  lost-update guard — a value neither of its forms reads makes the condition
+  false, which costs a 200, the field's own designed degraded mode, where
+  refusing would answer with the 412 the field exists to avoid. `Range` does not
+  either, on §14.2's outright "A server MAY ignore the Range header field.", and
+  `range_ignored` is what says the field was there at all.
+
+  **`evaluate` runs §13.2.2's six steps behind the two of §13.2.1's three
+  exclusion rules a recipient can decide from what it holds.** Every outcome the
+  algorithm names has a `Verdict` variant — ten of them, which
+  `grep '^http_semantics::conditional::Verdict::' xtask/snapshots/http-semantics-documented.txt | grep -v '\.'`
+  lists — so a caller matches once rather than reading a cause and re-deriving a
+  code from prose. The third exclusion rule is not this crate's and cannot be:
+  "A server MUST ignore all received preconditions if its response to the same
+  request without those conditions, prior to processing the request content,
+  would have been a status code other than a 2xx (Successful) or 412
+  (Precondition Failed)." A caller that has already settled on a redirect or a
+  failure must not call this at all.
+
+  Three rules each read as unconditional and one request satisfies all three — a
+  malformed `If-Match` on an OPTIONS request at a proxy — so the order between
+  them is written down rather than derived. `Recipient::Forwarding` answers
+  first, because §13.2.1 states the forward MUST NOT unconditionally and only
+  then attaches the method rule with *Likewise*, and because `Verdict::Proceed`
+  promises no forwarding: answering it there would license a proxy to drop
+  fields it MUST forward. `Method::NoRepresentation` is next and does answer
+  `Proceed`, since to ignore every conditional field is to act as if none
+  arrived. A refusal ranks below both, being this crate's own departure rather
+  than one of the RFC's, and a departure cannot displace a MUST.
+
+  **A refusal is then answered INSIDE the step that consults its field, not
+  ahead of the algorithm.** Dispatching it up front saw only the recipient
+  gates, and §13.2.2's steps are also a control flow: step 1 answering 412 for a
+  false `If-Match` ENDS the run, and step 3 sits downstream of that answer, so a
+  malformed `If-None-Match` beside a false `If-Match` is a field the evaluation
+  never consulted. Six candidate wirings were built and run against this
+  module's own cells; the one those cells were blind to is a refusal placed
+  between the gates and step 1 with each field gated as its own step is, because
+  such a refusal crosses no recipient gate and so reds nothing about recipients.
+  `a_refusal_at_step_3_does_not_displace_the_step_that_terminated_first` is the
+  cell that was missing, and it is that wiring's sole witness.
+
+  **Step 5 answers 416 where the step's own *otherwise* reads 200, and the site
+  records that as a choice rather than a derivation.** Nothing above it
+  satisfied step 5's first bullet, so a literal reading lands in "otherwise,
+  ignore the Range header field and respond 200 (OK)" — while RFC 9110 §14.2,
+  whose subject is this exact request, makes it a SHOULD-416 and every conjunct
+  of that SHOULD is met. §13.1.5 is the third text and it is what tips the
+  reading: "Otherwise, the recipient SHOULD process the Range header field as
+  requested", and processing an unsatisfiable ranges-specifier as requested is
+  what §14.2 spells out one section later. The other reading is defensible and
+  the function says so at length; no erratum on RFC 9110 touches either section,
+  so 416 stands as a choice and not as a correction.
+
+  **RFC 9111 §4.3.2 binds a `Recipient::Cache`, and this crate can apply one
+  third of it.** Its MUST NOT has three disjuncts — "A cache MUST NOT evaluate
+  conditional header fields that only apply to an origin server, occur in a
+  request with semantics that cannot be satisfied with a cached response, or
+  occur in a request with a target resource for which it has no stored
+  responses; such preconditions are likely intended for some other (inbound)
+  server." — and only the first is a fact about the fields, applied here as
+  §13.2.2's own origin gate on steps 1 and 2. The other two are facts about the
+  cache's store, which this call is never told, so they are a delegation on
+  `evaluate` in the shape §13.2.1's third exclusion rule already has one RFC
+  over. §4.3.2's `Date` SHOULD is a delegation too: `Selected` takes one
+  modification date and does not ask where it came from.
+
+  What the accumulator costs a caller is pinned rather than bounded, per pointer
+  width, at module scope so that every `cargo check` on every tier enforces it —
+  `assert!(core::mem::size_of::<Preconditions<'_>>() == 1152)` on a 64-bit
+  target and 728 under `cargo check -p http-semantics --no-default-features
+  --target thumbv6m-none-eabi`, which is the tier the number is written down
+  for. Almost all of it is the two `TagList`s and the `RangesSpecifier`, and a
+  bound set well above a value asserts nothing about it.
+
+- **`validator` — RFC 9110 §8.8's entity tag, its list form, and the selected
+  representation a precondition is evaluated against.**
+
+  `EntityTag` reads `entity-tag = [ weak ] opaque-tag`, and the marker is
+  case-sensitive because RFC 9110 §8.8.3 says so in prose as well as in ABNF:
+  an origin server "MUST mark the entity tag as weak by prefixing its opaque
+  value with "W/" (case-sensitive)", so a lowercase `w/` is not a weakness
+  marker but a value that is no `entity-tag` at all. `strong_eq` and `weak_eq`
+  are §8.8.3.2's two comparison functions, and which one a field takes is a MUST
+  rather than a preference — §13.1.1 requires the strong one of an origin server
+  for `If-Match`, §13.1.2 the weak one of a recipient for `If-None-Match`, and
+  §13.1.5 the strong one again for `If-Range`'s tag form. Each function's doc
+  names the sections that put it there, because wiring a field to the wrong one
+  is a defect this module cannot see.
+
+  **`TagList` walks its own commas, because each of the crate's two existing
+  walkers gets a live guard wrong.** `grammar::list_elements` splits on raw
+  commas and `etagc = %x21 / %x23-7E / obs-text` admits one between the DQUOTEs,
+  so it reads the single tag `"a,b"` as two elements that are each malformed.
+  `grammar::parameterised_list` is quote-aware in the wrong sense: it implements
+  RFC 9110 §5.6.4's `quoted-string`, which has `quoted-pair`, and §8.8.3's
+  `opaque-tag` has none — so `"a\"` is one valid tag whose content is `a\`, and
+  a `quoted-string` reader takes that DQUOTE for escaped data, runs off the end
+  of the value, and refuses a live lost-update guard as malformed. §8.8.3's own
+  note names backslash unescaping as what recipients carried over from RFC 2616,
+  so reproducing it here would be building the legacy bug on purpose. What does
+  not come along with a walk of its own is §5.6.1.2's empty-element rule, which
+  `list_elements` holds for every recipient list it can delimit; `TagList::parse`
+  carries that rule across explicitly and is tested for it here.
+
+  `MAX_TAGS` is sixteen and it bounds REAL tags. §5.6.1.2 opens "Empty elements
+  do not contribute to the count of elements present.", so an empty element
+  spends no slot here either and the empties are unbounded, which
+  `a_comma_flood_is_not_too_many_tags` pins. Overflow is `TagError::TooMany`
+  rather than a truncation, and that is the whole reason there is a bound rather
+  than a cap: judging a precondition from the tags that fit could find no match,
+  answer as though the client sent none of the others, and silently void the
+  guard. The clause that asks a recipient to accept empties "but not so much
+  that they could be used as a denial-of-service mechanism" governs EMPTY
+  elements, and it was standing in for a bound on real ones at three sites:
+  `git grep -n 'not so much that they' fc30179` names them, and they are
+  `MAX_SUBPROTOCOL_OFFERS`, the test that pins it, and the cycle-6 entry below,
+  which this cycle amends to rest on §5.4 — the clause that is about the size of
+  what a server agrees to process.
+
+  `Selected` is a type-state rather than a struct with a rule written on it:
+  every validator lives on `Present`, so `Selected::absent()` has no method that
+  could attach one. Strength is asserted and never deduced —
+  `with_last_modified` records a weak validator and `with_strong_last_modified`
+  a strong one — because §8.8.2.2 makes a `Last-Modified` used as a request
+  validator "implicitly weak unless it is possible to deduce that it is strong"
+  and gives three ways to deduce it: one is knowledge only the origin server
+  has, and the other two are half `Date` arithmetic this crate could do and half
+  a judgement about clocks that it could not. There is no `Date`-taking
+  constructor on purpose, because computing the arithmetic half would read as
+  having checked the rule.
+
+  `etagc` is read from RFC 9110 §8.8.3's body text, which admits `obs-text`,
+  and not from Appendix A's collected grammar, which spells the same rule
+  `etagc = "!" / %x23-7E` and drops it. No erratum settles the disagreement, so
+  the body text governs: a recipient refusing a byte the sender was allowed to
+  send would refuse the guard the tag exists to carry.
+
+- **`range` — RFC 9110 §14.1's `ranges-specifier`, §14.4's `Content-Range` in
+  both directions, and §14.6's `multipart/byteranges` written and read.**
+
+  **`Pos::Beyond` is how §14.1.2's closing MUST is met.** That section requires
+  that "recipients MUST anticipate potentially large decimal numerals and
+  prevent parsing errors due to integer conversion overflows", and this design
+  meets it by never performing the conversion: a numeral no `u64` holds becomes
+  `Beyond`, and every §14.1.2 rule stays total over one — a `Beyond` `first-pos`
+  is at or above every possible length, a `Beyond` `last-pos` is already that
+  section's own normalisation condition, and a `Beyond` `suffix-length` exceeds
+  every representation. `Range: bytes=0-18446744073709551616` therefore parses,
+  resolves, and is not an ignore. Validity is settled while the digits are still
+  in hand: §14.1.1's "An int-range is invalid if the last-pos value is present
+  and less than the first-pos" is decided by comparing the two numerals as digit
+  strings, since `Beyond` deliberately keeps none of them.
+
+  `ContentRange` takes the opposite decision on the same question, and on
+  DEFINEDNESS rather than on cost. §14.1.2's rules each have a total answer for
+  a `Beyond` position, as above; §14.4's validity clauses compare the numerals
+  against EACH OTHER, and `Beyond` against `Beyond` decides neither of them. So
+  a `Content-Range` numeral past `u64::MAX` is refused whole — affordable in a
+  way a refused `Range` would not have been, since the only thing §14.4 grants a
+  recipient over a value it cannot read is to decline to recombine.
+
+  The production parsed is the corrected one. RFC 9110 §14.1.1 prints
+  `ranges-specifier = range-unit "=" range-set`; erratum 7306, reported by
+  Julian Reschke and verified in 2023, puts an `OWS` back between the `=` and
+  the range-set, lost when the grammar was converted away from implied linear
+  whitespace. Under the printed production §14.1.2's own printed example
+  `bytes= 0-999, 4500-5499, -1000` is malformed, and under the corrected one it
+  is grammar.
+
+  `MAX_RANGE_SPECS` is eight where `MAX_TAGS` is sixteen, and the difference is
+  what overflow COSTS. Refusing a range-set is an ignore, sanctioned outright by
+  §14.2, so the client gets the 200 it would have got had it never sent the
+  field; refusing a tag list voids a guard, and no status the RFC names fits.
+  The shape eight deliberately does not hold is the one §14.2 itself names as an
+  attack, "a set of many small ranges that are not listed in ascending order".
+
+  **A span this crate does not interpret is still constrained, and by the
+  grammar at its DESTINATION.** RFC 9110 §14.1.1 hands the range unit what a
+  specifier MEANS — "The range unit name determines what kinds of range-spec are
+  applicable to its own specifiers" — and hands over none of the grammar that is
+  generic, so every element of a range-set under every unit is held to
+  `other-range = 1*( %x21-2B / %x2D-7E )`, and a `Content-Range`'s opaque tail
+  to §5.5's `1*field-vchar`. The second is load-bearing rather than tidy: that
+  tail is written back out verbatim, and into a header line of a body this crate
+  frames, where a CRLF would be a field line this crate wrote and nobody sent.
+  §14.4's two validity clauses reach every unit for the same reason — they are
+  stated over `range-resp`, whose numerals are `1*DIGIT`, with no unit condition
+  on either half — while a span that does not match that numeric shape stays
+  opaque, which is what keeps §14.6's own `exampleunit 1.2-4.3/25` readable.
+
+  The rule runs the other way too, and that direction is the one easily missed.
+  RFC 9110 §14.6 frames a body part by RFC 2046, whose §5.1.1 says "in no event
+  are headers (either message headers or body part headers) allowed to contain
+  anything other than US-ASCII characters." — narrower than what an HTTP field
+  value admits. So `ContentRange::parse` stays exactly as permissive as §5.5
+  lets it be, and the narrower rule sits at the encoder that crosses into MIME.
+  But RFC 2045 §5.1's grammar for a body part's `Content-Type` is WIDER than
+  §8.3.1's in places, so the reader is held to RFC 2045's own lexis rather than
+  being repaired by narrowing the value until an HTTP parser can read it —
+  `media`'s summary tabulates nine values where the two grammars part company,
+  and reading the field in the grammar of the place the field is answers all of
+  them at once. `RangeError::NonAsciiPartHeader` is answered by the reader and
+  the writer alike, because one crate giving two answers about the same bytes is
+  what either asymmetry produces.
+
+  **The reader ends the cycle accepting and refusing things a first reading does
+  not.** Each is now a rule stated at its site:
+
+  - A line beginning with the `dash-boundary` whose tail makes it neither of RFC
+    2046 §5.1.1's two delimiters means different things in different places.
+    Inside a body part it is a fault, on §5.1's "The boundary delimiter MUST NOT
+    appear inside any of the encapsulated parts, on a line by itself or as the
+    prefix of any line."; in the preamble it is text to walk past, on §5.1.1's
+    "implementations must ignore anything that appears before the first boundary
+    delimiter line or after the last one." A reader applying either sentence
+    everywhere is wrong somewhere — applying §5.1's everywhere fails a
+    conforming body over the one region the specification names as the place to
+    ignore whatever is there.
+  - A delimiter line is read to the end its own grammar gives it: RFC 2046
+    §5.1.1's `transport-padding := *LWSP-char` and then CRLF for an ordinary
+    one, and two more hyphens, padding and an optional epilogue for the close.
+    Skipping to the line's CRLF from wherever the boundary ended let `--SEP--`
+    and `--SEP--JUNK` close a body alike, with the junk dropped in silence.
+  - A recognised part field is held unparsed until the line beneath it settles
+    whether it was folded. Reading it on its own physical line failed a folded
+    `Content-Type: text/` against its own grammar half-read and answered a
+    verdict about the MESSAGE over the conforming input
+    `RangeError::PartValueNotContiguous` exists to describe — which names a
+    limit of a no-alloc reader and not a fault in the body.
+  - A `Content-Transfer-Encoding` this crate does not recognise is not a
+    malformed body. RFC 2045 §6.4 states the receiver behaviour for exactly that
+    value and it is not rejection: "Any entity with an unrecognized
+    Content-Transfer-Encoding must be treated as if it has a Content-Type of
+    "application/octet-stream", regardless of what the Content-Type header field
+    actually says." So there are four readings and not two — the set that may
+    skip §15.3.7.2's width test on the strength of a NAME stays closed to §6.1's
+    five, and everything else that is still a `mechanism` is handed over with
+    its token intact and the skip made visible.
+  - `message/partial` and `message/external-body` are held to `7bit`, and RFC
+    2045 §6.4's composite prohibition does not already cover it. §6.4 says that
+    "it is EXPRESSLY FORBIDDEN to use any encodings other than "7bit", "8bit",
+    or "binary" with any composite media type"; RFC 2046 §5.2.2 and §5.2.3 then
+    withdraw two of the three §6.4 permits, each calling `8bit` and `binary`
+    explicitly prohibited for its own subtype. A guard keyed on a top-level type
+    cannot express that, and answering the composite refusal there would be a
+    true refusal with a false reason.
+
+- **`status` — the vocabulary moved out of `http1-proto`, and the move renamed
+  it.** `SuggestedStatus` was named for what a failed parse suggests, and RFC
+  9110 §13.2.2's algorithm produces 200 and 206, which that name cannot hold
+  without reading as a category error. The type is
+  `http_semantics::status::Status` now, with five codes that vocabulary did not
+  have — 200, 206, 304, 412 and 416 — and `http1-proto` re-exports it under the
+  old name, so no call site changed. Membership is about the vocabulary's HOME
+  rather than about which crate produces each code, and the crate's README
+  gained the exception class that keeps `FieldsTooLarge` in it: RFC 6585 §5's
+  rule, which RFC 9110 §19.2 lists as an informative reference rather than a
+  specification it builds on.
+
+### Breaking (unreleased)
+
+- **BREAKING (unreleased): `MediaType`, `MediaRange`, `ParamValue` and
+  `ListMember` derive no `PartialEq` or `Eq`, and every type added this cycle
+  was born without one.** Each derive compared the bytes as the sender wrote
+  them, and each type's own section makes some of those bytes insignificant:
+  RFC 9110 §8.3.1's "The type and subtype tokens are case-insensitive." over
+  `text/plain` against `TEXT/PLAIN`; §5.6.6's `OWS` around a parameter's `;`
+  over `text/plain;charset=utf-8` against `text/plain; charset=utf-8`; and
+  §5.6.6's "A parameter value that matches the token production can be
+  transmitted either as a token or within a quoted-string.  The quoted and
+  unquoted values are equivalent." over the two spellings of one parameter
+  value. `ListMember` compares a private field besides, so two members with
+  identical `name` and `params` bytes compare unequal when one was parsed across
+  an RFC 9110 §5.2 field-line join and the other was not — a property of how the
+  input arrived, not of what the sender said, and one the type never claimed to
+  report.
+
+  **A doc note beside the derive is what was there already, and it is not a
+  substitute.** All four shipped at `fc30179` with a paragraph directing a
+  caller to compare the accessors case-insensitively instead; a documented trap
+  is still a trap, because the disclosure tells a reader that `==` answers a
+  question it should not have been asked and leaves the wrong answer one
+  keystroke away. **And a semantic `PartialEq` is not the repair either.** RFC
+  9110 §5.6.6 settles only half of it — "Parameter names are case-insensitive.
+  Parameter values might or might not be case-sensitive, depending on the
+  semantics of the parameter name." — which is conditional on a name these types
+  do not know, while parameter ORDER is nobody's rule at all; folding case would
+  invent one answer and not folding it the other. What each type offers instead
+  is the unconditional half: `ParamValue::unescaped` walks a value with the
+  quoted-string's spelling gone, so `a.unescaped().eq(b.unescaped())` compares
+  across both variants, and the media types direct a caller at `ty`, `subtype`
+  and `params`.
+
+- **BREAKING (unreleased): `HttpDate` gained `Ord` and `PartialOrd`, and both
+  are DERIVED on purpose.** The fields are declared coarsest-first — year,
+  month, day, hour, minute, second — so the derived lexicographic comparison IS
+  civil order, and `23:59:60` sorts strictly before the midnight that follows
+  it, which is the true UTC order. Writing the comparison over `unix_seconds`
+  instead is the obvious shape and is unlawful: a leap second shares that value
+  with the following midnight, so an instant-ordering answers `Equal` for two
+  values the structural `Eq` calls unequal. Reordering the fields silently
+  breaks it, which the declaration says in as many words. Two tests defend the
+  ordering and both compare through `<` and `>`, which resolve to `PartialOrd` —
+  a hand-written `Ord` over `unix_seconds` with `PartialOrd` left derived passes
+  both, and only clippy's deny-by-default `derive_ord_xor_partial_ord` catches
+  it, so an `#[allow]` on that lint is the tests' blind spot.
+
+### A defect the same sweep found and did not fix
+
+- **`http1_proto::Target` keeps a derived equality that compares spellings, and
+  now says so.** Nothing about it changed but its documentation.
+  `Eq`/`PartialEq` there compare the request-target as the sender wrote it, byte
+  for byte, and RFC 9110 §4.2.3 is the section it disagrees with: scheme-based
+  normalization omits a port equal to the scheme's default, makes an empty path
+  equivalent to `/` outside an OPTIONS target, and equates an unreserved
+  character with its percent-encoded octet, while on case it is explicit — "The
+  scheme and host are case-insensitive and normally provided in lowercase; all
+  other components are compared in a case-sensitive manner." The section then
+  prints three URIs it calls equivalent,
+  `http://example.com:80/~smith/home.html`,
+  `http://EXAMPLE.com/%7Esmith/home.html` and
+  `http://EXAMPLE.com:/%7esmith/home.html`, and the derive answers false for
+  every pair of them.
+
+  The derive is kept and the narrow question it does answer is now written at
+  the type — whether two requests carried the same bytes in the same form —
+  because §4.2.3 leaves the comparison open, "HTTP does not require the use of a
+  specific method for determining equivalence.", and a normalising `PartialEq`
+  would have to pick one, over a `&str` this crate parses and does not decode. A
+  caller deciding that two requests address the same resource normalizes first
+  and does not ask `==`. It is recorded here rather than left in a commit
+  message because it is a live defect on a sibling crate's public surface, and
+  the branch that found it owes the disclosure whether or not it took the fix.
+  This branch touches `http1-proto` for the status move and for doc links, and
+  it does not touch `Target`'s derive.
+
+### Tooling
+
+- **Three specs joined `quote-check`'s `FETCHED` list, one of them obsolete.**
+  RFC 822, RFC 2045 and RFC 2046 bring the cache to fourteen
+  (`ls .rfc-cache/*.txt | wc -l`). RFC 822 is there despite being superseded,
+  and it is not the exception the list's own rule forbids: RFC 2045 §1 makes it
+  live law for a MIME body part's header fields — "All of the header fields
+  defined in this document are subject to the general syntactic rules for header
+  fields specified in RFC 822." — so a body part's `Content-Type` is read in RFC
+  822's lexical classes and those productions are gradeable against nothing
+  else. The list also gained the rule that a spec belongs on it as soon as the
+  workspace has the text on disk, not when a quotation of it first lands:
+  `--fetch` builds the cache CI grades against, so a spec present in a
+  developer's cache and absent from the list is a local-green/CI-red trap, and
+  that trap had already sprung once.
+
+- **`quote-check` read a production as `name =`, and RFC 2046 writes
+  `name :=`.** Every production of that RFC was therefore ungraded. The
+  separator is widened and nothing on the right-hand side moved. It is the shape
+  the private-item link gate above has: a green that covered less than its name
+  said, and a check that never looked reading exactly like one that looked and
+  found nothing.
+
+- **`quote-check` could not fail a FABRICATED quotation, and one shipped.** An
+  invented sentence matches no spec, so it anchors in nothing, so it can never
+  be graded; naming an RFC in its block moves it from invisible to counted and
+  no further. The backlog of unanchored spans is now held PER FILE against a
+  committed table, pinned exactly in both directions. Per file rather than one
+  workspace total, because deleting a genuine span in one file and adding an
+  invented one in another leaves a total unmoved and moves two per-file numbers.
+  Exact rather than a ceiling, because a growth-only budget lets the backlog
+  shrink unrecorded — a span deleted, reworded past the extractor, or moved into
+  a fence read differently — and because reading a span and repairing it then
+  reds the gate with the smaller number to write down, which is the ratchet.
+  **What neither half closes is named at the table rather than left to be
+  found:** substituting an invented span for a genuine one INSIDE one file moves
+  no number, exactly as it would not under a growth-only budget.
+
+- **`doc-check` collected no documented re-export at all.** rustdoc gives a
+  `use` item `name: null` and puts the imported name in `inner.use.name`, so
+  `http1_proto::grammar`, `http1_proto::media` and this cycle's own
+  `pub use http_semantics::status::Status as SuggestedStatus` were invisible to
+  the snapshot — prose that could be deleted with nothing failing. All three sit
+  on it now, under the names a caller writes; `http1-proto`'s snapshot moves
+  from 792 documented items to 786 across this branch, the fall being
+  `SuggestedStatus`'s six variants and two methods becoming one re-export line.
+  The fixture test carries a control — an item with empty docs that must NOT be
+  collected — so it cannot pass by collecting everything.
+
+- **Six new leaves join the link-time no-panic proof, and the crate got its
+  first size assertions.** `grep -c 'fn shim_' http-semantics/tests/no_panic.rs`
+  counts twelve where `fc30179` had six: the entity tag and its list, the
+  ranges-specifier and the resolution behind it, and `Content-Range` in both
+  directions, beside the `shim_lie` control. `resolve` is a shim of its own
+  rather than a tail on the parse's, because it holds the cycle's only new
+  checked arithmetic and a shim should fail for the code it names. Measured
+  rather than assumed: a bare index put in place of `ContentRange::encode`'s
+  buffer test reds the link naming `shim_content_range_encode` and nothing else,
+  and one put in place of `TagList::get`'s slot lookup names `shim_tag_list`.
+  And `git grep -c 'const _: () = assert!' fc30179 -- 'http-semantics/src/*'`
+  finds nothing where the crate now carries twelve, in three files —
+  `Option<EntityTag>` and `TagList`, `Option<Pos>`, `Option<RangeSpec>` and
+  `RangesSpecifier`, and `Preconditions` — each pinned per pointer width, so a
+  slot count raised without thinking reds the build rather than the device.
+
 ## A fourth bypass of one gate, and the redesign that ends the series
 
 ### Tooling
@@ -1694,10 +2222,12 @@ inline 64-entry header table (~2 KB) is replaced by the borrowed `HeadView`.
   now bounded inside the one function both gates call, and mirrored at both
   emitters so nothing this crate writes is something it refuses to read. The
   worst input either server now accepts costs **371 µs**, and the 16 KiB dense
-  head is refused in 13.8 µs. RFC 9110 §5.6.1.2 asks for the bound in as many
-  words — a recipient parses empty list elements "but not so much that they could
-  be used as a denial-of-service mechanism" — and §5.4 makes the refusal a 4xx,
-  which is what a reject-only handshake writes (`the_offer_list_is_bounded`,
+  head is refused in 13.8 µs. RFC 9110 §5.4 is what licenses the bound — a
+  server refuses a "request header field line, field value, or set of fields
+  larger than it wishes to process" with a 4xx, which is what a reject-only
+  handshake writes. (§5.6.1.2's denial-of-service clause governs EMPTY list
+  elements, which this bound does not count and does not limit; citing it here
+  was the misattribution `MAX_TAGS` later shed.) (`the_offer_list_is_bounded`,
   `the_offer_count_is_bounded_by_what_our_own_server_reads`,
   `the_offer_count_bound_is_the_same_in_both_directions`,
   `the_offer_count_bound_is_symmetric_on_both_transports`).

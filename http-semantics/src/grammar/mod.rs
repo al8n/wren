@@ -80,9 +80,29 @@ pub fn trim_ows(v: &[u8]) -> &[u8] {
 
 /// Splits a comma-separated list value into its non-empty, OWS-trimmed
 /// elements. RFC 9110 §5.6.1.2: "A recipient MUST parse and ignore a
-/// reasonable number of empty list elements" — EVERY list consumer routes
-/// through here, so the empty-element rule lives in exactly one place instead
-/// of being rediscovered per open-coded `split(b',')`.
+/// reasonable number of empty list elements" — every RECIPIENT list consumer
+/// this split can delimit comes through here, so the empty-element rule lives
+/// in one place instead of being rediscovered per open-coded `split(b',')`.
+/// RECIPIENT is part of the rule and not a hedge: what this drops is what
+/// §5.6.1.2 tells a recipient to ignore and §5.6.1.1 forbids a SENDER to
+/// generate, so a sender-side check that took its elements from here would
+/// inherit a tolerance for the very elements it exists to refuse.
+/// [`sender_list_shape`], [`is_sender_token_list`] and [`is_protocol_list`]
+/// therefore delimit their own, though this split could have delimited all
+/// three.
+///
+/// The entrance is conditional, and the condition is the element grammar rather
+/// than a preference: a recipient consumer this can delimit MUST come through
+/// here, and one it cannot has to delimit its own elements.
+/// [`crate::validator::TagList`] is a consumer it cannot — `etagc` admits a
+/// comma between the DQUOTEs, so `"a,b"` is one entity tag that this split
+/// reads as two malformed elements — and any list whose own grammar hides a
+/// delimiter inside an element is in the same position.
+///
+/// §5.6.1.2's MUST does not come along with a new walker, so an exception owns
+/// the rule: it states it where it parses, and tests it there. Which is also
+/// the limit on what this entrance proves — a reader may not conclude from it
+/// alone that a given list value in this crate was split here.
 #[inline]
 pub fn list_elements(value: &[u8]) -> impl Iterator<Item = &[u8]> {
   value
@@ -863,19 +883,43 @@ impl Expectations {
 /// `Upgrade:` with nothing in it is asking it to put an empty element on the
 /// wire, and this refuses.
 ///
+/// So it delimits its OWN elements, for the reason [`list_elements`] gives:
+/// that split drops the empties §5.6.1.2 tells a RECIPIENT to ignore, and a
+/// sender-side check taking its elements from there inherits a tolerance for
+/// the very elements it exists to refuse — `,websocket`, `websocket,` and
+/// `a,,b` are all sendable under one. The walk is [`sender_list_shape`]'s,
+/// with the element grammar in place of its emptiness test, and
+/// [`is_sender_token_list`] delimits its own for the same reason.
+///
+/// **The two refusals are one refusal here**, which is why no separate
+/// emptiness test appears below: §7.8's `protocol` is built out of
+/// `token = 1*tchar` (§5.6.2), which admits no empty run, so an empty element
+/// fails as a `protocol` before §5.6.1.1 has to be consulted. The value naming
+/// at least one protocol falls out of the same step — `""` is one empty element
+/// rather than no elements.
+///
 /// The RECIPIENT side is [`lists_a_protocol`], and it is deliberately more
 /// tolerant. The two are not an inconsistency: §5.6.1.1 and §5.6.1.2 are
 /// adjacent sections stating opposite MUSTs for the two roles, and this core
 /// implements both.
 pub fn is_protocol_list(value: &[u8]) -> bool {
-  let mut named = false;
-  for element in list_elements(value) {
-    if !is_protocol(element) {
+  let mut at = 0usize;
+  loop {
+    // `None` is a value whose §5.6.4 quoted-string never closes, which is not a
+    // list at all and so is not a `#protocol` either. `protocol` admits no
+    // quoted-string, but a DQUOTE is not a `tchar`, so such a value was already
+    // going to be refused by the element grammar below.
+    let Some(end) = list_element_end(value, at) else {
+      return false;
+    };
+    if !is_protocol(trim_ows(value.get(at..end).unwrap_or_default())) {
       return false;
     }
-    named = true;
+    if value.get(end).is_none() {
+      return true;
+    }
+    at = end.saturating_add(1);
   }
-  named
 }
 
 /// The same production asked as a RECIPIENT, over the COMBINED value of every
@@ -977,7 +1021,42 @@ pub struct BufferTooSmall {
 /// [`unescape_into`](Self::unescape_into) and
 /// [`eq_unescaped_ignore_ascii_case`](Self::eq_unescaped_ignore_ascii_case)
 /// below are how this type discharges it.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+///
+/// # There is no `PartialEq`, and the two halves fail it differently
+///
+/// This type derives neither `PartialEq` nor `Eq`. A derive would compare the
+/// bytes as written AND which variant held them, and §5.6.6 settles half of
+/// that outright: "A parameter value that matches the token production
+/// can be transmitted either as a token or within a quoted-string.  The quoted
+/// and unquoted values are equivalent." So [`Token`](Self::Token)`(b"utf-8")`
+/// and [`Quoted`](Self::Quoted)`(b"utf-8")` are one parameter value spelled two
+/// ways, and a derive calls them different — a wrong answer to a question the
+/// RFC answers. §5.6.4's own MUST — quoted below on
+/// [`unescaped`](Self::unescaped) — puts a second pair of spellings under one
+/// value, because a `quoted-pair` is read as the octet behind its backslash: a
+/// [`Quoted`](Self::Quoted) holding a redundant escape and a
+/// [`Quoted`](Self::Quoted) holding that bare octet are one value, and a derive
+/// separates them too.
+///
+/// **The other half is why a semantic `PartialEq` is not the fix.** §5.6.6:
+/// "Parameter names are case-insensitive.  Parameter values might or might not
+/// be case-sensitive, depending on the semantics of the parameter name." That
+/// is conditional on the NAME, and this type is the value of every field that
+/// spells its parameters in this grammar, so it does not know which name it
+/// belongs to. Folding case would invent one answer and not folding it would
+/// invent the other. The precedent for removing rather than repairing is
+/// [`MediaType`](crate::media::MediaType), whose own doc gives the same
+/// reasoning at length, and [`ContentRange`](crate::range::ContentRange) before
+/// it.
+///
+/// What a caller says instead is the unconditional half, which is the whole of
+/// what this crate can promise: [`unescaped`](Self::unescaped) is a `u8`
+/// iterator over the value with the quoted-string's spelling gone, so
+/// `a.unescaped().eq(b.unescaped())` compares two values across both variants,
+/// and [`eq_unescaped_ignore_ascii_case`](Self::eq_unescaped_ignore_ascii_case)
+/// adds the case fold where the caller's own parameter name is what makes it
+/// right.
+#[derive(Debug, Copy, Clone)]
 #[non_exhaustive]
 pub enum ParamValue<'a> {
   /// The parameter carried no `=`. RFC 9110 §5.6.6's `parameter` requires one;
@@ -1054,6 +1133,16 @@ impl<'a> ParamValue<'a> {
   /// Two passes: the length is counted before anything is written, so a call
   /// that does not fit writes NOTHING and leaves `out` as it found it.
   ///
+  /// # What the caller owes the bytes afterwards
+  ///
+  /// This writes into the caller's own buffer and not into any wire grammar
+  /// this crate governs, which is why it is the one writer here that carries no
+  /// destination rule. A caller that re-emits these bytes into a
+  /// `quoted-string` MUST re-escape them: the escapes were taken OFF, so a
+  /// DQUOTE or a backslash in the result stands unescaped and would close or
+  /// re-open the string it is written into. Nothing here can see where the
+  /// bytes go next.
+  ///
   /// # Errors
   ///
   /// [`BufferTooSmall`] when `out` is shorter than the unescaped value.
@@ -1092,15 +1181,33 @@ impl<'a> ParamValue<'a> {
 /// One member of a parameterised `#`-list: a name and its parameters, with
 /// quoted-string values kept intact.
 ///
-/// `PartialEq` is over these bytes as written, not the parsed parameters:
-/// `params` is the untrimmed remainder after the member's first `;`, so
-/// `ext; q=1` and `ext;  q=1` compare unequal here even though both walk to
-/// the same `(name, ParamValue)` pairs through [`params`](ListMember::params).
-/// A caller wanting that value equality compares `params()`'s output instead.
-/// The derive also compares the private `QuotedTail`, so two members with
-/// identical `name` and `params` bytes can still compare unequal when one was
-/// parsed across an RFC 9110 §5.2 field-line join and the other was not.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// # There is no `PartialEq`, and documenting the trap is not a substitute
+///
+/// This type derives neither `PartialEq` nor `Eq`. `params` is the untrimmed
+/// remainder after the member's first `;`, so a derive makes `ext; q=1` and
+/// `ext;  q=1` unequal even though both walk to the same
+/// `(name, `[`ParamValue`]`)` pairs through [`params`](Self::params). The
+/// difference is the `OWS` §5.6.6's `parameters = *( OWS ";" OWS [ parameter ] )`
+/// puts around the `;`, and it is the same defect
+/// [`MediaType`](crate::media::MediaType) and
+/// [`MediaRange`](crate::media::MediaRange) derive no equality over either —
+/// each of them holding or built from one of these.
+///
+/// **Do not restore the derive with a doc note beside it.** A documented trap
+/// is still a trap: the disclosure tells a reader that `==` answers a question
+/// it should not have been asked, and leaves the wrong answer one keystroke
+/// away. The derive compares the private `QuotedTail` besides, so two members
+/// with identical `name` and `params` bytes compare unequal when one was
+/// parsed across an RFC 9110 §5.2 field-line join and the other was not — a
+/// property of how the input arrived, not of what the sender said, and one
+/// this type never claimed to report.
+///
+/// A caller compares [`name`](Self::name) under whatever rule its own field
+/// gives that token — §8.3.1's case-insensitivity for a media range, its own
+/// for anything else — and walks [`params`](Self::params) pairwise, comparing
+/// each name with [`eq_ignore_ascii`] and each [`ParamValue`] as that type's
+/// own doc directs.
+#[derive(Debug, Copy, Clone)]
 pub struct ListMember<'a> {
   name: &'a [u8],
   params: &'a [u8],

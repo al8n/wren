@@ -1,5 +1,6 @@
 //! The RFC 9110 §8.3.1 media type and §12.5.1 `Accept` range, over the §5.6.6
-//! parameter grammar the crate already walks.
+//! parameter grammar the crate already walks — and RFC 2045 §5.1's media type,
+//! which is a different grammar for the same value.
 //!
 //! Two entry points share one walk: [`media_type`] reads a single
 //! `Content-Type` value and [`accept`] walks an `Accept` field's lines.
@@ -7,6 +8,67 @@
 //! the one derivation those sections settle; choosing a representation from the
 //! result is the caller's, and §12.1 says a user agent "cannot rely on
 //! proactive negotiation preferences being consistently honored".
+//!
+//! A third entry point, `mime_content_type`, is crate-internal and answers
+//! RFC 2045 §5.1's `content` for `range::multipart` — the one place in this
+//! crate that is inside a MIME body part. It lives HERE, and not there, because
+//! reading a media type is this module's work whichever grammar spells it, and
+//! because the two walks belong in one file for anyone comparing them. The
+//! dependency runs one way: `range::multipart` names this module, and nothing
+//! here names `range`.
+//!
+//! # The MIME grammar and the HTTP grammar disagree, and here is where
+//!
+//! A body part's `Content-Type` is not an HTTP field. RFC 9110 §14.6 hands the
+//! framing of a `multipart/byteranges` body to RFC 2046, RFC 2046 §5.1 gives a
+//! body part its own header fields, and RFC 2045 §5.1 gives that field its own
+//! grammar — RFC 822's structured-field lexing over RFC 2045's `token` — which
+//! is not RFC 9110 §8.3.1's. So `mime_content_type` reads the field in the
+//! grammar of the place the field is, and [`media_type`] stays exactly as
+//! strict as §8.3.1 makes it, for the HTTP field sections it is for.
+//!
+//! The two are not one grammar with a lenience bolted on. **Do not try to unify
+//! them**: each row below is a value one accepts and the other must not.
+//!
+//! | value | RFC 2045 §5.1, a body part | RFC 9110 §8.3.1 + §5.6.6, a field section |
+//! | --- | --- | --- |
+//! | `text / plain` | a media type: RFC 5322 §3.2.2 puts white space between lexical tokens | not one: `text ` is no `token` |
+//! | `text (c) /plain` | a media type: §5.1 admits RFC 822 comments | not one: §8.3.1 has no comment production |
+//! | `text/plain; charset = us-ascii` | one parameter: the `=` is a symbol like any other | no parameter: `charset ` is no `parameter-name` |
+//! | `text/plain; charset=us-ascii (c)` | value `us-ascii`, the comment discarded | value `us-ascii (c)`, which is no `token` — refused |
+//! | `application/x-{foo}` | a media type: `{` and `}` are no `tspecials` | not one: neither is a `tchar` |
+//! | `text/plain;charset="a<DEL>b"` | a media type: DEL is RFC 822 `qtext` | not one: DEL is no §5.6.4 `qdtext` |
+//! | `text/plain;` | refused: `*(";" parameter)` brackets nothing | a media type with no parameters: `*( OWS ";" OWS [ parameter ] )` |
+//! | `x-/plain`, `text/x-` | refused: `x-` is a `token` and is no `x-token`, so it names no `type` and no `subtype` | media types: §8.3.1 spells both halves `token` and has no `extension-token` |
+//! | `text/plain, text/html` | refused: `,` is a `tspecials` and `content` holds no list | refused: §8.3 makes `Content-Type` a singleton |
+//!
+//! The first four rows are white space and comments around a SYMBOL — the `/`,
+//! the `;`, the `=`. `;` is the narrow one of those three: §5.6.6 already puts
+//! `OWS` around it, so only a COMMENT parts the two there, while `/` and `=`
+//! admit no HTTP whitespace at all. The fifth and sixth rows are the two
+//! ALPHABETS, and each is a set difference in its own lexical class: RFC 2045's
+//! `token` is `%x21-7E` minus fifteen `tspecials` and §5.6.2's `tchar` is that
+//! set minus `{` and `}`, while RFC 822's `qtext` is `CHAR` minus three
+//! characters and §5.6.4's `qdtext` also excludes the CTLs and DEL. Those two
+//! quoted-string classes are not orderable in either direction, since `qdtext`
+//! admits the `obs-text` `CHAR` has no room for. The seventh and eighth rows
+//! are the two where HTTP admits what MIME refuses, which is what keeps either
+//! grammar from containing the other: HTTP's parameter carries a bracket
+//! RFC 2045 does not write, and §8.3.1 spells `type` and `subtype` as a bare
+//! `token` each, where §5.1 builds a `type` out of `discrete-type /
+//! composite-type` and a `subtype` out of `extension-token / iana-token` —
+//! productions whose `X-` half is `x-token`, which a bare `x-` is not. That
+//! eighth row is why [`encode_part_header`](crate::range::multipart::encode_part_header)
+//! refuses a [`MediaType`] that [`media_type`] returned: the writer puts the
+//! value where RFC 2045 governs. The last row is a value both refuse, on two
+//! different sentences.
+//!
+//! Both parsers produce one [`MediaType`], so a caller meets one type and
+//! [`encode_part_header`](crate::range::multipart::encode_part_header) takes one
+//! argument. What that writer spells back is §8.3.1's preferred tight form
+//! either way — `text / plain` re-frames as `text/plain` — which is the same
+//! media type and not the same bytes, exactly as a parameter's `OWS` has always
+//! been.
 
 use crate::grammar::{
   ListError, ListMember, ParamIter, ParamValue, has_bare_comma, is_token, parameterised_list_with,
@@ -115,34 +177,144 @@ const fn ascii(bytes: &[u8]) -> &str {
   }
 }
 
-/// One media type: RFC 9110 §8.3.1's `type "/" subtype parameters`.
+/// One media type: RFC 9110 §8.3.1's `type "/" subtype parameters`, or
+/// RFC 2045 §5.1's `type "/" subtype *(";" parameter)`.
 ///
 /// Borrows the value it was parsed from; nothing is copied.
 ///
-/// `Eq`/`PartialEq` compare the SAME bytes [`ListMember`]'s own `PartialEq`
-/// does — as written, not as parsed — which is what lets a test assert
-/// `media_type(..) == Err(MediaError::..)` without a `MediaType` value on the
-/// other side.
+/// # Two grammars, one type
 ///
-/// That byte equality does NOT honour §8.3.1's "The type and subtype tokens
-/// are case-insensitive" (quoted below, on [`ty`](Self::ty) and
-/// [`subtype`](Self::subtype)): a `MediaType` parsed from `TEXT/plain`
-/// compares UNEQUAL to one parsed from `text/plain` under this derive. A
-/// caller comparing two media types compares [`ty`](Self::ty) and
-/// [`subtype`](Self::subtype) with `str::eq_ignore_ascii_case`, not `==` on
-/// the whole value.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// [`media_type`] is §8.3.1's parser, for the grammar of an HTTP field section.
+/// RFC 2045 §5.1's is the grammar of a MIME body part's header block, and
+/// `mime_content_type` beside it in this module is that one — a different
+/// grammar for the same value, tabulated row by row in this module's own
+/// summary. Both produce THIS type, so a caller holding a `Content-Type` meets
+/// one thing whichever context it came out of, and
+/// [`encode_part_header`](crate::range::multipart::encode_part_header) takes one
+/// argument rather than two.
+///
+/// What travels with the value is which grammar its PARAMETERS are spelled in,
+/// because the two disagree about the bytes between them —
+/// `text/plain; charset = us-ascii` carries one parameter in MIME's grammar and
+/// none at all in HTTP's. [`params`](Self::params) walks each in its own grammar
+/// and yields the same pairs, so nothing downstream of it has to know which it
+/// is holding.
+///
+/// The accessors below are stated in §8.3.1's words because the two grammars
+/// agree on everything they say. Where the grammars differ is what each admits
+/// INSIDE a lexical token — `application/x-{foo}` is a MIME media type and is
+/// not an HTTP one, and `charset="a<DEL>b"` is a MIME parameter and is not an
+/// HTTP one — so a value read in the MIME context can hold a byte §5.6.2's
+/// `tchar` or §5.6.4's `qdtext` does not, and putting one into an HTTP field
+/// section is the caller's decision rather than this type's promise. It runs the
+/// other way once: `obs-text` is `qdtext` and is no RFC 822 `CHAR`.
+///
+/// # There is no `PartialEq`, and there is no right one
+///
+/// This type deliberately derives neither `PartialEq` nor `Eq`. A derive over
+/// the bytes as written answers a question media-type equivalence does not
+/// ask. Three probes, all of them `false` under such a derive and all of them
+/// one media type:
+///
+/// - `media_type(b"text/plain")` against `media_type(b"TEXT/PLAIN")`. §8.3.1:
+///   "The type and subtype tokens are case-insensitive."
+/// - `media_type(b"text/plain;charset=utf-8")` against
+///   `media_type(b"text/plain; charset=utf-8")`, whose only difference is the
+///   `OWS` §5.6.6 puts there.
+/// - A value from [`media_type`] against one `range::multipart` read out of a
+///   body part, since the parameter section carries the grammar it is spelled
+///   in and the two spellings are two variants.
+///
+/// The first two hold with or without the third; the MIME parser only adds a
+/// second route to the same wrong answer. The precedent for removing rather
+/// than repairing is in this crate and it is the same reasoning:
+/// [`ContentRange`](crate::range::ContentRange) derives no `PartialEq` either,
+/// because its `range-unit` is stored as the sender wrote it and §14.1's "All
+/// range unit names are case-insensitive" makes a derived equality contradict
+/// the section the value comes from.
+///
+/// **And a semantic `PartialEq` is not the fix.** Media-type equivalence needs
+/// answers this crate does not have — whether parameter order matters, what a
+/// duplicate parameter means, which parameter values are case-sensitive — and
+/// inventing them would be a contract nobody asked for. The specific clause is
+/// §5.6.6's rather than §8.3.1's, and it settles only the first half: "Parameter
+/// names are case-insensitive.  Parameter values might or might not be
+/// case-sensitive, depending on the semantics of the parameter name." So the
+/// values are the parameter's own question and the ORDER is nobody's. A caller
+/// comparing two media types compares [`ty`](Self::ty) and
+/// [`subtype`](Self::subtype) with
+/// [`eq_ignore_ascii`](crate::grammar::eq_ignore_ascii) or
+/// `str::eq_ignore_ascii_case`, and walks [`params`](Self::params) itself under
+/// whatever rule its own field defines. That is a question a caller can state.
+#[derive(Debug, Copy, Clone)]
 pub struct MediaType<'a> {
   ty: &'a [u8],
   subtype: &'a [u8],
-  member: ListMember<'a>,
+  params: MediaParams<'a>,
+}
+
+/// A media type's parameter section, kept with the grammar it is spelled in.
+///
+/// Not a `&[u8]` and a flag: the HTTP arm carries a whole [`ListMember`],
+/// because that is what §5.6.6's walk needs to resume — the parameters' bytes
+/// and what became of a quoted-string still open when the member's first field
+/// line ended. The MIME arm needs neither, since RFC 2045 §5.1's `content` is
+/// one field's value and this crate refuses a body part's folded field before a
+/// media type is read out of it.
+///
+/// No `PartialEq`: this discriminant records which grammar spelled the
+/// parameters, so a derive here makes a §8.3.1-parsed `text/plain` compare
+/// unequal to a §5.1-parsed one.
+#[derive(Debug, Copy, Clone)]
+enum MediaParams<'a> {
+  /// RFC 9110 §5.6.6's `*( OWS ";" OWS [ parameter ] )`, as [`media_type`] read
+  /// it.
+  Http(ListMember<'a>),
+  /// RFC 2045 §5.1's `*(";" parameter)` under RFC 822's structured-field
+  /// lexing, as `mime_content_type` read it: everything the value had left
+  /// after its `subtype`.
+  Mime(&'a [u8]),
+}
+
+/// The iterator [`MediaType::params`] hands back: one media type's parameters,
+/// in wire order, whichever of the two grammars the value was read in.
+///
+/// One `Item` for both, because the pairs are the same pairs — RFC 2045 §5.1's
+/// `parameter := attribute "=" value` and RFC 9110 §5.6.6's
+/// `parameter = parameter-name "=" parameter-value` name a token and either a
+/// token or a quoted-string, and only what may sit BETWEEN those pieces differs.
+#[derive(Debug, Clone)]
+pub struct MediaTypeParams<'a>(MediaTypeParamsInner<'a>);
+
+/// Which walk a [`MediaTypeParams`] is driving.
+#[derive(Debug, Clone)]
+enum MediaTypeParamsInner<'a> {
+  /// The crate's RFC 9110 §5.6.6 walk.
+  Http(ParamIter<'a>),
+  /// This module's own RFC 2045 §5.1 walk.
+  Mime(MimeParams<'a>),
+}
+
+impl<'a> Iterator for MediaTypeParams<'a> {
+  type Item = Result<(&'a [u8], ParamValue<'a>), ListError>;
+
+  #[inline]
+  fn next(&mut self) -> Option<Self::Item> {
+    match &mut self.0 {
+      MediaTypeParamsInner::Http(params) => params.next(),
+      MediaTypeParamsInner::Mime(params) => params.next(),
+    }
+  }
 }
 
 impl<'a> MediaType<'a> {
   /// The `type` token.
   ///
   /// RFC 9110 §8.3.1: "The type and subtype tokens are case-insensitive." This
-  /// hands over the bytes as written; the comparison is the caller's.
+  /// hands over the bytes as written; the comparison is the caller's. RFC 2045
+  /// §5.1 says the same of the MIME grammar's two tokens: "The type, subtype,
+  /// and parameter names are not case sensitive.  For example, TEXT, Text, and
+  /// TeXt are all equivalent top-level media types."
   #[inline]
   pub const fn ty(&self) -> &'a str {
     ascii(self.ty)
@@ -156,9 +328,39 @@ impl<'a> MediaType<'a> {
 
   /// Every parameter, in wire order — including one named `q`, which carries no
   /// special meaning in a `Content-Type`.
+  ///
+  /// Walked in the grammar the value was read in, which is the whole of what
+  /// this type stores alongside its two tokens; the pairs are the same pairs
+  /// either way. See [`MediaTypeParams`] for the two walks.
   #[inline]
-  pub const fn params(&self) -> ParamIter<'a> {
-    self.member.params()
+  pub const fn params(&self) -> MediaTypeParams<'a> {
+    MediaTypeParams(match self.params {
+      MediaParams::Http(member) => MediaTypeParamsInner::Http(member.params()),
+      MediaParams::Mime(params) => MediaTypeParamsInner::Mime(MimeParams::new(params)),
+    })
+  }
+
+  /// Builds a media type out of pieces RFC 2045 §5.1's parser has already
+  /// established.
+  ///
+  /// **Crate-internal, and deliberately not a second public media-type type.**
+  /// §5.1's `content` is a different grammar from §8.3.1's `media-type`, but the
+  /// VALUE it produces is a media type like any other — a type, a subtype and a
+  /// list of parameters — so a caller reading a body part meets the same type it
+  /// meets reading an HTTP field, and one writer can spell either back.
+  ///
+  /// `ty` and `subtype` must each be a §5.1 `token` and `params` must be that
+  /// grammar's parameter section, already walked. Nothing is re-checked here:
+  /// [`params`](Self::params) will walk `params` again in §5.1's grammar, and
+  /// `mime_content_type` — the one caller, further down this file — is what has
+  /// established they agree.
+  #[inline]
+  pub(crate) const fn from_mime_parts(ty: &'a [u8], subtype: &'a [u8], params: &'a [u8]) -> Self {
+    Self {
+      ty,
+      subtype,
+      params: MediaParams::Mime(params),
+    }
   }
 }
 
@@ -207,8 +409,655 @@ pub fn media_type(value: &[u8]) -> Result<MediaType<'_>, MediaError> {
   Ok(MediaType {
     ty,
     subtype,
-    member,
+    params: MediaParams::Http(member),
   })
+}
+
+/// RFC 2045 §5.1's `Content-Type` value, read where THAT grammar is the one in
+/// force.
+///
+/// ```text
+/// content := "Content-Type" ":" type "/" subtype
+///            *(";" parameter)
+///
+/// parameter := attribute "=" value
+///
+/// attribute := token
+///
+/// value := token / quoted-string
+/// ```
+///
+/// The field name and its colon belong to whoever split the header block: the
+/// `multipart` reader under `range`, which is this function's one caller. What
+/// stands here is the value behind that colon, on the one line RFC 2046 §5.1.1
+/// leaves it on.
+///
+/// # Which context this is, and why one parser cannot be both
+///
+/// A body part's header block is not an HTTP field section. RFC 9110 §14.6
+/// frames a `multipart/byteranges` body by RFC 2046, RFC 2046 §5.1 gives a body
+/// part its own header fields, and RFC 2045 §1 says what those fields inherit:
+/// "All of the header fields defined in this document are subject to the general
+/// syntactic rules for header fields specified in RFC 822.  In particular, all
+/// of these header fields except for Content-Disposition can include RFC 822
+/// comments, which have no semantic content and should be ignored during MIME
+/// processing." §5.1 says the same about this field in particular — "In
+/// addition, comments are allowed in accordance with RFC 822 rules for
+/// structured header fields." — and prints the case, calling two spellings
+/// "completely equivalent":
+///
+/// ```text
+/// Content-type: text/plain; charset=us-ascii (Plain text)
+///
+/// Content-type: text/plain; charset="us-ascii"
+/// ```
+///
+/// This module's own summary tabulates every place the two grammars part
+/// company. [`media_type`] stays exactly as strict as §8.3.1 makes it, because
+/// an HTTP field section is where that strictness is right; the difference lives
+/// in [`MimeParams`] and the lexical predicates below it.
+///
+/// # Every span is still borrowed
+///
+/// RFC 5322 §3.2.2: "Runs of FWS, comment, or CFWS that occur between lexical
+/// tokens in a structured header field are semantically interpreted as a single
+/// space character." BETWEEN lexical tokens — so white space and comments never
+/// sit inside one, every token and every `quoted-string` this reads is a
+/// contiguous run of the caller's own bytes, and [`MediaType`] borrows each the
+/// way an HTTP-parsed one does. A no-alloc reader can read this grammar whole.
+///
+/// That is why the answer for `text/plain; (c) charset=us-ascii` is a media type
+/// rather than a refusal for a value in two pieces: the comment there is in a
+/// comment position, so nothing has to be joined. RFC 822's line fold really is
+/// two spans, and the caller refuses one before a value reaches this; and
+/// `charset=a(c)b` never was one, because RFC 5322 §3.2.3's
+/// `atom = [CFWS] 1*atext [CFWS]` puts the comment position outside the token
+/// and never inside it.
+///
+/// # What the caller must have established
+///
+/// **That `value` is the body of one RFC 822 `field`**, which is to say that it
+/// carries no bare CR and no bare LF. The three productions this walk is built
+/// on do not settle that between them: `qtext` and `ctext` exclude the CR by
+/// name, but the LF is a `CHAR` neither production mentions, so this walk admits
+/// `charset="a<LF>b"` and would hand the LF back inside a parameter's span. What
+/// forbids it is the grammar one level up —
+/// `field = field-name ":" [ field-body ] CRLF`, whose
+/// `field-body = field-body-contents [CRLF LWSP-char field-body]` admits a
+/// line-break octet only as the CRLF of a fold — and the caller is where that
+/// grammar is: `range::multipart` splits a body part's header block at every
+/// CRLF, refuses the fold, and refuses any line with one of those two octets
+/// left inside it.
+///
+/// The rule has ONE entrance today. A second caller that skipped it would put a
+/// line break into a borrowed span, and
+/// [`encode_part_header`](crate::range::multipart::encode_part_header) copies a
+/// quoted interior into a body part's header block verbatim, checking only that
+/// it is US-ASCII — which a CR and an LF both are.
+///
+/// # `None`, and only `None`
+///
+/// Every fault this grammar has is one refusal to its one caller, so an error
+/// type here would be a distinction nothing reads: a value that is not §5.1's
+/// `content` — no `/`, an empty `type` or `subtype` (§5.1: "Note also that a
+/// subtype specification is MANDATORY -- it may not be omitted from a
+/// Content-Type header field.  As such, there are no default subtypes."), a byte
+/// outside §5.1's `token` where a token belongs, a `type` or a `subtype` in the
+/// `X-` namespace that is not an `x-token` ([`keeps_x_token`], which
+/// [`mime_type_and_subtype`] holds each half to), a `;` with no `parameter`
+/// behind it, a parameter with no `=` or no value, a comment or a
+/// `quoted-string` the value ends inside of, or anything at all where only a `;`
+/// or the end of the value may be — every one of them reaches
+/// `range::multipart` as the same `None`, and that module turns it into the one
+/// [`RangeError::MalformedMultipart`](crate::range::RangeError::MalformedMultipart)
+/// its `# Errors` promises.
+pub(crate) fn mime_content_type(value: &[u8]) -> Option<MediaType<'_>> {
+  let (ty, subtype, params) = mime_type_and_subtype(value)?;
+  // Walked HERE, before the value exists, so that every parameter has been read
+  // by the time a caller can ask for one. `MimeParams` is the only walk of this
+  // grammar, so what it refuses is what this refuses and there is no second
+  // opinion to drift from; and because it has already refused everything it can,
+  // a re-walk through `MediaType::params` yields `Ok` for every parameter of
+  // every value this function returns.
+  for param in MimeParams::new(params) {
+    if param.is_err() {
+      return None;
+    }
+  }
+  Some(MediaType::from_mime_parts(ty, subtype, params))
+}
+
+/// `[CFWS] type [CFWS] "/" [CFWS] subtype`, and what the value has left behind
+/// it.
+///
+/// The `[CFWS]`s are RFC 822's, which RFC 5322 §3.2.2 restates as
+/// `CFWS = (1*([FWS] comment) [FWS]) / FWS` and admits "between many elements in
+/// header field bodies". The `/` is a delimiter rather than a token byte because
+/// RFC 2045 §5.1 put it there: "Note that the definition of "tspecials" is the
+/// same as the RFC 822 definition of "specials" with the addition of the three
+/// characters "/", "?", and "=", and the removal of "."." A `token` therefore
+/// stops at a `/` on its own, and [`mime_token`] needs no special case for it.
+///
+/// `None` for anything that is not this shape, which [`mime_content_type`]
+/// reports as one refusal — the pieces are not separable faults, since a value
+/// with no `/` in it has no `type` either.
+///
+/// # A `token` in each position is the alphabet and not the production
+///
+/// RFC 2045 §5.1 does not spell either half as `token`. Outside its seven
+/// literals a `type` is an `extension-token` and a `subtype` is an
+/// `extension-token` or an `iana-token`, and both of those offer `x-token`,
+/// whose tail §5.1 requires to be a `token` and therefore non-empty. So `x-` is
+/// a `token` in both positions and is a `type` in neither and a `subtype` in
+/// neither — [`keeps_x_token`] is that rule, and it is the same call §6.1's
+/// `mechanism` reader makes about the same namespace.
+///
+/// Reading it here rather than at [`mime_content_type`] keeps the whole of
+/// §5.1's `type "/" subtype` in one function: a caller of this gets the two
+/// spans only when both are what the grammar says they are. Everything else is
+/// out of reach of bytes — an unregistered `example/foo` is a well-formed
+/// `ietf-token` as far as anything here can see, and `range::multipart`'s
+/// `TopLevelType` is where that undecidability is reported rather than refused.
+fn mime_type_and_subtype(value: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+  let (ty, rest) = mime_token(skip_cfws(value)?)?;
+  let rest = skip_cfws(rest)?.strip_prefix(b"/")?;
+  let (subtype, rest) = mime_token(skip_cfws(rest)?)?;
+  (keeps_x_token(ty) && keeps_x_token(subtype)).then_some((ty, subtype, rest))
+}
+
+/// Walks RFC 2045 §5.1's `*(";" parameter)` under RFC 822's lexing, one
+/// parameter at a time.
+///
+/// ```text
+/// parameter := attribute "=" value
+///
+/// attribute := token
+///
+/// value := token / quoted-string
+/// ```
+///
+/// with `[CFWS]` admitted around each of the three symbols — the `;`, the `=`,
+/// and the DQUOTEs a `quoted-string` is delimited by — on RFC 5322 §3.2.2's
+/// statement that runs of comments and white space "occur between lexical
+/// tokens in a structured header field".
+///
+/// # Two things this refuses that RFC 9110 §5.6.6's walk admits
+///
+/// **An empty element.** §5.6.6 spells `parameters = *( OWS ";" OWS [ parameter
+/// ] )` with the parameter BRACKETED, so `text/plain;` is one media type and no
+/// parameters there. RFC 2045 §5.1's `*(";" parameter)` brackets nothing, so a
+/// `;` with nothing behind it is not this grammar and the value is refused.
+///
+/// **A parameter with no `=`.** §5.1's `parameter := attribute "=" value` has no
+/// alternative without one, so [`ParamValue::None`] is a value this walk never
+/// yields. [`media_type`] reaches the same answer for its own grammar by a
+/// different route — the walker admits the bare-name form for the fields that
+/// define it, and that entry point rejects what those fields keep.
+///
+/// # Its `Err` is a fault this crate refuses whole
+///
+/// The item type is [`ListError`]'s so that one iterator can carry either
+/// grammar's parameters to [`MediaType::params`], and that vocabulary is
+/// RFC 9110's: `UnterminatedQuotedString` and `InvalidQuotedByte` name exactly
+/// what happened, and every structural refusal of MIME's own — a missing `;`, a
+/// missing `=`, an empty element, a comment the value ends inside of — is
+/// reported as [`ListError::NotAToken`], the walker's nearest word for *what
+/// stands here is not the token that belongs here*.
+///
+/// The imprecision does not reach a caller. [`mime_content_type`] is the one
+/// constructor of a MIME-parsed [`MediaType`], it drives this walk to the end
+/// before returning, and it turns any `Err` into a refusal of the whole value —
+/// so what a caller sees is that refusal, and a re-walk of a value that survived
+/// it yields only `Ok`.
+#[derive(Debug, Clone)]
+struct MimeParams<'a> {
+  /// What is left of the value: `*( [CFWS] ";" [CFWS] parameter ) [CFWS]`.
+  rest: &'a [u8],
+  /// Set by the walk that ended it, whether it ended at the value's end or at a
+  /// fault — nothing behind a `;` this walk could not read is a parameter it
+  /// could.
+  done: bool,
+}
+
+impl<'a> MimeParams<'a> {
+  /// Opens a walk over everything a value had left after its `subtype`.
+  #[inline]
+  const fn new(params: &'a [u8]) -> Self {
+    Self {
+      rest: params,
+      done: false,
+    }
+  }
+
+  /// One `[CFWS] ";" [CFWS] parameter`, and what is left behind it.
+  ///
+  /// `Ok(None)` is the end of the value — `[CFWS]` and then nothing — which is
+  /// §5.1's `*( … )` matching zero more times.
+  fn step(rest: &'a [u8]) -> Result<Option<MimeParam<'a>>, ListError> {
+    let rest = skip_cfws(rest).ok_or(ListError::NotAToken)?;
+    let Some(rest) = rest.strip_prefix(b";") else {
+      // The repetition is over. Either the value ended, or a byte stands where
+      // only a `;` or the end may — `text/plain x`, where `x` is a second token
+      // §5.1's `content` has no room for.
+      return if rest.is_empty() {
+        Ok(None)
+      } else {
+        Err(ListError::NotAToken)
+      };
+    };
+    let rest = skip_cfws(rest).ok_or(ListError::NotAToken)?;
+    // `attribute := token`, and a `token` is `1*<…>`: there is no empty
+    // parameter to skip past here, which is the whole of what `text/plain;`
+    // fails.
+    let (name, rest) = mime_token(rest).ok_or(ListError::NotAToken)?;
+    let rest = skip_cfws(rest).ok_or(ListError::NotAToken)?;
+    let rest = rest.strip_prefix(b"=").ok_or(ListError::NotAToken)?;
+    let rest = skip_cfws(rest).ok_or(ListError::NotAToken)?;
+    // `value := token / quoted-string`, and the DQUOTE is what tells them apart:
+    // §5.1's `tspecials` holds it, so no `token` can begin with one.
+    match rest.first() {
+      Some(b'"') => {
+        let (interior, tail) = mime_quoted_string(rest)?;
+        Ok(Some(MimeParam {
+          name,
+          value: ParamValue::Quoted(interior),
+          rest: tail,
+        }))
+      }
+      _ => {
+        let (token, tail) = mime_token(rest).ok_or(ListError::NotAToken)?;
+        Ok(Some(MimeParam {
+          name,
+          value: ParamValue::Token(token),
+          rest: tail,
+        }))
+      }
+    }
+  }
+}
+
+/// One RFC 2045 §5.1 `parameter`, and where the walk resumes behind it.
+///
+/// A struct rather than a nested tuple: a `((name, value), rest)` puts two
+/// different things at the same nesting level and tells them apart by position
+/// alone.
+struct MimeParam<'a> {
+  /// `attribute := token`.
+  name: &'a [u8],
+  /// `value := token / quoted-string`, the quoted form's DQUOTEs already off.
+  value: ParamValue<'a>,
+  /// What the value has left: the next `[CFWS] ";"`, or the trailing `[CFWS]`.
+  rest: &'a [u8],
+}
+
+impl<'a> Iterator for MimeParams<'a> {
+  type Item = Result<(&'a [u8], ParamValue<'a>), ListError>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.done {
+      return None;
+    }
+    match Self::step(self.rest) {
+      Ok(Some(param)) => {
+        self.rest = param.rest;
+        Some(Ok((param.name, param.value)))
+      }
+      Ok(None) => {
+        self.done = true;
+        None
+      }
+      Err(e) => {
+        self.done = true;
+        Some(Err(e))
+      }
+    }
+  }
+}
+
+/// The RFC 2045 §5.1 `token` at the front of `value`, and what follows it.
+///
+/// ```text
+/// token := 1*<any (US-ASCII) CHAR except SPACE, CTLs,
+///             or tspecials>
+/// ```
+///
+/// `None` when the next byte is not a token byte, the empty token included —
+/// `1*` names at least one character, which is what makes `text/plain;` and
+/// `text//plain` faults rather than values with an empty piece in them.
+///
+/// This is where the two grammars differ INSIDE a lexical token rather than
+/// between two of them: `{` and `}` are ordinary `token` characters here and are
+/// not RFC 9110 §5.6.2 `tchar`s, so `application/x-{foo}` is a media type in a
+/// body part and is not one in an HTTP field section. The module's own table
+/// says which side each test pins.
+fn mime_token(value: &[u8]) -> Option<(&[u8], &[u8])> {
+  let end = value
+    .iter()
+    .position(|byte| !is_mime_token_char(*byte))
+    .unwrap_or(value.len());
+  let (token, tail) = value.split_at_checked(end)?;
+  (!token.is_empty()).then_some((token, tail))
+}
+
+/// Whether `name` keeps RFC 2045 §5.1's `x-token` rule: a name in the `X-`
+/// namespace is an `x-token`, or it is nothing at all.
+///
+/// ```text
+/// x-token := <The two characters "X-" or "x-" followed, with
+///             no intervening white space, by any token>
+/// ```
+///
+/// **This is the workspace's only spelling of those two characters.** RFC 2045
+/// offers `x-token` at THREE productions — §5.1's `type` and `subtype`, through
+/// `extension-token`, and §6.1's `mechanism` — and each of them has the same
+/// question to decide about the same namespace:
+///
+/// ```text
+/// type := discrete-type / composite-type
+///
+/// discrete-type := "text" / "image" / "audio" / "video" /
+///                  "application" / extension-token
+///
+/// composite-type := "message" / "multipart" / extension-token
+///
+/// extension-token := ietf-token / x-token
+///
+/// subtype := extension-token / iana-token
+///
+/// mechanism := "7bit" / "8bit" / "binary" /
+///              "quoted-printable" / "base64" /
+///              ietf-token / x-token
+/// ```
+///
+/// Teaching the rule to one of the three in a copy of its own leaves the other
+/// two admitting a bare `x-` — `x-/plain` and `text/x-` read out of a body part
+/// and handed over as media types. A rule written once and called from three
+/// places cannot drift that way: a fourth production would call this too, and a
+/// correction to it reaches every caller.
+///
+/// # `true` for a name outside the namespace, and that is not an admission
+///
+/// This decides ONE alternative. A `name` that does not open `X-` is not an
+/// `x-token`, and this says nothing at all about it — whether it is one of
+/// §5.1's or §6.1's literals, an `ietf-token`, or an `iana-token` is the
+/// caller's own production to ask, and every caller asks it separately. What
+/// this settles is the half all three share.
+///
+/// # Why an `X-` name that is not an `x-token` matches nothing else either
+///
+/// The tail is a `token`, which §5.1 spells `1*<…>` — NON-EMPTY — so a bare
+/// `x-` fails the one production it looks like it belongs to. Every remaining
+/// alternative of all three is a registry, and the registries are closed to this
+/// namespace from both sides:
+///
+/// - **Media types.** RFC 2046 §6: "A media type value beginning with the
+///   characters "X-" is a private value, to be used by consenting systems by
+///   mutual agreement." and, in the sentence behind it, "Any format without a
+///   rigorous and public definition must be named with an "X-" prefix, and
+///   publicly specified values shall never begin with "X-"." That is a rule
+///   about a media type VALUE, and the same section names the top-level case
+///   outright — "In general, the use of "X-" top-level types is strongly
+///   discouraged." — so it reaches `type` and `subtype` alike. RFC 2045 §5.1
+///   states it of a subtype from the registry's own side: "Private values
+///   (starting with "X-") may be defined bilaterally between two cooperating
+///   agents without outside registration or standardization. Such values cannot
+///   be registered or standardized."
+/// - **Mechanisms.** RFC 2045 §6.3: "all content-transfer-encoding namespace
+///   except that beginning with "X-" is explicitly reserved to the IETF for
+///   future use".
+///
+/// So `ietf-token` — "An extension token defined by a standards-track RFC and
+/// registered with IANA." — and `iana-token` — "A publicly-defined extension
+/// token. Tokens of this form must be registered with IANA as specified in
+/// RFC 2048." — are both out of reach of an `X-` name. Such a name is admitted
+/// by `x-token` or by nothing at all, and `x-` is admitted by nothing at all.
+pub(crate) fn keeps_x_token(name: &[u8]) -> bool {
+  match name {
+    // The two characters §5.1 spells both ways, and then the whole of what is
+    // behind them as ONE `token`. `mime_token` answers `None` for an empty tail,
+    // which is the `1*` the production requires, and hands back whatever was not
+    // a token byte — so an empty remainder is what says the tail is a token and
+    // is nothing else besides.
+    [b'x' | b'X', b'-', tail @ ..] => matches!(mime_token(tail), Some((_, []))),
+    _ => true,
+  }
+}
+
+/// One byte of RFC 2045 §5.1's `token`: `%x21-7E` minus the fifteen
+/// [`TSPECIALS`].
+///
+/// The alphabet as one predicate, so that the two things that need it ask the
+/// same question. [`mime_token`] wants it byte by byte, because a `Content-Type`
+/// arrives undelimited — there the token ends where the alphabet does, at the
+/// `/`, the `;`, the `=`, a SPACE or a `(` — and the `Content-Transfer-Encoding`
+/// reader in `range::multipart` wants it of a whole slice, because that value
+/// arrives already delimited. It is crate-visible for that second caller alone.
+///
+/// The byte set is RFC 822's grammar arithmetic done once. Its `CHAR` is
+/// US-ASCII 0-127 and its `CTL` is 0-31 and 127, so `CHAR` minus the CTLs minus
+/// SPACE is `%x21-7E`, and `tspecials` removes fifteen of those.
+pub(crate) fn is_mime_token_char(byte: u8) -> bool {
+  matches!(byte, 0x21..=0x7E) && !TSPECIALS.contains(&byte)
+}
+
+/// RFC 2045 §5.1's fifteen `tspecials`, in the order that production lists
+/// them.
+///
+/// The set [`is_mime_token_char`] subtracts, written out as a byte string so
+/// that it can be READ against the RFC's own line — fifteen `|`-separated
+/// character literals is a shape a reader checks by counting rather than by
+/// comparing. §5.1's own note under the production says these must sit inside a
+/// quoted-string to be used within a parameter value, and a `mechanism` is a
+/// bare token with nowhere to put one.
+const TSPECIALS: &[u8] = b"()<>@,;:\\\"/[]?=";
+
+/// RFC 822's `CHAR`, which every MIME lexical class below is carved out of.
+///
+/// ```text
+/// CHAR        =  <any ASCII character>        ; (  0-177,  0.-127.)
+/// ```
+///
+/// The octal and decimal ranges in that comment are the whole definition, so
+/// this is `u8::is_ascii` under the name the grammar gives it. It is not the
+/// bound RFC 9110 §5.5 puts on an HTTP field value: that one admits `obs-text`,
+/// `%x80-FF`, and RFC 822 has no such production. Nothing is lost by the
+/// difference — `range::multipart` holds a body part's whole header block to
+/// RFC 2046 §5.1.1's US-ASCII rule before any of this runs — but the predicate
+/// is written from RFC 822 rather than inherited, because the grammar in force
+/// here is RFC 822's.
+const fn is_mime_char(byte: u8) -> bool {
+  byte.is_ascii()
+}
+
+/// RFC 822's `qtext`: what may stand unescaped between a `quoted-string`'s
+/// DQUOTEs.
+///
+/// ```text
+/// qtext       =  <any CHAR excepting <">,     ; => may be folded
+///                 "\" & CR, and including
+///                 linear-white-space>
+/// ```
+///
+/// Three exclusions and no more. **This is not RFC 9110 §5.6.4's `qdtext`**, and
+/// the difference is not a lenience to be tidied away later:
+/// `qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text` excludes every CTL
+/// and DEL. So `charset="a<DEL>b"` — a conforming MIME parameter, since DEL is a
+/// `CHAR` and is none of the three — was read with §5.6.4's scanner and refused,
+/// and that refusal cost the whole part and every part behind it in the body.
+/// The two exclusion lists are not orderable: RFC 822 admits the CTLs §5.6.4
+/// forbids and forbids the `obs-text` §5.6.4 admits.
+///
+/// The DQUOTE and the backslash are excluded here and reached through their own
+/// arms in [`mime_quoted_string`], which is what makes `"a\"b"` one string
+/// containing a quote. The CR is excluded outright, and the production's own
+/// comment says why that does not forbid folding: a fold is
+/// `linear-white-space =  1*([CRLF] LWSP-char)`, so the CR of one arrives as
+/// part of THAT production rather than as `qtext`. This crate never sees a fold
+/// — the caller refuses a folded body-part field before a value reaches here —
+/// so what the exclusion catches is a bare CR, which is no fold at all.
+const fn is_mime_qtext(byte: u8) -> bool {
+  is_mime_char(byte) && byte != b'"' && byte != b'\\' && byte != b'\r'
+}
+
+/// RFC 822's `ctext`: what may stand unescaped inside a comment.
+///
+/// ```text
+/// ctext       =  <any CHAR excluding "(",     ; => may be folded
+///                 ")", "\" & CR, & including
+///                 linear-white-space>
+/// ```
+///
+/// The same shape as [`is_mime_qtext`] with the comment's own delimiters
+/// excluded in place of the DQUOTE, and the CR excluded for the same reason —
+/// this production excludes it in as many words, so [`skip_comment`] must not
+/// admit one.
+const fn is_mime_ctext(byte: u8) -> bool {
+  is_mime_char(byte) && byte != b'(' && byte != b')' && byte != b'\\' && byte != b'\r'
+}
+
+/// RFC 822's `quoted-pair`, as the test on the byte BEHIND the backslash.
+///
+/// ```text
+/// quoted-pair =  "\" CHAR                     ; may quote any char
+/// ```
+///
+/// So the escaped byte is any `CHAR` whatever, which is broader than RFC 9110
+/// §5.6.4's `quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )`: that one
+/// excludes every other CTL, and this one excludes none of them. §3.4.1 states
+/// the rule in prose as well — "To quote a character, precede it with a
+/// backslash" — with no character set attached.
+const fn is_mime_quoted_char(byte: u8) -> bool {
+  is_mime_char(byte)
+}
+
+/// The interior of the RFC 822 `quoted-string` that opens at the front of
+/// `value`, and what follows its closing DQUOTE.
+///
+/// ```text
+/// quoted-string = <"> *(qtext/quoted-pair) <">; Regular qtext or
+///                                             ;   quoted chars.
+/// ```
+///
+/// RFC 2045 §5.1: "Note that the value of a quoted string parameter does not
+/// include the quotes.  That is, the quotation marks in a quoted-string are not
+/// a part of the value of the parameter, but are merely used to delimit that
+/// parameter value." So the interior is what comes back, with its escapes
+/// untouched — the same shape the HTTP walk hands back, and the shape
+/// `range::multipart`'s writer puts the DQUOTEs back around.
+///
+/// The cursor is an index into `value` rather than a re-slice, so the interior
+/// can be cut out of the caller's own bytes at the end; every step of it is
+/// saturating and every read of it is a checked one.
+///
+/// # Errors
+///
+/// [`ListError::UnterminatedQuotedString`] when `value` ends with the string
+/// still open, the dangling backslash of a `quoted-pair` included.
+/// [`ListError::InvalidQuotedByte`] for a byte neither [`is_mime_qtext`] nor
+/// [`is_mime_quoted_char`] admits. [`ListError::NotAToken`] for a `value` that
+/// does not open with a DQUOTE — a caller error rather than a fact about the
+/// input — and for the two slices of the closing arm, which the cursor makes
+/// unreachable and which are answered rather than unwrapped because this crate's
+/// leaves are proved panic-free at link time.
+fn mime_quoted_string(value: &[u8]) -> Result<(&[u8], &[u8]), ListError> {
+  if value.first() != Some(&b'"') {
+    return Err(ListError::NotAToken);
+  }
+  // Past the opening DQUOTE, which is what the interior starts behind.
+  let mut at: usize = 1;
+  loop {
+    let Some(&byte) = value.get(at) else {
+      return Err(ListError::UnterminatedQuotedString);
+    };
+    at = at.saturating_add(1);
+    match byte {
+      b'"' => {
+        let (Some(interior), Some(tail)) = (value.get(1..at.saturating_sub(1)), value.get(at..))
+        else {
+          return Err(ListError::NotAToken);
+        };
+        return Ok((interior, tail));
+      }
+      b'\\' => {
+        let Some(&escaped) = value.get(at) else {
+          return Err(ListError::UnterminatedQuotedString);
+        };
+        if !is_mime_quoted_char(escaped) {
+          return Err(ListError::InvalidQuotedByte);
+        }
+        at = at.saturating_add(1);
+      }
+      b if is_mime_qtext(b) => {}
+      _ => return Err(ListError::InvalidQuotedByte),
+    }
+  }
+}
+
+/// Walks past RFC 5322 §3.2.2's `CFWS` at the front of `value`, or `None` for a
+/// comment that never closes or that carries a byte RFC 822's `ctext` and
+/// `quoted-pair` do not admit.
+///
+/// `CFWS = (1*([FWS] comment) [FWS]) / FWS`, with `FWS` here reduced to the SP
+/// and HTAB of one unfolded line.
+///
+/// Crate-visible for the second RFC 2045 field in this crate. §6.1 defines
+/// `Content-Transfer-Encoding` as structured too, so the same `CFWS` sits around
+/// its `mechanism`, and the `multipart` reader under `range` strips it with this
+/// rather than with a second walk that could disagree about what a comment is.
+pub(crate) fn skip_cfws(value: &[u8]) -> Option<&[u8]> {
+  let mut rest = value;
+  loop {
+    match rest.split_first() {
+      Some((b' ' | b'\t', tail)) => rest = tail,
+      Some((b'(', tail)) => rest = skip_comment(tail)?,
+      _ => return Some(rest),
+    }
+  }
+}
+
+/// Walks past the interior and the closing `)` of a comment whose opening `(`
+/// has already been read, or `None` if the value ends first or a byte the
+/// grammar excludes stands inside.
+///
+/// ```text
+/// comment     =  "(" *(ctext / quoted-pair / comment) ")"
+/// ```
+///
+/// so comments NEST. The depth is a counter rather than recursion: a recursive
+/// walk over attacker-chosen input is a stack this crate cannot bound, and a
+/// `no_std` target has no room to spare for one.
+///
+/// Three of the four arms are the three alternatives the repetition offers — a
+/// nested comment, a `quoted-pair`, and `ctext` — and the fourth is the refusal
+/// that makes this a walk of a grammar rather than a search for the matching
+/// paren. A `\)` does not close a comment because the backslash opens a
+/// [`quoted-pair`](is_mime_quoted_char), which makes the `)` behind it comment
+/// text; RFC 5322 §3.2.1 states the same rule for its own `quoted-pair`.
+fn skip_comment(value: &[u8]) -> Option<&[u8]> {
+  let mut rest = value;
+  let mut depth: usize = 1;
+  loop {
+    let (byte, tail) = rest.split_first()?;
+    rest = tail;
+    match *byte {
+      b'(' => depth = depth.checked_add(1)?,
+      b')' => {
+        depth = depth.checked_sub(1)?;
+        if depth == 0 {
+          return Some(rest);
+        }
+      }
+      b'\\' => {
+        let (escaped, tail) = rest.split_first()?;
+        if !is_mime_quoted_char(*escaped) {
+          return None;
+        }
+        rest = tail;
+      }
+      byte if is_mime_ctext(byte) => {}
+      _ => return None,
+    }
+  }
 }
 
 /// A `qvalue` (RFC 9110 §12.4.2) in thousandths: `0..=1000`.
@@ -293,15 +1142,32 @@ pub(crate) fn parse_qvalue(v: &[u8]) -> Option<Weight> {
 ///
 /// Borrows the field lines it was parsed from.
 ///
-/// `Eq`/`PartialEq` compare the SAME bytes [`ListMember`]'s own `PartialEq`
-/// does — as written, not as parsed — the same rule [`MediaType`]'s derive
-/// documents and for the same reason: it lets a test assert
-/// `accept(..).next() == Some(Err(MediaError::..))` without a `MediaRange`
-/// value on the other side. It does NOT honour §8.3.1's case-insensitive
-/// `type`/`subtype` (the same tokens a `media-range` reuses): a caller wanting
-/// that compares [`ty`](Self::ty) and [`subtype`](Self::subtype) with
-/// `str::eq_ignore_ascii_case`, not `==` on the whole value.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// # No `PartialEq`
+///
+/// A derive here compares the SAME bytes this type holds a [`ListMember`] of —
+/// as written, not as parsed — and that type carries no derive of its own for
+/// the identical reason. Two probes, both `false` under such a derive and both
+/// one media range:
+///
+/// - `accept([b"text/html".as_slice()]).next()` against
+///   `accept([b"TEXT/HTML".as_slice()]).next()`. §8.3.1: "The type and subtype
+///   tokens are case-insensitive" — the same tokens a `media-range` reuses.
+/// - `accept([b"text/html;level=3".as_slice()]).next()` against
+///   `accept([b"text/html; level=3".as_slice()]).next()`, whose only
+///   difference is the `OWS` §5.6.6 puts around a parameter's `;`.
+///
+/// [`MediaType`] is in exactly this position — the same case-insensitive
+/// tokens, the same `OWS`, the same [`ListMember`] this type also holds one
+/// of — so the two get the same answer, and a ruling that reached only one of
+/// them would have answered a type rather than the claim underneath it. A
+/// semantic `PartialEq` is not the fix either, for the
+/// reason [`MediaType`]'s own doc gives at length: media-range equivalence
+/// needs answers this crate does not have — whether parameter order matters,
+/// what a duplicate parameter means, which parameter values are
+/// case-sensitive. A caller compares [`ty`](Self::ty) and
+/// [`subtype`](Self::subtype) with `str::eq_ignore_ascii_case`, and walks
+/// [`params`](Self::params) itself under whatever rule its own field defines.
+#[derive(Debug, Copy, Clone)]
 pub struct MediaRange<'a> {
   ty: Option<&'a [u8]>,
   subtype: Option<&'a [u8]>,
@@ -557,6 +1423,14 @@ fn same_value(fold_case: bool, a: ParamValue<'_>, b: ParamValue<'_>) -> bool {
 /// `name` has already been matched ASCII-case-insensitively by the caller
 /// (§5.6.6: "Parameter names are case-insensitive"), so `Charset` selects this
 /// exactly as `charset` does.
+///
+/// The `[RFC2046]` in §8.3.1's sentence is RFC 9110's own citation mark and is
+/// quoted verbatim, brackets and all. The definition below is what keeps it
+/// from dangling as an unresolved intra-doc link — escaping the brackets would
+/// resolve that too, and would put a `\` where the RFC has none, which
+/// `quote-check` reads as a character the quotation does not have.
+///
+/// [RFC2046]: https://www.rfc-editor.org/rfc/rfc2046
 fn rfc_folds_case(name: &[u8]) -> bool {
   name.eq_ignore_ascii_case(b"charset")
 }

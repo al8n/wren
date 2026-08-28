@@ -516,14 +516,6 @@ http1_proto::error::Refusal::ChunkFramingTooLarge.exchange
 http1_proto::error::Refusal::ChunkFramingTooLarge.limit
 http1_proto::error::Refusal::suggested_status
 http1_proto::error::SuggestedStatus
-http1_proto::error::SuggestedStatus::BadRequest
-http1_proto::error::SuggestedStatus::ContentTooLarge
-http1_proto::error::SuggestedStatus::FieldsTooLarge
-http1_proto::error::SuggestedStatus::NotImplemented
-http1_proto::error::SuggestedStatus::UriTooLong
-http1_proto::error::SuggestedStatus::VersionNotSupported
-http1_proto::error::SuggestedStatus::code
-http1_proto::error::SuggestedStatus::reason
 http1_proto::event
 http1_proto::event::Event
 http1_proto::event::Event::ExchangeAborted
@@ -580,6 +572,7 @@ http1_proto::event::SWITCHED
 http1_proto::event::StartLine
 http1_proto::event::StartLine::Request
 http1_proto::event::StartLine::Status
+http1_proto::grammar
 http1_proto::head
 http1_proto::head::Field
 http1_proto::head::Field.name
@@ -727,6 +720,7 @@ http1_proto::head::view::HeadView::request_line
 http1_proto::head::view::HeadView::start_line_bytes
 http1_proto::macros
 http1_proto::macros::cfg_heap
+http1_proto::media
 http1_proto::validate
 http1_proto::validate::BodyFraming
 http1_proto::validate::BodyFraming::Chunked

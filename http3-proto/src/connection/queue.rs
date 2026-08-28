@@ -297,7 +297,7 @@ pub(crate) const RESET_TOMBSTONE_CAP: usize = RESET_CAP;
 /// counting against QUIC `MAX_STREAMS` — derived from the store capacity — until the
 /// driver reports it closed), so on the heap tiers it is backed by an unbounded
 /// [`Vec`](std::vec::Vec) that simply grows (matching the unbounded slab `StreamStore`),
-/// and on the bare tier by a fixed array that FAILS CLOSED at [`RESET_TOMBSTONE_CAP`]
+/// and on the bare tier by a fixed array that FAILS CLOSED at `RESET_TOMBSTONE_CAP`
 /// (the caller fails the connection — see [`record`](Self::record)). Either way a reset
 /// bidi request id is absorbed, never uni-classified, under any churn until it is closed.
 ///

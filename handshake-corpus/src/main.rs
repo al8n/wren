@@ -174,9 +174,10 @@ mod corpus {
   ///
   /// RFC 9110 §5.2 makes the several lines of one field a single comma-joined
   /// value and §5.3 lets a sender split a list across them; RFC 2616 §2.1's
-  /// `#rule` — the ABNF RFC 6455 states its grammars in — adds that "null
-  /// elements are allowed, but do not contribute to the count of elements
-  /// present". So these are one value written nine ways.
+  /// `#rule` — the ABNF RFC 6455 states its grammars in, and RFC 822 §2.7's
+  /// wording verbatim — adds that "null elements are allowed, but do not
+  /// contribute to the count of elements present". So these are one value
+  /// written nine ways.
   fn one(a: &str) -> Vec<Vec<String>> {
     vec![
       vec![a.into()],

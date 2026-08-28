@@ -116,11 +116,30 @@
 //! will either panic at its size or learn to ignore it; both are worse than
 //! knowing what it actually holds.
 //!
+//! **The backlog is still a check, and it is the only one a FABRICATION can
+//! trip.** An invented sentence matches no spec, so it anchors in nothing, so
+//! it can never be graded — naming an RFC in its block moves it from invisible
+//! to counted and no further. [`UNTRIAGED`] is what makes counted checkable:
+//! the backlog is held to a number PER FILE, so a file that grows one fails,
+//! whatever the total does. **Tripping a fabrication is not the same as
+//! being proof against one**, and the gap is named at that constant rather
+//! than left for a reader to find: what it detects is GROWTH and PLACEMENT,
+//! and what it tracks is triage. What it does not do is read the backlog for
+//! anyone; see that constant for why the numbers are pinned in both directions
+//! and what the count would cost to drive to zero.
+//!
 //! **What this still cannot see**, stated rather than merely being the case:
-//! a quotation so reworded, or so short an excerpt, that its own first
-//! [`ANCHOR_CHARS`] characters match nothing in any loaded spec is beyond
-//! this tool's reach — anchoring is the floor the whole check stands on, and
-//! nothing narrows a spec it cannot even find a foothold in.
+//!
+//! - A quotation so reworded, or so short an excerpt, that its own first
+//!   [`ANCHOR_CHARS`] characters match nothing in any loaded spec is beyond
+//!   this tool's reach — anchoring is the floor the whole check stands on, and
+//!   nothing narrows a spec it cannot even find a foothold in.
+//! - A fabricated span put in the place of a genuine untriaged one INSIDE a
+//!   single file. The file's count does not move, so [`UNTRIAGED`] has nothing
+//!   to disagree with, and the swap is invisible to a run. Pinning the number
+//!   exactly does not close this — a growth-only budget misses the same case,
+//!   and the two are indistinguishable here. What the exact per-file number
+//!   DOES close is a different pair of cases, both named at that constant.
 //!
 //! An ABNF production goes the OTHER way once admitted as a candidate: it is
 //! checked against every loaded spec regardless of citation — see
@@ -238,7 +257,7 @@
 //! `.txt` in the directory is loaded, so adding a spec is adding a file.
 
 use std::{
-  collections::HashSet,
+  collections::{BTreeMap, HashSet},
   fs,
   path::{Path, PathBuf},
   process::Command,
@@ -301,8 +320,116 @@ pub const DEFAULT_DIR: &str = ".rfc-cache";
 /// quoting a dead spec a live one now governs, or a deliberate historical
 /// note; either way, adding an obsolete RFC to make a production pass is the
 /// same shape of bending this gate as loosening the extractor would be.
+///
+/// An RFC belongs here as soon as the workspace has the TEXT of it on disk, not
+/// when a quotation of it first lands. `--fetch` builds the cache CI grades
+/// against, so a spec present in a developer's `.rfc-cache` and absent from
+/// this list grades locally and reports [`Grade::Unloaded`] in CI — the
+/// local-green/CI-red trap this list has already sprung once, over RFC 2046.
+/// RFC 2045 was added here for that reason before anything quoted it.
+///
+/// RFC 822 is here despite being obsolete, and it is not the exception the
+/// paragraph above forbids. RFC 2045 §1 makes it LIVE law for a MIME body
+/// part's header fields — "All of the header fields defined in this document
+/// are subject to the general syntactic rules for header fields specified in
+/// RFC 822." — so `http-semantics` reads a body part's `Content-Type` in RFC
+/// 822's lexical classes, and those productions are gradeable only against RFC
+/// 822's own text. That is the opposite of quoting a dead spec a live one now
+/// governs: the live spec is what sends a reader here.
 const FETCHED: &[u32] = &[
-  3986, 5322, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220,
+  822, 2045, 2046, 3986, 5322, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220,
+];
+
+/// The untriaged backlog, per file, as it stands — and the whole of what makes
+/// that backlog a check rather than a number.
+///
+/// # What this closes
+///
+/// This gate could not fail a FABRICATED quotation, and one shipped. A sentence
+/// invented and attributed to §5.5 matches no cached RFC, so it anchors in
+/// nothing; an unanchored span is at best `unattributable`, which [`run`]
+/// PRINTS and never fails on. Naming the RFC in the block moved such a span
+/// from invisible to counted, and counted is not checked. The module doc admits
+/// the hole in its own words, and this is a PARTIAL fix beside that admission:
+/// it closes the ways such a span can be ADDED or MOVED without the numbers
+/// disagreeing, and the section below names the one it leaves open.
+///
+/// # Why per-file counts rather than a triaged list
+///
+/// Ninety-seven spans is a week of reading, and the module doc says why the
+/// backlog is not a defect list: it holds two different things a human has not
+/// told apart. What can be done without that week is deny it any room to GROW
+/// unnoticed, which is what a fabrication needs when it is ADDED to a file. One
+/// that REPLACES a span needs no room at all; the section below names that case
+/// and says plainly that this table does not close it.
+///
+/// # Pinned exactly, and per FILE — what each half closes, and what neither does
+///
+/// A file's count must EQUAL its entry, and the entries are per file rather
+/// than one workspace total. The two halves close different things:
+///
+/// - **Per file, rather than one total.** Delete a genuine untriaged span in
+///   one file and add a fabricated one in another, and a single workspace
+///   total does not move. Two per-file numbers both do, and the failure names
+///   both files. Cross-file substitution, and any movement of spans between
+///   files, is what this half sees.
+/// - **Exact, rather than a ceiling.** A budget that only fails on growth lets
+///   the backlog SHRINK unrecorded — a span deleted, reworded past the
+///   extractor, or moved into a fence this reads differently, with nothing
+///   saying so. It also makes triage visible: reading a span and repairing or
+///   exempting it reds this gate with the smaller number to write down, which
+///   is the ratchet. It is the discipline `doc-check`'s committed snapshot
+///   already runs on: a number that changed in EITHER direction is a change
+///   someone has to look at.
+///
+/// **What neither half closes: substitution inside ONE file.** Delete a genuine
+/// untriaged span, add a fabricated one in the same file, and the count does
+/// not move — exactly as it would not under a growth-only budget. Requiring the
+/// exact number changes nothing about that case, and the module doc carries the
+/// hole beside the anchoring one.
+///
+/// So, plainly, what this gate IS: a detector of GROWTH and of PLACEMENT, and a
+/// tracker of triage. It is not fabrication-proof, and a green run does not say
+/// that no span in this backlog was invented — only that no file holds a
+/// different number of them than the last person to look wrote down.
+///
+/// A file absent from this table must hold ZERO. That half is enforced only
+/// when the run is not `--include-ignored`, because `docs/` is gitignored: it
+/// exists on a developer's disk and not in CI, so a table listing its files
+/// would be a table CI could never satisfy. The files that ARE listed are
+/// tracked, present in both modes, and checked in both.
+///
+/// Regenerate the numbers from the run's own report: a failure names the file
+/// and both counts.
+const UNTRIAGED: &[(&str, usize)] = &[
+  ("CHANGELOG.md", 5),
+  ("http1-proto/CHANGELOG.md", 1),
+  ("http1-proto/src/body/encode.rs", 4),
+  ("http1-proto/src/body/mod.rs", 5),
+  ("http1-proto/src/connection/inbound.rs", 5),
+  ("http1-proto/src/connection/mod.rs", 10),
+  ("http1-proto/src/connection/outbound.rs", 3),
+  ("http1-proto/src/connection/tests.rs", 9),
+  ("http1-proto/src/connection/tunnel.rs", 8),
+  ("http1-proto/src/event/mod.rs", 3),
+  ("http1-proto/src/head/encode.rs", 3),
+  ("http1-proto/src/head/mod.rs", 1),
+  ("http1-proto/src/head/view.rs", 1),
+  ("http1-proto/src/validate/mod.rs", 1),
+  ("http1-proto/tests/smuggling.rs", 2),
+  ("http3-proto/README.md", 1),
+  ("http3-proto/src/connection/mod.rs", 2),
+  ("websocket-proto/src/handshake/connect.rs", 4),
+  ("websocket-proto/src/handshake/fields.rs", 5),
+  ("websocket-proto/src/handshake/h1/client.rs", 1),
+  ("websocket-proto/src/handshake/h1/server.rs", 6),
+  ("websocket-proto/src/negotiation.rs", 3),
+  ("wren-compio/src/handshake/mod.rs", 1),
+  ("wren-compio/src/handshake/tests.rs", 1),
+  ("wren-reactor/src/handshake/mod.rs", 1),
+  ("wren-reactor/src/handshake/tests.rs", 1),
+  ("xtask/src/handshake_diff.rs", 1),
+  ("xtask/src/quote_check.rs", 3),
 ];
 
 /// How much of a span must be found in a spec for the span to be treated as a
@@ -420,9 +547,14 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   // checkable claim against a loaded spec — same marker, same mechanism as
   // `abnf_exempt`, extended to quotations (Ruling 9).
   let mut quote_exempt = 0usize;
+  // The backlog split by the file it sits in, which is what `UNTRIAGED` is
+  // checked against. The running total above stays as it was: one is the
+  // number the report prints, the other is the number the gate holds.
+  let mut untriaged_by_file: BTreeMap<String, usize> = BTreeMap::new();
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = crate::report::site(source.strip_prefix(&root).unwrap_or(source));
+    let untriaged_before = unattributable;
     let extracted = spans_for(source, &text);
     let (spans, productions) = (extracted.quoted, extracted.productions);
     abnf_skipped += extracted.uncited;
@@ -492,6 +624,9 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
           }
         }
       }
+    }
+    if unattributable > untriaged_before {
+      untriaged_by_file.insert(shown.clone(), unattributable - untriaged_before);
     }
     for (line, production) in productions {
       if exempt.contains(&production) {
@@ -563,9 +698,15 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   // TRIAGE QUEUE, not a defect tally — see the module doc's "Attribution by
   // citation" section for what it holds and why treating it as a defect
   // count is the wrong read.
+  //
+  // It is not only printed. `UNTRIAGED` holds the same spans PER FILE
+  // and `untriaged_drift` fails on any file that differs, which is what makes
+  // a fabricated quotation reachable by this gate at all — see that constant
+  // for the hole it closes and why the numbers are pinned rather than
+  // bounded.
   println!(
     "quote-check: {unattributable} prose-sized spans in blocks citing a loaded spec matched \
-     nothing — untriaged, not failed"
+     nothing — untriaged, and held per file against `UNTRIAGED`"
   );
   // Ruling 11, as Ruling 12 leaves it: printed every run, pass or fail — a
   // coverage claim ("a quotation is graded against the spec it cites") is
@@ -578,7 +719,16 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
      names, {fallback} against any loaded spec (block names no loaded spec)"
   );
 
-  if failures == 0 && abnf_failures == 0 {
+  // The backlog's own gate. Printed above as a total; held to a number here,
+  // per file — see `UNTRIAGED` for why the number is pinned rather than
+  // bounded, and for what a run that could not fail a fabricated quotation
+  // cost.
+  let backlog = untriaged_drift(&untriaged_by_file, UNTRIAGED, include_ignored);
+  for line in &backlog {
+    println!("{line}");
+  }
+
+  if failures == 0 && abnf_failures == 0 && backlog.is_empty() {
     println!(
       "quote-check: {checked} quotations verbatim, {abnf_checked} ABNF productions verbatim"
     );
@@ -595,7 +745,75 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
       "{abnf_failures} of {abnf_checked} ABNF productions are not the spec's own characters"
     ));
   }
+  if !backlog.is_empty() {
+    reasons.push(format!(
+      "{} file(s) hold a different number of untriaged spans than `UNTRIAGED` records",
+      backlog.len()
+    ));
+  }
   Err(reasons.join("; ").into())
+}
+
+/// Every file whose untriaged count differs from the one [`UNTRIAGED`] records,
+/// as the lines [`run`] prints and fails on.
+///
+/// Both directions, and both are reported with the number to write down rather
+/// than with an instruction to think: MORE than recorded is a span this run
+/// could not attribute and no one has looked at — the shape a fabricated
+/// quotation arrives in — and FEWER is triage done, which the table has to be
+/// told about or the ratchet slips back.
+///
+/// `include_ignored` relaxes exactly one half: a file absent from the table is
+/// required to hold zero only when the run scanned the tracked tree alone.
+/// `docs/` is gitignored and quotes the RFCs heavily, so requiring its files to
+/// be listed would make one command check two different sets depending on where
+/// it runs — which is the failure the module doc's "Which files are walked"
+/// section already refuses.
+///
+/// `recorded` is a parameter rather than [`UNTRIAGED`] read directly, for the
+/// reason `doc-check`'s `unclaimed_snapshots` takes its crate list as one: a
+/// unit test needs a table of its own, and a rule that can only be exercised
+/// against this workspace's own 97 spans is a rule nothing checks.
+fn untriaged_drift(
+  counts: &BTreeMap<String, usize>,
+  recorded: &[(&str, usize)],
+  include_ignored: bool,
+) -> Vec<String> {
+  let mut out = Vec::new();
+  for (file, &found) in counts {
+    let recorded = recorded
+      .iter()
+      .find(|(name, _)| *name == file)
+      .map(|(_, count)| *count);
+    match recorded {
+      Some(recorded) if recorded == found => {}
+      Some(recorded) => out.push(format!(
+        "quote-check: {file}: {found} untriaged span(s), `UNTRIAGED` records {recorded} — \
+         {}",
+        if found > recorded {
+          "a span this run could not attribute to any spec it names. Read it: repair the \
+           quotation, mark it `gate-exempt`, or raise the number here once it is known to be \
+           the author's own words"
+        } else {
+          "triage was done and the table was not told. Lower the number here"
+        }
+      )),
+      None if include_ignored => {}
+      None => out.push(format!(
+        "quote-check: {file}: {found} untriaged span(s), and the file is not in `UNTRIAGED` — \
+         a file absent from that table must hold none"
+      )),
+    }
+  }
+  for (file, recorded) in recorded {
+    if !counts.contains_key(*file) {
+      out.push(format!(
+        "quote-check: {file}: 0 untriaged span(s), `UNTRIAGED` records {recorded} — the whole \
+         entry is stale; remove it"
+      ));
+    }
+  }
+  out
 }
 
 /// Every quotation and candidate ABNF production `path`'s contents holds,
@@ -1436,9 +1654,9 @@ fn quoted_spans(block: &str) -> Vec<(usize, &str)> {
 /// built its productions are gone. [`quoted_spans`] would not have found them
 /// either: a production without a terminal carries no `"` at all.
 ///
-/// A span counts when it opens with `name =`, which is what separates an RFC
-/// 5234 rule from a backticked identifier. `=/` (incremental alternatives)
-/// counts too.
+/// A span counts when it opens with `name =` or RFC 2046's `name :=`, which is
+/// what separates a grammar rule from a backticked identifier. `=/`
+/// (incremental alternatives) counts too.
 fn abnf_spans(line: &str) -> Vec<String> {
   let mut out = Vec::new();
   let mut rest = line;
@@ -1456,13 +1674,41 @@ fn abnf_spans(line: &str) -> Vec<String> {
   out
 }
 
-/// Whether `span` opens with an RFC 5234 rule name and a single `=`.
+// The two spans below name the SHAPE this function matches rather than any RFC's
+// rule, and both are production-shaped by construction — this is the tool inside
+// its own corpus, and the marker is the mechanism it documents for exactly that.
+// gate-exempt: name = value — metasyntax for the shape, not a production of any RFC
+// gate-exempt: name := value — the same shape in RFC 2046's spelling
+/// Whether `span` opens with a grammar rule name and a single `=`, optionally
+/// preceded by RFC 2046's `:`.
 ///
 /// Two Rust shapes reach the same first character and neither is assignment:
 /// a comparison (`need == out.len()`) and a match arm (`other => panic!()`).
 /// Requiring the character AFTER the `=` to be neither a second `=` nor a
 /// `>` is what excludes both, while `=/` — RFC 5234's incremental
 /// alternative — still counts, its second character being `/`.
+///
+/// # `:=`, and why the SEPARATOR is the only thing widened
+///
+/// RFC 9110 and its siblings write `name = value`; **RFC 2046 writes
+/// `name := value`**, for all 26 of its productions. §14.6 delegates the
+/// `multipart/byteranges` framing to that RFC and §19.1 lists it as normative,
+/// so this workspace transcribes its rules — `dash-boundary`, `delimiter`,
+/// `close-delimiter`, `transport-padding`, `discard-text`, `body-part`,
+/// `encapsulation`, `boundary`, `bchars` — and every one of them was
+/// hand-checked and ungraded until the `:` was admitted here. An optional `:`
+/// before the `=` is the WHOLE of that change.
+///
+/// Nothing on the right-hand side moved, and that is a ruling rather than a
+/// scope decision: narrowing there was tried and rejected, because any rule
+/// keyed on the right-hand side makes a BROKEN production stop looking like one
+/// too, and a check whose defect makes the item disappear is worse than no
+/// check. [`exempted_spans`] carries that ruling in full, and its marker is
+/// what a production-shaped span that is not a production is answered with.
+///
+/// The `:` is not trimmed away from the `=`: RFC 2046 writes the two adjacent,
+/// so `foo: = bar` is not a production and neither is a Rust path — `Self::x`
+/// puts a second `:` where the `=` would have to be.
 ///
 /// The `=>` half arrived with the fenced-line count, which is where a match
 /// arm turns up: this workspace's two README fences each write one, and a
@@ -1482,7 +1728,9 @@ fn is_production(span: &str) -> bool {
   if name.is_empty() || !name.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
     return false;
   }
-  let mut after_name = trimmed[name.len()..].trim_start().chars();
+  let after_name = trimmed[name.len()..].trim_start();
+  let after_name = after_name.strip_prefix(':').unwrap_or(after_name);
+  let mut after_name = after_name.chars();
   after_name.next() == Some('=') && !matches!(after_name.next(), Some('=' | '>'))
 }
 
@@ -1952,8 +2200,65 @@ fn is_ignored(path: &Path) -> Result<bool, Error> {
 
 #[cfg(test)]
 mod tests {
-  use super::{markdown_quotations, quotations, spans_for};
-  use std::path::Path;
+  use super::{markdown_quotations, quotations, spans_for, untriaged_drift};
+  use std::{collections::BTreeMap, path::Path};
+
+  fn counts(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
+    pairs
+      .iter()
+      .map(|(file, count)| ((*file).to_string(), *count))
+      .collect()
+  }
+
+  // The backlog's gate, in every direction it has one. A fabricated quotation
+  // arrives as the first row and as nothing else — it anchors in no spec, so
+  // no grade can ever reach it — which is why "more than recorded" has to fail
+  // rather than print. The other three rows are what keeps that number honest:
+  // a file whose backlog SHRANK and a table entry with nothing behind it are
+  // both the ratchet slipping, and a file absent from the table holding spans
+  // is the same thing as the first row with the entry left off.
+  #[test]
+  fn the_untriaged_backlog_is_held_in_both_directions() {
+    let table = &[("a.rs", 2), ("b.rs", 1)];
+
+    assert!(untriaged_drift(&counts(&[("a.rs", 2), ("b.rs", 1)]), table, false).is_empty());
+
+    let grown = untriaged_drift(&counts(&[("a.rs", 3), ("b.rs", 1)]), table, false);
+    assert_eq!(grown.len(), 1, "{grown:?}");
+    assert!(grown[0].contains("a.rs: 3 untriaged span(s), `UNTRIAGED` records 2"));
+
+    let shrunk = untriaged_drift(&counts(&[("a.rs", 1), ("b.rs", 1)]), table, false);
+    assert_eq!(shrunk.len(), 1, "{shrunk:?}");
+    assert!(shrunk[0].contains("Lower the number here"));
+
+    let stale = untriaged_drift(&counts(&[("a.rs", 2)]), table, false);
+    assert_eq!(stale.len(), 1, "{stale:?}");
+    assert!(stale[0].contains("the whole entry is stale"));
+  }
+
+  // The one relaxation, and its boundary. `docs/` is gitignored, so a file the
+  // table does not list is required to hold nothing ONLY when the run scanned
+  // the tracked tree — otherwise one command would check two different sets
+  // depending on where it ran. A file the table DOES list is checked either
+  // way, because it is tracked and present in both.
+  #[test]
+  fn an_unlisted_file_is_required_to_hold_none_only_on_the_tracked_tree() {
+    let table = &[("a.rs", 2)];
+    let found = counts(&[("a.rs", 2), ("docs/design.md", 9)]);
+
+    let tracked = untriaged_drift(&found, table, false);
+    assert_eq!(tracked.len(), 1, "{tracked:?}");
+    assert!(tracked[0].contains("docs/design.md"));
+    assert!(tracked[0].contains("not in `UNTRIAGED`"));
+
+    assert!(untriaged_drift(&found, table, true).is_empty());
+
+    // …and the listed file still is, with the ignored tree scanned.
+    let drifted = counts(&[("a.rs", 3), ("docs/design.md", 9)]);
+    let both = untriaged_drift(&drifted, table, true);
+    assert_eq!(both.len(), 1, "{both:?}");
+    assert!(both[0].contains("a.rs"));
+  }
 
   fn spans(source: &str) -> Vec<String> {
     quotations(source)

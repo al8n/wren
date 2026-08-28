@@ -247,8 +247,9 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> Inner<R, Ro, S> {
   }
 
   /// Queues the close handshake: proto encodes the Close (drained into the write
-  /// buffer FIFO, after any queued data); the caller drives [`poll_next`] /
-  /// [`poll_flush`] to put it on the wire and read the echo.
+  /// buffer FIFO, after any queued data); the caller drives
+  /// [`poll_next`](Self::poll_next) / [`poll_flush`](Self::poll_flush) to put it on the
+  /// wire and read the echo.
   fn start_close(&mut self, code: CloseCode, reason: &str) -> Result<(), Error> {
     if let Some(kind) = self.poisoned {
       return Err(Error::Io(kind.into()));
@@ -287,8 +288,10 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> Inner<R, Ro, S> {
   /// Flushes the ordered write buffer to the transport. `Ready(Ok)` once empty;
   /// `Pending` when the transport would block. Polls the transport through the
   /// fan-out `transport_waker` (not the caller's), so transport readiness wakes BOTH
-  /// halves; the caller registers its own task via [`poll_flush_writer`] /
-  /// [`poll_ready_writer`] / the read pump. Takes no `cx` for that reason.
+  /// halves; the caller registers its own task via
+  /// [`poll_flush_writer`](Self::poll_flush_writer) /
+  /// [`poll_ready_writer`](Self::poll_ready_writer) / the read pump. Takes no `cx` for
+  /// that reason.
   fn poll_flush(&mut self) -> Poll<Result<(), Error>> {
     if let Some(kind) = self.poisoned {
       return Poll::Ready(Err(Error::Io(kind.into())));
@@ -343,8 +346,8 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> Inner<R, Ro, S> {
   /// The write half's flush entry point. Registers the caller in the reactor's write
   /// slot BEFORE polling: if the transport signals readiness between the poll and the
   /// register, `AtomicWaker` would forget it (a lost wakeup). Registering first means a
-  /// readiness edge during [`poll_flush`] wakes this already-registered task. A stale
-  /// registration on the `Ready` path is harmless.
+  /// readiness edge during [`poll_flush`](Self::poll_flush) wakes this
+  /// already-registered task. A stale registration on the `Ready` path is harmless.
   fn poll_flush_writer(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
     self.reactor.write.register(cx.waker());
     self.poll_flush()
@@ -370,7 +373,8 @@ impl<R: RuntimeLite, Ro: role::Role, S: Duplex> Inner<R, Ro, S> {
   }
 
   /// The write half's backpressure gate. Registers in the reactor's write slot BEFORE
-  /// polling, for the same register-before-poll reason as [`poll_flush_writer`].
+  /// polling, for the same register-before-poll reason as
+  /// [`poll_flush_writer`](Self::poll_flush_writer).
   fn poll_ready_writer(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
     self.reactor.write.register(cx.waker());
     self.poll_ready()

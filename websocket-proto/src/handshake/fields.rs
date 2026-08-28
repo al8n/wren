@@ -16,8 +16,8 @@
 //! grammar). Questions 2 and 3 are collapsed here: a field is reachable ONLY
 //! through the accessor named for it, that accessor yields the field's COMPLETE
 //! logical value — every occurrence in arrival order — and the only questions
-//! askable of it are the three [`FieldValue`] methods, each with exactly one
-//! implementation in the crate.
+//! askable of it are the three [`FieldValue`](crate::handshake::fields::FieldValue)
+//! methods, each with exactly one implementation in the crate.
 //!
 //! So the gate and the reader cannot answer either question differently,
 //! because neither of them answers it: they read the same accessor, and the
