@@ -19,6 +19,9 @@ http_semantics::auth::AuthParam::name
 http_semantics::auth::AuthParam::value
 http_semantics::auth::ValueSpansFieldLines
 http_semantics::auth::auth_param
+http_semantics::auth::is_token68_byte
+http_semantics::auth::token68
+http_semantics::auth::token68_end
 http_semantics::conditional
 http_semantics::conditional::DateField
 http_semantics::conditional::DateField::Absent

@@ -1,9 +1,18 @@
-//! RFC 9110 §11.2's `auth-param`: the name/value pair every authentication
-//! field in §11 is built out of.
+//! RFC 9110 §11.2's two forms of authentication data: the `auth-param` every
+//! authentication field in §11 is built out of, and the `token68` a credential
+//! may carry in place of a whole list of them.
 //!
 //! ```text
+//! token68    = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
 //! auth-param = token BWS "=" BWS ( token / quoted-string )
 //! ```
+//!
+//! §11.2 says in prose which of the two follows a scheme: "either a
+//! comma-separated list of parameters or a single sequence of characters
+//! capable of holding base64-encoded information". Nothing in
+//! `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` orders the
+//! alternatives, so a recipient is the one that decides, and [`token68`] is
+//! where this module writes that decision down.
 //!
 //! Removing the `BWS` is this module's own work rather than a courtesy to the
 //! sender. §5.6.3: "A recipient MUST parse for such bad whitespace and remove
@@ -272,6 +281,121 @@ fn auth_param(element: &[u8]) -> Result<AuthParam<'_>, AuthError> {
       Some(end) if end == value.len() => Ok(AuthParam { name, value }),
       _ => Err(AuthError::MalformedParameter),
     },
+  }
+}
+
+/// RFC 9110 §11.2's `token68` alphabet: one byte of the run its production
+/// opens with.
+///
+/// ALPHA, DIGIT and `-`, `.`, `_`, `~` are RFC 3986's 66 unreserved URI
+/// characters; `+` and `/` are the two behind them, and §11.2 gives the reason
+/// in as many words — the syntax is sized "so that it can hold a base64,
+/// base64url (URL and filename safe alphabet), base32, or base16 (hex)
+/// encoding, with or without padding, but excluding whitespace".
+///
+/// Neither this set nor §5.6.2's `tchar` contains the other, so a run of these
+/// bytes is not thereby a `token` and a `token` is not thereby one of these:
+/// `/` is here and is no `tchar`, while `!`, `#`, `$`, `%`, `&`, `'`, `*`, `^`,
+/// `` ` `` and `|` are `tchar`s and are not here.
+#[inline]
+const fn is_token68_byte(b: u8) -> bool {
+  matches!(b,
+    b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+}
+
+/// The end of the RFC 9110 §11.2 `token68` starting at `at`, or `None` when
+/// there is not one.
+///
+/// ```text
+/// token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+/// ```
+///
+/// Two runs, in that order, with no way back to the first: the alphabet's,
+/// which `1*` gives a floor of one byte, and the `=` pad, which `*` lets be
+/// empty. So `====` is not a token68 whose run happens to be empty — it is not
+/// a token68 — and `a=b` ends at the `b` rather than reading it as more of the
+/// alphabet.
+///
+/// This is the RUN, and not the reading. Whether the bytes it names are taken
+/// as a `token68` at all is [`token68`]'s question, and the answer is `no` for
+/// every run that stops short of its element's end.
+// No dead-code allowance of its own, unlike its one caller below: the
+// allowance on `token68` makes that function a root the lint walks out from,
+// and this is reachable from there.
+fn token68_end(value: &[u8], at: usize) -> Option<usize> {
+  let mut end = at;
+  while value.get(end).copied().is_some_and(is_token68_byte) {
+    end = end.saturating_add(1);
+  }
+  if end == at {
+    return None;
+  }
+  while value.get(end) == Some(&b'=') {
+    end = end.saturating_add(1);
+  }
+  Some(end)
+}
+
+/// Which of RFC 9110 §11.2's two forms the credential body at `at` takes,
+/// answered as the `token68` when that is the one and `None` when the bytes are
+/// to be read as `#auth-param` instead.
+///
+/// `at` is the first byte after a scheme's `1*SP`. §11.2 puts the choice in
+/// prose — the scheme is followed by "either a comma-separated list of
+/// parameters or a single sequence of characters capable of holding
+/// base64-encoded information" — and §11.3 puts it in the grammar as
+/// `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`, which §11.4
+/// writes again as `credentials`. ABNF's `/` is an unordered choice, so nothing
+/// there orders the two and a recipient decides.
+///
+/// # The rule
+///
+/// The `token68` is taken when its run reaches the end of its own list element:
+/// the end of `value`, or the comma §5.6.1 puts between elements, with the
+/// `OWS` that comma may carry skipped on the way. Anything else is the other
+/// form. `dGVzdA==` and `mF_9.B5f-4.1JqM` are `token68`s by that rule, and
+/// `foo=bar` is not — its pad has token bytes behind it, so the run stops
+/// inside the element instead of ending it.
+///
+/// The end of `value` and that comma are one terminator rather than two: §5.2
+/// joins repeated field lines into one value with a comma, so a run that
+/// reaches the end of ONE line meets the comma next and is read the same way
+/// either way.
+///
+/// At that comma the element is closed and nothing reopens it. A `#challenge`
+/// walk tells a parameter of the CURRENT challenge from the scheme of the next
+/// one by looking past the comma, and asking that question here instead could
+/// change the answer only for an element both forms refuse: `Basic dGVzdA==,
+/// realm=x` has no derivation either way, since `realm=x` is no challenge
+/// without `1*SP` behind its token and `dGVzdA==` is no parameter. What such a
+/// walk is left deciding is therefore which fault to report, never whether a
+/// conforming value is read.
+///
+/// # Why taking it greedily steals nothing
+///
+/// No element this returns `Some` for is an `auth-param`, so answering the run
+/// first can take no reading away from the other form. A run that reaches the
+/// end of its element leaves nothing but `=` behind its first `=`, and
+/// `auth-param = token BWS "=" BWS ( token / quoted-string )` needs a `token`
+/// or a `quoted-string` there: `=` is neither, and the production names a value
+/// rather than admitting nothing at all. `the_two_branches_are_never_both_derivable`
+/// is that argument executed.
+///
+/// The shape worth saying it out loud for is `Scheme foo=`, which reads like a
+/// parameter whose value went missing. It is not one — only the `token68`
+/// derives it — so this answers `foo=` and no fault is reported. An element
+/// that is NEITHER form is left to the parameter reading and refused there,
+/// which is why no `MalformedToken68` exists to report.
+// Dead outside tests: the caller that would put a scheme's `1*SP` behind it is
+// the challenge walk, and this module does not hold one yet.
+#[cfg_attr(not(test), allow(dead_code))]
+fn token68(value: &[u8], at: usize) -> Option<&[u8]> {
+  let end = token68_end(value, at)?;
+  match value.get(skip_ows(value, end)) {
+    // Nothing behind the run inside its own element, so the run IS the
+    // element and the first form is the one taken.
+    None | Some(&b',') => value.get(at..end),
+    Some(_) => None,
   }
 }
 
