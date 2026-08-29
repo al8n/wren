@@ -1497,3 +1497,294 @@ fn the_elements_behind_a_closing_line_are_reached_at_every_entry_point() {
   assert_eq!(second.unwrap().unwrap().name(), b"b");
   assert_eq!(third.unwrap().unwrap().name(), b"c");
 }
+
+// ── RFC 9110 §11.2's one-name-once MUST, and the bound that checks it ────────
+
+/// Sixteen `auth-param`s with sixteen distinct names — exactly what
+/// [`MAX_TRACKED_PARAMS`] slots hold.
+///
+/// A macro rather than a `const` so the same bytes can be `concat!`ed behind an
+/// `auth-scheme` and in front of a seventeenth parameter without being written
+/// twice: a fixture spelled out once per entry point is a fixture that can
+/// drift between them, and what these tests compare is the SAME list read three
+/// ways.
+macro_rules! sixteen_params {
+  () => {
+    "p01=1, p02=2, p03=3, p04=4, p05=5, p06=6, p07=7, p08=8, \
+     p09=9, p10=10, p11=11, p12=12, p13=13, p14=14, p15=15, p16=16"
+  };
+}
+
+/// Sixty-four empty list elements. RFC 9110 §5.6.1.2: "Empty elements do not
+/// contribute to the count of elements present."
+macro_rules! empty_elements {
+  () => {
+    ", , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , \
+     , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , "
+  };
+}
+
+const SIXTEEN: &[u8] = sixteen_params!().as_bytes();
+/// One name past the bound, and a further one behind THAT: the second is what
+/// makes the walk's end assertable rather than borrowed from the input running
+/// out.
+const SEVENTEEN_THEN_ONE_MORE: &[u8] = concat!(sixteen_params!(), ", p17=17, p18=18").as_bytes();
+const SEVENTEEN_WITH_A_REPEAT: &[u8] = concat!(sixteen_params!(), ", P01=99").as_bytes();
+const FLOODED_SIXTEEN: &[u8] = concat!(empty_elements!(), sixteen_params!()).as_bytes();
+
+const SIXTEEN_CHALLENGE: &[u8] = concat!("Basic ", sixteen_params!()).as_bytes();
+const SEVENTEEN_CHALLENGE: &[u8] = concat!("Basic ", sixteen_params!(), ", p17=17").as_bytes();
+const SEVENTEEN_CHALLENGE_WITH_A_REPEAT: &[u8] =
+  concat!("Basic ", sixteen_params!(), ", P01=99").as_bytes();
+const FLOODED_SIXTEEN_CHALLENGE: &[u8] =
+  concat!("Basic ", empty_elements!(), sixteen_params!()).as_bytes();
+
+#[test]
+fn a_parameter_name_occurs_once_per_challenge() {
+  // RFC 9110 §11.2: "Authentication parameters are name/value pairs, where the
+  // name token is matched case-insensitively and each parameter name MUST only
+  // occur once per challenge." The whole challenge is refused rather than the
+  // repeat dropped: a scheme handed one of two `realm`s cannot tell which one
+  // the sender meant, and answering from the first would be a guess.
+  let [fault, past] = walk::<2>([&br#"Basic realm="x", realm="y""#[..]]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert!(past.is_none());
+
+  // Names that differ by more than case are two parameters and not a repeat.
+  let credential = one([&br#"Basic realm="x", realmm="y""#[..]]);
+  assert_eq!(
+    names::<3>(&credential),
+    [Some(&b"realm"[..]), Some(b"realmm"), None]
+  );
+}
+
+#[test]
+fn a_repeated_name_is_matched_case_insensitively() {
+  // The fold is RFC 9110 §11.2's own sentence: the name token "is matched
+  // case-insensitively", in the same breath as the MUST it governs. A reader
+  // comparing the sender's bytes would call these two parameters.
+  for value in [
+    &br#"Basic realm="x", REALM="y""#[..],
+    br#"Basic Realm="x", rEaLm="y""#,
+    br#"Basic REALM="x", realm="y""#,
+  ] {
+    let [fault, past] = walk::<2>([value]);
+    assert_eq!(
+      fault.unwrap().unwrap_err(),
+      AuthError::DuplicateParameter,
+      "{value:?}"
+    );
+    assert!(past.is_none(), "{value:?}");
+  }
+}
+
+#[test]
+fn the_rule_is_per_list_and_not_per_field_value() {
+  // "per challenge" is where RFC 9110 §11.2 DOES scope the rule, so two
+  // challenges of one `WWW-Authenticate` value carrying the same name are two
+  // challenges and not a repeat. §11.4 has a user agent choose among them by
+  // their schemes, and a rule applied across the value would refuse the pair
+  // that choice is for.
+  let [basic, newauth, past] = walk::<3>([&br#"Basic realm="x", Newauth realm="y""#[..]]);
+  assert!(past.is_none());
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(names::<2>(&basic), [Some(&b"realm"[..]), None]);
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert_eq!(names::<2>(&newauth), [Some(&b"realm"[..]), None]);
+}
+
+#[test]
+fn the_duplicate_rule_holds_at_every_entry_point() {
+  // §11.2 writes the rule for a CHALLENGE. Applying it to a `credentials`
+  // value and to an `Authentication-Info` list is this module's ruling rather
+  // than the RFC's wording — `AuthError::DuplicateParameter` records the
+  // argument — and this is that ruling executed at all three entry points.
+  let [fault, past] = walk::<2>([&b"Basic a=1, A=2"[..]]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert!(past.is_none());
+
+  assert_eq!(
+    credentials(b"Basic a=1, A=2").unwrap_err(),
+    AuthError::DuplicateParameter
+  );
+
+  // The bare `#auth-param` field has no challenge for the wording to scope the
+  // rule to, and is where the extension does the most work. A parameter is
+  // written BEHIND the repeat so the walk's end is asserted rather than
+  // borrowed from the input running out: `one_fault_ends_the_parameter_walk`
+  // is the rule, and a fault that left the walk running would hand `b=3` over
+  // as though the list had been read.
+  let [first, fault, past, further] = info::<4>([&b"a=1, A=2, b=3"[..]]);
+  assert_eq!(first.unwrap().unwrap().name(), b"a");
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert!(past.is_none());
+  assert!(further.is_none());
+}
+
+#[test]
+fn a_failed_name_does_not_stop_the_challenge_walk() {
+  // The boundaries either side of a repeat are still known, so §11.4's choice
+  // among challenges survives one that cannot be read — the same rule every
+  // fault but `InvalidQuotedString` is met with.
+  let [fault, newauth, past] = walk::<3>([&br#"Basic realm="x", realm="y", Newauth c=1"#[..]]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert_eq!(names::<2>(&newauth), [Some(&b"c"[..]), None]);
+  assert!(past.is_none());
+}
+
+#[test]
+fn a_repeat_across_a_field_line_join_is_still_a_repeat() {
+  // RFC 9110 §5.2 makes the two lines one value with a comma at the join, so
+  // the second `a` is another element of the SAME list rather than the start
+  // of a second one.
+  let [fault, past] = walk::<2>([&b"Basic a=1"[..], b"a=2"]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert!(past.is_none());
+
+  let [first, fault, past, further] = info::<4>([&b"a=1"[..], b"a=2, b=3"]);
+  assert_eq!(first.unwrap().unwrap().name(), b"a");
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert!(past.is_none());
+  assert!(further.is_none());
+}
+
+#[test]
+fn exactly_the_tracked_count_fits() {
+  // The fixtures are sized off the published constant.
+  assert_eq!(MAX_TRACKED_PARAMS, 16);
+
+  let credential = one([SIXTEEN_CHALLENGE]);
+  assert_eq!(credential.params().count(), MAX_TRACKED_PARAMS);
+  assert_eq!(credentials(SIXTEEN_CHALLENGE).unwrap().params().count(), 16);
+
+  let mut count = 0;
+  for param in auth_info([SIXTEEN]) {
+    param.expect("sixteen distinct names fit");
+    count += 1;
+  }
+  assert_eq!(count, MAX_TRACKED_PARAMS);
+}
+
+#[test]
+fn one_parameter_past_the_bound_is_refused_and_not_left_unchecked() {
+  // Nothing in this list is malformed and §11.2 bounds it nowhere, so this is
+  // a refusal meeting conforming input — which `MAX_TRACKED_PARAMS` says in as
+  // many words. The alternative it rules out is worse than a refusal: a walk
+  // that stopped CHECKING at the last slot would hand back a list it never
+  // established was duplicate-free.
+  let [fault, past] = walk::<2>([SEVENTEEN_CHALLENGE]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::TooManyParameters);
+  assert!(past.is_none());
+
+  assert_eq!(
+    credentials(SEVENTEEN_CHALLENGE).unwrap_err(),
+    AuthError::TooManyParameters
+  );
+
+  // The streaming walk hands over the sixteen it recorded and then refuses,
+  // ending the walk exactly as every other fault on this path does —
+  // `one_fault_ends_the_parameter_walk` is that rule for the other faults and
+  // this is it for these two. An eighteenth parameter stands BEHIND the
+  // refusal and the loop does not break, so the walk's end is asserted rather
+  // than borrowed from the input running out: a refusal that left the walk
+  // running would hand `p18` over out of a list it had just declared it could
+  // not check.
+  let mut yielded = 0;
+  let mut refusals = 0;
+  let mut past = 0;
+  for param in auth_info([SEVENTEEN_THEN_ONE_MORE]) {
+    match param {
+      Ok(_) if refusals == 0 => yielded += 1,
+      Err(AuthError::TooManyParameters) if refusals == 0 => refusals += 1,
+      _ => past += 1,
+    }
+  }
+  assert_eq!(yielded, MAX_TRACKED_PARAMS);
+  assert_eq!(refusals, 1);
+  assert_eq!(past, 0, "the walk went on past its own refusal");
+}
+
+#[test]
+fn a_repeat_at_the_bound_is_reported_as_the_repeat_it_is() {
+  // The seventeenth name is `P01`, which folds onto the first slot. Every name
+  // before it went INTO a slot — the bound refuses rather than skipping — so
+  // the repeat is proven and the fault the sender committed is the one
+  // reported, rather than this reader's own limit.
+  let [fault, past] = walk::<2>([SEVENTEEN_CHALLENGE_WITH_A_REPEAT]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert!(past.is_none());
+
+  assert_eq!(
+    credentials(SEVENTEEN_CHALLENGE_WITH_A_REPEAT).unwrap_err(),
+    AuthError::DuplicateParameter
+  );
+
+  let mut fault = None;
+  for param in auth_info([SEVENTEEN_WITH_A_REPEAT]) {
+    if let Err(e) = param {
+      fault = Some(e);
+      break;
+    }
+  }
+  assert_eq!(fault, Some(AuthError::DuplicateParameter));
+}
+
+#[test]
+fn a_challenge_past_the_tracking_bound_is_refused_and_the_next_one_is_read() {
+  // A refusal costs the challenge that earned it and nothing behind it, so
+  // §11.4's choice still reaches the scheme after it.
+  let [fault, newauth, past] =
+    walk::<3>([SEVENTEEN_CHALLENGE, b"Newauth realm=\"r\", nonce=\"n\""]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::TooManyParameters);
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert_eq!(
+    names::<3>(&newauth),
+    [Some(&b"realm"[..]), Some(b"nonce"), None]
+  );
+  assert!(past.is_none());
+}
+
+#[test]
+fn a_comma_flood_is_not_too_many_parameters() {
+  // The distinctive claim of the bound: the empty elements accepted here are
+  // UNBOUNDED and spend no slot. RFC 9110 §5.6.1.2's "reasonable number"
+  // governs EMPTY elements while `MAX_TRACKED_PARAMS` bounds the names a
+  // duplicate check records, so a flood is refused only once it carries that
+  // many real parameters, however many empties preceded them. This is the
+  // position `a_comma_flood_is_not_too_many_tags` pins for the crate's other
+  // bound, extended to this one — an implementation counting empties against
+  // the slots passes every list above and fails here.
+  let credential = one([FLOODED_SIXTEEN_CHALLENGE]);
+  assert_eq!(credential.params().count(), MAX_TRACKED_PARAMS);
+
+  assert_eq!(
+    credentials(FLOODED_SIXTEEN_CHALLENGE)
+      .unwrap()
+      .params()
+      .count(),
+    MAX_TRACKED_PARAMS
+  );
+
+  let mut count = 0;
+  for param in auth_info([FLOODED_SIXTEEN]) {
+    param.expect("an empty element spends no slot");
+    count += 1;
+  }
+  assert_eq!(count, MAX_TRACKED_PARAMS);
+}
+
+#[test]
+fn a_token68_credential_spends_no_slot() {
+  // §11.2's two alternatives are exclusive, so the branch that takes no list
+  // records no name — which is what `MAX_TRACKED_PARAMS` says it does not
+  // count. A `token68` long enough to have been many parameters is still one
+  // value.
+  let credential = credentials(b"Basic bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb==").unwrap();
+  assert!(credential.token68().is_some());
+  assert_eq!(credential.params().count(), 0);
+}

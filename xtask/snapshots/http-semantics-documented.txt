@@ -15,6 +15,7 @@ http_semantics::auth::AuthError::UnterminatedQuotedString
 http_semantics::auth::AuthInfo
 http_semantics::auth::AuthInfo.done
 http_semantics::auth::AuthInfo.exhausted
+http_semantics::auth::AuthInfo.seen
 http_semantics::auth::AuthInfo<I>::element
 http_semantics::auth::AuthInfo<I>::next_line
 http_semantics::auth::AuthParam
@@ -48,6 +49,7 @@ http_semantics::auth::Credential::scheme
 http_semantics::auth::Credential::scheme_is
 http_semantics::auth::Credential::token68
 http_semantics::auth::MAX_CHALLENGE_LINES
+http_semantics::auth::MAX_TRACKED_PARAMS
 http_semantics::auth::ParamWalk
 http_semantics::auth::ParamWalk.at
 http_semantics::auth::ParamWalk.line
@@ -65,6 +67,11 @@ http_semantics::auth::Section.overrun
 http_semantics::auth::Section.start
 http_semantics::auth::Section::opening_at
 http_semantics::auth::Section::spend
+http_semantics::auth::SeenNames
+http_semantics::auth::SeenNames.len
+http_semantics::auth::SeenNames.names
+http_semantics::auth::SeenNames::new
+http_semantics::auth::SeenNames::record
 http_semantics::auth::Step
 http_semantics::auth::Step::Element
 http_semantics::auth::Step::Element.after_comma

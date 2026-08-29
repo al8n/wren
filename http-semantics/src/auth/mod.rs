@@ -55,6 +55,14 @@
 //! arrive as separate lines. [`Credential`] therefore names a region per line,
 //! [`MAX_CHALLENGE_LINES`] bounds how many, and [`AuthParamIter`] reads the
 //! boundary between two of them as the comma §5.2 put there.
+//!
+//! # One name, once
+//!
+//! RFC 9110 §11.2 puts a MUST on the names in a parameter list, and all three
+//! entry points here check it. [`AuthError::DuplicateParameter`] carries the
+//! rule, the case fold it is compared under, and the ruling that decides which
+//! lists it is applied to; [`MAX_TRACKED_PARAMS`] carries the bound that
+//! checking it needs, and what happens at that bound.
 // gate-exempt: realm = "x" — one field value shown in prose, carrying the BWS
 // this module accepts; not a production of any RFC.
 // gate-exempt: crate::validator — named for contrast: §8.8.3's `opaque-tag` is
@@ -105,6 +113,56 @@ use crate::grammar::{
 /// A parse-constant rather than a caller-set knob: the storage is in the
 /// binary, so a caller cannot raise it.
 pub const MAX_CHALLENGE_LINES: usize = 16;
+
+/// How many `auth-param` names one parameter list may carry while RFC 9110
+/// §11.2's one-name-once MUST is checked over it.
+///
+/// That MUST is checked against the names already read — "each parameter name
+/// MUST only occur once per challenge" is a statement about the list so far —
+/// and a reader that borrows its input and allocates nothing holds those names
+/// in a fixed array of this many slots. §11.2 puts no bound on `#auth-param`,
+/// so this is a bound of the WALK and not of the grammar.
+///
+/// Sixteen, and the measurement behind the number is the storage: a slot is a
+/// `&[u8]`, 16 bytes on a 64-bit target, so the record is 256 bytes — on the
+/// stack while a [`Credential`] is validated, and inside the walk
+/// [`auth_info`] hands back for as long as its caller holds it. It sits above
+/// the parameter lists that occur: the largest in wide use are Digest's,
+/// roughly nine parameters in a challenge and a dozen in the credential that
+/// answers one.
+///
+/// # A refusal, and not a cap
+///
+/// One parameter past this many is [`AuthError::TooManyParameters`], and the
+/// list is refused rather than read with the MUST left unchecked past the last
+/// name that fit. Nothing about such a list is malformed — §11.2 bounds it
+/// nowhere — so **this is a refusal that can meet conforming input**: a sender
+/// that writes seventeen distinct parameters has written something the grammar
+/// allows and this recipient will not read. The alternative is worse than a
+/// refusal rather than merely different, which is why the bound is drawn here
+/// at all: a walk that stopped CHECKING at the last slot would hand back a
+/// list it never established was duplicate-free, and a repeat sitting past
+/// that slot would be a MUST silently un-enforced. That is the trade
+/// [`MAX_TAGS`](crate::validator::MAX_TAGS) already made in this crate, in the
+/// same words, and [`MAX_CHALLENGE_LINES`] makes again a line at a time.
+///
+/// # What it does not count
+///
+/// Empty list elements spend no slot. RFC 9110 §5.6.1.2 opens "Empty elements
+/// do not contribute to the count of elements present.", so a comma flood is
+/// refused only once it carries this many real parameters, however many empty
+/// elements arrived beside them — `a_comma_flood_is_not_too_many_parameters`
+/// is that sentence made executable, in the position
+/// `a_comma_flood_is_not_too_many_tags` already pins for the crate's other
+/// bound.
+///
+/// Nor does it count a credential whose body took §11.2's other alternative. A
+/// `token68` is not a list and holds no name to repeat, so
+/// [`Credential::params`] is empty for one and no slot is ever spent.
+///
+/// A parse-constant rather than a caller-set knob: the storage is in the
+/// binary, so a caller cannot raise it.
+pub const MAX_TRACKED_PARAMS: usize = 16;
 
 /// Why an RFC 9110 §11 authentication field could not be read.
 ///
@@ -185,14 +243,42 @@ pub enum AuthError {
   /// parameters are name/value pairs, where the name token is matched
   /// case-insensitively and each parameter name MUST only occur once per
   /// challenge."
+  ///
+  /// The fold is that sentence's own: the name is a `token`, the same sentence
+  /// matches it case-insensitively, and so `realm` repeated as `Realm` is the
+  /// repeat this reports rather than a second parameter.
+  ///
+  /// # Which lists the rule is applied to, which is this module's ruling
+  ///
+  /// §11.2 writes it "per challenge", and that WORDING covers one of the three
+  /// parameter lists §11 defines. Extending it to the other two is this
+  /// module's decision and not the RFC's text, and it is recorded here rather
+  /// than left to look like a quotation:
+  ///
+  /// - A [`credentials`] value is `auth-scheme [ 1*SP ( token68 / #auth-param ) ]`,
+  ///   the same production §11.3 names a challenge, written for a request. A
+  ///   scheme that cannot make sense of one name twice in a 401 cannot make
+  ///   sense of it twice in the `Authorization` answering that 401.
+  /// - An [`auth_info`] value is a bare `#auth-param` with no challenge around
+  ///   it for the wording to scope the rule to. Reading the sentence as
+  ///   literally as its words allow would leave that field's repeats
+  ///   unreported, which is a narrower green than "one name, once" — so the
+  ///   rule is applied to each of its lists as it is to a challenge's.
+  ///
+  /// What it is NOT applied across is two lists. Two challenges of one
+  /// `WWW-Authenticate` value each carrying `realm` are two challenges and not
+  /// a repeat, because "per challenge" is where §11.2 does scope the rule and
+  /// §11.4 has a user agent choose between challenges by their schemes.
   #[error("a parameter name occurs more than once")]
   DuplicateParameter,
-  /// More parameters in one list than the names a duplicate check can hold, so
-  /// the list is refused rather than left unchecked past the last one it could
-  /// record.
+  /// More parameters in one list than the [`MAX_TRACKED_PARAMS`] names a
+  /// duplicate check can hold, so the list is refused rather than left
+  /// unchecked past the last one it could record.
   ///
-  /// Nothing here is malformed — §11.2 bounds the list nowhere — so this names
-  /// a limit of a no-alloc reader rather than a fault the sender committed.
+  /// Nothing here is malformed — RFC 9110 §11.2 bounds the list nowhere — so
+  /// this names a limit of a no-alloc reader rather than a fault the sender
+  /// committed. That constant carries the storage the number is measured from,
+  /// and says in its own words that it is a refusal and not a cap.
   #[error("more parameters than this recipient can track")]
   TooManyParameters,
 }
@@ -554,8 +640,10 @@ impl<'a> Credential<'a> {
   /// # Errors
   ///
   /// Whatever the parameter list carries: [`AuthError::MalformedParameter`],
-  /// [`AuthError::UnterminatedQuotedString`] or
-  /// [`AuthError::InvalidQuotedString`].
+  /// [`AuthError::UnterminatedQuotedString`],
+  /// [`AuthError::InvalidQuotedString`], [`AuthError::DuplicateParameter`] for
+  /// RFC 9110 §11.2's one-name-once MUST, and
+  /// [`AuthError::TooManyParameters`] past [`MAX_TRACKED_PARAMS`] names.
   fn read(scheme: &'a [u8], body: BodyLines<'a>) -> Result<Self, AuthError> {
     // §11.2's two alternatives are exclusive, and the `token68` is taken only
     // when it is the WHOLE body. `token68` answers for one element, where a
@@ -572,9 +660,14 @@ impl<'a> Credential<'a> {
       _ => None,
     };
     if token.is_none() {
+      // The one place a credential's parameter names are collected, because it
+      // is the one place its whole list is walked before the value exists.
+      // §11.2's MUST is a property of the LIST, so a check made where a caller
+      // reads one parameter at a time could only ever answer it late.
+      let mut seen = SeenNames::new();
       let mut walk = ParamWalk::over(body);
       while let Some(param) = walk.step() {
-        param?;
+        seen.record(param?.name())?;
       }
     }
     Ok(Self {
@@ -700,6 +793,73 @@ impl<'a> BodyLines<'a> {
   /// The region at `at`, or no bytes when there is not one.
   fn line(&self, at: usize) -> &'a [u8] {
     self.lines.get(at).copied().unwrap_or_default()
+  }
+}
+
+/// The `auth-param` names one parameter list has used, as far as the walk over
+/// it has read.
+///
+/// RFC 9110 §11.2: "Authentication parameters are name/value pairs, where the
+/// name token is matched case-insensitively and each parameter name MUST only
+/// occur once per challenge." Answering that needs the names already seen, a
+/// reader that allocates nothing holds them in [`MAX_TRACKED_PARAMS`] slots,
+/// and that is the whole reason the bound exists — see the constant for what
+/// happens at it.
+///
+/// One record per list. A [`Credential`]'s is built and spent inside
+/// [`Credential::read`]; [`auth_info`]'s walk carries its own across the
+/// parameters it hands out one at a time.
+#[derive(Debug, Clone)]
+struct SeenNames<'a> {
+  /// Empty past `len`.
+  names: [&'a [u8]; MAX_TRACKED_PARAMS],
+  /// How many slots the list has spent.
+  len: usize,
+}
+
+impl<'a> SeenNames<'a> {
+  /// A record of no names: where every parameter list starts.
+  const fn new() -> Self {
+    Self {
+      names: [&[]; MAX_TRACKED_PARAMS],
+      len: 0,
+    }
+  }
+
+  /// Takes one parameter's name, reporting the second occurrence of one.
+  ///
+  /// # Errors
+  ///
+  /// [`AuthError::DuplicateParameter`] when `name` is one already recorded,
+  /// folded as RFC 9110 §11.2 matches it; [`AuthError::TooManyParameters`]
+  /// when it is not one and there is no slot left to record it in.
+  ///
+  /// **The duplicate is asked first**, so a list one past the bound whose next
+  /// name repeats a recorded one is answered with the fault the SENDER
+  /// committed rather than with this reader's own limit. The repeat is proven
+  /// and not guessed at when that happens: the bound refuses rather than
+  /// skipping, so every name before it went into a slot and the record the
+  /// comparison runs over is the whole list so far. The crate's other
+  /// two-fault record orders its own the same way and for the same reason —
+  /// a `TagList` asks about `*` before it asks whether an element parses,
+  /// lest the caller be told which fault it was by whichever check ran first.
+  fn record(&mut self, name: &'a [u8]) -> Result<(), AuthError> {
+    // The slots past `len` hold no name rather than an empty one — a `token`
+    // has at least one byte, so nothing a caller can send matches them — and
+    // the prefix is taken to say that rather than to make it true.
+    let used = self.names.get(..self.len).unwrap_or_default();
+    if used.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+      return Err(AuthError::DuplicateParameter);
+    }
+    // The slot lookup IS the bound: `None` means this name is the
+    // `MAX_TRACKED_PARAMS + 1`th, which is the refusal that constant
+    // documents.
+    let Some(slot) = self.names.get_mut(self.len) else {
+      return Err(AuthError::TooManyParameters);
+    };
+    *slot = name;
+    self.len = self.len.saturating_add(1);
+    Ok(())
   }
 }
 
@@ -1058,9 +1218,17 @@ where
 /// `1*SP` nor the end of the value, or where `1*SP` is followed by the HTAB no
 /// rule puts there; and whatever the body carries —
 /// [`AuthError::MalformedParameter`],
-/// [`AuthError::UnterminatedQuotedString`] or
-/// [`AuthError::InvalidQuotedString`]. One `Result` and nothing behind it:
-/// there is one credential in the field, so there is nothing to continue to.
+/// [`AuthError::UnterminatedQuotedString`],
+/// [`AuthError::InvalidQuotedString`], [`AuthError::DuplicateParameter`] for
+/// RFC 9110 §11.2's one-name-once MUST, applied to this field's list for the
+/// reason that variant records, and [`AuthError::TooManyParameters`] past
+/// [`MAX_TRACKED_PARAMS`] names. One `Result` and nothing behind it: there is
+/// one credential in the field, so there is nothing to continue to, and a
+/// fault anywhere in it refuses the whole value rather than a part of it.
+///
+/// Not [`AuthError::ChallengeSpansTooManyLines`], which needs a second field
+/// line to be reachable at all: this field's value is one, and the reader
+/// beneath is handed exactly that one.
 #[inline]
 pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
   read_credential([value])
@@ -1145,6 +1313,21 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// Validation is eager — a challenge is walked to its end before it is yielded
 /// — which is what lets [`Credential::params`] be infallible and what lets one
 /// walk go on after a fault at all.
+///
+/// # Errors
+///
+/// A yielded `Err` is [`AuthError::MissingScheme`] for an element with bytes
+/// and no leading `token`; [`AuthError::MalformedScheme`] for one whose token
+/// the challenge grammar cannot continue from;
+/// [`AuthError::ChallengeSpansTooManyLines`] past [`MAX_CHALLENGE_LINES`];
+/// [`AuthError::DuplicateParameter`] for RFC 9110 §11.2's one-name-once MUST,
+/// which is per challenge here and so is NOT reported of two challenges that
+/// carry the same name; [`AuthError::TooManyParameters`] past
+/// [`MAX_TRACKED_PARAMS`] names in one of them; and whatever else that
+/// challenge's parameter list carries —
+/// [`AuthError::MalformedParameter`], [`AuthError::UnterminatedQuotedString`]
+/// or [`AuthError::InvalidQuotedString`]. One per challenge, and the section
+/// above says which of them the walk continues past.
 #[inline]
 pub fn challenges<'a, I>(lines: I) -> impl Iterator<Item = Result<Credential<'a>, AuthError>>
 where
@@ -1567,6 +1750,10 @@ where
 /// bounded by it: a list spread over more lines than a challenge may occupy is
 /// read rather than refused.
 ///
+/// A bound on the PARAMETERS is a different question and this walk does carry
+/// one: [`MAX_TRACKED_PARAMS`], for the record RFC 9110 §11.2's one-name-once
+/// MUST is checked against. Lines are unbounded here and names are not.
+///
 /// # A trailer's lines, which are field lines
 ///
 /// RFC 9110 §11.6.3: "Authentication-Info can be sent as a trailer field
@@ -1602,7 +1789,18 @@ where
 /// `auth-scheme` and its parameters are, read as one element of this field;
 /// [`AuthError::UnterminatedQuotedString`] for a string still open when the
 /// last field line ended; [`AuthError::InvalidQuotedString`] for a byte §5.6.4
-/// forbids inside one.
+/// forbids inside one; [`AuthError::DuplicateParameter`] for RFC 9110 §11.2's
+/// one-name-once MUST, applied to this field's list for the reason that
+/// variant records; and [`AuthError::TooManyParameters`] past
+/// [`MAX_TRACKED_PARAMS`] names.
+///
+/// The last two are reported AT the parameter that broke the rule, which is
+/// where this walk differs from the other two entry points rather than in the
+/// rule it applies. A [`Credential`] is validated whole before it exists, so a
+/// repeat anywhere in it refuses the whole credential; here the parameters in
+/// front of the repeat were already handed over, and what the fault says is
+/// that the walk ends there — the same thing every other fault on this path
+/// says, and the reason none of them is silently dropped.
 #[inline]
 pub fn auth_info<'a, I>(lines: I) -> impl Iterator<Item = Result<AuthParam<'a>, AuthError>>
 where
@@ -1616,6 +1814,7 @@ where
     at: 0,
     exhausted: false,
     done: false,
+    seen: SeenNames::new(),
   }
 }
 
@@ -1631,6 +1830,11 @@ struct AuthInfo<'a, I> {
   /// A fault was reported, or the value ran out. Either way there is no
   /// further parameter to hand over.
   done: bool,
+  /// The names this field's list has already used, for RFC 9110 §11.2's
+  /// one-name-once MUST. [`MAX_TRACKED_PARAMS`] slots, which is the bulk of
+  /// this walk's size and is paid by whoever holds the iterator; that constant
+  /// carries the measurement.
+  seen: SeenNames<'a>,
 }
 
 impl<'a, I> Iterator for AuthInfo<'a, I>
@@ -1692,8 +1896,10 @@ where
   /// # Errors
   ///
   /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
-  /// quoted-string, and whatever [`auth_param`] makes of the element. Any of
-  /// them ends the walk.
+  /// quoted-string, whatever [`auth_param`] makes of the element, and
+  /// [`AuthError::DuplicateParameter`] or [`AuthError::TooManyParameters`]
+  /// from the record of names this field's list has already used. Any of them
+  /// ends the walk.
   fn element(&mut self) -> Result<AuthParam<'a>, AuthError> {
     let head = self.line;
     let start = self.at;
@@ -1737,7 +1943,15 @@ where
     }
 
     let element = head.get(start..head_end).unwrap_or_default();
-    let param = auth_param(element, tail);
+    let mut param = auth_param(element, tail);
+    // RFC 9110 §11.2's one-name-once MUST, over the list this field IS. The
+    // record is the walk's rather than the element's, because the rule is
+    // about the list and a single element cannot see one.
+    if let Ok(read) = param
+      && let Err(repeat) = self.seen.record(read.name())
+    {
+      param = Err(repeat);
+    }
     if param.is_err() {
       self.done = true;
     }
