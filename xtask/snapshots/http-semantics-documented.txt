@@ -49,7 +49,7 @@ http_semantics::auth::Credential::scheme
 http_semantics::auth::Credential::scheme_is
 http_semantics::auth::Credential::token68
 http_semantics::auth::MAX_CHALLENGE_LINES
-http_semantics::auth::MAX_TRACKED_PARAMS
+http_semantics::auth::MAX_PARAMS_PER_CREDENTIAL
 http_semantics::auth::ParamWalk
 http_semantics::auth::ParamWalk.at
 http_semantics::auth::ParamWalk.line

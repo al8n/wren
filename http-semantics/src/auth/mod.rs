@@ -61,7 +61,7 @@
 //! RFC 9110 §11.2 puts a MUST on the names in a parameter list, and all three
 //! entry points here check it. [`AuthError::DuplicateParameter`] carries the
 //! rule, the case fold it is compared under, and the ruling that decides which
-//! lists it is applied to; [`MAX_TRACKED_PARAMS`] carries the bound that
+//! lists it is applied to; [`MAX_PARAMS_PER_CREDENTIAL`] carries the bound that
 //! checking it needs, and what happens at that bound.
 // gate-exempt: realm = "x" — one field value shown in prose, carrying the BWS
 // this module accepts; not a production of any RFC.
@@ -162,7 +162,7 @@ pub const MAX_CHALLENGE_LINES: usize = 16;
 ///
 /// A parse-constant rather than a caller-set knob: the storage is in the
 /// binary, so a caller cannot raise it.
-pub const MAX_TRACKED_PARAMS: usize = 16;
+pub const MAX_PARAMS_PER_CREDENTIAL: usize = 16;
 
 // What the slot counts cost, checked at module scope so that every `cargo
 // check` on every tier enforces it. A `#[test]` would assert it only where a
@@ -188,12 +188,12 @@ pub const MAX_TRACKED_PARAMS: usize = 16;
 // round `Credential` to 296. On a 32-bit one a slice is 8, so the array is 128,
 // `BodyLines` is 132, and `Credential` is 148.
 //
-// `MAX_TRACKED_PARAMS` is the same 16 and buys that array a second time in
+// `MAX_PARAMS_PER_CREDENTIAL` is the same 16 and buys that array a second time in
 // `SeenNames`, which is NOT in these figures: that record is spent inside
 // `Credential::read`, and the copy `auth_info`'s walk carries lives there
 // rather than in any `Credential`. The two constants being equal is why the
 // one number reads like the other's, and the storage is separate: neither of
-// these figures follows from `MAX_TRACKED_PARAMS`.
+// these figures follows from `MAX_PARAMS_PER_CREDENTIAL`.
 //
 // An `AuthParam` is two slices and nothing else: 32 on a 64-bit target, 16 on a
 // 32-bit one. An `AuthError` is eight fieldless variants, so one byte holds the
@@ -320,7 +320,7 @@ pub enum AuthError {
   /// §11.4 has a user agent choose between challenges by their schemes.
   #[error("a parameter name occurs more than once")]
   DuplicateParameter,
-  /// More parameters in one list than the [`MAX_TRACKED_PARAMS`] names a
+  /// More parameters in one list than the [`MAX_PARAMS_PER_CREDENTIAL`] names a
   /// duplicate check can hold, so the list is refused rather than left
   /// unchecked past the last one it could record.
   ///
@@ -695,7 +695,7 @@ impl<'a> Credential<'a> {
   /// [`AuthError::UnterminatedQuotedString`],
   /// [`AuthError::InvalidQuotedString`], [`AuthError::DuplicateParameter`] for
   /// RFC 9110 §11.2's one-name-once MUST, and
-  /// [`AuthError::TooManyParameters`] past [`MAX_TRACKED_PARAMS`] names.
+  /// [`AuthError::TooManyParameters`] past [`MAX_PARAMS_PER_CREDENTIAL`] names.
   fn read(scheme: &'a [u8], body: BodyLines<'a>) -> Result<Self, AuthError> {
     // §11.2's two alternatives are exclusive, and the `token68` is taken only
     // when it is the WHOLE body. `token68` answers for one element, where a
@@ -854,7 +854,7 @@ impl<'a> BodyLines<'a> {
 /// RFC 9110 §11.2: "Authentication parameters are name/value pairs, where the
 /// name token is matched case-insensitively and each parameter name MUST only
 /// occur once per challenge." Answering that needs the names already seen, a
-/// reader that allocates nothing holds them in [`MAX_TRACKED_PARAMS`] slots,
+/// reader that allocates nothing holds them in [`MAX_PARAMS_PER_CREDENTIAL`] slots,
 /// and that is the whole reason the bound exists — see the constant for what
 /// happens at it.
 ///
@@ -864,7 +864,7 @@ impl<'a> BodyLines<'a> {
 #[derive(Debug, Clone)]
 struct SeenNames<'a> {
   /// Empty past `len`.
-  names: [&'a [u8]; MAX_TRACKED_PARAMS],
+  names: [&'a [u8]; MAX_PARAMS_PER_CREDENTIAL],
   /// How many slots the list has spent.
   len: usize,
 }
@@ -873,7 +873,7 @@ impl<'a> SeenNames<'a> {
   /// A record of no names: where every parameter list starts.
   const fn new() -> Self {
     Self {
-      names: [&[]; MAX_TRACKED_PARAMS],
+      names: [&[]; MAX_PARAMS_PER_CREDENTIAL],
       len: 0,
     }
   }
@@ -904,7 +904,7 @@ impl<'a> SeenNames<'a> {
       return Err(AuthError::DuplicateParameter);
     }
     // The slot lookup IS the bound: `None` means this name is the
-    // `MAX_TRACKED_PARAMS + 1`th, which is the refusal that constant
+    // `MAX_PARAMS_PER_CREDENTIAL + 1`th, which is the refusal that constant
     // documents.
     let Some(slot) = self.names.get_mut(self.len) else {
       return Err(AuthError::TooManyParameters);
@@ -1274,7 +1274,7 @@ where
 /// [`AuthError::InvalidQuotedString`], [`AuthError::DuplicateParameter`] for
 /// RFC 9110 §11.2's one-name-once MUST, applied to this field's list for the
 /// reason that variant records, and [`AuthError::TooManyParameters`] past
-/// [`MAX_TRACKED_PARAMS`] names. One `Result` and nothing behind it: there is
+/// [`MAX_PARAMS_PER_CREDENTIAL`] names. One `Result` and nothing behind it: there is
 /// one credential in the field, so there is nothing to continue to, and a
 /// fault anywhere in it refuses the whole value rather than a part of it.
 ///
@@ -1375,7 +1375,7 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// [`AuthError::DuplicateParameter`] for RFC 9110 §11.2's one-name-once MUST,
 /// which is per challenge here and so is NOT reported of two challenges that
 /// carry the same name; [`AuthError::TooManyParameters`] past
-/// [`MAX_TRACKED_PARAMS`] names in one of them; and whatever else that
+/// [`MAX_PARAMS_PER_CREDENTIAL`] names in one of them; and whatever else that
 /// challenge's parameter list carries —
 /// [`AuthError::MalformedParameter`], [`AuthError::UnterminatedQuotedString`]
 /// or [`AuthError::InvalidQuotedString`]. One per challenge, and the section
@@ -1803,7 +1803,7 @@ where
 /// read rather than refused.
 ///
 /// A bound on the PARAMETERS is a different question and this walk does carry
-/// one: [`MAX_TRACKED_PARAMS`], for the record RFC 9110 §11.2's one-name-once
+/// one: [`MAX_PARAMS_PER_CREDENTIAL`], for the record RFC 9110 §11.2's one-name-once
 /// MUST is checked against. Lines are unbounded here and names are not.
 ///
 /// # A trailer's lines, which are field lines
@@ -1844,7 +1844,7 @@ where
 /// forbids inside one; [`AuthError::DuplicateParameter`] for RFC 9110 §11.2's
 /// one-name-once MUST, applied to this field's list for the reason that
 /// variant records; and [`AuthError::TooManyParameters`] past
-/// [`MAX_TRACKED_PARAMS`] names.
+/// [`MAX_PARAMS_PER_CREDENTIAL`] names.
 ///
 /// The last two are reported AT the parameter that broke the rule, which is
 /// where this walk differs from the other two entry points rather than in the
@@ -1883,7 +1883,7 @@ struct AuthInfo<'a, I> {
   /// further parameter to hand over.
   done: bool,
   /// The names this field's list has already used, for RFC 9110 §11.2's
-  /// one-name-once MUST. [`MAX_TRACKED_PARAMS`] slots, which is the bulk of
+  /// one-name-once MUST. [`MAX_PARAMS_PER_CREDENTIAL`] slots, which is the bulk of
   /// this walk's size and is paid by whoever holds the iterator; that constant
   /// carries the measurement.
   seen: SeenNames<'a>,

@@ -99,7 +99,7 @@ is green.
   example is a test here, asserted challenge by challenge and parameter by
   parameter.
 
-- **`MAX_CHALLENGE_LINES` and `MAX_TRACKED_PARAMS`, both sixteen, and both a
+- **`MAX_CHALLENGE_LINES` and `MAX_PARAMS_PER_CREDENTIAL`, both sixteen, and both a
   refusal rather than a cap.** Each can refuse input the grammar allows, and
   each says so at its own definition rather than leaving a caller to find out.
 

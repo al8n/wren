@@ -1277,7 +1277,7 @@ fn credentials_is_panic_free() {
   // Empty elements in quantity, which RFC 9110 §5.6.1.2 has a recipient ignore
   // and which spend no slot of the one-name-once record.
   assert!(shim_credentials(black_box(b"Basic ,, a=1 ,, b=2 ,,".as_slice())) > 0);
-  // Exactly `MAX_TRACKED_PARAMS` names, and one past it.
+  // Exactly `MAX_PARAMS_PER_CREDENTIAL` names, and one past it.
   assert!(
     shim_credentials(black_box(
       b"Basic a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10,k=11,l=12,m=13,n=14,o=15,p=16".as_slice()
@@ -1468,7 +1468,7 @@ fn auth_info_is_panic_free() {
   assert!(shim_auth_info(black_box(&[b"rspauth=\"a".as_slice(), b"b\", qop=auth"])) > 0);
   // Empty elements, empty lines and OWS-only lines, which spend no slot.
   assert!(shim_auth_info(black_box(&[b", a=1 ,,".as_slice(), b"", b" ", b"b=2"])) > 0);
-  // Exactly `MAX_TRACKED_PARAMS` names, then one past it — the second is the
+  // Exactly `MAX_PARAMS_PER_CREDENTIAL` names, then one past it — the second is the
   // refusal that constant documents, reported AT the parameter that broke it.
   assert!(
     shim_auth_info(black_box(&[

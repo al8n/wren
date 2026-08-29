@@ -1501,7 +1501,7 @@ fn the_elements_behind_a_closing_line_are_reached_at_every_entry_point() {
 // ── RFC 9110 §11.2's one-name-once MUST, and the bound that checks it ────────
 
 /// Sixteen `auth-param`s with sixteen distinct names — exactly what
-/// [`MAX_TRACKED_PARAMS`] slots hold.
+/// [`MAX_PARAMS_PER_CREDENTIAL`] slots hold.
 ///
 /// A macro rather than a `const` so the same bytes can be `concat!`ed behind an
 /// `auth-scheme` and in front of a seventeenth parameter without being written
@@ -1655,10 +1655,10 @@ fn a_repeat_across_a_field_line_join_is_still_a_repeat() {
 #[test]
 fn exactly_the_tracked_count_fits() {
   // The fixtures are sized off the published constant.
-  assert_eq!(MAX_TRACKED_PARAMS, 16);
+  assert_eq!(MAX_PARAMS_PER_CREDENTIAL, 16);
 
   let credential = one([SIXTEEN_CHALLENGE]);
-  assert_eq!(credential.params().count(), MAX_TRACKED_PARAMS);
+  assert_eq!(credential.params().count(), MAX_PARAMS_PER_CREDENTIAL);
   assert_eq!(credentials(SIXTEEN_CHALLENGE).unwrap().params().count(), 16);
 
   let mut count = 0;
@@ -1666,13 +1666,13 @@ fn exactly_the_tracked_count_fits() {
     param.expect("sixteen distinct names fit");
     count += 1;
   }
-  assert_eq!(count, MAX_TRACKED_PARAMS);
+  assert_eq!(count, MAX_PARAMS_PER_CREDENTIAL);
 }
 
 #[test]
 fn one_parameter_past_the_bound_is_refused_and_not_left_unchecked() {
   // Nothing in this list is malformed and §11.2 bounds it nowhere, so this is
-  // a refusal meeting conforming input — which `MAX_TRACKED_PARAMS` says in as
+  // a refusal meeting conforming input — which `MAX_PARAMS_PER_CREDENTIAL` says in as
   // many words. The alternative it rules out is worse than a refusal: a walk
   // that stopped CHECKING at the last slot would hand back a list it never
   // established was duplicate-free.
@@ -1703,7 +1703,7 @@ fn one_parameter_past_the_bound_is_refused_and_not_left_unchecked() {
       _ => past += 1,
     }
   }
-  assert_eq!(yielded, MAX_TRACKED_PARAMS);
+  assert_eq!(yielded, MAX_PARAMS_PER_CREDENTIAL);
   assert_eq!(refusals, 1);
   assert_eq!(past, 0, "the walk went on past its own refusal");
 }
@@ -1753,21 +1753,21 @@ fn a_challenge_past_the_tracking_bound_is_refused_and_the_next_one_is_read() {
 fn a_comma_flood_is_not_too_many_parameters() {
   // The distinctive claim of the bound: the empty elements accepted here are
   // UNBOUNDED and spend no slot. RFC 9110 §5.6.1.2's "reasonable number"
-  // governs EMPTY elements while `MAX_TRACKED_PARAMS` bounds the names a
+  // governs EMPTY elements while `MAX_PARAMS_PER_CREDENTIAL` bounds the names a
   // duplicate check records, so a flood is refused only once it carries that
   // many real parameters, however many empties preceded them. This is the
   // position `a_comma_flood_is_not_too_many_tags` pins for the crate's other
   // bound, extended to this one — an implementation counting empties against
   // the slots passes every list above and fails here.
   let credential = one([FLOODED_SIXTEEN_CHALLENGE]);
-  assert_eq!(credential.params().count(), MAX_TRACKED_PARAMS);
+  assert_eq!(credential.params().count(), MAX_PARAMS_PER_CREDENTIAL);
 
   assert_eq!(
     credentials(FLOODED_SIXTEEN_CHALLENGE)
       .unwrap()
       .params()
       .count(),
-    MAX_TRACKED_PARAMS
+    MAX_PARAMS_PER_CREDENTIAL
   );
 
   let mut count = 0;
@@ -1775,13 +1775,13 @@ fn a_comma_flood_is_not_too_many_parameters() {
     param.expect("an empty element spends no slot");
     count += 1;
   }
-  assert_eq!(count, MAX_TRACKED_PARAMS);
+  assert_eq!(count, MAX_PARAMS_PER_CREDENTIAL);
 }
 
 #[test]
 fn a_token68_credential_spends_no_slot() {
   // §11.2's two alternatives are exclusive, so the branch that takes no list
-  // records no name — which is what `MAX_TRACKED_PARAMS` says it does not
+  // records no name — which is what `MAX_PARAMS_PER_CREDENTIAL` says it does not
   // count. A `token68` long enough to have been many parameters is still one
   // value.
   let credential = credentials(b"Basic bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb==").unwrap();
