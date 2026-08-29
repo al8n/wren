@@ -792,7 +792,9 @@ impl<'a> ParamWalk<'a> {
     // walk can hand out — plus, when a quoted-string held it open at that
     // region's end, the escape state to continue that string with.
     let (head_end, mut open) = match scan_to_delim(head, start, b',') {
-      Delim::At(end) => (end, None),
+      // The element ends here, so the `OWS` RFC 9110 §5.6.1.2 hangs on the
+      // comma in front of it belongs to the list rather than to the value.
+      Delim::At(end) => (trim_ows_end(head, end), None),
       Delim::Open(escape) => (head.len(), Some(escape)),
       Delim::Invalid => {
         self.done = true;
@@ -850,6 +852,28 @@ impl<'a> ParamWalk<'a> {
     }
     param
   }
+}
+
+/// Where `value` ends once the RFC 9110 §5.6.1.2 `OWS` behind its last byte is
+/// off it.
+///
+/// `#element => [ element ] *( OWS "," OWS [ element ] )` puts `OWS` on BOTH
+/// sides of every comma, so the whitespace in front of one belongs to the list
+/// and not to the element it follows. [`auth_param`] is handed an element with
+/// that whitespace already off both ends, and a walk that left the trailing
+/// half on would refuse `Basic a=1 , b=2` — §11.2's
+/// `( token / quoted-string )` is one alternative taken whole, and a token
+/// with a space behind it is neither.
+///
+/// Only ever called where the element ENDED on this line. A line that runs out
+/// inside a §5.6.4 quoted-string ends no element, and a space there is data the
+/// string carries rather than the list's.
+fn trim_ows_end(value: &[u8], end: usize) -> usize {
+  let mut end = end;
+  while end > 0 && matches!(value.get(end.saturating_sub(1)), Some(b' ' | b'\t')) {
+    end = end.saturating_sub(1);
+  }
+  end
 }
 
 /// Skips RFC 9110 §11.3's `1*SP` from `at`.
@@ -930,6 +954,464 @@ where
     body.push(line)?;
   }
   Credential::read(scheme, body)
+}
+
+/// Reads RFC 9110 §11.6.1's `WWW-Authenticate` and §11.7.1's
+/// `Proxy-Authenticate` — the two authentication fields whose value is a list
+/// of challenges rather than one credential.
+///
+/// ```text
+/// WWW-Authenticate = #challenge
+/// Proxy-Authenticate = #challenge
+/// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+///
+/// `lines` are the field's lines in wire order. §11.6.1 says the field "can
+/// occur multiple times", and §5.2 makes those lines one value with a comma at
+/// each join, so a challenge and even one of its values may cross a line the
+/// way [`Credential`] describes.
+///
+/// # The comma that ends a challenge, and the one that does not
+///
+/// §11.6.1 states the problem this walk exists for: the value "might contain
+/// more than one challenge, and each challenge can contain a comma-separated
+/// list of authentication parameters". Both levels are the same §5.6.1
+/// construct, one inside the other — Appendix A writes the nesting out as
+/// `challenge = auth-scheme [ 1*SP ( token68 / [ auth-param *( OWS "," OWS auth-param ) ] ) ]`
+/// — so at a comma the next element is either another `auth-param` of the
+/// challenge already open or the `auth-scheme` of the next one. Three rules
+/// decide it, in this order, and the order is the substance.
+///
+/// **The SP after the scheme token is what admits a parameter section at
+/// all**, and it is read before anything is trimmed. `1*SP` is the only
+/// entrance the production has, so a scheme not followed by SP takes no
+/// parameters and the comma behind it is a boundary: `Basic , type=1` is ONE
+/// challenge with one parameter, and `Basic, type=1` is TWO, the second of
+/// which nothing derives. The two values differ by one byte, and a walker that
+/// split on commas with the `OWS` §5.6.1.2 hangs on them already trimmed off
+/// would have destroyed the byte that separates them.
+///
+/// **At a comma an empty element is skipped first.** §5.6.1.2: "A recipient
+/// MUST parse and ignore a reasonable number of empty list elements". The skip
+/// comes before the boundary question because `Basic a=1,,b=2` is one
+/// challenge with two parameters, and a rule that read the empty element as an
+/// element with no leading token — and therefore as a boundary — would split
+/// it.
+///
+/// **Then the next element's leading `token` and the first non-`BWS` byte
+/// behind it decide.** `auth-param = token BWS "=" BWS ( token / quoted-string )`
+/// opens with exactly those two, so an `=` there makes the element a parameter
+/// of the CURRENT challenge and anything else — a different byte, the
+/// element's end, or no leading token at all — makes it the scheme of the
+/// next.
+///
+/// A challenge then closes at the end of its last VALUE, not at the end of the
+/// element that question was asked about, so nothing of the next challenge is
+/// ever inside the one before it.
+///
+/// # What follows an error
+///
+/// One `Result` per challenge, and the walk continues exactly while the comma
+/// structure is still trustworthy. Every boundary it finds is a comma OUTSIDE
+/// a quoted-string, so [`AuthError::InvalidQuotedString`] ends it: once a
+/// quoted-string scan has failed, no later comma can be told from data. Every
+/// other fault leaves the boundaries known and the walk goes on, because
+/// §11.4 has a user agent choose among challenges by "selecting the challenge
+/// with what it considers to be the most secure auth-scheme that it
+/// understands" — and one unreadable challenge must not hide the readable one
+/// behind it. That is a deliberate divergence from
+/// [`crate::grammar::parameterised_list`], which poisons on any `Err`: a
+/// parameter list is not a list a caller searches.
+///
+/// A failed challenge is reported ONCE. The walk then seeks the next boundary
+/// over the same clean scan and does not re-read what is left of the failed
+/// challenge as challenges of its own, so in `Basic a=1, =x, type=b, Newauth
+/// c=1` the `type=b` is part of the failure already reported rather than a
+/// second one. A `QuotedScan::Invalid` met during that seek reports
+/// [`AuthError::InvalidQuotedString`] and stops the walk, exactly as it does
+/// anywhere else; one that never closes consumes the rest of the input, and
+/// the walk ends there.
+///
+/// Validation is eager — a challenge is walked to its end before it is yielded
+/// — which is what lets [`Credential::params`] be infallible and what lets one
+/// walk go on after a fault at all.
+#[inline]
+pub fn challenges<'a, I>(lines: I) -> impl Iterator<Item = Result<Credential<'a>, AuthError>>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  Challenges {
+    lines: lines.into_iter(),
+    // The walk starts with no line in hand, which is the same position as a
+    // line that has been spent: the next element comes from the next one.
+    line: &[],
+    at: 0,
+    exhausted: false,
+    done: false,
+    seeking: false,
+  }
+}
+
+/// Where a `#challenge` walk stands once it has been moved to the next element
+/// of the value RFC 9110 §5.2 joined the field lines into.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Step {
+  /// The cursor is on the element's first byte.
+  Element {
+    /// Whether a comma — one the sender wrote, or the one §5.2 puts at a join
+    /// — was crossed to reach it, which is what makes §11.6.1's boundary
+    /// question apply at all. The FIRST element of a parameter section is
+    /// admitted by the `1*SP` in front of it and is asked nothing.
+    after_comma: bool,
+  },
+  /// The value has no more elements.
+  End,
+}
+
+/// One challenge's body as it is collected, across the field lines RFC 9110
+/// §5.2 joined into one value.
+struct Section<'a> {
+  /// The regions taken so far.
+  body: BodyLines<'a>,
+  /// Where the current line's region begins.
+  start: usize,
+  /// Where the challenge ends in the current line: the end of the last element
+  /// read there. A region is cut HERE rather than at the line's end, because
+  /// what lies behind it is the next challenge and the commas and `OWS`
+  /// §5.6.1.2 puts between elements — and the boundary between two regions
+  /// already stands for the one comma §5.2 put there.
+  end: usize,
+  /// A region did not fit in [`MAX_CHALLENGE_LINES`].
+  ///
+  /// Recorded rather than returned at once, because the walk still has a
+  /// challenge boundary to find: stopping here would leave the cursor inside
+  /// the refused challenge, and the elements behind it would then be read as
+  /// challenges of their own — which is the one thing
+  /// [`challenges`] promises not to do after a fault. What was collected is no
+  /// longer the whole challenge, so [`AuthError::ChallengeSpansTooManyLines`]
+  /// is the answer rather than whatever a partial body happens to parse as.
+  overrun: bool,
+}
+
+impl<'a> Section<'a> {
+  /// A body that begins at `at` on the line its scheme was read from.
+  const fn opening_at(at: usize) -> Self {
+    Self {
+      body: BodyLines::new(),
+      start: at,
+      end: at,
+      overrun: false,
+    }
+  }
+
+  /// Takes what the line being left behind contributes, up to `end`, and opens
+  /// a region at the start of the next one.
+  fn spend(&mut self, line: &'a [u8], end: usize) {
+    if self
+      .body
+      .push(line.get(self.start..end).unwrap_or_default())
+      .is_err()
+    {
+      self.overrun = true;
+    }
+    self.start = 0;
+    self.end = 0;
+  }
+}
+
+/// The walk [`challenges`] hands out: the field lines still to come, the one
+/// being walked, and where in it the next element starts.
+struct Challenges<'a, I> {
+  lines: I,
+  line: &'a [u8],
+  at: usize,
+  /// `lines` answered `None` once. An `Iterator` is not required to keep doing
+  /// so, and RFC 9110 §5.2's value ends at the last line either way.
+  exhausted: bool,
+  done: bool,
+  /// A challenge failed with the cursor still inside it, so where it ends has
+  /// to be found before another challenge can be read there.
+  seeking: bool,
+}
+
+impl<'a, I> Iterator for Challenges<'a, I>
+where
+  I: Iterator<Item = &'a [u8]>,
+{
+  type Item = Result<Credential<'a>, AuthError>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.done {
+      return None;
+    }
+    if self.seeking {
+      self.seeking = false;
+      if let Err(fault) = self.seek() {
+        self.done = true;
+        return Some(Err(fault));
+      }
+    }
+    match self.open_element(None) {
+      Step::End => {
+        self.done = true;
+        None
+      }
+      Step::Element { .. } => {
+        let read = self.challenge();
+        // Every boundary this walk finds is a comma outside a quoted-string,
+        // so a scan that failed inside one leaves every comma behind it a
+        // guess. Nothing further is read.
+        if matches!(read, Err(AuthError::InvalidQuotedString)) {
+          self.done = true;
+        }
+        Some(read)
+      }
+    }
+  }
+}
+
+impl<'a, I> Challenges<'a, I>
+where
+  I: Iterator<Item = &'a [u8]>,
+{
+  /// The next field line of the value, or `None` once there are none left.
+  fn next_line(&mut self) -> Option<&'a [u8]> {
+    if self.exhausted {
+      return None;
+    }
+    let next = self.lines.next();
+    if next.is_none() {
+      self.exhausted = true;
+    }
+    next
+  }
+
+  /// Moves the cursor to the first byte of the next element of the value,
+  /// skipping the empty ones and crossing RFC 9110 §5.2's joins.
+  ///
+  /// `region` is the body being collected, when there is one; a walk that is
+  /// only looking for a boundary passes `None` and takes nothing.
+  fn open_element(&mut self, mut region: Option<&mut Section<'a>>) -> Step {
+    let mut after_comma = false;
+    loop {
+      self.at = skip_ows(self.line, self.at);
+      match self.line.get(self.at) {
+        // RFC 9110 §5.6.1.2: "A recipient MUST parse and ignore a reasonable
+        // number of empty list elements".
+        Some(&b',') => {
+          self.at = self.at.saturating_add(1);
+          after_comma = true;
+        }
+        // This line is spent OUTSIDE a quoted-string, so §5.2's join comma is
+        // the separator it looks like and the next line opens a new element.
+        None => {
+          let Some(next) = self.next_line() else {
+            return Step::End;
+          };
+          let spent = self.line;
+          self.line = next;
+          self.at = 0;
+          after_comma = true;
+          if let Some(section) = region.as_deref_mut() {
+            // The cursor moves BEFORE the region is taken, so a body that
+            // cannot hold this one leaves the walk standing on the new line
+            // rather than losing it with the error.
+            let end = section.end;
+            section.spend(spent, end);
+          }
+        }
+        Some(_) => return Step::Element { after_comma },
+      }
+    }
+  }
+
+  /// Walks the element at the cursor to its end, leaving the cursor on the
+  /// comma that ends it or at the end of the line the value runs out on.
+  ///
+  /// A field line's end does not end the element when a RFC 9110 §5.6.4
+  /// quoted-string is still open there: §5.2's join comma is data inside one,
+  /// so the element runs on to wherever the string closes.
+  /// `scan_quoted_after_join` is this crate's one implementation of that rule
+  /// and feeds the join's comma THROUGH any pending escape, so the escape is
+  /// spent on the comma and a DQUOTE arriving first on the next line closes
+  /// the string.
+  ///
+  /// # Errors
+  ///
+  /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
+  /// quoted-string — the one fault that leaves the commas behind it unreadable
+  /// and so is the one this walk cannot continue past.
+  fn skip_element(&mut self, mut region: Option<&mut Section<'a>>) -> Result<(), AuthError> {
+    let mut open = match scan_to_delim(self.line, self.at, b',') {
+      Delim::At(end) => {
+        self.at = end;
+        None
+      }
+      Delim::Open(escape) => {
+        self.at = self.line.len();
+        Some(escape)
+      }
+      Delim::Invalid => return Err(AuthError::InvalidQuotedString),
+    };
+    while let Some(escape) = open.take() {
+      let Some(next) = self.next_line() else {
+        // Nothing left to close the string on, so the element ends inside it.
+        // `auth_param` reports that over the same bytes, once the whole
+        // challenge has been collected.
+        self.at = self.line.len();
+        break;
+      };
+      let spent = self.line;
+      self.line = next;
+      self.at = next.len();
+      if let Some(section) = region.as_deref_mut() {
+        // The element is still open here, so ALL of the line being left is the
+        // challenge's — including the bytes that begin no element of their own
+        // but carry the close of this one.
+        section.spend(spent, spent.len());
+      }
+      match scan_quoted_after_join(next, escape) {
+        QuotedScan::Closed(end) => match scan_to_delim(next, end, b',') {
+          Delim::At(at) => self.at = at,
+          Delim::Open(escape) => open = Some(escape),
+          Delim::Invalid => return Err(AuthError::InvalidQuotedString),
+        },
+        QuotedScan::Open { escape } => open = Some(escape),
+        QuotedScan::Invalid => return Err(AuthError::InvalidQuotedString),
+      }
+    }
+    if let Some(section) = region {
+      section.end = self.at;
+    }
+    Ok(())
+  }
+
+  /// Whether the element at the cursor is the `auth-scheme` of the NEXT
+  /// challenge rather than another `auth-param` of the one already open.
+  ///
+  /// RFC 9110 §11.2's `auth-param = token BWS "=" BWS ( token / quoted-string )`
+  /// opens with a `token` and an `=`, with only §5.6.3's `BWS` between them, so
+  /// those two are the whole question — and the `=` is looked for on THIS
+  /// element's line, because a `token` carries no comma and §5.2 puts one at
+  /// every join.
+  ///
+  /// An element with no leading token is not a parameter either, and this
+  /// answers `true` for it: it opens a challenge, where
+  /// [`AuthError::MissingScheme`] names what is wrong with it. Reporting a
+  /// malformed parameter instead would blame a production the element was
+  /// never being read by.
+  fn opens_a_challenge(&self) -> bool {
+    match token_end(self.line, self.at) {
+      None => true,
+      Some(end) => self.line.get(skip_ows(self.line, end)) != Some(&b'='),
+    }
+  }
+
+  /// Reads the challenge at the cursor, leaving the cursor on the first byte
+  /// of the next one — or at the end of the value.
+  ///
+  /// Eager: the challenge is walked to its end and every parameter in it read
+  /// before the [`Credential`] exists. That is what lets
+  /// [`Credential::params`] be infallible, and what lets this walk report one
+  /// fault per challenge and still go on to the next.
+  ///
+  /// # Errors
+  ///
+  /// [`AuthError::MissingScheme`] and [`AuthError::MalformedScheme`] leave the
+  /// cursor INSIDE the challenge that failed, so `seeking` is set and the next
+  /// boundary is found before another challenge is read there. Every other
+  /// fault is met with the challenge's own extent already walked, so the
+  /// cursor is on that boundary already.
+  fn challenge(&mut self) -> Result<Credential<'a>, AuthError> {
+    let head = self.line;
+    let Some(scheme_end) = token_end(head, self.at) else {
+      self.seeking = true;
+      return Err(AuthError::MissingScheme);
+    };
+    let scheme = head.get(self.at..scheme_end).unwrap_or_default();
+    self.at = scheme_end;
+    // The byte after the scheme is decisive and is read before anything is
+    // trimmed: `[ 1*SP ( token68 / #auth-param ) ]` has no other entrance, so
+    // a scheme not followed by SP takes no body at all.
+    let body_at = match head.get(scheme_end) {
+      Some(&b' ') => {
+        let at = skip_sp(head, scheme_end);
+        self.at = at;
+        // `1*SP` has taken every SP there was. RFC 9110 §5.6.1.2 expands a
+        // list as `#element => [ element ] *( OWS "," OWS [ element ] )`,
+        // which hangs every OWS it has on a comma — so a HTAB standing where
+        // the first element should be is derived by nothing.
+        if head.get(at) == Some(&b'\t') {
+          self.seeking = true;
+          return Err(AuthError::MalformedScheme);
+        }
+        at
+      }
+      // The scheme ends its element — on a comma, or at a line end where
+      // §5.2's join comma is the next character of the value. Either way it is
+      // a whole challenge that took no parameters.
+      None | Some(&b',') => return Credential::read(scheme, BodyLines::new()),
+      Some(_) => {
+        self.seeking = true;
+        return Err(AuthError::MalformedScheme);
+      }
+    };
+
+    let mut section = Section::opening_at(body_at);
+    loop {
+      match self.open_element(Some(&mut section)) {
+        Step::End => break,
+        Step::Element { after_comma } => {
+          if after_comma && self.opens_a_challenge() {
+            break;
+          }
+          self.skip_element(Some(&mut section))?;
+        }
+      }
+    }
+    // The challenge closes at the end of its last element, and the region it
+    // is in is cut there: the bytes behind it are the next challenge's, or the
+    // empty elements between the two.
+    let (line, end) = (self.line, section.end);
+    section.spend(line, end);
+    if section.overrun {
+      return Err(AuthError::ChallengeSpansTooManyLines);
+    }
+    Credential::read(scheme, section.body)
+  }
+
+  /// Finds where the challenge that just failed ends, without reading what is
+  /// left of it as challenges of its own.
+  ///
+  /// The same boundary rule as the walk itself, run over a scan that collects
+  /// nothing: at each comma the next element's leading `token` and the byte
+  /// behind it say whether it still belongs to the failed challenge. RFC
+  /// 9110 §11.6.1's ambiguity is resolved once per challenge, so `type=b` in
+  /// `Basic a=1, =x, type=b, Newauth c=1` is part of the fault already
+  /// reported rather than a second one.
+  ///
+  /// # Errors
+  ///
+  /// [`AuthError::InvalidQuotedString`], which makes the commas behind it
+  /// unreadable during a seek exactly as it does anywhere else. A
+  /// quoted-string that never closes is the benign case and no error at all:
+  /// it consumes the rest of the input, and the walk ends where the value
+  /// does.
+  fn seek(&mut self) -> Result<(), AuthError> {
+    loop {
+      self.skip_element(None)?;
+      match self.open_element(None) {
+        Step::End => return Ok(()),
+        // A comma was crossed by construction: the element just skipped ended
+        // on one, or at the line end RFC 9110 §5.2 puts one at.
+        Step::Element { .. } => {
+          if self.opens_a_challenge() {
+            return Ok(());
+          }
+        }
+      }
+    }
+  }
 }
 
 #[cfg(test)]

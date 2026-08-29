@@ -713,3 +713,434 @@ fn a_forbidden_byte_is_reported_wherever_the_walk_meets_it() {
     AuthError::InvalidQuotedString
   );
 }
+
+// ── RFC 9110 §11.6.1's #challenge, and the comma that means two things ───────
+
+/// One `#challenge` walk collected into a fixed array, `None` past its last
+/// result.
+///
+/// `N` is written one larger than the answer a test expects, so the trailing
+/// `None` is the assertion that the walk stopped where it was supposed to
+/// rather than the test reading only a prefix of it.
+fn walk<'a, const N: usize>(
+  lines: impl IntoIterator<Item = &'a [u8]>,
+) -> [Option<Result<Credential<'a>, AuthError>>; N] {
+  let mut out = [None; N];
+  for (slot, outcome) in out.iter_mut().zip(challenges(lines)) {
+    *slot = Some(outcome);
+  }
+  out
+}
+
+/// One challenge's parameter names in wire order, `None` past its last.
+fn names<'a, const N: usize>(credential: &Credential<'a>) -> [Option<&'a [u8]>; N] {
+  let mut out = [None; N];
+  for (slot, param) in out.iter_mut().zip(credential.params()) {
+    *slot = Some(param.name());
+  }
+  out
+}
+
+/// The one challenge `lines` holds, with the walk asserted to hold nothing
+/// else.
+fn one<'a>(lines: impl IntoIterator<Item = &'a [u8]>) -> Credential<'a> {
+  let [first, second] = walk::<2>(lines);
+  assert!(
+    second.is_none(),
+    "a second challenge where one was expected"
+  );
+  first
+    .expect("no challenge at all")
+    .expect("challenge failed")
+}
+
+#[test]
+fn the_worked_example_of_section_11_6_1() {
+  // RFC 9110 §11.6.1 prints this field, wrapped across two of the document's
+  // own lines and carrying a `quoted-pair` DQUOTE in its last value:
+  //
+  //    WWW-Authenticate: Basic realm="simple", Newauth realm="apps",
+  //                     type=1, title="Login to \"apps\""
+  //
+  // and then says what it holds. "This header field contains two challenges",
+  // one for Basic with a realm value of simple and one for Newauth with a
+  // realm value of apps, and "It also contains two additional parameters".
+  // Which challenge those last two belong to is the whole of §11.6.1's
+  // ambiguity: the commas in front of them look exactly like the comma in
+  // front of Newauth.
+  let value = br#"Basic realm="simple", Newauth realm="apps", type=1, title="Login to \"apps\"""#;
+
+  let [basic, newauth, past] = walk::<3>([&value[..]]);
+  assert!(past.is_none(), "the field holds two challenges and no more");
+
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert!(basic.token68().is_none());
+  assert_eq!(names::<2>(&basic), [Some(&b"realm"[..]), None]);
+  let realm = basic.params().next().unwrap();
+  assert!(matches!(realm.value(), Ok(ParamValue::Quoted(v)) if v == b"simple"));
+
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert!(newauth.token68().is_none());
+  assert_eq!(
+    names::<4>(&newauth),
+    [Some(&b"realm"[..]), Some(b"type"), Some(b"title"), None]
+  );
+  let mut params = newauth.params();
+  assert!(matches!(params.next().unwrap().value(), Ok(ParamValue::Quoted(v)) if v == b"apps"));
+  assert!(matches!(params.next().unwrap().value(), Ok(ParamValue::Token(v)) if v == b"1"));
+  // The escaped DQUOTEs are `quoted-pair`s, so the sender wrote one character
+  // where the field carries two bytes.
+  let title = params.next().unwrap().value().unwrap();
+  assert!(matches!(title, ParamValue::Quoted(raw) if raw == br#"Login to \"apps\""#));
+  assert!(title.unescaped().eq(br#"Login to "apps""#.iter().copied()));
+
+  // The same field, split at an element boundary the way RFC 9110 §5.3 lets a
+  // sender split any `#challenge` list. §5.2 joins the lines with a comma,
+  // which lands beside the one already there — an empty element, and §11.6.1
+  // says of exactly that shape that "In practice, this ambiguity does not
+  // affect the semantics of the header field value and thus is harmless."
+  let [basic, newauth, past] = walk::<3>([
+    &br#"Basic realm="simple", Newauth realm="apps","#[..],
+    br#"                 type=1, title="Login to \"apps\"""#,
+  ]);
+  assert!(past.is_none());
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert_eq!(
+    names::<4>(&newauth),
+    [Some(&b"realm"[..]), Some(b"type"), Some(b"title"), None]
+  );
+}
+
+#[test]
+fn the_sentence_the_worked_example_prints() {
+  // RFC 9110 §11.6.1's example is one field value, and what a walker has to
+  // implement is the sentence above it: a value "might contain more than one
+  // challenge, and each challenge can contain a comma-separated list of
+  // authentication parameters". So the shapes below vary both counts, none of
+  // them is the printed example, and every comma in them is decided by the
+  // same rule.
+  //
+  // The generating grammar is RFC 9110 Appendix A's expansion, where both
+  // levels are the same construct one inside the other:
+  //
+  // ```text
+  // challenge = auth-scheme [ 1*SP ( token68 / [ auth-param *( OWS "," OWS auth-param ) ] ) ]
+  // ```
+  for (value, shape) in [
+    (&b"A"[..], &[(&b"A"[..], 0usize)][..]),
+    (b"A, B", &[(&b"A"[..], 0), (b"B", 0)]),
+    (b"A, B, C", &[(&b"A"[..], 0), (b"B", 0), (b"C", 0)]),
+    (b"A x=1", &[(&b"A"[..], 1)]),
+    (b"A x=1, y=2", &[(&b"A"[..], 2)]),
+    (b"A x=1, y=2, z=3", &[(&b"A"[..], 3)]),
+    (b"A x=1, B", &[(&b"A"[..], 1), (b"B", 0)]),
+    (b"A, B y=1", &[(&b"A"[..], 0), (b"B", 1)]),
+    (b"A x=1, B y=2", &[(&b"A"[..], 1), (b"B", 1)]),
+    (
+      b"A x=1, y=2, B z=3, C",
+      &[(&b"A"[..], 2), (b"B", 1), (b"C", 0)],
+    ),
+  ] {
+    let [first, second, third, past] = walk::<4>([value]);
+    assert!(past.is_none(), "{value:?}");
+    for (read, &(scheme, count)) in [first, second, third].into_iter().zip(shape) {
+      let credential = read
+        .unwrap_or_else(|| panic!("{value:?}: too few challenges"))
+        .unwrap_or_else(|fault| panic!("{value:?}: {fault}"));
+      assert_eq!(credential.scheme(), scheme, "{value:?}");
+      assert_eq!(credential.params().count(), count, "{value:?}");
+    }
+    assert!(
+      walk::<4>([value])
+        .get(shape.len())
+        .is_some_and(|read| read.is_none()),
+      "{value:?}: more challenges than the shape names"
+    );
+  }
+}
+
+#[test]
+fn the_sp_after_the_scheme_is_what_admits_a_parameter_section() {
+  // RFC 9110 §11.3 gives a challenge no other entrance to its parameters:
+  // `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`. So the byte
+  // after the scheme token decides the whole reading, and these two values
+  // are one space apart.
+  //
+  // With the SP, the section opens on an empty first element §5.6.1.2 admits
+  // and `type=1` is a parameter of `Basic`.
+  let credential = one([&b"Basic , type=1"[..]]);
+  assert_eq!(credential.scheme(), b"Basic");
+  assert_eq!(names::<2>(&credential), [Some(&b"type"[..]), None]);
+
+  // Without it the scheme takes no parameters at all, the comma is a
+  // challenge boundary, and `type=1` has to be a challenge of its own — which
+  // it is not, since the grammar admits nothing after a scheme without
+  // `1*SP`.
+  let [basic, malformed, past] = walk::<3>([&b"Basic, type=1"[..]]);
+  assert!(past.is_none());
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(basic.params().count(), 0);
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+
+  // A walker that trimmed the list's OWS before asking would have destroyed
+  // the deciding byte, so the two answers are asserted to differ.
+  assert_ne!(
+    walk::<3>([&b"Basic , type=1"[..]]).map(|read| read.map(|r| r.is_ok())),
+    walk::<3>([&b"Basic, type=1"[..]]).map(|read| read.map(|r| r.is_ok()))
+  );
+}
+
+#[test]
+fn an_empty_element_is_skipped_before_the_boundary_is_asked() {
+  // RFC 9110 §5.6.1.2's rule comes first: "A recipient MUST parse and ignore a
+  // reasonable number of empty list elements". A rule that read the empty
+  // element between these two commas as an element with no leading token —
+  // and therefore as a boundary — would split one challenge into two.
+  let credential = one([&b"Basic a=1,,b=2"[..]]);
+  assert_eq!(credential.scheme(), b"Basic");
+  assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
+
+  // The same at the challenge level, and in quantity: §5.6.1.2's "Empty
+  // elements do not contribute to the count of elements present.", which
+  // `a_comma_flood_is_not_too_many_tags` already pins for this crate.
+  let [basic, newauth, past] = walk::<3>([&b" , ,Basic a=1, ,, , Newauth b=2, ,"[..]]);
+  assert!(past.is_none());
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+
+  // A trailing comma is one of those empty elements, and `#challenge` has a
+  // list for it to sit in.
+  assert_eq!(
+    one([&b"Basic dGVzdA==,"[..]]).token68(),
+    Some(&b"dGVzdA=="[..])
+  );
+}
+
+#[test]
+fn a_challenge_reaches_its_parameters_only_through_1_sp() {
+  // Spec §4.1's declined leniency, pinned so it is not quietly restored.
+  // `1*SP` is SP alone, and RFC 9110 §5.6.1.2 expands a list as
+  // `#element => [ element ] *( OWS "," OWS [ element ] )`, which hangs every
+  // OWS it has on a comma — so a HTAB standing where the first element should
+  // be is derived by nothing.
+  let [fault, past] = walk::<2>([&b"Basic \ta=1"[..]]);
+  assert!(past.is_none());
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedScheme);
+
+  // The same byte glued straight to the scheme is the other shape of the same
+  // error, and neither is subsumed by the other.
+  let [fault, past] = walk::<2>([&b"Basic\ta=1"[..]]);
+  assert!(past.is_none());
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedScheme);
+}
+
+#[test]
+fn a_challenge_closes_at_the_end_of_its_value() {
+  // Spec §10's `["Basic realm=", "x"]` row, which only this walk can answer.
+  // RFC 9110 §5.2 joins the lines to `Basic realm=,x`, and at that comma the
+  // next element's leading token is `x` with no `=` behind it — a boundary.
+  // So `realm=` ends the `Basic` challenge, where §11.2's
+  // `token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`
+  // is the branch that derives it, and `x` is a second challenge.
+  let [basic, x, past] = walk::<3>([&b"Basic realm="[..], b"x"]);
+  assert!(past.is_none());
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(basic.token68(), Some(&b"realm="[..]));
+  let x = x.unwrap().unwrap();
+  assert_eq!(x.scheme(), b"x");
+  assert_eq!(x.params().count(), 0);
+
+  // A challenge closes at the end of its VALUE and not at the end of the
+  // element the boundary question was asked about, so the OWS §5.6.1.2 hangs
+  // on the comma is no part of either challenge — and a `token68` whose run is
+  // followed by that OWS still ends its credential.
+  let [basic, newauth, past] = walk::<3>([&br#"Basic dGVzdA== , Newauth realm="x""#[..]]);
+  assert!(past.is_none());
+  assert_eq!(basic.unwrap().unwrap().token68(), Some(&b"dGVzdA=="[..]));
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+}
+
+#[test]
+fn the_ows_a_list_hangs_on_its_comma_is_no_part_of_a_parameter() {
+  // RFC 9110 §5.6.1.2's `#element => [ element ] *( OWS "," OWS [ element ] )`
+  // puts OWS on BOTH sides of every comma, so the space in front of one is the
+  // list's and not the value's. A walker that handed it to the parameter would
+  // refuse a conforming value, since `( token / quoted-string )` is one
+  // alternative taken whole.
+  let credential = one([&b"Basic a=1 , b=2"[..]]);
+  assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
+  let mut params = credential.params();
+  assert!(matches!(params.next().unwrap().value(), Ok(ParamValue::Token(v)) if v == b"1"));
+
+  // The same OWS where a quoted value carries it.
+  let credential = one([&br#"Basic a="1" , b=2"#[..]]);
+  assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
+
+  // And the same walk reached through `credentials`, where every comma is a
+  // parameter separator and no boundary question is asked at all.
+  assert_eq!(
+    read_credential([&b"Basic a=1 , b=2"[..]])
+      .unwrap()
+      .params()
+      .count(),
+    2
+  );
+}
+
+#[test]
+fn a_failed_challenge_is_reported_once() {
+  // Spec §5.2's rule, and the value it is written over. The second element
+  // has bytes and no leading token, so it opens a challenge that has no
+  // scheme; the walk then seeks the next boundary rather than re-reading what
+  // is left of that challenge as challenges of their own. `type=b` is
+  // therefore part of the reported failure and not a second error.
+  let [basic, missing, newauth, past] = walk::<4>([&b"Basic a=1, =x, type=b, Newauth c=1"[..]]);
+  assert!(
+    past.is_none(),
+    "three results, and `type=b` is not a fourth"
+  );
+
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(names::<2>(&basic), [Some(&b"a"[..]), None]);
+
+  assert_eq!(missing.unwrap().unwrap_err(), AuthError::MissingScheme);
+
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert_eq!(names::<2>(&newauth), [Some(&b"c"[..]), None]);
+}
+
+#[test]
+fn the_walk_continues_while_the_commas_are_still_trustworthy() {
+  // Spec §5.2's table, one row per continuable error: the boundary the walk
+  // would resume at was known when the fault fired, so RFC 9110 §11.4's user
+  // agent — "selecting the challenge with what it considers to be the most
+  // secure auth-scheme that it understands" — still gets to see the challenge
+  // behind it.
+  for (value, fault) in [
+    (&b"Basic a=1, =x, Newauth b=1"[..], AuthError::MissingScheme),
+    (b"Basic, type=1, Newauth b=1", AuthError::MalformedScheme),
+    (b"Basic a=x y, Newauth b=1", AuthError::MalformedParameter),
+  ] {
+    let mut walk = challenges([value]).skip_while(|read| read.is_ok());
+    assert_eq!(walk.next().unwrap().unwrap_err(), fault, "{value:?}");
+    let last = walk
+      .next()
+      .unwrap_or_else(|| panic!("{value:?}: walk stopped"));
+    assert_eq!(last.unwrap().scheme(), b"Newauth", "{value:?}");
+  }
+
+  // And the row that does not continue. Every boundary this walk finds is a
+  // comma outside a quoted-string, so once a quoted-string scan has failed it
+  // can no longer tell which commas were separators.
+  let [fault, past] = walk::<2>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
+  assert!(past.is_none(), "nothing behind a forbidden byte is read");
+
+  // Including where it is the SEEK past an already-reported challenge that
+  // meets it: the first fault is reported, and then the walk stops on the
+  // second rather than guessing at the commas behind it.
+  let [basic, malformed, invalid, past] =
+    walk::<4>([&b"Basic, type=1, x=\"a\x00b\", Newauth c=1"[..]]);
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(
+    invalid.unwrap().unwrap_err(),
+    AuthError::InvalidQuotedString
+  );
+  assert!(past.is_none());
+
+  // The row spec §5.2's table calls end of input by construction: a string
+  // that never closed consumed the rest of the value, so there is nothing
+  // behind it for the walk to continue to.
+  let [fault, past] = walk::<2>([&br#"Basic a="x"#[..]]);
+  assert_eq!(
+    fault.unwrap().unwrap_err(),
+    AuthError::UnterminatedQuotedString
+  );
+  assert!(past.is_none());
+
+  // A quoted-string that never closes is the benign end of the same seek: it
+  // consumes the rest of the input and the walk ends.
+  let [basic, malformed, past] = walk::<3>([&b"Basic, type=\"x"[..]]);
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert!(past.is_none());
+}
+
+#[test]
+fn a_challenge_split_across_field_lines_is_still_one_challenge() {
+  // RFC 9110 §11.6.1: the field "can occur multiple times", and §5.2 makes the
+  // lines one value "concatenated in order, with each field line value
+  // separated by a comma". At that comma the next element's leading token has
+  // an `=` behind it, so it is a parameter of the challenge already open.
+  let credential = one([&b"Basic a=1"[..], b"b=2"]);
+  assert_eq!(credential.scheme(), b"Basic");
+  assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
+
+  // A value that spans the join keeps its challenge and every name in it, and
+  // only that one value reports it is not one slice.
+  let credential = one([
+    &br#"Digest realm="x", opaque="jo"#[..],
+    br#"in", nonce="y""#,
+  ]);
+  assert!(credential.scheme_is("digest"));
+  let mut params = credential.params();
+  assert!(matches!(params.next().unwrap().value(), Ok(ParamValue::Quoted(v)) if v == b"x"));
+  assert_eq!(
+    params.next().unwrap().value().unwrap_err(),
+    ValueSpansFieldLines
+  );
+  assert!(matches!(params.next().unwrap().value(), Ok(ParamValue::Quoted(v)) if v == b"y"));
+  assert!(params.next().is_none());
+
+  // Lines that carry no element bytes spend no entry, so a challenge whose
+  // parameters sit either side of them is one challenge.
+  let credential = one([&b"Basic a=1"[..], b"", b" , ,", b"\t", b"b=2"]);
+  assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
+
+  // A name split by a join is not a name: RFC 9110 §5.2 joins these to
+  // `Basic real,m=x`, and at that comma `m` has an `=` behind it, so the
+  // challenge goes on and `real` is a parameter name with no value.
+  let [fault, past] = walk::<2>([&b"Basic real"[..], b"m=x"]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none());
+
+  // And a boundary is found across a join exactly as it is inside a line.
+  let [basic, newauth, past] = walk::<3>([&b"Basic a=1"[..], b"Newauth b=2"]);
+  assert!(past.is_none());
+  assert_eq!(
+    names::<2>(&basic.unwrap().unwrap()),
+    [Some(&b"a"[..]), None]
+  );
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+}
+
+#[test]
+fn a_challenge_past_the_line_bound_is_refused_and_the_next_one_is_read() {
+  // The refusal `MAX_CHALLENGE_LINES` names, met inside a walk rather than
+  // over one credential — and the walk goes on, because the boundary behind
+  // the refused challenge is still a comma this scan resolved.
+  let mut lines = [&b""[..]; 18];
+  lines[..SEVENTEEN_LINES.len()].copy_from_slice(&SEVENTEEN_LINES);
+  lines[17] = b"Newauth z=1";
+
+  let [refused, newauth, past] = walk::<3>(lines);
+  assert!(past.is_none());
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+
+  // Sixteen of the same lines is the shape that fits.
+  let credential = one(SEVENTEEN_LINES.iter().take(MAX_CHALLENGE_LINES).copied());
+  assert_eq!(credential.params().count(), MAX_CHALLENGE_LINES);
+}
