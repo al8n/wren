@@ -911,9 +911,6 @@ fn skip_sp(value: &[u8], at: usize) -> usize {
 /// `1*SP` nor the end of the credential, or where `1*SP` is followed by the
 /// HTAB no rule puts there; [`AuthError::ChallengeSpansTooManyLines`] past
 /// [`MAX_CHALLENGE_LINES`]; and whatever the parameter list carries.
-// Dead outside tests: the fields that will read a credential are §11.6's and
-// §11.7's, and this module does not hold their entry points yet.
-#[cfg_attr(not(test), allow(dead_code))]
 fn read_credential<'a, I>(lines: I) -> Result<Credential<'a>, AuthError>
 where
   I: IntoIterator<Item = &'a [u8]>,
@@ -954,6 +951,73 @@ where
     body.push(line)?;
   }
   Credential::read(scheme, body)
+}
+
+/// Reads RFC 9110 §11.6.2's `Authorization` and §11.7.2's
+/// `Proxy-Authorization` — the two authentication fields whose value is one
+/// credential rather than a list of challenges.
+///
+/// ```text
+/// Authorization = credentials
+/// Proxy-Authorization = credentials
+/// credentials = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+///
+/// `value` is the field's value, and §11.6.2 says what is in it: "Its value
+/// consists of credentials containing the authentication information of the
+/// user agent for the realm of the resource being requested." §11.7.2 says
+/// the same of the proxy's field, for its own client. The reader beneath this
+/// takes field LINES, because a [`Credential`] is the one production
+/// [`challenges`] also finds across §5.2's joins; this field carries one
+/// value, and this hands it the one it was given.
+///
+/// # The comma that cannot end a credential
+///
+/// `credentials` is singular. Neither field is a `#`-list, so there is no list
+/// at the top of either value for a comma to be a separator of, and every
+/// comma in one belongs to the `#auth-param` list the production ends in. The
+/// question [`challenges`] has to answer at each comma — another `auth-param`
+/// of the challenge already open, or the `auth-scheme` of the next one — has
+/// no second reading to choose between here, and this path asks it nowhere.
+///
+/// A sender that writes two credentials into one value is therefore read as
+/// the field is defined rather than as it was meant. `Basic x=1, Digest y=2`
+/// puts `Digest y` where a parameter's name and its `=` belong, and RFC 9110
+/// §11.2's `auth-param = token BWS "=" BWS ( token / quoted-string )` admits
+/// only §5.6.3's `BWS` between those two, so a second token there is derived
+/// by nothing. [`AuthError::MalformedParameter`] is the answer and it is the
+/// right one: the field admits one credential, and reporting a malformed one
+/// is not the same as silently taking the first of two.
+///
+/// # A trailing comma, which needs a list to be an empty element of
+///
+/// `Basic dGVzdA==,` is a valid `WWW-Authenticate` and is not a valid
+/// `Authorization`, and the asymmetry is the grammar's rather than this
+/// module's. There the comma is an empty element of `#challenge`, and RFC 9110
+/// §5.6.1.2 is what skips it: "A recipient MUST parse and ignore a reasonable
+/// number of empty list elements". Here `token68` has matched `dGVzdA==`, the
+/// production is complete, and no list is left for an empty element to sit in
+/// — nor is `,` one of the bytes `token68` is made of, so nothing derives it
+/// at all. The body is then read as the other alternative and refused there,
+/// which is where §11.2 has a fault to name.
+///
+/// Where the credential took the `#auth-param` branch instead —
+/// `Newauth realm="x",` — the trailing comma IS an empty element of that list,
+/// and is skipped in this singular field exactly as in the plural one.
+///
+/// # Errors
+///
+/// [`AuthError::MissingScheme`] for a value with no leading `token`;
+/// [`AuthError::MalformedScheme`] where the scheme is followed by neither
+/// `1*SP` nor the end of the value, or where `1*SP` is followed by the HTAB no
+/// rule puts there; and whatever the body carries —
+/// [`AuthError::MalformedParameter`],
+/// [`AuthError::UnterminatedQuotedString`] or
+/// [`AuthError::InvalidQuotedString`]. One `Result` and nothing behind it:
+/// there is one credential in the field, so there is nothing to continue to.
+#[inline]
+pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
+  read_credential([value])
 }
 
 /// Reads RFC 9110 §11.6.1's `WWW-Authenticate` and §11.7.1's

@@ -66,6 +66,7 @@ http_semantics::auth::ValueTail::Continues
 http_semantics::auth::ValueTail::Ends
 http_semantics::auth::auth_param
 http_semantics::auth::challenges
+http_semantics::auth::credentials
 http_semantics::auth::is_token68_byte
 http_semantics::auth::read_credential
 http_semantics::auth::skip_sp

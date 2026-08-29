@@ -1144,3 +1144,112 @@ fn a_challenge_past_the_line_bound_is_refused_and_the_next_one_is_read() {
   let credential = one(SEVENTEEN_LINES.iter().take(MAX_CHALLENGE_LINES).copied());
   assert_eq!(credential.params().count(), MAX_CHALLENGE_LINES);
 }
+
+// ── RFC 9110 §11.6.2's Authorization, which holds ONE credential ─────────────
+
+#[test]
+fn the_whole_field_value_is_one_credential() {
+  // RFC 9110 §11.6.2 spells the field `Authorization = credentials` and
+  // §11.7.2 spells `Proxy-Authorization = credentials`; neither is a `#`-list,
+  // so no comma in the value can end a credential and start another. Every one
+  // of them separates `auth-param`s of the single credential the field holds,
+  // and no boundary question is asked anywhere on this path.
+  let credential = credentials(b"Newauth a=1, b=\"two\", c=3").unwrap();
+  assert_eq!(credential.scheme(), b"Newauth");
+  assert!(credential.token68().is_none());
+  assert_eq!(
+    names::<4>(&credential),
+    [Some(&b"a"[..]), Some(b"b"), Some(b"c"), None]
+  );
+
+  // A `token68` credential, which is the other branch of the same production.
+  let basic = credentials(b"Basic dGVzdA==").unwrap();
+  assert_eq!(basic.token68(), Some(&b"dGVzdA=="[..]));
+  assert_eq!(basic.params().count(), 0);
+
+  // A bare scheme is a whole credential, and an empty value has none.
+  assert_eq!(credentials(b"Basic").unwrap().scheme(), b"Basic");
+  assert_eq!(credentials(b"").unwrap_err(), AuthError::MissingScheme);
+}
+
+#[test]
+fn a_second_credential_in_the_field_is_a_parameter_that_is_not_one() {
+  // Spec §7's row. `Basic x=1, Digest y=2` is two credentials only in a field
+  // that could hold two, and `Authorization` is not one — so the comma is a
+  // parameter boundary and `Digest y` is read where a name and its `=` should
+  // be. RFC 9110 §11.2's
+  // `auth-param = token BWS "=" BWS ( token / quoted-string )` puts only
+  // §5.6.3's `BWS` between the two, and a second token is not that.
+  assert_eq!(
+    credentials(b"Basic x=1, Digest y=2").unwrap_err(),
+    AuthError::MalformedParameter
+  );
+
+  // The same bytes handed to the `#challenge` walk are two challenges, because
+  // that field HAS the list this one does not. Reporting the malformed
+  // credential is not the same as silently taking the first of two.
+  let [basic, digest, past] = walk::<3>([&b"Basic x=1, Digest y=2"[..]]);
+  assert!(past.is_none());
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+}
+
+#[test]
+fn a_scheme_reaches_its_body_only_through_1_sp_here_too() {
+  // §4.1's one-byte pair, asked of the singular field. Through `challenges`
+  // `Basic, type=1` is TWO challenges, the second of which nothing derives;
+  // through `credentials` the comma is derived by nothing at all, since
+  // `credentials = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` has no list
+  // at its top level for the comma to be a separator of.
+  assert_eq!(
+    credentials(b"Basic, type=1").unwrap_err(),
+    AuthError::MalformedScheme
+  );
+  let [basic, malformed, past] = walk::<3>([&b"Basic, type=1"[..]]);
+  assert!(past.is_none());
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+
+  // With the SP the section opens, and the empty first element §5.6.1.2 skips
+  // leaves one parameter — the same answer the plural field gives.
+  let credential = credentials(b"Basic , type=1").unwrap();
+  assert_eq!(names::<2>(&credential), [Some(&b"type"[..]), None]);
+}
+
+#[test]
+fn a_trailing_comma_needs_a_list_to_be_an_empty_element_of() {
+  // Spec §7.1's three rows, and the asymmetry is the grammar's. RFC 9110
+  // §11.6.1's `WWW-Authenticate = #challenge` is a list, so the comma behind a
+  // whole challenge is an empty element of it — the one §5.6.1.2 asks a
+  // recipient to "parse and ignore".
+  assert_eq!(
+    one([&b"Basic dGVzdA==,"[..]]).token68(),
+    Some(&b"dGVzdA=="[..])
+  );
+
+  // `Authorization = credentials` holds no such list. Once `token68` has
+  // matched `dGVzdA==` the production is complete, and `,` is not one of the
+  // bytes `token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" )
+  // *"="` admits, so nothing derives it: the body is re-read as the other
+  // alternative and fails there, which is why no `MalformedToken68` exists.
+  assert_eq!(
+    credentials(b"Basic dGVzdA==,").unwrap_err(),
+    AuthError::MalformedParameter
+  );
+
+  // Where the credential took the `#auth-param` branch instead, the trailing
+  // comma IS an empty element of that list, and is skipped in the singular
+  // context exactly as in the plural one. Task 3 hand-traced this row and did
+  // not test it; this is the test.
+  let credential = credentials(b"Newauth realm=\"x\",").unwrap();
+  assert_eq!(credential.scheme(), b"Newauth");
+  assert_eq!(names::<2>(&credential), [Some(&b"realm"[..]), None]);
+  assert!(matches!(
+    credential.params().next().unwrap().value(),
+    Ok(ParamValue::Quoted(v)) if v == b"x"
+  ));
+
+  // And the empty elements are unbounded at this level too.
+  let credential = credentials(b"Newauth ,,a=1,,,b=2,,").unwrap();
+  assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
+}
