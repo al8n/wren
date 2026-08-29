@@ -1099,16 +1099,17 @@ no_panic_shim! {
   /// Reached through the `__no_panic_internals` forwarder: the walks above it
   /// are the crate's entry points and this is not, so it stays `pub(crate)`.
   ///
-  /// `continues` is the crate-private `ValueTail` the walk supplies, spelled
-  /// as a `bool` at the crate boundary and driven BOTH ways below. It is what
+  /// `tail` is the crate-private `ValueTail` the walk supplies, spelled as a
+  /// `u8` at the crate boundary and driven ALL THREE ways below — `1` for
+  /// `Continues`, `2` for `Trails`, anything else for `Ends`. It is what
   /// separates a quoted value RFC 9110 §5.2's field-line join closed on a
-  /// later line from one that never closes at all, and the two take different
-  /// exits.
+  /// later line from one that closed there and then ran on past its close, and
+  /// from one that never closes at all; the three take different exits.
   ///
   /// Returns the bytes it read with `value()`'s answer folded in, so nothing
   /// here is optimized out as unused and neither accessor can be dropped.
-  fn shim_auth_param(element: &[u8], continues: bool) -> usize {
-    let Ok(param) = auth_param(element, continues) else {
+  fn shim_auth_param(element: &[u8], tail: u8) -> usize {
+    let Ok(param) = auth_param(element, tail) else {
       return 0;
     };
     param.name().len().wrapping_add(match param.value() {
@@ -1128,24 +1129,25 @@ fn auth_param_is_panic_free() {
   // RFC 9110 §11.2's two notations, and the §5.6.3 BWS a recipient removes
   // before interpreting the element — which is this production's own, and is
   // what §5.6.6's `parameter` walker refuses.
-  assert!(shim_auth_param(black_box(br#"realm="x""#.as_slice()), black_box(false)) > 0);
-  assert!(shim_auth_param(black_box(b"realm=x".as_slice()), black_box(false)) > 0);
-  assert!(
-    shim_auth_param(
-      black_box(b"realm \t = \t \"x\"".as_slice()),
-      black_box(false)
-    ) > 0
-  );
+  assert!(shim_auth_param(black_box(br#"realm="x""#.as_slice()), black_box(0)) > 0);
+  assert!(shim_auth_param(black_box(b"realm=x".as_slice()), black_box(0)) > 0);
+  assert!(shim_auth_param(black_box(b"realm \t = \t \"x\"".as_slice()), black_box(0)) > 0);
   // A `quoted-pair`, which an `auth-param` value admits.
-  assert!(shim_auth_param(black_box(br#"nonce="a\"b""#.as_slice()), black_box(false)) > 0);
-  // The join, both ways: a value still open where the element ends is a
-  // parameter when a later field line closed it, and a fault when none did.
-  assert!(shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(true)) > 0);
+  assert!(shim_auth_param(black_box(br#"nonce="a\"b""#.as_slice()), black_box(0)) > 0);
+  // The join, all three ways: a value still open where the element ends is a
+  // parameter when a later field line closed it and the element ended at that
+  // close, a fault when bytes other than the list's own `OWS` stood behind the
+  // close, and a fault when nothing closed it at all.
+  assert!(shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(1)) > 0);
   assert_eq!(
-    shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(false)),
+    shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(2)),
     0
   );
-  // Each refusal on its own, and under both readings of the tail: no `=`, an
+  assert_eq!(
+    shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(0)),
+    0
+  );
+  // Each refusal on its own, and under every reading of the tail: no `=`, an
   // `=` with no value behind it, a name that is not a token, bytes behind a
   // closed string, a byte RFC 9110 §5.6.4 forbids inside one, nothing at all,
   // and bytes that are not ASCII.
@@ -1158,8 +1160,9 @@ fn auth_param_is_panic_free() {
     b"",
     &[0xffu8, 0x3d, 0x22],
   ] {
-    assert_eq!(shim_auth_param(black_box(refused), black_box(false)), 0);
-    assert_eq!(shim_auth_param(black_box(refused), black_box(true)), 0);
+    for tail in [0u8, 1, 2, 3] {
+      assert_eq!(shim_auth_param(black_box(refused), black_box(tail)), 0);
+    }
   }
 }
 
@@ -1298,8 +1301,9 @@ fn credentials_is_panic_free() {
   // §5.6.1.2 would hang it on, a repeated name under
   // §11.2's case-insensitive fold, the trailing comma this field has no list
   // to make an empty element of, a second credential where a parameter name
-  // belongs, an unterminated quoted value, a byte §5.6.4 forbids inside one,
-  // nothing at all, and bytes that are not ASCII.
+  // belongs, an unterminated quoted value, one that closed with bytes behind
+  // its close, a byte §5.6.4 forbids inside one, nothing at all, and bytes
+  // that are not ASCII.
   for refused in [
     b"=x".as_slice(),
     b"Basic=1",
@@ -1308,6 +1312,7 @@ fn credentials_is_panic_free() {
     b"Basic dGVzdA==,",
     b"Basic x=1, Digest y=2",
     b"Basic a=\"1",
+    b"Basic a=\"x,y\"junk",
     b"Basic a=\"\x00\"",
     b"",
     &[0xffu8, 0x20, 0x3d],
@@ -1372,6 +1377,16 @@ fn challenges_is_panic_free() {
   // A string left open at the join with its escape spent by the join's own
   // comma, so the next line's leading DQUOTE closes it.
   assert!(shim_challenges(black_box(&[b"Basic p=\"a\\".as_slice(), b"\", x=1"])) > 0);
+  // A value that closed across the join with bytes behind that close, which
+  // ends the first challenge's own reading and not the walk: the boundary
+  // still came from a clean scan, so `Newauth` behind it is read.
+  assert!(
+    shim_challenges(black_box(&[
+      b"Basic a=\"x".as_slice(),
+      b"y\"junk, Newauth c=3"
+    ]))
+      > 0
+  );
   // Empty lines, OWS-only lines and empty elements, which spend no entry.
   assert!(
     shim_challenges(black_box(&[
@@ -1498,9 +1513,14 @@ fn auth_info_is_panic_free() {
   // in it.
   assert!(shim_auth_info(black_box(&[b"a=1, A=2".as_slice()])) > 0);
   // Nothing to hand back: an element that is no parameter at the head of the
-  // list, a byte RFC 9110 §5.6.4 forbids inside a quoted-string, no lines at
-  // all, one empty line, and bytes that are not ASCII.
+  // list, a value that closed across RFC 9110 §5.2's join with bytes behind
+  // that close, a byte §5.6.4 forbids inside a quoted-string, no lines at all,
+  // one empty line, and bytes that are not ASCII.
   assert_eq!(shim_auth_info(black_box(&[b"realm".as_slice()])), 0);
+  assert_eq!(
+    shim_auth_info(black_box(&[b"a=\"x".as_slice(), b"y\"junk"])),
+    0
+  );
   assert_eq!(shim_auth_info(black_box(&[b"a=\"\x00\"".as_slice()])), 0);
   assert_eq!(shim_auth_info(black_box(&[])), 0);
   assert_eq!(shim_auth_info(black_box(&[b"".as_slice()])), 0);

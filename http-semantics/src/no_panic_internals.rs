@@ -42,22 +42,25 @@ pub fn parse_qvalue(v: &[u8]) -> Option<crate::media::Weight> {
 /// `auth-param = token BWS "=" BWS ( token / quoted-string )`, read over one
 /// list element with the list's own `OWS` already off both ends.
 ///
-/// `continues` is `crate::auth::ValueTail` spelled as a `bool` at this
-/// boundary. That enum answers what RFC 9110 §5.2's field-line join did with a
-/// quoted value the element leaves open, it is `pub(crate)` like the function
-/// itself, and a test crate cannot name it — so the two states cross as
-/// `true` for `Continues` and `false` for `Ends`, and the shim drives both.
+/// `tail` is `crate::auth::ValueTail` spelled as a `u8` at this boundary. That
+/// enum answers what RFC 9110 §5.2's field-line join did with a quoted value
+/// the element leaves open, it is `pub(crate)` like the function itself, and a
+/// test crate cannot name it — so its three states cross as `1` for
+/// `Continues`, `2` for `Trails` and anything else for `Ends`, and the shim
+/// drives all three. A `bool` carried the two states this had before `Trails`
+/// separated a value that closed across the join from one that closed and then
+/// ran on past its close.
 #[inline]
 pub fn auth_param(
   element: &[u8],
-  continues: bool,
+  tail: u8,
 ) -> Result<crate::auth::AuthParam<'_>, crate::auth::AuthError> {
   crate::auth::auth_param(
     element,
-    if continues {
-      crate::auth::ValueTail::Continues
-    } else {
-      crate::auth::ValueTail::Ends
+    match tail {
+      1 => crate::auth::ValueTail::Continues,
+      2 => crate::auth::ValueTail::Trails,
+      _ => crate::auth::ValueTail::Ends,
     },
   )
 }

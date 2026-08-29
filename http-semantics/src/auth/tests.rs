@@ -498,6 +498,124 @@ fn the_escape_pending_at_a_join_is_spent_on_the_join_comma() {
 }
 
 #[test]
+fn a_value_that_closed_across_a_join_has_ended_its_element() {
+  // RFC 9110 §5.2 makes these two field lines one value — the field line
+  // values "concatenated in order, with each field line value separated by a
+  // comma" — so they are `Basic realm="x,"junk`. The quoted-string opens at
+  // the first DQUOTE, takes `x` and the join's comma as `qdtext`, and closes
+  // at the second; `junk` then stands behind it. §11.2's
+  // `auth-param = token BWS "=" BWS ( token / quoted-string )` admits ONE
+  // token or ONE quoted-string as the value and nothing after it, so those
+  // four bytes are derived by nothing.
+  assert_eq!(
+    read_credential([&b"Basic realm=\"x"[..], b"\"junk"]).unwrap_err(),
+    AuthError::MalformedParameter
+  );
+
+  // The same bytes on ONE field line, where this has always been the answer:
+  // `auth_param` refuses a quoted-string with bytes behind its close. RFC 9110
+  // §5.2's join is a way of writing the value and not a way past the rule, and
+  // the pair of them is the whole point of the fix.
+  assert_eq!(
+    credentials(b"Basic realm=\"x,\"junk").unwrap_err(),
+    AuthError::MalformedParameter
+  );
+
+  // What MAY stand there is the whitespace RFC 9110 §5.6.1.2 hangs on the
+  // comma in front of the next element —
+  // `#element => [ element ] *( OWS "," OWS [ element ] )` — and a line end,
+  // where §5.2's own comma is the value's next character.
+  for lines in [
+    [&b"Basic a=\"long"[..], b"tail\" \t"],
+    [&b"Basic a=\"long"[..], b"tail\" \t,"],
+    [&b"Basic a=\"long"[..], b"tail\""],
+  ] {
+    let credential = read_credential(lines).unwrap();
+    let mut params = credential.params();
+    let a = params.next().unwrap();
+    assert_eq!(a.name(), b"a", "{lines:?}");
+    assert_eq!(a.value().unwrap_err(), ValueSpansFieldLines, "{lines:?}");
+    assert!(params.next().is_none(), "{lines:?}");
+  }
+}
+
+// gate-exempt: a="x,y" "z,w", b=2 — the one field value RFC 9110 §5.2 joins
+// three lines into, shown in prose; not a production of any RFC.
+#[test]
+fn a_string_opened_behind_the_close_is_not_a_second_value() {
+  // A DQUOTE is not `OWS` either, so a string opening BEHIND the close is
+  // trailing junk like any other — and the element then runs on to wherever
+  // THAT string closes, which is a further field line. RFC 9110 §5.2 joins
+  // these three into `a="x,y" "z,w", b=2`, whose first element carries two
+  // quoted-strings where §11.2's `( token / quoted-string )` names one.
+  //
+  // The verdict has to survive the crossing: the last line closes cleanly with
+  // a comma behind it, so a walk that asked only the LAST region would call
+  // this a value that merely spans field lines.
+  let [first, past] = info::<2>([&b"a=\"x"[..], b"y\" \"z", b"w\", b=2"]);
+  assert_eq!(first.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none());
+
+  // And it has to survive a line that closes NOTHING. Here the junk's own
+  // string spans a third line before closing on a fourth, so the walk is told
+  // twice in a row that a string is still open — and the second of those says
+  // nothing about bytes behind a close, because on that line there is no
+  // close. A walk that took each answer as the whole verdict rather than
+  // adding it to what it already knew would forget the junk on that line and
+  // read `a` as a value that merely spans field lines.
+  //
+  // Both readers carry this loop, so both are driven: the one
+  // `Credential::read` spends before a credential exists, and the one
+  // §11.6.3's field walks as it hands parameters out.
+  let [first, past] = info::<2>([&b"a=\"x"[..], b"y\" \"z", b"w", b"\", b=2"]);
+  assert_eq!(first.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none());
+  assert_eq!(
+    read_credential([&b"Basic a=\"x"[..], b"y\" \"z", b"w", b"\", b=2"]).unwrap_err(),
+    AuthError::MalformedParameter
+  );
+
+  // Which is not the same input as the one whose second string never closes.
+  // There the combined value ends INSIDE a string, and what a value ends
+  // inside is what decides — `a_string_still_open_on_the_last_line_is_unterminated`
+  // pins that half, and this is the byte that separates the two.
+  assert_eq!(
+    read_credential([&b"Basic a=\"x"[..], b"y\" \"z"]).unwrap_err(),
+    AuthError::UnterminatedQuotedString
+  );
+}
+
+#[test]
+fn the_junk_behind_a_close_is_refused_at_every_entry_point() {
+  // `rejoin` is the one place this module carries an element across RFC 9110
+  // §5.2's join, and all three walks reach it. The `#challenge` walk
+  // additionally has to go on: §11.4 has a user agent choose among challenges
+  // by "selecting the challenge with what it considers to be the most secure
+  // auth-scheme that it understands", so the boundary behind the refused
+  // challenge still has to be the one a clean scan found, and `Newauth` is
+  // still read.
+  let [basic, newauth, past] = walk::<3>([&b"Basic a=\"x"[..], b"y\"junk, Newauth c=3"]);
+  assert_eq!(basic.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert_eq!(names::<2>(&newauth), [Some(&b"c"[..]), None]);
+  assert!(past.is_none());
+
+  // §11.6.3's field is a parameter list and nothing else, and one fault ends
+  // that walk — so the parameter behind the junk is not handed over either.
+  let [first, past] = info::<2>([&b"a=\"x"[..], b"y\"junk, b=2"]);
+  assert_eq!(first.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none());
+
+  // §11.6.2's field holds ONE credential, and a fault anywhere in it refuses
+  // the whole value.
+  assert_eq!(
+    credentials(b"Basic a=\"x,y\"junk, b=2").unwrap_err(),
+    AuthError::MalformedParameter
+  );
+}
+
+#[test]
 fn a_field_line_carrying_no_element_bytes_spends_no_entry() {
   // RFC 9110 §5.6.1.2 opens "Empty elements do not contribute to the count of
   // elements present.", so a line that carries only OWS and commas is a run of

@@ -255,6 +255,13 @@ pub enum AuthError {
   /// A `token BWS "=" BWS ( token / quoted-string )` that does not complete: no
   /// leading token, no `=`, no value behind it, or a value that is neither a
   /// whole `token` nor a whole `quoted-string`.
+  ///
+  /// Whole is whole across §5.2's join as well. A quoted value that opened on
+  /// one field line and closed on a later one has ended its element there, so
+  /// only the `OWS` §5.6.1.2 hangs on the next comma may follow that close:
+  /// `Basic realm="x` and `"junk` are joined into `Basic realm="x,"junk`,
+  /// whose value is the quoted-string `"x,"` with four bytes behind it, and
+  /// this is what that is.
   #[error("not a valid auth-param")]
   MalformedParameter,
   /// A §5.6.4 quoted-string still open when the LAST field line ended, so it
@@ -446,14 +453,30 @@ impl<'a> AuthParam<'a> {
 /// the close may therefore be on a line this parameter does not hold. Only the
 /// walk that crossed the join knows, so it says. [`crate::grammar::ParamIter`]
 /// carries the same fact for a §5.6.6 `parameter`, under its own name.
+///
+/// Three answers rather than two, because closing is not ending. RFC 9110
+/// §11.2's `auth-param = token BWS "=" BWS ( token / quoted-string )` takes one
+/// alternative WHOLE, so what stands behind the close decides as much as the
+/// close does — and those bytes are on a line the parameter does not hold
+/// either.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum ValueTail {
   /// Nothing was open where the line ended, or what was open never closed on
   /// any later one. Either way the parameter's bytes are all there is of it.
   Ends,
-  /// It closed on a later field line, across §5.2's join — so the value is
-  /// real, and is not one contiguous slice.
+  /// It closed on a later field line, across §5.2's join, and the element
+  /// ended there — so the value is real, and is not one contiguous slice.
   Continues,
+  /// It closed on a later field line and the element did NOT end there: bytes
+  /// other than the `OWS` RFC 9110 §5.6.1.2 hangs on the next comma stand
+  /// behind that close.
+  ///
+  /// One token or one quoted-string is the whole of a value, so nothing
+  /// derives those bytes and the parameter is
+  /// [`AuthError::MalformedParameter`]. [`auth_param`]'s `QuotedScan::Closed`
+  /// arm is the same fault spelled on one field line, and this is what keeps
+  /// §5.2's join from being a way past it.
+  Trails,
 }
 
 /// Reads one RFC 9110 §11.2 `auth-param` out of `element`.
@@ -470,9 +493,10 @@ pub(crate) enum ValueTail {
 /// # Errors
 ///
 /// [`AuthError::MalformedParameter`] when `element` is not
-/// `token BWS "=" BWS ( token / quoted-string )`;
-/// [`AuthError::UnterminatedQuotedString`] when a quoted value is still open
-/// where `element` ends and `tail` says nothing closed it;
+/// `token BWS "=" BWS ( token / quoted-string )`, and for the one shape only
+/// `tail` can report — a quoted value that closed across the join with bytes
+/// behind that close; [`AuthError::UnterminatedQuotedString`] when a quoted
+/// value is still open where `element` ends and `tail` says nothing closed it;
 /// [`AuthError::InvalidQuotedString`] when one carries a byte §5.6.4 forbids.
 // `pub(crate)` for one caller outside this module and no other: the
 // `__no_panic_internals` forwarder the link proof's shim over it reaches it
@@ -500,6 +524,10 @@ pub(crate) fn auth_param(element: &[u8], tail: ValueTail) -> Result<AuthParam<'_
         // well formed — it is simply not one slice to hand back, which is what
         // [`AuthParam::value`] reports over these same bytes.
         ValueTail::Continues => Ok(AuthParam { name, value }),
+        // It closed there and the element ran on past that close, which the
+        // arm above this `match` already refuses when both lie on one field
+        // line. One rule, and RFC 9110 §5.2's join is not a way past it.
+        ValueTail::Trails => Err(AuthError::MalformedParameter),
         ValueTail::Ends => Err(AuthError::UnterminatedQuotedString),
       },
       QuotedScan::Invalid => Err(AuthError::InvalidQuotedString),
@@ -1038,6 +1066,10 @@ impl<'a> ParamWalk<'a> {
     // before the next region's first byte — so the escape is spent on the
     // comma, and a DQUOTE arriving first on that line closes the string.
     let mut tail = ValueTail::Ends;
+    // Set by the first region that carries bytes behind the value's close, and
+    // never cleared afterwards: a later region closing the string THOSE bytes
+    // opened does not make them derivable.
+    let mut trailing = false;
     while let Some(escape) = open.take() {
       let next_line = self.line.saturating_add(1);
       if next_line >= self.body.len {
@@ -1052,12 +1084,21 @@ impl<'a> ParamWalk<'a> {
       self.at = next.len();
       match rejoin(next, escape) {
         // Past the string, the rest of this region is the element's like any
-        // other, up to the comma that ends it.
-        Rejoin::Ends(at) => {
-          tail = ValueTail::Continues;
+        // other, up to the comma that ends it — and only the list's own `OWS`
+        // may be in between, which is what `trails` answers.
+        Rejoin::Ends { at, trails } => {
+          trailing |= trails;
+          tail = if trailing {
+            ValueTail::Trails
+          } else {
+            ValueTail::Continues
+          };
           self.at = at;
         }
-        Rejoin::Open(escape) => open = Some(escape),
+        Rejoin::Open { escape, trails } => {
+          trailing |= trails;
+          open = Some(escape);
+        }
         Rejoin::Invalid => {
           self.done = true;
           return Err(AuthError::InvalidQuotedString);
@@ -1082,11 +1123,26 @@ impl<'a> ParamWalk<'a> {
 /// bare list — so [`rejoin`] answers it once and this is what it answers with.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Rejoin {
-  /// The string closed and the element ends at this offset on the new line.
-  Ends(usize),
-  /// A quoted-string is open again where the new line ends, carrying the state
-  /// RFC 9110 §5.2's NEXT join comma is to be fed through.
-  Open(bool),
+  /// The string closed and the element ends on the new line.
+  Ends {
+    /// Where on that line it ends.
+    at: usize,
+    /// Whether anything other than the `OWS` RFC 9110 §5.6.1.2 hangs on a
+    /// comma stood between the close and `at`. Nothing else is derivable
+    /// there, so this is [`ValueTail::Trails`] on its way to the one function
+    /// that decides the production.
+    trails: bool,
+  },
+  /// A quoted-string is open again where the new line ends.
+  Open {
+    /// The state RFC 9110 §5.2's NEXT join comma is to be fed through.
+    escape: bool,
+    /// As on [`Rejoin::Ends`], and a DQUOTE that opened a string of its own
+    /// BEHIND the value's close is itself such a byte — so this is set for
+    /// every string that opens there, and the walk carries it over whatever
+    /// further lines that string takes.
+    trails: bool,
+  },
   /// A byte §5.6.4 forbids appeared inside a quoted-string.
   Invalid,
 }
@@ -1100,29 +1156,57 @@ enum Rejoin {
 /// arriving first on `next` CLOSES the string — and
 /// [`crate::grammar::scan_to_delim`] is its one implementation of where a
 /// comma stops being a delimiter. This is the two of them in the order an
-/// element needs them: past the close, the rest of the line is the element's
-/// like any other, up to the comma that ends it.
+/// element needs them, with the rule below drawn between.
 ///
-/// # Why a close in the middle is not reported
+/// # A close is not an end
 ///
-/// [`Rejoin::Ends`] is the only answer that says a value crossed the join, and
-/// a close met on the way — this line closing the element's string and opening
-/// another behind it — is not reported, because it could not change that. A
-/// walk over these answers ends in exactly two ways: at an `Ends`, or with the
-/// field lines exhausted while something is still open. The second is an
-/// element that ends inside a string whatever closed before it. The first is
-/// reachable only where the string open at the start of THAT line closed,
-/// which the element's own string had to have done first. So `Ends` is the
-/// crossing, and a flag for the closes behind it would be read by nothing —
-/// which is how it was written first, and a mutation of it survived the suite.
+/// Past the close only whitespace is derivable. RFC 9110 §11.2's
+/// `auth-param = token BWS "=" BWS ( token / quoted-string )` takes one
+/// alternative WHOLE, and §5.6.1.2 expands the list around it as
+/// `#element => [ element ] *( OWS "," OWS [ element ] )` — so between a value
+/// that closed here and the comma that ends its element there is room for that
+/// `OWS` and for nothing else. The run is therefore WALKED rather than scanned
+/// for a delimiter, and anything it reaches other than the comma or the end of
+/// `next` is reported as `trails` — the end of a line being that comma too,
+/// since §5.2 puts one at every join and the value ends where the lines run
+/// out.
+///
+/// An earlier revision scanned straight to the comma and reported nothing
+/// about what it crossed, which read `Basic realm="x` and `"junk` — one
+/// challenge over two field lines, joined by §5.2 into `Basic realm="x,"junk`
+/// — as the parameter `realm`, with `junk` swallowed. The same bytes written
+/// on ONE line were already refused, since [`auth_param`] has always refused a
+/// quoted-string with bytes behind its close; only the join was a way past it.
+///
+/// # Why the verdict travels rather than stopping the scan
+///
+/// Where the element ENDS is still the delimiter scan's answer, taken over the
+/// same bytes and by the same rule as before. A verdict on one element must
+/// not move the boundary the elements BEHIND it are read from: `challenges`
+/// reports one fault per challenge and goes on to the next, and it can only do
+/// that while every boundary it knows came from one clean scan. So the fault
+/// rides out as a flag, and the walk that carries the element is the one that
+/// spends it — at [`auth_param`], through [`ValueTail::Trails`].
 fn rejoin(next: &[u8], escape: bool) -> Rejoin {
   match scan_quoted_after_join(next, escape) {
-    QuotedScan::Closed(end) => match scan_to_delim(next, end, b',') {
-      Delim::At(at) => Rejoin::Ends(at),
-      Delim::Open(escape) => Rejoin::Open(escape),
-      Delim::Invalid => Rejoin::Invalid,
+    QuotedScan::Closed(end) => {
+      let at = skip_ows(next, end);
+      match next.get(at) {
+        None | Some(&b',') => Rejoin::Ends { at, trails: false },
+        Some(_) => match scan_to_delim(next, at, b',') {
+          Delim::At(at) => Rejoin::Ends { at, trails: true },
+          Delim::Open(escape) => Rejoin::Open {
+            escape,
+            trails: true,
+          },
+          Delim::Invalid => Rejoin::Invalid,
+        },
+      }
+    }
+    QuotedScan::Open { escape } => Rejoin::Open {
+      escape,
+      trails: false,
     },
-    QuotedScan::Open { escape } => Rejoin::Open(escape),
     QuotedScan::Invalid => Rejoin::Invalid,
   }
 }
@@ -1659,9 +1743,17 @@ where
         // but carry the close of this one.
         section.spend(spent, spent.len());
       }
+      // `trails` is dropped HERE and nowhere else. This walk is looking for
+      // the challenge's extent, and every byte it crosses lands in the region
+      // it collects — so `Credential::read` runs the same `rejoin` over the
+      // same bytes and reports the fault there, once, as it does for every
+      // other fault a parameter list carries. Reporting it here would refuse
+      // the challenge before its boundary was known, and a `seek` — which
+      // collects nothing and is walking a challenge that ALREADY failed —
+      // would report a second fault for one that was reported once.
       match rejoin(next, escape) {
-        Rejoin::Ends(at) => self.at = at,
-        Rejoin::Open(escape) => open = Some(escape),
+        Rejoin::Ends { at, trails: _ } => self.at = at,
+        Rejoin::Open { escape, trails: _ } => open = Some(escape),
         Rejoin::Invalid => return Err(AuthError::InvalidQuotedString),
       }
     }
@@ -2031,6 +2123,10 @@ where
     self.at = head_end;
 
     let mut tail = ValueTail::Ends;
+    // Set by the first line that carries bytes behind the value's close, and
+    // never cleared afterwards: a later line closing the string THOSE bytes
+    // opened does not make them derivable.
+    let mut trailing = false;
     while let Some(escape) = open.take() {
       let Some(next) = self.next_line() else {
         // No further line, so the combined value ends inside the string.
@@ -2042,11 +2138,19 @@ where
       self.line = next;
       self.at = next.len();
       match rejoin(next, escape) {
-        Rejoin::Ends(at) => {
-          tail = ValueTail::Continues;
+        Rejoin::Ends { at, trails } => {
+          trailing |= trails;
+          tail = if trailing {
+            ValueTail::Trails
+          } else {
+            ValueTail::Continues
+          };
           self.at = at;
         }
-        Rejoin::Open(escape) => open = Some(escape),
+        Rejoin::Open { escape, trails } => {
+          trailing |= trails;
+          open = Some(escape);
+        }
         Rejoin::Invalid => {
           self.done = true;
           return Err(AuthError::InvalidQuotedString);
