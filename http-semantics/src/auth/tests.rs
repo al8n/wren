@@ -1253,3 +1253,247 @@ fn a_trailing_comma_needs_a_list_to_be_an_empty_element_of() {
   let credential = credentials(b"Newauth ,,a=1,,,b=2,,").unwrap();
   assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
 }
+
+// ── RFC 9110 §11.6.3's Authentication-Info, a list and nothing else ──────────
+
+/// One `#auth-param` walk collected into a fixed array, `None` past its last
+/// result.
+///
+/// `N` is written one larger than the answer a test expects, so the trailing
+/// `None` is the assertion that the walk stopped where it was supposed to
+/// rather than the test reading only a prefix of it.
+fn info<'a, const N: usize>(
+  lines: impl IntoIterator<Item = &'a [u8]>,
+) -> [Option<Result<AuthParam<'a>, AuthError>>; N] {
+  let mut out = [None; N];
+  for (slot, outcome) in out.iter_mut().zip(auth_info(lines)) {
+    *slot = Some(outcome);
+  }
+  out
+}
+
+/// Seventeen field lines — one more than [`MAX_CHALLENGE_LINES`] — carrying
+/// twelve parameters, the first of which is one value spread over six of them.
+///
+/// Every line has element bytes on it, so a walk that spent an entry per line
+/// the way a [`Credential`] must would run out on this input. The parameter
+/// count is kept well under the crate's other bound so that this pins the one
+/// it is about.
+const SEVENTEEN_INFO_LINES: [&[u8]; 17] = [
+  b"p00=\"a", b"a", b"a", b"a", b"a", b"a\"", b"p01=1", b"p02=2", b"p03=3", b"p04=4", b"p05=5",
+  b"p06=6", b"p07=7", b"p08=8", b"p09=9", b"p10=10", b"p11=11",
+];
+
+#[test]
+fn the_field_is_a_parameter_list_with_no_scheme_in_front_of_it() {
+  // RFC 9110 §11.6.3 spells `Authentication-Info = #auth-param` and §11.7.3
+  // spells `Proxy-Authentication-Info = #auth-param`. There is no
+  // `auth-scheme` in either and no `token68` behind one, and what the
+  // parameters mean is not this parser's either — §11.6.3: "This specification
+  // only describes the generic format; authentication schemes using
+  // Authentication-Info will define the individual parameters."
+  let [next, rsp, past] = info::<3>([&b"nextnonce=\"47364c23\", rspauth=6629fae4"[..]]);
+  assert!(past.is_none());
+  let next = next.unwrap().unwrap();
+  assert_eq!(next.name(), b"nextnonce");
+  assert!(matches!(next.value(), Ok(ParamValue::Quoted(v)) if v == b"47364c23"));
+  let rsp = rsp.unwrap().unwrap();
+  assert_eq!(rsp.name(), b"rspauth");
+  assert!(matches!(rsp.value(), Ok(ParamValue::Token(v)) if v == b"6629fae4"));
+
+  // A whole challenge is not a parameter, because this field has nothing that
+  // admits a scheme: `Basic` is read as a name, and RFC 9110 §11.2's
+  // `auth-param = token BWS "=" BWS ( token / quoted-string )` puts only
+  // §5.6.3's `BWS` between that name and its `=`, which a second token is not.
+  let [fault, past] = info::<2>([&b"Basic realm=\"x\""[..]]);
+  assert!(past.is_none());
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedParameter);
+
+  // `#auth-param` has no lower bound — RFC 9110 §5.6.1's `<n>#<m>element` is
+  // written here with neither — so an empty value is an empty list and not a
+  // fault.
+  assert!(info::<1>([&b""[..]])[0].is_none());
+  assert!(info::<1>([&b" , ,"[..]])[0].is_none());
+}
+
+#[test]
+fn a_parameter_list_is_read_across_the_lines_it_arrived_on() {
+  // RFC 9110 §5.2 makes repeated field lines one value, the field line values
+  // "concatenated in order, with each field line value separated by a comma",
+  // so a sender that split this list at an element boundary wrote the same
+  // list as one that did not.
+  let [first, second, third, past] = info::<4>([&b"a=1"[..], b"b=2", b"c=3"]);
+  assert!(past.is_none());
+  assert_eq!(first.unwrap().unwrap().name(), b"a");
+  assert_eq!(second.unwrap().unwrap().name(), b"b");
+  assert_eq!(third.unwrap().unwrap().name(), b"c");
+
+  // A VALUE that crosses the join is spec §5.2's rule, and it is the same rule
+  // at all three entry points: the walk keeps the parameter, `name()` still
+  // answers, and the one fact that is true — this value is not one contiguous
+  // slice — surfaces at `value()` and nowhere else. No error is reported here.
+  let [spanning, plain, past] = info::<3>([&b"a=\"long"[..], b"tail\", b=2"]);
+  assert!(past.is_none());
+  let spanning = spanning.unwrap().unwrap();
+  assert_eq!(spanning.name(), b"a");
+  assert_eq!(spanning.value().unwrap_err(), ValueSpansFieldLines);
+  let plain = plain.unwrap().unwrap();
+  assert_eq!(plain.name(), b"b");
+  assert!(matches!(plain.value(), Ok(ParamValue::Token(v)) if v == b"2"));
+
+  // The escape pending at a join is spent on the join's own comma, so the next
+  // line's leading DQUOTE closes the string — the same reading
+  // `the_escape_pending_at_a_join_is_spent_on_the_join_comma` pins for a
+  // credential, reached through this walk instead.
+  let [closed, past] = info::<2>([&b"a=\"x\\"[..], b"\""]);
+  assert!(past.is_none());
+  let closed = closed.unwrap().unwrap();
+  assert_eq!(closed.name(), b"a");
+  assert_eq!(closed.value().unwrap_err(), ValueSpansFieldLines);
+}
+
+#[test]
+fn a_trailer_field_line_is_read_as_any_other_field_line() {
+  // RFC 9110 §11.6.3: "Authentication-Info can be sent as a trailer field
+  // (Section 6.5) when the authentication scheme explicitly allows this."
+  // §11.7.3 says the same of `Proxy-Authentication-Info`.
+  //
+  // Nothing in this module honours that sentence, because nothing in it can
+  // tell. `auth_info` is handed field LINES and takes no other argument: there
+  // is no section, no flag and no branch in it that a header line and a
+  // trailer line could take differently, so a trailer's lines parse
+  // identically BY CONSTRUCTION rather than by a check that could be got
+  // wrong. Whether the scheme allows the field there at all is the caller's,
+  // since this crate implements no authentication scheme.
+  //
+  // What is asserted is the operational half of "cannot tell": a value a
+  // sender wrote as one line and the same value it wrote as two — which is
+  // what a trailer section, announced field by field, tends to look like —
+  // give the same parameters, because RFC 9110 §5.2 joins the second back into
+  // the first and this walk is the only reader either reaches.
+  let [h1, h2, h_past] = info::<3>([&b"nextnonce=\"a1b2\", rspauth=\"c3d4\""[..]]);
+  let [t1, t2, t_past] = info::<3>([&b"nextnonce=\"a1b2\""[..], b"rspauth=\"c3d4\""]);
+  assert!(h_past.is_none());
+  assert!(t_past.is_none());
+
+  let (h1, t1) = (h1.unwrap().unwrap(), t1.unwrap().unwrap());
+  assert_eq!(h1.name(), t1.name());
+  assert_eq!(h1.name(), b"nextnonce");
+  assert!(matches!(t1.value(), Ok(ParamValue::Quoted(v)) if v == b"a1b2"));
+
+  let (h2, t2) = (h2.unwrap().unwrap(), t2.unwrap().unwrap());
+  assert_eq!(h2.name(), t2.name());
+  assert_eq!(h2.name(), b"rspauth");
+  assert!(matches!(t2.value(), Ok(ParamValue::Quoted(v)) if v == b"c3d4"));
+}
+
+#[test]
+fn a_parameter_list_is_not_bounded_by_the_challenge_line_bound() {
+  // `MAX_CHALLENGE_LINES` bounds what one `Credential` can NAME at once: a
+  // challenge is handed over whole, so a borrowing reader has to hold every
+  // region it spans and the array holding them is a fixed size. This walk
+  // hands over one parameter at a time and never names more than the line that
+  // parameter began on, so the bound has nothing here to bound — and a list
+  // spread over more lines than it is read rather than refused.
+  assert!(SEVENTEEN_INFO_LINES.len() > MAX_CHALLENGE_LINES);
+  let read = auth_info(SEVENTEEN_INFO_LINES).count();
+  assert_eq!(read, 12);
+  assert!(auth_info(SEVENTEEN_INFO_LINES).all(|param| param.is_ok()));
+
+  // The first parameter is the value spread over six of those lines, and it is
+  // the walk's own regression against dropping the lines that begin no element
+  // of their own: they carry the DQUOTE that closes it.
+  let mut walk = auth_info(SEVENTEEN_INFO_LINES);
+  let spanning = walk.next().unwrap().unwrap();
+  assert_eq!(spanning.name(), b"p00");
+  assert_eq!(spanning.value().unwrap_err(), ValueSpansFieldLines);
+  assert_eq!(walk.next().unwrap().unwrap().name(), b"p01");
+  assert_eq!(walk.last().unwrap().unwrap().name(), b"p11");
+}
+
+#[test]
+fn one_fault_ends_the_parameter_walk() {
+  // Spec §5.2 lets `challenges()` go on after a fault because §11.4 has a user
+  // agent SEARCH that list for a scheme it understands, and one unreadable
+  // challenge must not hide the readable one behind it. A parameter list is
+  // not searched that way, and the crate's own parameter walk —
+  // `crate::grammar::ParamIter` — poisons on any `Err`. This one does the
+  // same: the fault is reported once and the walk ends there.
+  let [good, fault, past] = info::<3>([&b"a=1, b, c=3"[..]]);
+  assert_eq!(good.unwrap().unwrap().name(), b"a");
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none());
+
+  // A string still open when the LAST field line ends never closed, which is
+  // the one case the join cannot rescue.
+  let [fault, past] = info::<2>([&b"a=\"x"[..]]);
+  assert_eq!(
+    fault.unwrap().unwrap_err(),
+    AuthError::UnterminatedQuotedString
+  );
+  assert!(past.is_none());
+
+  // %x00 is neither `qdtext` nor an octet a `quoted-pair` may escape, and
+  // after it no comma can be told from data.
+  let [fault, past] = info::<2>([&b"a=\"x\x00\", b=2"[..]]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
+  assert!(past.is_none());
+}
+
+#[test]
+fn the_same_parameter_list_reads_the_same_through_every_entry_point() {
+  // One `#auth-param` list, reached once as the body of a credential and once
+  // as the whole of an `Authentication-Info` field. RFC 9110 §11.6.3 says the
+  // field uses the `auth-param` syntax §11.2 defines, which is the syntax the
+  // body of §11.4's `credentials` is a list of — so the two walks are over one
+  // production and are asserted to agree rather than left to drift.
+  // The OWS RFC 9110 §5.6.1.2 hangs on both sides of every comma is the list's
+  // and not the value's, at this entry point as at the other two.
+  let credential = credentials(b"Basic a=1 , b=\"x\" , c = 3").unwrap();
+  let [first, second, third, past] = info::<4>([&b"a=1 , b=\"x\" , c = 3"[..]]);
+  assert!(past.is_none());
+
+  let mut params = credential.params();
+  for expected in [first, second, third] {
+    let expected = expected.unwrap().unwrap();
+    let got = params.next().unwrap();
+    assert_eq!(got.name(), expected.name());
+    match (got.value(), expected.value()) {
+      (Ok(ParamValue::Token(a)), Ok(ParamValue::Token(b))) => assert_eq!(a, b),
+      (Ok(ParamValue::Quoted(a)), Ok(ParamValue::Quoted(b))) => assert_eq!(a, b),
+      _ => panic!("the two walks read one parameter differently"),
+    }
+  }
+  assert!(params.next().is_none());
+}
+
+#[test]
+fn the_elements_behind_a_closing_line_are_reached_at_every_entry_point() {
+  // `rejoin` is the one place this module carries an element across RFC 9110
+  // §5.2's join, and all three walks reach it. Past the DQUOTE that closes the
+  // value, the rest of that field line is ordinary list bytes: the elements
+  // behind it belong to the challenge, the credential or the parameter list
+  // that was open, and a walk that left its cursor at the line's END instead
+  // would lose every one of them.
+  //
+  // `the_line_that_closes_a_value_carries_the_elements_behind_it` pins this
+  // over `read_credential`. These are the other two, and the `#challenge` walk
+  // additionally has to find, behind that close, the boundary §11.6.1's
+  // ambiguity turns on.
+  let [basic, newauth, past] = walk::<3>([&b"Basic a=\"x"[..], b"y\", b=2, Newauth c=3"]);
+  assert!(past.is_none());
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(names::<3>(&basic), [Some(&b"a"[..]), Some(b"b"), None]);
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert_eq!(names::<2>(&newauth), [Some(&b"c"[..]), None]);
+
+  let [first, second, third, past] = info::<4>([&b"a=\"x"[..], b"y\", b=2, c=3"]);
+  assert!(past.is_none());
+  let first = first.unwrap().unwrap();
+  assert_eq!(first.name(), b"a");
+  assert_eq!(first.value().unwrap_err(), ValueSpansFieldLines);
+  assert_eq!(second.unwrap().unwrap().name(), b"b");
+  assert_eq!(third.unwrap().unwrap().name(), b"c");
+}

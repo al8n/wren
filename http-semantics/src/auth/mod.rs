@@ -823,22 +823,15 @@ impl<'a> ParamWalk<'a> {
       self.line = next_line;
       let next = self.body.line(next_line);
       self.at = next.len();
-      match scan_quoted_after_join(next, escape) {
-        QuotedScan::Closed(end) => {
+      match rejoin(next, escape) {
+        // Past the string, the rest of this region is the element's like any
+        // other, up to the comma that ends it.
+        Rejoin::Ends(at) => {
           tail = ValueTail::Continues;
-          // Past the string, the rest of this region is the element's like any
-          // other, up to the comma that ends it.
-          match scan_to_delim(next, end, b',') {
-            Delim::At(at) => self.at = at,
-            Delim::Open(escape) => open = Some(escape),
-            Delim::Invalid => {
-              self.done = true;
-              return Err(AuthError::InvalidQuotedString);
-            }
-          }
+          self.at = at;
         }
-        QuotedScan::Open { escape } => open = Some(escape),
-        QuotedScan::Invalid => {
+        Rejoin::Open(escape) => open = Some(escape),
+        Rejoin::Invalid => {
           self.done = true;
           return Err(AuthError::InvalidQuotedString);
         }
@@ -851,6 +844,59 @@ impl<'a> ParamWalk<'a> {
       self.done = true;
     }
     param
+  }
+}
+
+/// What the field line behind an RFC 9110 §5.2 join does to an element left
+/// open inside a §5.6.4 quoted-string where the line before it ended.
+///
+/// Three walks over this module's elements ask exactly this at exactly this
+/// point — a credential's parameter list, a `#challenge` value, and §11.6.3's
+/// bare list — so [`rejoin`] answers it once and this is what it answers with.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Rejoin {
+  /// The string closed and the element ends at this offset on the new line.
+  Ends(usize),
+  /// A quoted-string is open again where the new line ends, carrying the state
+  /// RFC 9110 §5.2's NEXT join comma is to be fed through.
+  Open(bool),
+  /// A byte §5.6.4 forbids appeared inside a quoted-string.
+  Invalid,
+}
+
+/// Carries an element across RFC 9110 §5.2's join and says where it got to.
+///
+/// `escape` is the state the line before this one ended in.
+/// [`crate::grammar::scan_quoted_after_join`] is this crate's one
+/// implementation of the join rule — it feeds the join's comma THROUGH the
+/// open string first, so a pending escape is spent on the comma and a DQUOTE
+/// arriving first on `next` CLOSES the string — and
+/// [`crate::grammar::scan_to_delim`] is its one implementation of where a
+/// comma stops being a delimiter. This is the two of them in the order an
+/// element needs them: past the close, the rest of the line is the element's
+/// like any other, up to the comma that ends it.
+///
+/// # Why a close in the middle is not reported
+///
+/// [`Rejoin::Ends`] is the only answer that says a value crossed the join, and
+/// a close met on the way — this line closing the element's string and opening
+/// another behind it — is not reported, because it could not change that. A
+/// walk over these answers ends in exactly two ways: at an `Ends`, or with the
+/// field lines exhausted while something is still open. The second is an
+/// element that ends inside a string whatever closed before it. The first is
+/// reachable only where the string open at the start of THAT line closed,
+/// which the element's own string had to have done first. So `Ends` is the
+/// crossing, and a flag for the closes behind it would be read by nothing —
+/// which is how it was written first, and a mutation of it survived the suite.
+fn rejoin(next: &[u8], escape: bool) -> Rejoin {
+  match scan_quoted_after_join(next, escape) {
+    QuotedScan::Closed(end) => match scan_to_delim(next, end, b',') {
+      Delim::At(at) => Rejoin::Ends(at),
+      Delim::Open(escape) => Rejoin::Open(escape),
+      Delim::Invalid => Rejoin::Invalid,
+    },
+    QuotedScan::Open { escape } => Rejoin::Open(escape),
+    QuotedScan::Invalid => Rejoin::Invalid,
   }
 }
 
@@ -1334,14 +1380,10 @@ where
         // but carry the close of this one.
         section.spend(spent, spent.len());
       }
-      match scan_quoted_after_join(next, escape) {
-        QuotedScan::Closed(end) => match scan_to_delim(next, end, b',') {
-          Delim::At(at) => self.at = at,
-          Delim::Open(escape) => open = Some(escape),
-          Delim::Invalid => return Err(AuthError::InvalidQuotedString),
-        },
-        QuotedScan::Open { escape } => open = Some(escape),
-        QuotedScan::Invalid => return Err(AuthError::InvalidQuotedString),
+      match rejoin(next, escape) {
+        Rejoin::Ends(at) => self.at = at,
+        Rejoin::Open(escape) => open = Some(escape),
+        Rejoin::Invalid => return Err(AuthError::InvalidQuotedString),
       }
     }
     if let Some(section) = region {
@@ -1475,6 +1517,231 @@ where
         }
       }
     }
+  }
+}
+
+/// Reads RFC 9110 §11.6.3's `Authentication-Info` and §11.7.3's
+/// `Proxy-Authentication-Info` — the two authentication fields that are a
+/// parameter list and nothing else.
+///
+/// ```text
+/// Authentication-Info = #auth-param
+/// Proxy-Authentication-Info = #auth-param
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// No `auth-scheme` stands in front of these and no `token68` behind one, so
+/// there is no [`Credential`] here to hold them and no boundary question to
+/// ask: every comma outside a quoted-string separates one `auth-param` from
+/// the next, and each is yielded on its own. What the parameters MEAN is not
+/// this parser's either — RFC 9110 §11.6.3: "This specification only describes
+/// the generic format; authentication schemes using Authentication-Info will
+/// define the individual parameters." §11.6.3 also frees the field of any
+/// other context: "The Authentication-Info field can be used in any HTTP
+/// response, independently of request method and status code."
+///
+/// `lines` are the field's lines in wire order. §5.2 makes a repeated field
+/// one value, its field line values "concatenated in order, with each field
+/// line value separated by a comma", so a sender that split this list at an
+/// element boundary wrote the same list as one that did not — and a value may
+/// legally open on one line and close on the next, which the walk crosses.
+///
+/// `#auth-param` carries neither bound of §5.6.1's `<n>#<m>element`, so an
+/// empty field value is an empty list rather than a fault.
+///
+/// # What a join can still take away
+///
+/// One VALUE's contiguity, and nothing else. A parameter whose quoted-string
+/// crosses a join keeps its boundaries and its name, so the walk yields it and
+/// [`AuthParam::name`] answers; [`AuthParam::value`] is where
+/// [`ValueSpansFieldLines`] is reported, exactly as it is for a parameter
+/// reached through [`Credential::params`]. The rule is one rule at all three
+/// entry points, and §11.6.3's field is not the place it changes.
+///
+/// # No line bound
+///
+/// [`MAX_CHALLENGE_LINES`] bounds what one [`Credential`] can NAME at once,
+/// because a challenge is handed over whole and a borrowing reader has to hold
+/// every region it spans. This walk hands over one parameter at a time and
+/// never names more than the line that parameter began on, so nothing here is
+/// bounded by it: a list spread over more lines than a challenge may occupy is
+/// read rather than refused.
+///
+/// # A trailer's lines, which are field lines
+///
+/// RFC 9110 §11.6.3: "Authentication-Info can be sent as a trailer field
+/// (Section 6.5) when the authentication scheme explicitly allows this."
+/// §11.7.3 writes the same sentence for the proxy's field.
+///
+/// Nothing here honours that, because nothing here can tell. This reader takes
+/// field lines and takes nothing else: no section reaches it, so no branch in
+/// it can turn on one, and a trailer section's lines are read identically to a
+/// header section's BY CONSTRUCTION rather than by a check that could be got
+/// wrong. §6.5 is what makes that sound rather than lucky — a trailer field is
+/// a §5 field that happens to be located in a trailer section, with the same
+/// syntax it would have had in a header one. Whether the scheme allows the
+/// field there at all is the caller's, since this crate implements no
+/// authentication scheme.
+///
+/// # What follows a fault
+///
+/// One, and then the walk ends. A `#challenge` value is a list a caller
+/// SEARCHES — §11.4 has a user agent choose "the challenge with what it
+/// considers to be the most secure auth-scheme that it understands" — so
+/// [`challenges`] reports a fault and goes on, lest one unreadable challenge
+/// hide the readable one behind it. A parameter list is not searched that way,
+/// and this crate's other parameter walk,
+/// [`crate::grammar::parameterised_list`], poisons on any `Err`. This one does
+/// the same, so a caller reading a fault knows the rest of the list was not
+/// silently dropped one parameter at a time.
+///
+/// # Errors
+///
+/// [`AuthError::MalformedParameter`] for an element that is not
+/// `token BWS "=" BWS ( token / quoted-string )` — which is what an
+/// `auth-scheme` and its parameters are, read as one element of this field;
+/// [`AuthError::UnterminatedQuotedString`] for a string still open when the
+/// last field line ended; [`AuthError::InvalidQuotedString`] for a byte §5.6.4
+/// forbids inside one.
+#[inline]
+pub fn auth_info<'a, I>(lines: I) -> impl Iterator<Item = Result<AuthParam<'a>, AuthError>>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  AuthInfo {
+    lines: lines.into_iter(),
+    // The walk starts with no line in hand, which is the same position as a
+    // line that has been spent: the next element comes from the next one.
+    line: &[],
+    at: 0,
+    exhausted: false,
+    done: false,
+  }
+}
+
+/// The walk [`auth_info`] hands out: the field lines still to come, the one
+/// being walked, and where in it the next element starts.
+struct AuthInfo<'a, I> {
+  lines: I,
+  line: &'a [u8],
+  at: usize,
+  /// `lines` answered `None` once. An `Iterator` is not required to keep doing
+  /// so, and RFC 9110 §5.2's value ends at the last line either way.
+  exhausted: bool,
+  /// A fault was reported, or the value ran out. Either way there is no
+  /// further parameter to hand over.
+  done: bool,
+}
+
+impl<'a, I> Iterator for AuthInfo<'a, I>
+where
+  I: Iterator<Item = &'a [u8]>,
+{
+  type Item = Result<AuthParam<'a>, AuthError>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      if self.done {
+        return None;
+      }
+      self.at = skip_ows(self.line, self.at);
+      match self.line.get(self.at) {
+        // RFC 9110 §5.6.1.2: "A recipient MUST parse and ignore a reasonable
+        // number of empty list elements".
+        Some(&b',') => self.at = self.at.saturating_add(1),
+        // This line is spent OUTSIDE a quoted-string, so §5.2's join comma is
+        // the separator it looks like and the next line opens a new element.
+        None => {
+          let Some(next) = self.next_line() else {
+            self.done = true;
+            return None;
+          };
+          self.line = next;
+          self.at = 0;
+        }
+        Some(_) => return Some(self.element()),
+      }
+    }
+  }
+}
+
+impl<'a, I> AuthInfo<'a, I>
+where
+  I: Iterator<Item = &'a [u8]>,
+{
+  /// The next field line of the value, or `None` once there are none left.
+  fn next_line(&mut self) -> Option<&'a [u8]> {
+    if self.exhausted {
+      return None;
+    }
+    let next = self.lines.next();
+    if next.is_none() {
+      self.exhausted = true;
+    }
+    next
+  }
+
+  /// Takes the element at the cursor, leaving the cursor on whatever ended it
+  /// — which may be on a LATER field line than the element began on.
+  ///
+  /// The parameter is named over the bytes of the line it STARTED on, which is
+  /// all a borrowing reader can hand back. When RFC 9110 §5.2's join carried a
+  /// quoted value onto a further line, [`ValueTail::Continues`] is what says
+  /// so, and [`AuthParam::value`] reports it over those same bytes.
+  ///
+  /// # Errors
+  ///
+  /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
+  /// quoted-string, and whatever [`auth_param`] makes of the element. Any of
+  /// them ends the walk.
+  fn element(&mut self) -> Result<AuthParam<'a>, AuthError> {
+    let head = self.line;
+    let start = self.at;
+    // What the element occupies on the line it starts on, plus — when a
+    // quoted-string held it open at that line's end — the escape state to
+    // continue that string with.
+    let (head_end, mut open) = match scan_to_delim(head, start, b',') {
+      // The element ends here, so the `OWS` RFC 9110 §5.6.1.2 hangs on the
+      // comma in front of it belongs to the list rather than to the value.
+      Delim::At(end) => (trim_ows_end(head, end), None),
+      Delim::Open(escape) => (head.len(), Some(escape)),
+      Delim::Invalid => {
+        self.done = true;
+        return Err(AuthError::InvalidQuotedString);
+      }
+    };
+    self.at = head_end;
+
+    let mut tail = ValueTail::Ends;
+    while let Some(escape) = open.take() {
+      let Some(next) = self.next_line() else {
+        // No further line, so the combined value ends inside the string.
+        // Whatever closed on an earlier one does not change that: what is
+        // still open is what the element ends in, and `auth_param` reports it.
+        tail = ValueTail::Ends;
+        break;
+      };
+      self.line = next;
+      self.at = next.len();
+      match rejoin(next, escape) {
+        Rejoin::Ends(at) => {
+          tail = ValueTail::Continues;
+          self.at = at;
+        }
+        Rejoin::Open(escape) => open = Some(escape),
+        Rejoin::Invalid => {
+          self.done = true;
+          return Err(AuthError::InvalidQuotedString);
+        }
+      }
+    }
+
+    let element = head.get(start..head_end).unwrap_or_default();
+    let param = auth_param(element, tail);
+    if param.is_err() {
+      self.done = true;
+    }
+    param
   }
 }
 
