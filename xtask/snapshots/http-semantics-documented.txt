@@ -2,6 +2,23 @@
 #   cargo run -p xtask -- doc-check --bless
 # A line REMOVED by --bless means this change dropped documentation.
 http_semantics
+http_semantics::auth
+http_semantics::auth::AuthError
+http_semantics::auth::AuthError::ChallengeSpansTooManyLines
+http_semantics::auth::AuthError::DuplicateParameter
+http_semantics::auth::AuthError::InvalidQuotedString
+http_semantics::auth::AuthError::MalformedParameter
+http_semantics::auth::AuthError::MalformedScheme
+http_semantics::auth::AuthError::MissingScheme
+http_semantics::auth::AuthError::TooManyParameters
+http_semantics::auth::AuthError::UnterminatedQuotedString
+http_semantics::auth::AuthParam
+http_semantics::auth::AuthParam.name
+http_semantics::auth::AuthParam.value
+http_semantics::auth::AuthParam::name
+http_semantics::auth::AuthParam::value
+http_semantics::auth::ValueSpansFieldLines
+http_semantics::auth::auth_param
 http_semantics::conditional
 http_semantics::conditional::DateField
 http_semantics::conditional::DateField::Absent
