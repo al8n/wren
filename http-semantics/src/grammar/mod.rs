@@ -1377,7 +1377,7 @@ enum QuotedTail {
 }
 
 /// Where a scan for a top-level delimiter got to.
-enum Delim {
+pub(crate) enum Delim {
   /// The delimiter — or the end of the input — is at this offset, with every
   /// §5.6.4 quoted-string before it closed.
   At(usize),
@@ -1399,7 +1399,12 @@ enum Delim {
 /// two unresolved cases apart, because a walk that must cross RFC 9110 §5.2's
 /// join needs the open string's escape state to continue it. Both take what a
 /// quoted-string IS from [`scan_quoted`], which is where that rule lives.
-fn scan_to_delim(value: &[u8], at: usize, delim: u8) -> Delim {
+///
+/// Visible to the whole crate because RFC 9110 §11.2's `#auth-param` walk asks
+/// the same question of the same rule. Writing out a second time where a
+/// comma stops being a delimiter is precisely the drift this function exists
+/// to prevent, so the answer is shared rather than reimplemented.
+pub(crate) fn scan_to_delim(value: &[u8], at: usize, delim: u8) -> Delim {
   let mut at = at;
   loop {
     match value.get(at) {
