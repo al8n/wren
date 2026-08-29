@@ -1277,6 +1277,9 @@ fn credentials_is_panic_free() {
   // Empty elements in quantity, which RFC 9110 §5.6.1.2 has a recipient ignore
   // and which spend no slot of the one-name-once record.
   assert!(shim_credentials(black_box(b"Basic ,, a=1 ,, b=2 ,,".as_slice())) > 0);
+  // The HTAB that IS the OWS §5.6.1.2 hangs on the section's first comma, so
+  // the section opens on the empty first element in front of it.
+  assert!(shim_credentials(black_box(b"Basic \t, type=1".as_slice())) > 0);
   // Exactly `MAX_PARAMS_PER_CREDENTIAL` names, and one past it.
   assert!(
     shim_credentials(black_box(
@@ -1291,7 +1294,8 @@ fn credentials_is_panic_free() {
     0
   );
   // Each refusal on its own: no scheme, a scheme glued to an `=`, the HTAB
-  // RFC 9110 §5.6.1.2 derives nothing for after `1*SP`, a repeated name under
+  // after `1*SP` that reaches an element rather than the comma RFC 9110
+  // §5.6.1.2 would hang it on, a repeated name under
   // §11.2's case-insensitive fold, the trailing comma this field has no list
   // to make an empty element of, a second credential where a parameter name
   // belongs, an unterminated quoted value, a byte §5.6.4 forbids inside one,
@@ -1382,6 +1386,12 @@ fn challenges_is_panic_free() {
   // A `token68` body, and the trailing comma this field DOES have a list to
   // make an empty element of.
   assert!(shim_challenges(black_box(&[b"Basic dGVzdA==,".as_slice()])) > 0);
+  // The OWS RFC 9110 §5.6.1.2 hangs on a comma, at each of the two edges that
+  // read it: behind the scheme, where the challenge is bare and the comma ends
+  // its element, and behind `1*SP`, where the parameter section opens on the
+  // empty first element in front of that comma.
+  assert!(shim_challenges(black_box(&[b"Basic\t, Newauth x=1".as_slice()])) > 0);
+  assert!(shim_challenges(black_box(&[b"Basic \t, type=1".as_slice()])) > 0);
   // A fault, and the challenge behind it: the walk reports one and goes on,
   // which is the seek this drives.
   assert!(

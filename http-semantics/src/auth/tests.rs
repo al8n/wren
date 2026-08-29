@@ -940,6 +940,67 @@ fn a_challenge_reaches_its_parameters_only_through_1_sp() {
 }
 
 #[test]
+fn a_token68_with_no_pad_is_read_through_the_challenge_walk_too() {
+  // RFC 9110 §11.2's
+  // `token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`
+  // needs no `=` at all, and the pins for that shape are otherwise reached
+  // through `credentials`. The first element of a parameter section is
+  // admitted by the `1*SP` in front of it, so §11.6.1's boundary question is
+  // not asked of it — and a walk that asked anyway would answer "the next
+  // challenge" here, since the run carries no `=` to say otherwise, and would
+  // split one challenge into two.
+  let credential = one([&b"Bearer mF_9.B5f-4.1JqM"[..]]);
+  assert_eq!(credential.scheme(), b"Bearer");
+  assert_eq!(credential.token68(), Some(&b"mF_9.B5f-4.1JqM"[..]));
+  assert_eq!(credential.params().count(), 0);
+}
+
+#[test]
+fn the_bws_in_front_of_an_equals_is_read_at_a_boundary_too() {
+  // RFC 9110 §11.2's `auth-param = token BWS "=" BWS ( token / quoted-string )`
+  // puts §5.6.3's BWS between the name and the `=`, so the byte that answers
+  // §11.6.1's boundary question is the first non-BWS one behind the token
+  // rather than the byte itself. A walk that read the raw byte would make the
+  // second element of `Basic a=1, b = 2` the scheme of a second challenge, and
+  // split a conforming value.
+  let credential = one([&b"Basic a=1, b = 2"[..]]);
+  assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
+  let mut params = credential.params();
+  assert_eq!(params.next().unwrap().name(), b"a");
+  assert!(matches!(params.next().unwrap().value(), Ok(ParamValue::Token(v)) if v == b"2"));
+}
+
+#[test]
+fn a_line_source_that_answered_none_has_ended_the_value() {
+  // RFC 9110 §5.2's value ends at the last field line, and `Iterator` does not
+  // promise that a `None` is final. So the walk latches the exhaustion rather
+  // than polling again: a source that yields after answering `None` cannot add
+  // a line to a value that already ended, and without the latch the walk would
+  // read the resurrected line as another challenge — the latch is polled a
+  // second time here, because the first `None` arrives inside `Basic`'s own
+  // element loop and the next `next()` asks again.
+  struct Resurrects(usize);
+  impl Iterator for Resurrects {
+    type Item = &'static [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+      self.0 += 1;
+      match self.0 {
+        1 => Some(b"Basic a=1"),
+        2 => None,
+        _ => Some(b"Newauth b=2"),
+      }
+    }
+  }
+
+  let [basic, past] = walk::<2>(Resurrects(0));
+  assert!(past.is_none(), "a line arrived after the value ended");
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(names::<2>(&basic), [Some(&b"a"[..]), None]);
+}
+
+#[test]
 fn a_challenge_closes_at_the_end_of_its_value() {
   // Spec §10's `["Basic realm=", "x"]` row, which only this walk can answer.
   // RFC 9110 §5.2 joins the lines to `Basic realm=,x`, and at that comma the
@@ -990,6 +1051,108 @@ fn the_ows_a_list_hangs_on_its_comma_is_no_part_of_a_parameter() {
       .params()
       .count(),
     2
+  );
+}
+
+#[test]
+fn the_ows_a_list_hangs_on_a_comma_has_to_reach_it() {
+  // The leading edge of the rule the test above pins at the trailing one. RFC
+  // 9110 §5.6.1.2's `#element => [ element ] *( OWS "," OWS [ element ] )`
+  // hangs every OWS it has ON a comma, so a HTAB is the list's whitespace when
+  // the comma is really behind it and is derived by nothing when an element is
+  // there instead. §5.6.3's OWS is SP or HTAB, so the run has to be walked to
+  // what it reaches rather than judged one byte at a time.
+  //
+  // The `#challenge` list's own edge, one comma apart. `1*SP` is SP alone, so
+  // neither value opens a parameter section; the first is a bare challenge
+  // with the list's OWS behind it, and the second has a HTAB where the
+  // production admits nothing.
+  let [basic, newauth, past] = walk::<3>([&b"Basic\t, Newauth x=1"[..]]);
+  assert!(past.is_none());
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(basic.params().count(), 0);
+  let newauth = newauth.unwrap().unwrap();
+  assert_eq!(newauth.scheme(), b"Newauth");
+  assert_eq!(names::<2>(&newauth), [Some(&b"x"[..]), None]);
+
+  let [fault, past] = walk::<2>([&b"Basic\tNewauth x=1"[..]]);
+  assert!(past.is_none());
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedScheme);
+
+  // So the HTAB spelling reads as the comma-only spelling does and NOT as the
+  // SP one, which is the pair §4.1 is written over: with the SP the section
+  // opens and `type=1` is a parameter of `Basic`; with the HTAB, as with no
+  // whitespace at all, `Basic` is whole and `type=1` has to be a challenge —
+  // which the grammar does not derive.
+  assert_eq!(
+    walk::<3>([&b"Basic\t, type=1"[..]]).map(|read| read.map(|r| r.is_ok())),
+    walk::<3>([&b"Basic, type=1"[..]]).map(|read| read.map(|r| r.is_ok()))
+  );
+  assert_ne!(
+    walk::<3>([&b"Basic\t, type=1"[..]]).map(|read| read.map(|r| r.is_ok())),
+    walk::<3>([&b"Basic , type=1"[..]]).map(|read| read.map(|r| r.is_ok()))
+  );
+
+  // The parameter section's opening edge, the same comma apart. Here `1*SP`
+  // HAS taken its SP, so the HTAB is the OWS in front of the section's first
+  // comma and the section opens on the empty first element §5.6.1.2 admits —
+  // and where it reaches an element instead, that section cannot start. Spec
+  // §4.1's declined leniency is the second of these and stays refused.
+  assert_eq!(
+    names::<2>(&one([&b"Basic \t,a=1"[..]])),
+    [Some(&b"a"[..]), None]
+  );
+  let [fault, past] = walk::<2>([&b"Basic \ta=1"[..]]);
+  assert!(past.is_none());
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_ne!(
+    walk::<2>([&b"Basic \t,a=1"[..]]).map(|read| read.map(|r| r.is_ok())),
+    walk::<2>([&b"Basic \ta=1"[..]]).map(|read| read.map(|r| r.is_ok()))
+  );
+
+  // A run of OWS is one run, and what ends it is what decides.
+  assert_eq!(
+    names::<2>(&one([&b"Basic \t \t, type=1"[..]])),
+    [Some(&b"type"[..]), None]
+  );
+  let [fault, past] = walk::<2>([&b"Basic \t \ta=1"[..]]);
+  assert!(past.is_none());
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedScheme);
+
+  // Both edges across RFC 9110 §5.2's join, where the comma the OWS hangs on
+  // is the one the join puts there rather than one the sender wrote.
+  let [basic, newauth, past] = walk::<3>([&b"Basic\t"[..], b"Newauth x=1"]);
+  assert!(past.is_none());
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  assert_eq!(
+    names::<2>(&one([&b"Basic \t"[..], b"x=1"])),
+    [Some(&b"x"[..]), None]
+  );
+
+  // The section's edge through the other two entry points, which reach it by
+  // the same code. `credentials` is singular, so only the section's edge is
+  // there to reach: the scheme's own HTAB has no list at the top of this
+  // field's value to be the OWS of, and stays refused.
+  assert_eq!(
+    names::<2>(&credentials(b"Basic \t, type=1").unwrap()),
+    [Some(&b"type"[..]), None]
+  );
+  assert_eq!(
+    read_credential([&b"Basic \t, type=1"[..]])
+      .unwrap()
+      .params()
+      .count(),
+    1
+  );
+  assert_eq!(
+    credentials(b"Basic \ta=1").unwrap_err(),
+    AuthError::MalformedScheme
+  );
+  assert_eq!(
+    credentials(b"Basic\t, type=1").unwrap_err(),
+    AuthError::MalformedScheme
   );
 }
 

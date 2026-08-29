@@ -240,11 +240,16 @@ pub enum AuthError {
   ///   `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`, which
   ///   admits nothing after the scheme without that `1*SP`, so an element
   ///   reading `type=1` is a scheme with an `=` glued to it, not a parameter.
+  ///   The element's END is where §5.6.1.2's `OWS` has already been walked
+  ///   over: `Basic<HTAB>, Newauth x=1` is two challenges, the first of them
+  ///   bare, because that `OWS` hangs on the comma and not on the scheme.
   /// - The token IS followed by `1*SP`, and what fails is the section behind
   ///   it. `1*SP` is SP alone; §5.6.1.2 expands a list as
   ///   `#element => [ element ] *( OWS "," OWS [ element ] )`, which attaches
-  ///   every `OWS` it has to a comma, so a HTAB standing where the first
-  ///   element should be is derived by nothing.
+  ///   every `OWS` it has to a comma, so a HTAB reaching an ELEMENT is derived
+  ///   by nothing and the section cannot start — `Basic<SP><HTAB>a=1`. A HTAB
+  ///   reaching the comma is that `OWS` and the section starts on the empty
+  ///   first element in front of it, exactly as `Basic<SP>, type=1` does.
   #[error("an auth-scheme is followed by something the challenge grammar does not admit")]
   MalformedScheme,
   /// A `token BWS "=" BWS ( token / quoted-string )` that does not complete: no
@@ -615,11 +620,13 @@ pub(crate) fn token68_end(value: &[u8], at: usize) -> Option<usize> {
 /// then the reading, and reports the fault.
 fn token68(value: &[u8], at: usize) -> Option<&[u8]> {
   let end = token68_end(value, at)?;
-  match value.get(skip_ows(value, end)) {
-    // Nothing behind the run inside its own element, so the run IS the
-    // element and the first form is the one taken.
-    None | Some(&b',') => value.get(at..end),
-    Some(_) => None,
+  // Nothing behind the run inside its own element, so the run IS the element
+  // and the first form is the one taken. `ends_element` is where that test
+  // lives: the scheme's own edges ask the same question of the same OWS.
+  if ends_element(value, end) {
+    value.get(at..end)
+  } else {
+    None
   }
 }
 
@@ -780,6 +787,14 @@ impl<'a> Credential<'a> {
         body: self.body,
         line: 0,
         at: 0,
+        // Inert by construction, and kept because it says what it means: no
+        // element a `token68` was taken from is an `auth-param`, which
+        // `the_two_branches_are_never_both_derivable` is the argument for, so
+        // a walk started over that body would refuse the one element it found
+        // and this iterator would drop the fault and end anyway. A mutation of
+        // this initialiser therefore survives the suite for the same reason
+        // `rejoin`'s escape flag does, and is named here rather than left to
+        // be rediscovered.
         done: self.token68.is_some(),
       },
     }
@@ -1134,6 +1149,25 @@ fn trim_ows_end(value: &[u8], end: usize) -> usize {
   end
 }
 
+/// Whether the RFC 9110 §5.6.1.2 list element being read ends at `at`.
+///
+/// The leading edge of the question [`trim_ows_end`] answers at the trailing
+/// one. `#element => [ element ] *( OWS "," OWS [ element ] )` hangs every
+/// `OWS` it has on a comma, so whitespace at `at` is the list's rather than
+/// the element's in front of it — and it closes that element only when the
+/// comma it hangs on is really behind it. §5.6.3's `OWS` is SP or HTAB, so one
+/// byte cannot answer this: the run has to be walked to what it reaches.
+///
+/// The end of `value` counts as that comma. RFC 9110 §5.2 joins repeated field
+/// lines into one value with a comma between them, so a run reaching the end
+/// of ONE line meets the comma next; and where no line follows, the value ends
+/// and no element stands behind the whitespace either way. That is the
+/// terminator [`token68`] already reads, and this is the one place it is
+/// written.
+fn ends_element(value: &[u8], at: usize) -> bool {
+  matches!(value.get(skip_ows(value, at)), None | Some(&b','))
+}
+
 /// Skips RFC 9110 §11.3's `1*SP` from `at`.
 ///
 /// SP alone, which is why §5.6.3's `OWS` skip is the wrong one here:
@@ -1166,8 +1200,9 @@ fn skip_sp(value: &[u8], at: usize) -> usize {
 ///
 /// [`AuthError::MissingScheme`] with no leading `token`;
 /// [`AuthError::MalformedScheme`] where the scheme is followed by neither
-/// `1*SP` nor the end of the credential, or where `1*SP` is followed by the
-/// HTAB no rule puts there; [`AuthError::ChallengeSpansTooManyLines`] past
+/// `1*SP` nor the end of the credential, or where `1*SP` is followed by a HTAB
+/// that reaches an element rather than the comma RFC 9110 §5.6.1.2 hangs its
+/// `OWS` on; [`AuthError::ChallengeSpansTooManyLines`] past
 /// [`MAX_CHALLENGE_LINES`]; and whatever the parameter list carries.
 fn read_credential<'a, I>(lines: I) -> Result<Credential<'a>, AuthError>
 where
@@ -1185,11 +1220,15 @@ where
   let (body_at, section) = match head.get(scheme_end) {
     Some(&b' ') => {
       let at = skip_sp(head, scheme_end);
-      // `1*SP` has taken every SP there was. RFC 9110 §5.6.1.2 expands a list
-      // as `#element => [ element ] *( OWS "," OWS [ element ] )`, which hangs
-      // every OWS it has on a comma — so a HTAB standing where the first
-      // element should be is derived by nothing, and the section cannot start.
-      if head.get(at) == Some(&b'\t') {
+      // `1*SP` has taken every SP there was, so a HTAB here is whitespace the
+      // parameter list owns rather than whitespace the scheme does. RFC 9110
+      // §5.6.1.2 expands a list as
+      // `#element => [ element ] *( OWS "," OWS [ element ] )`, which hangs
+      // every OWS it has on a comma: reaching that comma, the HTAB is the OWS
+      // in front of it and the section opens on the empty first element the
+      // expansion admits; reaching an element instead, nothing derives it and
+      // the section cannot start at all.
+      if head.get(at) == Some(&b'\t') && !ends_element(head, at) {
         return Err(AuthError::MalformedScheme);
       }
       (at, true)
@@ -1267,8 +1306,9 @@ where
 ///
 /// [`AuthError::MissingScheme`] for a value with no leading `token`;
 /// [`AuthError::MalformedScheme`] where the scheme is followed by neither
-/// `1*SP` nor the end of the value, or where `1*SP` is followed by the HTAB no
-/// rule puts there; and whatever the body carries —
+/// `1*SP` nor the end of the value, or where `1*SP` is followed by a HTAB that
+/// reaches an element rather than the comma RFC 9110 §5.6.1.2 hangs its `OWS`
+/// on; and whatever the body carries —
 /// [`AuthError::MalformedParameter`],
 /// [`AuthError::UnterminatedQuotedString`],
 /// [`AuthError::InvalidQuotedString`], [`AuthError::DuplicateParameter`] for
@@ -1319,7 +1359,11 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// challenge with one parameter, and `Basic, type=1` is TWO, the second of
 /// which nothing derives. The two values differ by one byte, and a walker that
 /// split on commas with the `OWS` §5.6.1.2 hangs on them already trimmed off
-/// would have destroyed the byte that separates them.
+/// would have destroyed the byte that separates them. What is asked of that
+/// byte is whether it is SP, and what is asked of a HTAB is where its `OWS`
+/// run gets to: `Basic<HTAB>, Newauth x=1` is two challenges, because the
+/// scheme is followed by the list's own whitespace and then the comma that
+/// ends its element.
 ///
 /// **At a comma an empty element is skipped first.** §5.6.1.2: "A recipient
 /// MUST parse and ignore a reasonable number of empty list elements". The skip
@@ -1678,11 +1722,15 @@ where
       Some(&b' ') => {
         let at = skip_sp(head, scheme_end);
         self.at = at;
-        // `1*SP` has taken every SP there was. RFC 9110 §5.6.1.2 expands a
-        // list as `#element => [ element ] *( OWS "," OWS [ element ] )`,
-        // which hangs every OWS it has on a comma — so a HTAB standing where
-        // the first element should be is derived by nothing.
-        if head.get(at) == Some(&b'\t') {
+        // `1*SP` has taken every SP there was, so a HTAB here is whitespace
+        // the parameter list owns rather than whitespace the scheme does. RFC
+        // 9110 §5.6.1.2 expands a list as
+        // `#element => [ element ] *( OWS "," OWS [ element ] )`, which hangs
+        // every OWS it has on a comma: reaching that comma, the HTAB is the
+        // OWS in front of it and the section opens on the empty first element
+        // the expansion admits; reaching an element instead, nothing derives
+        // it and the section cannot start at all.
+        if head.get(at) == Some(&b'\t') && !ends_element(head, at) {
           self.seeking = true;
           return Err(AuthError::MalformedScheme);
         }
@@ -1692,6 +1740,18 @@ where
       // §5.2's join comma is the next character of the value. Either way it is
       // a whole challenge that took no parameters.
       None | Some(&b',') => return Credential::read(scheme, BodyLines::new()),
+      // And it still ends its element with only whitespace between it and that
+      // comma. `1*SP` is SP alone, so a HTAB opens no parameter section; and
+      // RFC 9110 §5.6.1.2 expands the `#challenge` list the scheme sits in as
+      // `#element => [ element ] *( OWS "," OWS [ element ] )`, which hangs
+      // that OWS on the comma behind it. The scheme is a whole challenge and
+      // what follows the comma is the next one.
+      Some(&b'\t') if ends_element(head, scheme_end) => {
+        return Credential::read(scheme, BodyLines::new());
+      }
+      // Anything else behind the token: the production admits nothing there
+      // without `1*SP`, and a HTAB reaching this arm reached an element rather
+      // than the comma the arm above needs.
       Some(_) => {
         self.seeking = true;
         return Err(AuthError::MalformedScheme);
