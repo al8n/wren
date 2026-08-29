@@ -455,13 +455,18 @@ fn a_string_still_open_on_the_last_line_is_unterminated() {
     AuthError::UnterminatedQuotedString
   );
 
-  // A string that DID close across the join does not rescue the element when a
-  // later one on the same line never closes. What the combined value ends
-  // INSIDE is what decides, so this is unterminated too, and not a value that
-  // merely spans field lines.
+  // A string that DID close across the join ENDED the value, so the DQUOTE
+  // behind it opens nothing and there is no second string to leave open. The
+  // element is refused for what those bytes are — nothing `auth-param` derives
+  // — and not for where they stop, which is the same answer the same bytes get
+  // on one field line.
   assert_eq!(
     read_credential([&b"Basic a=\"x"[..], b"y\" \"z"]).unwrap_err(),
-    AuthError::UnterminatedQuotedString
+    AuthError::MalformedParameter
+  );
+  assert_eq!(
+    credentials(b"Basic a=\"x,y\" \"z").unwrap_err(),
+    AuthError::MalformedParameter
   );
 }
 
@@ -544,45 +549,48 @@ fn a_value_that_closed_across_a_join_has_ended_its_element() {
 #[test]
 fn a_string_opened_behind_the_close_is_not_a_second_value() {
   // A DQUOTE is not `OWS` either, so a string opening BEHIND the close is
-  // trailing junk like any other — and the element then runs on to wherever
-  // THAT string closes, which is a further field line. RFC 9110 §5.2 joins
-  // these three into `a="x,y" "z,w", b=2`, whose first element carries two
-  // quoted-strings where §11.2's `( token / quoted-string )` names one.
+  // trailing junk like any other — and junk derives nothing, so it opens no
+  // string. RFC 9110 §5.2 joins these three lines into `a="x,y" "z,w", b=2`,
+  // whose first element carries what LOOKS like two quoted-strings where
+  // §11.2's `( token / quoted-string )` names one; the second is `"z,w"` only
+  // if a run nothing derives may still say which commas are data.
   //
-  // The verdict has to survive the crossing: the last line closes cleanly with
-  // a comma behind it, so a walk that asked only the LAST region would call
-  // this a value that merely spans field lines.
-  let [first, past] = info::<2>([&b"a=\"x"[..], b"y\" \"z", b"w\", b=2"]);
-  assert_eq!(first.unwrap().unwrap_err(), AuthError::MalformedParameter);
-  assert!(past.is_none());
+  // The element therefore ENDS on the line its value closed on, and what the
+  // lines behind it hold cannot change that. The three inputs below differ
+  // only in that tail — none, a line that closes the junk's DQUOTE, and a line
+  // that closes nothing followed by one that does — and answer alike.
+  for tail in [&[][..], &[&b"w\", b=2"[..]], &[&b"w"[..], b"\", b=2"]] {
+    let lines = [&b"a=\"x"[..], b"y\" \"z"]
+      .into_iter()
+      .chain(tail.iter().copied());
+    let [first, past] = info::<2>(lines);
+    assert_eq!(
+      first.unwrap().unwrap_err(),
+      AuthError::MalformedParameter,
+      "{tail:?}"
+    );
+    assert!(past.is_none(), "{tail:?}");
 
-  // And it has to survive a line that closes NOTHING. Here the junk's own
-  // string spans a third line before closing on a fourth, so the walk is told
-  // twice in a row that a string is still open — and the second of those says
-  // nothing about bytes behind a close, because on that line there is no
-  // close. A walk that took each answer as the whole verdict rather than
-  // adding it to what it already knew would forget the junk on that line and
-  // read `a` as a value that merely spans field lines.
-  //
-  // Both readers carry this loop, so both are driven: the one
-  // `Credential::read` spends before a credential exists, and the one
-  // §11.6.3's field walks as it hands parameters out.
-  let [first, past] = info::<2>([&b"a=\"x"[..], b"y\" \"z", b"w", b"\", b=2"]);
-  assert_eq!(first.unwrap().unwrap_err(), AuthError::MalformedParameter);
-  assert!(past.is_none());
-  assert_eq!(
-    read_credential([&b"Basic a=\"x"[..], b"y\" \"z", b"w", b"\", b=2"]).unwrap_err(),
-    AuthError::MalformedParameter
-  );
+    // Both readers carry this loop, so both are driven: the one
+    // `Credential::read` spends before a credential exists, and the one
+    // §11.6.3's field walks as it hands parameters out.
+    let credential = [&b"Basic a=\"x"[..], b"y\" \"z"]
+      .into_iter()
+      .chain(tail.iter().copied());
+    assert_eq!(
+      read_credential(credential).unwrap_err(),
+      AuthError::MalformedParameter,
+      "{tail:?}"
+    );
+  }
 
-  // Which is not the same input as the one whose second string never closes.
-  // There the combined value ends INSIDE a string, and what a value ends
-  // inside is what decides — `a_string_still_open_on_the_last_line_is_unterminated`
-  // pins that half, and this is the byte that separates the two.
-  assert_eq!(
-    read_credential([&b"Basic a=\"x"[..], b"y\" \"z"]).unwrap_err(),
-    AuthError::UnterminatedQuotedString
-  );
+  // Where the element ended is visible from outside: a challenge written on
+  // the line behind the junk is REACHED, because the junk's DQUOTE did not
+  // swallow the join comma in front of it.
+  let [basic, digest, past] = walk::<3>([&b"Basic a=\"x"[..], b"y\" \"z", b"Digest realm=z"]);
+  assert_eq!(basic.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
 }
 
 #[test]
@@ -613,6 +621,56 @@ fn the_junk_behind_a_close_is_refused_at_every_entry_point() {
     credentials(b"Basic a=\"x,y\"junk, b=2").unwrap_err(),
     AuthError::MalformedParameter
   );
+}
+
+#[test]
+fn a_refused_run_hides_no_challenge_behind_it() {
+  // RFC 9110 §11.4 has a user agent select "the challenge with what it
+  // considers to be the most secure auth-scheme that it understands", so a
+  // challenge it cannot read must not take the readable ones behind it away.
+  // Each input below is a run of bytes some production has already refused,
+  // carrying one DQUOTE placed to swallow the comma in front of `Digest`.
+
+  // Behind the close of a value §5.2's join carried onto a second field line.
+  // The value of `a` closes at the DQUOTE the second line opens with, and the
+  // one in `junk` is what stands behind that close.
+  let [basic, broken, digest, past] = walk::<4>([
+    &b"Basic realm=x, Broken a=\"q"[..],
+    b"r\"junk\", Digest realm=z",
+  ]);
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(broken.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  let digest = digest.unwrap().unwrap();
+  assert_eq!(digest.scheme(), b"Digest");
+  assert_eq!(names::<2>(&digest), [Some(&b"realm"[..]), None]);
+  assert!(past.is_none());
+
+  // The same junk on ONE field line, which reaches the rule by the other
+  // entrance: the scan that finds where an element ends on the line it began
+  // on, rather than the one that carries an element across a join.
+  let [broken, digest, past] = walk::<3>([&b"Basic a=\"x\"ju\"nk, Digest realm=z"[..]]);
+  assert_eq!(broken.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // And by the third: the seek that gets past a challenge already reported.
+  // An element opening with `=` is neither a `challenge` nor an `auth-param`,
+  // so the whole run it stands in has been refused before the seek reads a
+  // byte of it — and a refused run holds no quoted-string for its DQUOTE to
+  // open, nor one for a byte §5.6.4 forbids to be inside.
+  for value in [
+    &b"=x\"junk, Digest realm=z"[..],
+    b"=x\"j\x00unk, Digest realm=z",
+  ] {
+    let [missing, digest, past] = walk::<3>([value]);
+    assert_eq!(
+      missing.unwrap().unwrap_err(),
+      AuthError::MissingScheme,
+      "{value:?}"
+    );
+    assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest", "{value:?}");
+    assert!(past.is_none(), "{value:?}");
+  }
 }
 
 #[test]
@@ -818,17 +876,25 @@ fn a_forbidden_byte_is_reported_wherever_the_walk_meets_it() {
     read_credential([&b"Basic a=\"x"[..], b"y\x00z\""]).unwrap_err(),
     AuthError::InvalidQuotedString
   );
-  // On the far side of the join, past the DQUOTE that closed that string,
-  // while the rest of the element is walked to the comma that ends it.
-  assert_eq!(
-    read_credential([&b"Basic a=\"x"[..], b"y\" \"\x00\""]).unwrap_err(),
-    AuthError::InvalidQuotedString
-  );
   // And in a LATER element, once the spanning one has been handed over: the
   // walk goes on from where that element ended, on the line it ended on.
   assert_eq!(
     read_credential([&b"Basic a=\"x"[..], b"y\", b=\"\x00\""]).unwrap_err(),
     AuthError::InvalidQuotedString
+  );
+
+  // And the point at which it does NOT meet one, because there is no string
+  // there to meet it in: behind the DQUOTE that closed the value. Those bytes
+  // derive nothing, so the DQUOTE in front of the %x00 opens no string and the
+  // %x00 is not inside one — the element is refused for being underivable,
+  // which is what the same bytes on ONE field line have always answered.
+  assert_eq!(
+    read_credential([&b"Basic a=\"x"[..], b"y\" \"\x00\""]).unwrap_err(),
+    AuthError::MalformedParameter
+  );
+  assert_eq!(
+    credentials(b"Basic a=\"x,y\" \"\x00\"").unwrap_err(),
+    AuthError::MalformedParameter
   );
 }
 
@@ -1325,17 +1391,17 @@ fn the_walk_continues_while_the_commas_are_still_trustworthy() {
   assert_eq!(fault.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
   assert!(past.is_none(), "nothing behind a forbidden byte is read");
 
-  // Including where it is the SEEK past an already-reported challenge that
-  // meets it: the first fault is reported, and then the walk stops on the
-  // second rather than guessing at the commas behind it.
-  let [basic, malformed, invalid, past] =
+  // Which is a rule about the walk that READS a challenge, and there is one
+  // walk it cannot be a rule about. A SEEK past an already-reported challenge
+  // reads no quoted-string at all — the bytes it crosses have been refused, so
+  // no production admits one there — and a scan that opens no string cannot
+  // fail inside one. The %x00 below sits in a challenge already reported as
+  // `MalformedScheme`, and §11.4's user agent still gets `Newauth`.
+  let [basic, malformed, newauth, past] =
     walk::<4>([&b"Basic, type=1, x=\"a\x00b\", Newauth c=1"[..]]);
   assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
   assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
-  assert_eq!(
-    invalid.unwrap().unwrap_err(),
-    AuthError::InvalidQuotedString
-  );
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
   assert!(past.is_none());
 
   // The row spec §5.2's table calls end of input by construction: a string

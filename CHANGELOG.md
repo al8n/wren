@@ -12,9 +12,9 @@ had done. That caller can now select a challenge by its scheme and read that
 challenge's parameters to the last one, without allocating and without this
 crate implementing any scheme. Phase 1 of the #70 ledger.
 
-`xtask/snapshots/http-semantics-documented.txt` gains 95 lines and loses none:
-`grep -vc '^#'` counts 572 documented items on it at `6360957` and 667 here.
-`cargo test -p http-semantics --all-features` reports 370 unit tests passing, 72
+`xtask/snapshots/http-semantics-documented.txt` gains 97 lines and loses none:
+`grep -vc '^#'` counts 572 documented items on it at `6360957` and 669 here.
+`cargo test -p http-semantics --all-features` reports 371 unit tests passing, 73
 of them this module's, beside the no-panic harness's fifteen and one doctest.
 The crate is still `no_std`, allocation-free, clock-free and panic-free, on the
 same `std` / `alloc` / `no-atomic` tiers its siblings run, and
@@ -72,7 +72,11 @@ is green.
   alternative whole, so only the `OWS` §5.6.1.2 hangs on the next comma may
   follow that close, and `Basic realm="x` followed by `"junk` is
   `AuthError::MalformedParameter` exactly as the same bytes written on one line
-  already were.
+  already were. A run behind such a close derives nothing, so it holds no
+  `quoted-string` for a DQUOTE in it to open: the element ends at the first RAW
+  comma in that run, and a malformed challenge cannot swallow the comma in
+  front of the next one. The walk that gets PAST an already-reported challenge
+  reads the same way, for the same reason.
 
   **Which of RFC 9110 §11.2's two alternatives a body took is a recipient's
   decision, and this module writes its own down.** §11.2 says in prose that a

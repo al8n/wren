@@ -1400,11 +1400,16 @@ pub(crate) enum Delim {
 /// join needs the open string's escape state to continue it. Both take what a
 /// quoted-string IS from [`scan_quoted`], which is where that rule lives.
 ///
-/// Visible to the whole crate because RFC 9110 §11.2's `#auth-param` walk asks
-/// the same question of the same rule. Writing out a second time where a
-/// comma stops being a delimiter is precisely the drift this function exists
-/// to prevent, so the answer is shared rather than reimplemented.
-pub(crate) fn scan_to_delim(value: &[u8], at: usize, delim: u8) -> Delim {
+/// Private to this module, and once was not: RFC 9110 §11.2's `#auth-param`
+/// walk asked this same question until it turned out to be asking a narrower
+/// one. An `auth-param` value is `( token / quoted-string )` taken WHOLE, so
+/// the first string to close in one of its elements closes the last thing that
+/// element may hold, and a scan that went on hunting delimiters past that
+/// close would read a DQUOTE among proven-underivable bytes as opening a
+/// second string. That module's `element_end` is where its narrower answer
+/// lives; the rule neither walk may restate is what a quoted-string IS, and
+/// both take it from [`scan_quoted`].
+fn scan_to_delim(value: &[u8], at: usize, delim: u8) -> Delim {
   let mut at = at;
   loop {
     match value.get(at) {

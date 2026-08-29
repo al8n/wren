@@ -70,8 +70,8 @@
 // `quoted-pair` is why none is forced here.
 
 use crate::grammar::{
-  Delim, ParamValue, QuotedScan, eq_ignore_ascii, scan_quoted, scan_quoted_after_join,
-  scan_to_delim, skip_ows, token_end,
+  Delim, ParamValue, QuotedScan, eq_ignore_ascii, scan_quoted, scan_quoted_after_join, skip_ows,
+  token_end,
 };
 
 /// How many field lines one [`Credential`]'s body may be spread over.
@@ -1046,7 +1046,7 @@ impl<'a> ParamWalk<'a> {
     // What the element occupies in the region it starts in — all a borrowing
     // walk can hand out — plus, when a quoted-string held it open at that
     // region's end, the escape state to continue that string with.
-    let (head_end, mut open) = match scan_to_delim(head, start, b',') {
+    let (head_end, mut open) = match element_end(head, start) {
       // The element ends here, so the `OWS` RFC 9110 §5.6.1.2 hangs on the
       // comma in front of it belongs to the list rather than to the value.
       Delim::At(end) => (trim_ows_end(head, end), None),
@@ -1066,10 +1066,6 @@ impl<'a> ParamWalk<'a> {
     // before the next region's first byte — so the escape is spent on the
     // comma, and a DQUOTE arriving first on that line closes the string.
     let mut tail = ValueTail::Ends;
-    // Set by the first region that carries bytes behind the value's close, and
-    // never cleared afterwards: a later region closing the string THOSE bytes
-    // opened does not make them derivable.
-    let mut trailing = false;
     while let Some(escape) = open.take() {
       let next_line = self.line.saturating_add(1);
       if next_line >= self.body.len {
@@ -1085,20 +1081,18 @@ impl<'a> ParamWalk<'a> {
       match rejoin(next, escape) {
         // Past the string, the rest of this region is the element's like any
         // other, up to the comma that ends it — and only the list's own `OWS`
-        // may be in between, which is what `trails` answers.
+        // may be in between, which is what `trails` answers. A region that
+        // closed the value ENDS the element, so this is read once and there is
+        // no verdict from an earlier region to carry into it.
         Rejoin::Ends { at, trails } => {
-          trailing |= trails;
-          tail = if trailing {
+          tail = if trails {
             ValueTail::Trails
           } else {
             ValueTail::Continues
           };
           self.at = at;
         }
-        Rejoin::Open { escape, trails } => {
-          trailing |= trails;
-          open = Some(escape);
-        }
+        Rejoin::Open { escape } => open = Some(escape),
         Rejoin::Invalid => {
           self.done = true;
           return Err(AuthError::InvalidQuotedString);
@@ -1134,14 +1128,13 @@ enum Rejoin {
     trails: bool,
   },
   /// A quoted-string is open again where the new line ends.
+  ///
+  /// Only ever the value's OWN string, still open: a line that closed it ends
+  /// the element on that same line, because nothing behind the close opens a
+  /// string of its own. [`after_close`] is where that is decided.
   Open {
     /// The state RFC 9110 §5.2's NEXT join comma is to be fed through.
     escape: bool,
-    /// As on [`Rejoin::Ends`], and a DQUOTE that opened a string of its own
-    /// BEHIND the value's close is itself such a byte — so this is set for
-    /// every string that opens there, and the walk carries it over whatever
-    /// further lines that string takes.
-    trails: bool,
   },
   /// A byte §5.6.4 forbids appeared inside a quoted-string.
   Invalid,
@@ -1153,10 +1146,23 @@ enum Rejoin {
 /// [`crate::grammar::scan_quoted_after_join`] is this crate's one
 /// implementation of the join rule — it feeds the join's comma THROUGH the
 /// open string first, so a pending escape is spent on the comma and a DQUOTE
-/// arriving first on `next` CLOSES the string — and
-/// [`crate::grammar::scan_to_delim`] is its one implementation of where a
-/// comma stops being a delimiter. This is the two of them in the order an
-/// element needs them, with the rule below drawn between.
+/// arriving first on `next` CLOSES the string. What lies behind that close is
+/// [`after_close`]'s, which is the same rule [`element_end`] applies on the
+/// line an element began on: one rule, and §5.2's join is neither a way past
+/// it nor a second spelling of it.
+fn rejoin(next: &[u8], escape: bool) -> Rejoin {
+  match scan_quoted_after_join(next, escape) {
+    QuotedScan::Closed(end) => {
+      let (at, trails) = after_close(next, end);
+      Rejoin::Ends { at, trails }
+    }
+    QuotedScan::Open { escape } => Rejoin::Open { escape },
+    QuotedScan::Invalid => Rejoin::Invalid,
+  }
+}
+
+/// Where the RFC 9110 §5.6.1.2 element that a §5.6.4 quoted-string just CLOSED
+/// at `end` ends, and whether anything underivable stood between the two.
 ///
 /// # A close is not an end
 ///
@@ -1165,49 +1171,90 @@ enum Rejoin {
 /// alternative WHOLE, and §5.6.1.2 expands the list around it as
 /// `#element => [ element ] *( OWS "," OWS [ element ] )` — so between a value
 /// that closed here and the comma that ends its element there is room for that
-/// `OWS` and for nothing else. The run is therefore WALKED rather than scanned
-/// for a delimiter, and anything it reaches other than the comma or the end of
-/// `next` is reported as `trails` — the end of a line being that comma too,
-/// since §5.2 puts one at every join and the value ends where the lines run
-/// out.
+/// `OWS` and for nothing else. Reaching the comma, or the end of `value`, the
+/// element is what it looked like and `trails` is false; the end of a line
+/// counts as that comma, since §5.2 puts one at every join and the value ends
+/// where the lines run out.
 ///
-/// An earlier revision scanned straight to the comma and reported nothing
-/// about what it crossed, which read `Basic realm="x` and `"junk` — one
-/// challenge over two field lines, joined by §5.2 into `Basic realm="x,"junk`
-/// — as the parameter `realm`, with `junk` swallowed. The same bytes written
-/// on ONE line were already refused, since [`auth_param`] has always refused a
-/// quoted-string with bytes behind its close; only the join was a way past it.
+/// # What a proven-malformed remainder may not decide
 ///
-/// # Why the verdict travels rather than stopping the scan
+/// Reaching anything ELSE, the remainder of the line derives nothing — and a
+/// run that derives nothing contains no quoted-string, so a DQUOTE in it opens
+/// none. [`recover_to_comma`] therefore takes the rest RAW, and this reports
+/// `trails` for the element.
 ///
-/// Where the element ENDS is still the delimiter scan's answer, taken over the
-/// same bytes and by the same rule as before. A verdict on one element must
-/// not move the boundary the elements BEHIND it are read from: `challenges`
-/// reports one fault per challenge and goes on to the next, and it can only do
-/// that while every boundary it knows came from one clean scan. So the fault
-/// rides out as a flag, and the walk that carries the element is the one that
-/// spends it — at [`auth_param`], through [`ValueTail::Trails`].
-fn rejoin(next: &[u8], escape: bool) -> Rejoin {
-  match scan_quoted_after_join(next, escape) {
-    QuotedScan::Closed(end) => {
-      let at = skip_ows(next, end);
-      match next.get(at) {
-        None | Some(&b',') => Rejoin::Ends { at, trails: false },
-        Some(_) => match scan_to_delim(next, at, b',') {
-          Delim::At(at) => Rejoin::Ends { at, trails: true },
-          Delim::Open(escape) => Rejoin::Open {
-            escape,
-            trails: true,
-          },
-          Delim::Invalid => Rejoin::Invalid,
-        },
+/// Granting those bytes quoted-string semantics is what an earlier revision
+/// did, and it is how a malformed challenge hid a well-formed one:
+/// `Basic realm=x, Broken a="q` and `r"junk", Digest realm=z` are two field
+/// lines that §5.2 joins into one value, the value of `a` closes at `r"`, and
+/// the DQUOTE in `junk"` then opened a string that swallowed the comma in
+/// front of `Digest`. RFC 9110 §11.4 has a user agent select "the challenge
+/// with what it considers to be the most secure auth-scheme that it
+/// understands", which it cannot do over a challenge it was never shown.
+fn after_close(value: &[u8], end: usize) -> (usize, bool) {
+  let at = skip_ows(value, end);
+  match value.get(at) {
+    None | Some(&b',') => (at, false),
+    Some(_) => (recover_to_comma(value, at), true),
+  }
+}
+
+/// Where the run at `at` — bytes some production has already refused — gives
+/// way to whatever the walk reads next: the first RAW comma, or the end of
+/// `value`.
+///
+/// The one recovery this module has, and it reads no RFC 9110 §5.6.4
+/// quoted-string. A quoted-string is something a production ADMITS at a
+/// position, and no production admits anything here; a DQUOTE among refused
+/// bytes is one more refused byte. So every comma in the run is the §5.6.1.2
+/// separator it looks like, and the first of them is where the refused run
+/// stops.
+///
+/// Stopping at the end of the line rather than crossing §5.2's join is the
+/// same answer: the join IS a comma, so the run ends there either way.
+///
+/// The direction this errs in is the one §11.4 needs. A recovery that ends too
+/// EARLY shows the caller more elements than the sender wrote, each answered
+/// on its own; one that ends too LATE hides them, and a hidden challenge is a
+/// challenge the caller cannot select.
+fn recover_to_comma(value: &[u8], at: usize) -> usize {
+  let mut at = at;
+  while !matches!(value.get(at), None | Some(&b',')) {
+    at = at.saturating_add(1);
+  }
+  at
+}
+
+/// Where the RFC 9110 §5.6.1.2 element starting at `at` ends — the comma that
+/// separates it from the next, or the end of `value`.
+///
+/// [`crate::grammar::scan_quoted`] is this crate's one implementation of what
+/// a quoted-string IS, and the answer here is taken from it, so a comma inside
+/// one is data here exactly as it is everywhere else in the crate.
+///
+/// What this adds over a plain delimiter scan is [`after_close`]'s rule: an
+/// `auth-param` value is one alternative taken whole, so the FIRST string to
+/// close in an element closes the last thing the element may hold. A scan that
+/// went on looking for delimiters past that close would read a DQUOTE in the
+/// bytes behind it as opening a second string — bytes that are already proven
+/// to derive nothing, deciding where the element ends.
+// gate-exempt: crate::grammar::scan_to_delim — the generic form, named for
+// contrast: §5.6.6's `parameters` and this module's own `=` splits still use
+// it, and it is deliberately NOT what an `#auth-param` element ends by.
+fn element_end(value: &[u8], at: usize) -> Delim {
+  let mut at = at;
+  loop {
+    match value.get(at) {
+      None | Some(&b',') => return Delim::At(at),
+      Some(&b'"') => {
+        return match scan_quoted(value, at.saturating_add(1), false) {
+          QuotedScan::Closed(end) => Delim::At(after_close(value, end).0),
+          QuotedScan::Open { escape } => Delim::Open(escape),
+          QuotedScan::Invalid => Delim::Invalid,
+        };
       }
+      Some(_) => at = at.saturating_add(1),
     }
-    QuotedScan::Open { escape } => Rejoin::Open {
-      escape,
-      trails: false,
-    },
-    QuotedScan::Invalid => Rejoin::Invalid,
   }
 }
 
@@ -1619,10 +1666,7 @@ where
     }
     if self.seeking {
       self.seeking = false;
-      if let Err(fault) = self.seek() {
-        self.done = true;
-        return Some(Err(fault));
-      }
+      self.seek();
     }
     match self.open_element(None) {
       Step::End => {
@@ -1709,13 +1753,21 @@ where
   /// spent on the comma and a DQUOTE arriving first on the next line closes
   /// the string.
   ///
+  /// `region` is the body being collected, and there is always one: every byte
+  /// this crosses is handed to [`Credential::read`], which re-derives over the
+  /// same bytes whatever fault they carry. That is why nothing is reported
+  /// here, and it is a property of the SIGNATURE rather than of the callers —
+  /// a walk that wanted a boundary without collecting one would be a walk
+  /// whose crossings nothing validates, which is what [`Challenges::seek`] is
+  /// and why it does not come here.
+  ///
   /// # Errors
   ///
   /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
   /// quoted-string — the one fault that leaves the commas behind it unreadable
   /// and so is the one this walk cannot continue past.
-  fn skip_element(&mut self, mut region: Option<&mut Section<'a>>) -> Result<(), AuthError> {
-    let mut open = match scan_to_delim(self.line, self.at, b',') {
+  fn skip_element(&mut self, region: &mut Section<'a>) -> Result<(), AuthError> {
+    let mut open = match element_end(self.line, self.at) {
       Delim::At(end) => {
         self.at = end;
         None
@@ -1737,29 +1789,23 @@ where
       let spent = self.line;
       self.line = next;
       self.at = next.len();
-      if let Some(section) = region.as_deref_mut() {
-        // The element is still open here, so ALL of the line being left is the
-        // challenge's — including the bytes that begin no element of their own
-        // but carry the close of this one.
-        section.spend(spent, spent.len());
-      }
-      // `trails` is dropped HERE and nowhere else. This walk is looking for
-      // the challenge's extent, and every byte it crosses lands in the region
-      // it collects — so `Credential::read` runs the same `rejoin` over the
-      // same bytes and reports the fault there, once, as it does for every
-      // other fault a parameter list carries. Reporting it here would refuse
-      // the challenge before its boundary was known, and a `seek` — which
-      // collects nothing and is walking a challenge that ALREADY failed —
-      // would report a second fault for one that was reported once.
+      // The element is still open here, so ALL of the line being left is the
+      // challenge's — including the bytes that begin no element of their own
+      // but carry the close of this one.
+      region.spend(spent, spent.len());
+      // `trails` is dropped HERE and nowhere else, because every byte this
+      // walk crosses lands in the region it collects — so `Credential::read`
+      // runs the same `rejoin` over the same bytes and reports the fault
+      // there, once, as it does for every other fault a parameter list
+      // carries. Reporting it here would refuse the challenge before its
+      // boundary was known.
       match rejoin(next, escape) {
         Rejoin::Ends { at, trails: _ } => self.at = at,
-        Rejoin::Open { escape, trails: _ } => open = Some(escape),
+        Rejoin::Open { escape } => open = Some(escape),
         Rejoin::Invalid => return Err(AuthError::InvalidQuotedString),
       }
     }
-    if let Some(section) = region {
-      section.end = self.at;
-    }
+    region.end = self.at;
     Ok(())
   }
 
@@ -1858,7 +1904,7 @@ where
           if after_comma && self.opens_a_challenge() {
             break;
           }
-          self.skip_element(Some(&mut section))?;
+          self.skip_element(&mut section)?;
         }
       }
     }
@@ -1876,30 +1922,43 @@ where
   /// Finds where the challenge that just failed ends, without reading what is
   /// left of it as challenges of its own.
   ///
-  /// The same boundary rule as the walk itself, run over a scan that collects
-  /// nothing: at each comma the next element's leading `token` and the byte
-  /// behind it say whether it still belongs to the failed challenge. RFC
-  /// 9110 §11.6.1's ambiguity is resolved once per challenge, so `type=b` in
+  /// At each comma the next element's leading `token` and the byte behind it
+  /// say whether it still belongs to the failed challenge. RFC 9110 §11.6.1's
+  /// ambiguity is resolved once per challenge, so `type=b` in
   /// `Basic a=1, =x, type=b, Newauth c=1` is part of the fault already
   /// reported rather than a second one.
   ///
-  /// # Errors
+  /// # A refused challenge decides no boundary
   ///
-  /// [`AuthError::InvalidQuotedString`], which makes the commas behind it
-  /// unreadable during a seek exactly as it does anywhere else. A
-  /// quoted-string that never closes is the benign case and no error at all:
-  /// it consumes the rest of the input, and the walk ends where the value
-  /// does.
-  fn seek(&mut self) -> Result<(), AuthError> {
+  /// The commas are found by [`recover_to_comma`] and not by the element walk
+  /// [`Challenges::skip_element`] runs, and that is the whole difference
+  /// between reading a challenge and getting past one. This walk collects
+  /// nothing, so nothing it crosses is ever validated — and every byte it
+  /// crosses belongs to a challenge ALREADY reported as malformed. Letting
+  /// those bytes say where a quoted-string begins would let them say which
+  /// commas separate elements, and so where the refused challenge ends and the
+  /// next one may start.
+  ///
+  /// That is not a hypothetical ordering: RFC 9110 §11.4 has a user agent
+  /// select "the challenge with what it considers to be the most secure
+  /// auth-scheme that it understands", and a sender who writes one DQUOTE into
+  /// a challenge this walk is recovering from would otherwise swallow every
+  /// comma behind it — hiding a stronger challenge inside the fault already
+  /// reported for a weaker one.
+  ///
+  /// So no fault is reported from here, because none can be: a run this walk
+  /// takes raw has no quoted-string in it to carry a byte §5.6.4 forbids, and
+  /// a §5.6.1.2 comma or the end of the value is all it ever stops at.
+  fn seek(&mut self) {
     loop {
-      self.skip_element(None)?;
+      self.at = recover_to_comma(self.line, self.at);
       match self.open_element(None) {
-        Step::End => return Ok(()),
+        Step::End => return,
         // A comma was crossed by construction: the element just skipped ended
         // on one, or at the line end RFC 9110 §5.2 puts one at.
         Step::Element { .. } => {
           if self.opens_a_challenge() {
-            return Ok(());
+            return;
           }
         }
       }
@@ -2110,7 +2169,7 @@ where
     // What the element occupies on the line it starts on, plus — when a
     // quoted-string held it open at that line's end — the escape state to
     // continue that string with.
-    let (head_end, mut open) = match scan_to_delim(head, start, b',') {
+    let (head_end, mut open) = match element_end(head, start) {
       // The element ends here, so the `OWS` RFC 9110 §5.6.1.2 hangs on the
       // comma in front of it belongs to the list rather than to the value.
       Delim::At(end) => (trim_ows_end(head, end), None),
@@ -2123,10 +2182,6 @@ where
     self.at = head_end;
 
     let mut tail = ValueTail::Ends;
-    // Set by the first line that carries bytes behind the value's close, and
-    // never cleared afterwards: a later line closing the string THOSE bytes
-    // opened does not make them derivable.
-    let mut trailing = false;
     while let Some(escape) = open.take() {
       let Some(next) = self.next_line() else {
         // No further line, so the combined value ends inside the string.
@@ -2138,19 +2193,17 @@ where
       self.line = next;
       self.at = next.len();
       match rejoin(next, escape) {
+        // A line that closed the value ENDS the element, so this is read once
+        // and there is no verdict from an earlier line to carry into it.
         Rejoin::Ends { at, trails } => {
-          trailing |= trails;
-          tail = if trailing {
+          tail = if trails {
             ValueTail::Trails
           } else {
             ValueTail::Continues
           };
           self.at = at;
         }
-        Rejoin::Open { escape, trails } => {
-          trailing |= trails;
-          open = Some(escape);
-        }
+        Rejoin::Open { escape } => open = Some(escape),
         Rejoin::Invalid => {
           self.done = true;
           return Err(AuthError::InvalidQuotedString);

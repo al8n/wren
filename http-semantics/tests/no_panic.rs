@@ -1378,8 +1378,8 @@ fn challenges_is_panic_free() {
   // comma, so the next line's leading DQUOTE closes it.
   assert!(shim_challenges(black_box(&[b"Basic p=\"a\\".as_slice(), b"\", x=1"])) > 0);
   // A value that closed across the join with bytes behind that close, which
-  // ends the first challenge's own reading and not the walk: the boundary
-  // still came from a clean scan, so `Newauth` behind it is read.
+  // ends the first challenge's own reading and not the walk: those bytes are
+  // taken raw to the comma that ends them, so `Newauth` behind it is read.
   assert!(
     shim_challenges(black_box(&[
       b"Basic a=\"x".as_slice(),
@@ -1387,6 +1387,24 @@ fn challenges_is_panic_free() {
     ]))
       > 0
   );
+  // The same, with a DQUOTE among those bytes — which opens no string, at each
+  // of the three entrances to that rule: behind a close the join carried over,
+  // behind one on the line the element began on, and inside the run a seek
+  // recovers a refused challenge through.
+  assert!(
+    shim_challenges(black_box(&[
+      b"Basic realm=x, Broken a=\"q".as_slice(),
+      b"r\"junk\", Digest realm=z"
+    ]))
+      > 0
+  );
+  assert!(
+    shim_challenges(black_box(&[
+      b"Basic a=\"x\"ju\"nk, Digest realm=z".as_slice()
+    ]))
+      > 0
+  );
+  assert!(shim_challenges(black_box(&[b"=x\"j\x00unk, Digest realm=z".as_slice()])) > 0);
   // Empty lines, OWS-only lines and empty elements, which spend no entry.
   assert!(
     shim_challenges(black_box(&[
@@ -1519,6 +1537,17 @@ fn auth_info_is_panic_free() {
   assert_eq!(shim_auth_info(black_box(&[b"realm".as_slice()])), 0);
   assert_eq!(
     shim_auth_info(black_box(&[b"a=\"x".as_slice(), b"y\"junk"])),
+    0
+  );
+  // The same with a DQUOTE among those bytes, which opens no string of its
+  // own: once behind a close §5.2's join carried over, and once behind one on
+  // the line the element began on.
+  assert_eq!(
+    shim_auth_info(black_box(&[b"a=\"x".as_slice(), b"y\" \"z, b=2"])),
+    0
+  );
+  assert_eq!(
+    shim_auth_info(black_box(&[b"a=\"x\"ju\"nk, b=2".as_slice()])),
     0
   );
   assert_eq!(shim_auth_info(black_box(&[b"a=\"\x00\"".as_slice()])), 0);
