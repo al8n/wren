@@ -1,5 +1,168 @@
 # UNRELEASED
 
+## `http-semantics` — RFC 9110 §11's six authentication fields, and two bounds that refuse rather than truncate
+
+An `auth` module joins the crate: §11.2's `auth-param` and `token68`, and the
+one production §11.3 spells `challenge` and §11.4 spells `credentials`, over
+the six fields §11.6 and §11.7 define between them. Before this, a caller
+handed a 401 or a CONNECT 407 could hold `WWW-Authenticate`'s bytes and do
+nothing with them: the walk existed nowhere in this workspace, and
+`http1-proto`'s README listed §11.3's challenge walk among the work nobody here
+had done. That caller can now select a challenge by its scheme and read that
+challenge's parameters to the last one, without allocating and without this
+crate implementing any scheme. Phase 1 of the #70 ledger.
+
+`xtask/snapshots/http-semantics-documented.txt` gains 89 lines and loses none:
+`grep -vc '^#'` counts 572 documented items on it at `6360957` and 661 here.
+`cargo test -p http-semantics --all-features` reports 363 unit tests passing, 65
+of them this module's, beside the no-panic harness's fifteen and one doctest.
+The crate is still `no_std`, allocation-free, clock-free and panic-free, on the
+same `std` / `alloc` / `no-atomic` tiers its siblings run, and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+### Added
+
+- **`auth` — one production, reached by three entry points that differ only in
+  how many of it a field holds.**
+
+  ```rust
+  pub fn challenges<'a, I>(lines: I) -> impl Iterator<Item = Result<Credential<'a>, AuthError>>
+  where I: IntoIterator<Item = &'a [u8]>;
+
+  pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError>;
+
+  pub fn auth_info<'a, I>(lines: I) -> impl Iterator<Item = Result<AuthParam<'a>, AuthError>>
+  where I: IntoIterator<Item = &'a [u8]>;
+
+  impl<'a> Credential<'a> {
+    pub const fn scheme(&self) -> &'a [u8];
+    pub fn scheme_is(&self, name: &str) -> bool;
+    pub const fn token68(&self) -> Option<&'a [u8]>;
+    pub const fn params(&self) -> AuthParamIter<'a>;
+  }
+
+  impl<'a> AuthParam<'a> {
+    pub const fn name(&self) -> &'a [u8];
+    pub fn value(&self) -> Result<ParamValue<'a>, ValueSpansFieldLines>;
+  }
+  ```
+
+  `challenges` reads §11.6.1's `WWW-Authenticate` and §11.7.1's
+  `Proxy-Authenticate`, the two fields whose value is a list of challenges;
+  `credentials` reads §11.6.2's `Authorization` and §11.7.2's
+  `Proxy-Authorization`, which hold exactly one; `auth_info` reads §11.6.3's
+  `Authentication-Info` and §11.7.3's `Proxy-Authentication-Info`, which are a
+  parameter list with no scheme in front of it. One `Credential` type serves the
+  first two because `challenge` and `credentials` are the same production
+  written twice.
+
+  **Two of the three take field LINES rather than a value, because a challenge
+  is not always one field line.** RFC 9110 §5.2 makes a repeated field one
+  value, its field line values "concatenated in order, with each field line
+  value separated by a comma", so a sender may split one challenge's parameter
+  list at any element boundary in it and the pieces arrive as separate lines. A
+  reader that borrows rather than joining has to name every line one challenge
+  landed on at once, which is what `Credential` does and what
+  `MAX_CHALLENGE_LINES` bounds. The one thing a join can still take away is a
+  single value's contiguity: a `quoted-string` that opens on one line and closes
+  on the next is reported at `AuthParam::value` as `ValueSpansFieldLines`, and
+  the parameter's own name is answered anyway.
+
+  **Which of RFC 9110 §11.2's two alternatives a body took is a recipient's
+  decision, and this module writes its own down.** §11.2 says in prose that a
+  scheme is followed by "either a comma-separated list of parameters or a single
+  sequence of characters capable of holding base64-encoded information", and
+  nothing in
+  `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` orders the two.
+  `Credential::token68` reports the answer this module reached: the run is a
+  `token68` when it matches that production AND ends the credential, so
+  `Scheme foo=` is a `token68` rather than a parameter missing its value, while
+  `Scheme foo=bar` is one parameter.
+
+  **Validation is eager, which is what makes `AuthParamIter` infallible.** A
+  challenge is walked to its end before it is yielded, so `Credential::params`
+  cannot fail and one `challenges` walk can go on after a fault — RFC 9110
+  §11.4 has a user agent choose by "selecting the challenge with what it
+  considers to be the most secure auth-scheme that it understands", and a list a
+  caller searches must not let one unreadable challenge hide the readable one
+  behind it. A
+  parameter list is not searched that way: `auth_info` reports its fault and
+  ends, as `grammar::parameterised_list` already does.
+
+  **RFC 9110 §11.2's one-name-once MUST is checked, per parameter list.**
+  "Authentication parameters are name/value pairs, where the name token is
+  matched case-insensitively and each parameter name MUST only occur once per
+  challenge", so `realm` repeated as `Realm` is `AuthError::DuplicateParameter`.
+  Applying it across a whole `#challenge` value instead would refuse the RFC's
+  own §11.6.1 example, which carries `realm` in both of its challenges — that
+  example is a test here, asserted challenge by challenge and parameter by
+  parameter.
+
+- **`MAX_CHALLENGE_LINES` and `MAX_TRACKED_PARAMS`, both sixteen, and both a
+  refusal rather than a cap.** Each can refuse input the grammar allows, and
+  each says so at its own definition rather than leaving a caller to find out.
+
+  A challenge spread over a seventeenth field line is
+  `AuthError::ChallengeSpansTooManyLines` and not the first sixteen lines of
+  one: a challenge is chosen by its scheme and answered with its parameters, so
+  part of one is not a smaller answer but a wrong one. A seventeenth distinct
+  parameter name is `AuthError::TooManyParameters` and not a list read with the
+  MUST left unchecked past the last name that fit, which is the alternative and
+  is worse than a refusal rather than merely different: a walk that stopped
+  CHECKING at its last slot would hand back a list it never established was
+  duplicate-free. `validator::MAX_TAGS` already made that trade in this crate
+  and is named in the same words at both constants.
+
+  Neither counts what RFC 9110 §5.6.1.2 excuses — "Empty elements do not
+  contribute to the count of elements present." — so a comma flood spends no
+  slot, and a `token68` credential spends none either, holding no name that
+  could repeat. The numbers are the storage: a slot is a `&[u8]`, so sixteen of
+  them is 256 bytes on a 64-bit target, which is what puts `Credential` at 296.
+  Both are parse-constants rather than knobs — the storage is in the binary, so
+  a caller cannot raise them.
+
+- **Five leaves join the crate's `no-panic` link proof**, one per entry point
+  plus the `auth-param` parser and the `token68` scanner, each proven
+  non-vacuous by injecting a reachable panic and reading which shims the link
+  then names. Two omissions are written at the shim site rather than left to be
+  inferred: no shim covers a `Display` impl, and the two generic walks are
+  proven for the one monomorphization the test instantiates.
+
+### What this cycle does NOT do
+
+- **No authentication scheme, because RFC 9110 defines none.** §11.1: "Aside
+  from the general framework, this document does not specify any authentication
+  schemes." Basic and Digest are RFC 7617 and RFC 7616, and neither is here.
+  Nothing in this module computes a credential, verifies one, or decides whether
+  a challenge should be answered — `scheme_is` compares the scheme token
+  case-insensitively and that is the whole of what it knows about schemes.
+
+- **`realm` is a parameter like any other, and there is no `Realm` type.** §11.5
+  assigns the protection-space comparison to the scheme, and this crate
+  implements no scheme, so two challenges with the same scheme and different
+  realms are two `Credential`s and nothing merges them. §11.5's own two
+  sentences about `realm`'s syntax bind a sender or are permissive to a
+  recipient; what licenses reading `realm=x` here is RFC 9110 §11.2's production
+  plus its reason, that scheme definitions "need to accept both notations, both
+  for senders and recipients, to allow recipients to use generic parsing
+  components regardless of the authentication scheme", which is precisely what
+  this is.
+
+- **Nothing here honours §11.6.3's trailer sentence, and nothing here needs to.**
+  `auth_info` takes field lines and takes nothing else — no section reaches it,
+  so no branch in it can turn on one, and a trailer section's lines are read
+  identically to a header section's by construction rather than by a check that
+  could be got wrong. Whether the scheme allows the field there is the caller's.
+
+- **No caller is wired to it yet.** `http1-proto` re-exports `grammar` and
+  `media` from this crate and nothing else, so a driver reaches `auth` by naming
+  `http-semantics` in its own manifest and handing it the field values a
+  `HeadView` walked out. That crate's README said §11.3's challenge walk was
+  work nobody had done, three lines after saying the neighbouring derivations
+  were computed there; both sentences are rewritten to the true state, which is
+  unwired rather than unreachable, and §11.3 is no longer listed as missing.
+
 ## A fifth gate whose green was narrower than its name, and a vocabulary that is not closed
 
 ### Tooling

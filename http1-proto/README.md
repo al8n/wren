@@ -80,30 +80,48 @@ crate exists; the other three are what that position obligates.
    two entity-tags match (§8.8.3.2), the order preconditions are evaluated in
    (§13.2.2): where those two RFCs give the answer, a consumer computing it
    differently is not making a different choice, it is wrong — so it is computed
-   here, once, holding no clock, no store and no socket; what only you hold, a
-   validator or a representation's length, arrives as an argument. An algorithm
-   another specification settles — a cache's freshness (RFC 9111 §4.2), a
-   reference resolved against a base URI (RFC 3986 §5), a content coding's
-   decode — is your layer's, however pure it is. Where RFC 9110 / 9112 settle
-   nothing and this core still answers — no status names over-large chunk
-   framing, so that refusal suggests a plain 400 — the answer is advice that
-   says so: a `SuggestedStatus` never binds you, and no advisory surface beyond
-   it will be added.
+   once, holding no clock, no store and no socket; what only you hold, a
+   validator or a representation's length, arrives as an argument. **Once for
+   the family, not once per wire format**, which is where three of those four
+   examples have gone: the media precedence, §8.8.3.2's comparison and §13.2.2's
+   order are RFC 9110's, and all three live in `http-semantics`. This crate
+   re-exports `grammar` and `media` from it whole, and `SuggestedStatus` is that
+   crate's `status::Status` under an older name — the status VOCABULARY is
+   shared, the mapping from a fault to one of its members is this crate's, and
+   §8.8.3.2 and §13.2.2 are reached the way a caller reaches them, by naming
+   `http-semantics`. What RFC 9112 settles alone — the §6.3 body-length list —
+   is computed here. An algorithm another specification settles — a cache's
+   freshness (RFC 9111 §4.2), a reference resolved against a base URI (RFC 3986
+   §5), a content coding's decode — is your layer's, however pure it is. Where
+   RFC 9110 / 9112 settle nothing and this core still answers — no status names
+   over-large chunk framing, so that refusal suggests a plain 400 — the answer
+   is advice that says so: a `SuggestedStatus` never binds you, and no advisory
+   surface beyond it will be added.
 4. **Choices the RFCs leave open are not ours.** Which representation to serve,
    which challenge to answer, whether to follow a redirect. The inputs to those
    decisions that RFC 9110 / 9112 themselves define — `Accept`'s media ranges, a
-   challenge's parameters — are parsed here, to the last parameter; the decision
-   is not. Fields whose grammar another specification owns — `Cookie` is the
-   canonical case — ride through as raw values for their own crate to read.
-   Content negotiation is the clearest case: nothing in §12 requires a server to
-   negotiate, and §12.1 says a user agent "cannot rely on proactive negotiation
-   preferences being consistently honored", so the ranking §12.5.1 settles is
-   ours and the pick is yours.
+   challenge's parameters — are parsed to the last parameter, here or in
+   `http-semantics` by clause 3's split; the decision is not. Fields whose
+   grammar another specification owns — `Cookie` is the canonical case — ride
+   through as raw values for their own crate to read. Content negotiation is the
+   clearest case: nothing in §12 requires a server to negotiate, and §12.1 says
+   a user agent "cannot rely on proactive negotiation preferences being
+   consistently honored", so the ranking §12.5.1 settles is ours and the pick is
+   yours.
 
-Where a clause names work this crate does not yet do — today, §11.3's challenge
-walk, §8.8.3.2's entity-tag comparison, and §13.2.2's precondition order — that
-is a missing feature here, to be filed as one. It is not licence to read the
-wire downstream.
+Where a clause names work nobody in this family has done, that is a missing
+feature, to be filed as one. It is not licence to read the wire downstream.
+
+Today what is missing is a WIRING rather than a rule. §11.3's challenge walk,
+§8.8.3.2's entity-tag comparison and §13.2.2's precondition order all exist in
+`http-semantics` — as `auth::challenges`, `validator::EntityTag`'s two
+comparisons, and `conditional::Preconditions` — and this crate re-exports
+`grammar` and `media` from it and nothing else. A caller therefore reaches them
+by naming `http-semantics` in its own manifest, a public dependency of this
+crate rather than a private one, and hands them the field values a `HeadView`
+walked out. What no code here does is that handing over: nothing feeds a scanned
+head's `If-*` values into `Preconditions::push`, and no method on a head reads a
+`WWW-Authenticate`. Unwired, not unreachable.
 
 So: not a router, not a URI resolver, not a cache, not a content codec. Each of
 those follows from the clauses above rather than standing beside them. This core
