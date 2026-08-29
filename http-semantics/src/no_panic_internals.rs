@@ -1,11 +1,10 @@
 //! Leaf-path forwarders for the `no-panic` link-time test (`tests/no_panic.rs`).
 //!
-//! Gated behind `test-no-panic`, doc-hidden, and exempt from semver: this `pub`
-//! forwarder exposes the one leaf entry point the test needs that the crate
-//! does not otherwise publish — the RFC 9110 §12.4.2 `qvalue` reader. The other
-//! four link-checked leaves — `grammar::parameterised_list`,
-//! `media::weight_for`, `date::parse_http_date` and `date::format_imf_fixdate`
-//! — are already `pub` and are called directly.
+//! Gated behind `test-no-panic`, doc-hidden, and exempt from semver: these
+//! `pub` forwarders expose the leaf entry points the test needs that the crate
+//! does not otherwise publish — the RFC 9110 §12.4.2 `qvalue` reader, and §11.2's
+//! two authentication leaves, `auth::auth_param` and `auth::token68_end`. Every
+//! other link-checked leaf is already `pub` and is called directly.
 //!
 //! A `pub use` of a `pub(crate)` item is illegal (E0364/E0365), so this is a
 //! thin forwarder rather than a re-export. Being `#[inline]` keeps the
@@ -17,7 +16,10 @@
 //! The forwarder is what lets `media::parse_qvalue` stay `pub(crate)`. While the
 //! shim lived in `http1-proto`'s test the function had to be `pub` — a crate
 //! boundary admits no narrower visibility — so a reader of this crate's public
-//! API met a `qvalue` reader that exists to serve another crate's test.
+//! API met a `qvalue` reader that exists to serve another crate's test. The two
+//! authentication leaves are `pub(crate)` for the same reason and no other:
+//! `auth::auth_param` and `auth::token68_end` have no caller but the walks
+//! above them, and neither is an entry point this crate offers.
 //!
 //! Names here are plain code spans rather than intra-doc links on purpose. This
 //! doc block is merged with the outer doc on the `lib.rs` declaration and
@@ -34,4 +36,44 @@
 #[inline]
 pub fn parse_qvalue(v: &[u8]) -> Option<crate::media::Weight> {
   crate::media::parse_qvalue(v)
+}
+
+/// Forwards to `crate::auth::auth_param` — RFC 9110 §11.2's
+/// `auth-param = token BWS "=" BWS ( token / quoted-string )`, read over one
+/// list element with the list's own `OWS` already off both ends.
+///
+/// `continues` is `crate::auth::ValueTail` spelled as a `bool` at this
+/// boundary. That enum answers what RFC 9110 §5.2's field-line join did with a
+/// quoted value the element leaves open, it is `pub(crate)` like the function
+/// itself, and a test crate cannot name it — so the two states cross as
+/// `true` for `Continues` and `false` for `Ends`, and the shim drives both.
+#[inline]
+pub fn auth_param(
+  element: &[u8],
+  continues: bool,
+) -> Result<crate::auth::AuthParam<'_>, crate::auth::AuthError> {
+  crate::auth::auth_param(
+    element,
+    if continues {
+      crate::auth::ValueTail::Continues
+    } else {
+      crate::auth::ValueTail::Ends
+    },
+  )
+}
+
+/// Forwards to `crate::auth::token68_end` — the RUN behind RFC 9110 §11.2's
+/// `token68`: two loops, the alphabet's and the `=` pad's, with no way back to
+/// the first.
+///
+/// Not the READING: whether the run its answer names is taken as a `token68`
+/// at all is `crate::auth::token68`'s question, and that function is reached
+/// through `credentials` and `challenges`, whose own shims cover it.
+// gate-exempt: crate::auth::token68 — named for contrast, and the contrast is
+// the point: this forwards to the RUN. The reading built on it is a different
+// function with no forwarder, reached only through the two entry points whose
+// shims inline it.
+#[inline]
+pub fn token68_end(value: &[u8], at: usize) -> Option<usize> {
+  crate::auth::token68_end(value, at)
 }

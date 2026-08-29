@@ -164,6 +164,55 @@ pub const MAX_CHALLENGE_LINES: usize = 16;
 /// binary, so a caller cannot raise it.
 pub const MAX_TRACKED_PARAMS: usize = 16;
 
+// What the slot counts cost, checked at module scope so that every `cargo
+// check` on every tier enforces it. A `#[test]` would assert it only where a
+// test harness runs, which is every tier EXCEPT `thumbv6m-none-eabi` — the one
+// these numbers are written down for, where a 296-byte `Credential` is a real
+// share of the stack budget. (`crate::validator`'s `TagList` assertions and
+// `crate::range`'s `RangesSpecifier` ones are written against the same
+// argument.)
+//
+// The figures are the compiler's own, and these assertions are the command that
+// takes them:
+//
+//   cargo check -p http-semantics --all-features
+//   cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi
+//
+// A `Credential`'s size is `MAX_CHALLENGE_LINES`'s, and the derivation names
+// that constant rather than a bare number a reader has to take on trust: the
+// body is a `[&[u8]; MAX_CHALLENGE_LINES]`, so raising the constant raises this
+// by one slice per line it admits. On a 64-bit target a slice is a fat pointer,
+// 16 bytes, so the array is 256 and `len` makes `BodyLines` 264; the scheme
+// slice and the `Option<&[u8]>` holding the `token68` reading — 16 too, with
+// `None` in the pointer's null niche rather than a discriminant of its own —
+// round `Credential` to 296. On a 32-bit one a slice is 8, so the array is 128,
+// `BodyLines` is 132, and `Credential` is 148.
+//
+// `MAX_TRACKED_PARAMS` is the same 16 and buys that array a second time in
+// `SeenNames`, which is NOT in these figures: that record is spent inside
+// `Credential::read`, and the copy `auth_info`'s walk carries lives there
+// rather than in any `Credential`. The two constants being equal is why the
+// one number reads like the other's, and the storage is separate: neither of
+// these figures follows from `MAX_TRACKED_PARAMS`.
+//
+// An `AuthParam` is two slices and nothing else: 32 on a 64-bit target, 16 on a
+// 32-bit one. An `AuthError` is eight fieldless variants, so one byte holds the
+// discriminant and there is nothing width-dependent to guard.
+//
+// Both widths are pinned rather than bounded, because a bound set well above a
+// value asserts nothing about it.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<Credential<'_>>() == 296);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<AuthParam<'_>>() == 32);
+
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<Credential<'_>>() == 148);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<AuthParam<'_>>() == 16);
+
+const _: () = assert!(core::mem::size_of::<AuthError>() == 1);
+
 /// Why an RFC 9110 §11 authentication field could not be read.
 ///
 /// One type for all six of them. §11.3's `challenge` and §11.4's `credentials`
@@ -393,7 +442,7 @@ impl<'a> AuthParam<'a> {
 /// walk that crossed the join knows, so it says. [`crate::grammar::ParamIter`]
 /// carries the same fact for a §5.6.6 `parameter`, under its own name.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum ValueTail {
+pub(crate) enum ValueTail {
   /// Nothing was open where the line ended, or what was open never closed on
   /// any later one. Either way the parameter's bytes are all there is of it.
   Ends,
@@ -420,7 +469,10 @@ enum ValueTail {
 /// [`AuthError::UnterminatedQuotedString`] when a quoted value is still open
 /// where `element` ends and `tail` says nothing closed it;
 /// [`AuthError::InvalidQuotedString`] when one carries a byte §5.6.4 forbids.
-fn auth_param(element: &[u8], tail: ValueTail) -> Result<AuthParam<'_>, AuthError> {
+// `pub(crate)` for one caller outside this module and no other: the
+// `__no_panic_internals` forwarder the link proof's shim over it reaches it
+// through. Every other caller is in this file.
+pub(crate) fn auth_param(element: &[u8], tail: ValueTail) -> Result<AuthParam<'_>, AuthError> {
   let Some(name_end) = token_end(element, 0) else {
     return Err(AuthError::MalformedParameter);
   };
@@ -489,10 +541,10 @@ const fn is_token68_byte(b: u8) -> bool {
 /// This is the RUN, and not the reading. Whether the bytes it names are taken
 /// as a `token68` at all is [`token68`]'s question, and the answer is `no` for
 /// every run that stops short of its element's end.
-// No dead-code allowance of its own, unlike its one caller below: the
-// allowance on `token68` makes that function a root the lint walks out from,
-// and this is reachable from there.
-fn token68_end(value: &[u8], at: usize) -> Option<usize> {
+// `pub(crate)` for one caller outside this module and no other: the
+// `__no_panic_internals` forwarder the link proof's shim over it reaches it
+// through. Every other caller is in this file.
+pub(crate) fn token68_end(value: &[u8], at: usize) -> Option<usize> {
   let mut end = at;
   while value.get(end).copied().is_some_and(is_token68_byte) {
     end = end.saturating_add(1);
