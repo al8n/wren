@@ -1260,7 +1260,20 @@ fn the_debug_of_a_body_prints_what_the_credential_holds() {
   );
 }
 
+// Not run under miri, for the reason the two `date` brute forces are not.
+// The crate is `forbid(unsafe_code)`, so there is no undefined behaviour in
+// what this drives for the interpreter to find, and what it does drive is the
+// most expensive thing in the crate: 181_896 field values, each derived once by
+// the collecting walk and once again by `Credential::read`. Interpreted, that
+// is hours — enough on its own to spend the whole `miri` job's budget and leave
+// the crates behind this one unrun. Every other tier runs it in full, and a
+// disagreement between the two producers is a logic error, which is what those
+// tiers are the check for.
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "181_896 field values, each derived twice; no unsafe to interpret"
+)]
 fn the_body_a_challenge_collected_reads_the_same_alone() {
   // The two producers, compared directly. `Credential::params` hands a caller
   // the answer of the walk over the collected body for a challenge the
