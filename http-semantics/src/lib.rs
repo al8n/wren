@@ -40,6 +40,7 @@ extern crate std;
 // siblings they are — names this root does not re-export. In `http1-proto` the
 // same three links resolved only because that root re-exports all three, so the
 // summary read as self-contained while depending on a list one file away.
+pub mod auth;
 pub mod conditional;
 pub mod date;
 pub mod grammar;

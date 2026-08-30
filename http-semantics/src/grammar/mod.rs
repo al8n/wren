@@ -1377,7 +1377,7 @@ enum QuotedTail {
 }
 
 /// Where a scan for a top-level delimiter got to.
-enum Delim {
+pub(crate) enum Delim {
   /// The delimiter — or the end of the input — is at this offset, with every
   /// §5.6.4 quoted-string before it closed.
   At(usize),
@@ -1399,6 +1399,22 @@ enum Delim {
 /// two unresolved cases apart, because a walk that must cross RFC 9110 §5.2's
 /// join needs the open string's escape state to continue it. Both take what a
 /// quoted-string IS from [`scan_quoted`], which is where that rule lives.
+///
+/// Private to this module, and not for RFC 9110 §11.2's `#auth-param` walk to
+/// reach: that walk asks a narrower question than this one, in two ways, so
+/// widening this visibility for it hands it the wrong answer twice. A DQUOTE
+/// opens a string only at the one position §11.2
+/// admits one — the first byte of an `auth-param` value, since `tchar`,
+/// `token68`'s alphabet and `BWS` all exclude DQUOTE — and everywhere else in
+/// an element it is a byte no production admits, which decides no boundary.
+/// And an `auth-param` value is `( token / quoted-string )` taken WHOLE, so the
+/// string that closes closes the last thing that element may hold, and a scan
+/// that goes on hunting delimiters behind that close reads a DQUOTE among
+/// proven-underivable bytes as opening a second string. Either reading lets a
+/// malformed challenge swallow the comma in front of a well-formed one. That
+/// module's `element_end` is where its narrower answer lives; the rule neither
+/// walk may restate is what a quoted-string IS, and both take it from
+/// [`scan_quoted`].
 fn scan_to_delim(value: &[u8], at: usize, delim: u8) -> Delim {
   let mut at = at;
   loop {

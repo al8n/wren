@@ -147,6 +147,26 @@ jobs:
       # to catch, one level up. `xtask` has no dependencies and no features, so
       # this runs on all three runners like the steps above it.
       - run: cargo test -p xtask
+      # The differential corpus's own suite, and the same argument one level
+      # further down. `auth-corpus` carries the ORACLE that says whether an
+      # answer from `http-semantics`'s RFC 9110 §11 walk hid a challenge, and
+      # every figure published about those fields is one of its verdicts
+      # counted. An oracle quietly made more permissive lowers the very number
+      # it exists to drive to zero and reports success, and this classifier has
+      # twice done exactly that. The suite pins the oracle against values RFC
+      # 9110 settles by hand, and pins the per-corpus tally that reproduces the
+      # published figures, so a tree that stops reproducing them reds here.
+      #
+      # It runs the WHOLE corpus — all 935 032 records, thirteen seconds of it
+      # in a debug build — rather than a subset, so there is no coverage caveat
+      # to remember. It pins a SHA-256 of the ANSWER column too, per corpus and
+      # over the whole run, taken with the same hash `auth-diff` publishes with:
+      # a tally of verdicts cannot see an answer that moves inside its own axis
+      # class, and the only other instrument that can is `auth-diff`, which
+      # needs two revisions and so cannot run on a commit.
+      # What the digest still cannot say is WHICH record moved — it names the
+      # corpus, and its failure names the command that names the record.
+      - run: cargo test -p auth-corpus
 
   no-std:
     runs-on: ubuntu-latest

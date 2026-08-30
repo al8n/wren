@@ -14,7 +14,9 @@
 //! Coverage: `parameterised_list`, `parse_qvalue`, `weight_for`,
 //! `parse_http_date`, `format_imf_fixdate`, `EntityTag::parse`,
 //! `TagList::parse`, `RangesSpecifier::parse`, `RangesSpecifier::resolve`,
-//! `ContentRange::parse` and `ContentRange::encode` are each link-checked via
+//! `ContentRange::parse`, `ContentRange::encode`, `auth::auth_param`,
+//! `auth::token68_end`, `auth::credentials`, `auth::challenges` and
+//! `auth::auth_info` are each link-checked via
 //! `#[no_panic]` shims — the join-aware RFC 9110 §5.6.6 list walk, whose
 //! cursors run over borrowed field lines the caller supplies and whose member
 //! boundaries cross the §5.2 join; the §12.4.2 `qvalue` reader, whose
@@ -22,10 +24,22 @@
 //! §12.5.1 weight selection, driven over the whole walk (the field's lines and
 //! the §5.2 join between them, the range iterator, each range's parameter walk
 //! and the candidate's, and the bounded per-instance match between the two);
-//! and §5.6.7's two halves — the reader, three fixed-column walks over an input
+//! §5.6.7's two halves — the reader, three fixed-column walks over an input
 //! whose length it fixes itself plus the epoch conversion behind them, and the
 //! writer, whose one bounds check stands between a caller's buffer and
-//! twenty-nine bytes.
+//! twenty-nine bytes; and §11's authentication leaves — the `auth-param`
+//! production with its `BWS`, the `token68` run behind it, and the three
+//! entry points that read one credential, a list of challenges, and a bare
+//! parameter list.
+//!
+//! **What that list does NOT cover is named where the shims are, not left to
+//! be inferred from its absence.** The `§11's authentication leaves` section
+//! below opens with the omissions its five shims leave — a `Display` impl no
+//! shim in this file covers, and the instantiations of a generic entry point
+//! that a shim driving ONE iterator type does not reach. al8n/wren#69 is the
+//! issue filed when a 3312-line file went unshimmed and nothing said so; a gap
+//! that reads as coverage is the defect, and a gap with its reason beside it is
+//! not.
 //!
 //! # Why the proof lives here rather than in `http1-proto`'s copy
 //!
@@ -185,7 +199,8 @@ macro_rules! no_panic_shim {
 use core::hint::black_box;
 
 use http_semantics::{
-  __no_panic_internals::parse_qvalue,
+  __no_panic_internals::{ValueTail, auth_param, parse_qvalue, token68_end},
+  auth::{auth_info, challenges, credentials},
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
   grammar::{ParamValue, parameterised_list},
   media::{media_type, weight_for},
@@ -1045,6 +1060,529 @@ fn content_range_is_panic_free() {
       );
     }
   }
+}
+
+// ── §11's authentication leaves ──────────────────────────────────────────────
+//
+// WHAT IS NOT PROVEN HERE, said where the coverage is claimed rather than left
+// to be inferred from its absence — al8n/wren#69 is the issue filed when a
+// 3312-line file went unshimmed and nothing said so:
+//
+// * **`Display`.** `AuthError` and `ValueSpansFieldLines` derive theirs from
+//   `thiserror`, and no shim in this file covers a `Display` impl — not
+//   theirs, and not `TagError`'s or `RangeError`'s either. Formatting a
+//   fixed string is not a leaf this file proves; it is one no shim has been
+//   written for.
+// * **Every instantiation but one, for the two generic entry points.**
+//   `challenges` and `auth_info` take `I: IntoIterator<Item = &'a [u8]>` and
+//   monomorphize per `I`. The shims below drive ONE — the `Copied<Iter<'_,
+//   &[u8]>>` a slice gives — so what is proven is the walk's own code compiled
+//   against that iterator. A caller handing them another iterator type gets a
+//   second instantiation, and no `#[no_panic]` guard was ever put on it. The
+//   crate's other list walks are in the same position; this is the first place
+//   it is written down.
+//
+// What IS proven beyond the five shims' own names: `auth::token68` — the
+// READING, as against `token68_end`'s run — and `Credential::read`,
+// `BodyLines`, `SeenNames`, `ParamWalk` and the `Challenges`/`AuthInfo` steps
+// have no shim of their own and need none. `credentials`, `challenges` and
+// `auth_info` are their only entrances, and the fat LTO these steps run under
+// inlines them into the three shims that drive those. That is coverage by
+// inlining, and it is the same claim every other shim in this file makes
+// about the leaves beneath its own entry point.
+
+no_panic_shim! {
+  /// Shim over `auth::auth_param` — RFC 9110 §11.2's
+  /// `auth-param = token BWS "=" BWS ( token / quoted-string )`, read over one
+  /// list element with the list's own `OWS` already off both ends.
+  ///
+  /// Reached through the `__no_panic_internals` forwarder: the walks above it
+  /// are the crate's entry points and this is not, so it stays `pub(crate)`.
+  ///
+  /// `tail` is the `ValueTail` the `__no_panic_internals` forwarder mirrors the
+  /// crate-private one as, and it is driven ALL THREE ways below. It is what
+  /// separates a quoted value RFC 9110 §5.2's field-line join closed on a
+  /// later line from one that closed there and then ran on past its close, and
+  /// from one that never closes at all; the three take different exits. An
+  /// enum, so there is no fourth value to drive and no arm that swallows one.
+  ///
+  /// Returns the bytes it read with `value()`'s answer folded in, so nothing
+  /// here is optimized out as unused and neither accessor can be dropped.
+  fn shim_auth_param(element: &[u8], tail: ValueTail) -> usize {
+    let Ok(param) = auth_param(element, tail) else {
+      return 0;
+    };
+    param.name().len().wrapping_add(match param.value() {
+      Ok(ParamValue::Token(bytes) | ParamValue::Quoted(bytes)) => bytes.len(),
+      // `#[non_exhaustive]`: `None` is unreachable for an `auth-param` — the
+      // production names a value — and carries no bytes in any case, and
+      // neither does a variant this file has not been taught yet.
+      Ok(_) => 0,
+      // The value crossed the join, so it is real and is not one slice.
+      Err(_) => 1,
+    })
+  }
+}
+
+#[test]
+fn auth_param_is_panic_free() {
+  // RFC 9110 §11.2's two notations, and the §5.6.3 BWS a recipient removes
+  // before interpreting the element — which is this production's own, and is
+  // what §5.6.6's `parameter` walker refuses.
+  let ends = ValueTail::Ends;
+  assert!(shim_auth_param(black_box(br#"realm="x""#.as_slice()), black_box(ends)) > 0);
+  assert!(shim_auth_param(black_box(b"realm=x".as_slice()), black_box(ends)) > 0);
+  assert!(
+    shim_auth_param(
+      black_box(b"realm \t = \t \"x\"".as_slice()),
+      black_box(ends)
+    ) > 0
+  );
+  // A `quoted-pair`, which an `auth-param` value admits.
+  assert!(shim_auth_param(black_box(br#"nonce="a\"b""#.as_slice()), black_box(ends)) > 0);
+  // The join, all three ways: a value still open where the element ends is a
+  // parameter when a later field line closed it and the element ended at that
+  // close, a fault when bytes other than the list's own `OWS` stood behind the
+  // close, and a fault when nothing closed it at all.
+  assert!(
+    shim_auth_param(
+      black_box(b"opaque=\"a".as_slice()),
+      black_box(ValueTail::Continues)
+    ) > 0
+  );
+  assert_eq!(
+    shim_auth_param(
+      black_box(b"opaque=\"a".as_slice()),
+      black_box(ValueTail::Trails)
+    ),
+    0
+  );
+  assert_eq!(
+    shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(ends)),
+    0
+  );
+  // Each refusal on its own, and under every reading of the tail: no `=`, an
+  // `=` with no value behind it, a name that is not a token, bytes behind a
+  // closed string, a byte RFC 9110 §5.6.4 forbids inside one, nothing at all,
+  // and bytes that are not ASCII.
+  for refused in [
+    b"realm".as_slice(),
+    b"realm=",
+    b"re alm=x",
+    br#"realm="x"y"#,
+    b"realm=\"a\x00b\"",
+    b"",
+    &[0xffu8, 0x3d, 0x22],
+  ] {
+    for tail in [ValueTail::Ends, ValueTail::Continues, ValueTail::Trails] {
+      assert_eq!(shim_auth_param(black_box(refused), black_box(tail)), 0);
+    }
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `auth::token68_end` — the RUN behind RFC 9110 §11.2's
+  /// `token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`,
+  /// which is two loops with no way back to the first.
+  ///
+  /// `at` arrives opaque and is driven PAST the end of `value`, because it is
+  /// a cursor the caller carries and a bounds check on it is exactly what this
+  /// has to survive.
+  ///
+  /// The READING built on that run — whether the bytes it names are taken as a
+  /// `token68` at all — is `auth::token68`'s, and it has no shim of its own:
+  /// it is reachable only through `credentials` and `challenges`, whose shims
+  /// inline it.
+  ///
+  /// Returns the end it found, so nothing here is optimized out as unused.
+  /// `None` and `Some(0)` are one answer here and cannot be confused: the run
+  /// has a floor of one byte, so no `Some` this can return is zero.
+  fn shim_token68_end(value: &[u8], at: usize) -> usize {
+    token68_end(value, at).unwrap_or(0)
+  }
+}
+
+#[test]
+fn token68_end_is_panic_free() {
+  // RFC 9110 §11.2's own shapes: a base64 run with padding, one without, and
+  // the pad alone — which is not a run with an empty alphabet part but no run
+  // at all, since `1*` puts a floor of one byte under it.
+  assert_eq!(
+    shim_token68_end(black_box(b"dGVzdA==".as_slice()), black_box(0)),
+    8
+  );
+  assert_eq!(
+    shim_token68_end(black_box(b"mF_9.B5f-4.1JqM".as_slice()), black_box(0)),
+    15
+  );
+  assert_eq!(
+    shim_token68_end(black_box(b"====".as_slice()), black_box(0)),
+    0
+  );
+  // The pad is a tail and not a byte of the alphabet, so a run does not
+  // resume behind one.
+  assert_eq!(
+    shim_token68_end(black_box(b"a=b".as_slice()), black_box(0)),
+    2
+  );
+  // A cursor inside the value, at its end, and past it — the last is the
+  // bounds check a caller's own arithmetic can hand this.
+  assert_eq!(
+    shim_token68_end(black_box(b"ab.cd".as_slice()), black_box(2)),
+    5
+  );
+  assert_eq!(
+    shim_token68_end(black_box(b"ab".as_slice()), black_box(2)),
+    0
+  );
+  assert_eq!(
+    shim_token68_end(black_box(b"ab".as_slice()), black_box(usize::MAX)),
+    0
+  );
+  // No run at all: a byte outside both the alphabet and the pad, empty input,
+  // and bytes that are not ASCII.
+  assert_eq!(
+    shim_token68_end(black_box(b"!x".as_slice()), black_box(0)),
+    0
+  );
+  assert_eq!(shim_token68_end(black_box(b"".as_slice()), black_box(0)), 0);
+  assert_eq!(
+    shim_token68_end(black_box([0xffu8, 0x3d].as_slice()), black_box(0)),
+    0
+  );
+}
+
+no_panic_shim! {
+  /// Shim over `auth::credentials` — RFC 9110 §11.6.2's `Authorization` and
+  /// §11.7.2's `Proxy-Authorization`, whose value is ONE credential.
+  ///
+  /// Driven through the whole production: the scheme, §11.2's choice between
+  /// a `token68` and a `#auth-param` list, the parameter walk, and the
+  /// one-name-once record `Credential::read` spends before the value exists.
+  /// Every accessor is read, so none of them can be dropped.
+  ///
+  /// Returns the bytes it read, so nothing here is optimized out as unused.
+  fn shim_credentials(value: &[u8]) -> usize {
+    let Ok(credential) = credentials(value) else {
+      return 0;
+    };
+    let mut seen = credential.scheme().len();
+    seen = seen.wrapping_add(usize::from(credential.scheme_is("basic")));
+    seen = seen.wrapping_add(credential.token68().map_or(0, <[u8]>::len));
+    for param in credential.params() {
+      seen = seen.wrapping_add(param.name().len());
+      seen = seen.wrapping_add(match param.value() {
+        Ok(ParamValue::Token(bytes) | ParamValue::Quoted(bytes)) => bytes.len(),
+        Ok(_) => 0,
+        Err(_) => 1,
+      });
+    }
+    seen.wrapping_add(1)
+  }
+}
+
+#[test]
+fn credentials_is_panic_free() {
+  // RFC 9110 §11.2's two body forms, and the bare scheme its `[ … ]` admits.
+  assert!(shim_credentials(black_box(b"Basic dGVzdA==".as_slice())) > 0);
+  assert!(shim_credentials(black_box(br#"Newauth realm="apps", type=1"#.as_slice())) > 0);
+  assert!(shim_credentials(black_box(b"Negotiate".as_slice())) > 0);
+  // §11.2's other `token68` shapes, including the trailing-`=` case that reads
+  // like a parameter whose value went missing and is not one.
+  assert!(shim_credentials(black_box(b"Bearer mF_9.B5f-4.1JqM".as_slice())) > 0);
+  assert!(shim_credentials(black_box(b"Scheme foo=".as_slice())) > 0);
+  // Empty elements in quantity, which RFC 9110 §5.6.1.2 has a recipient ignore
+  // and which spend no slot of the one-name-once record.
+  assert!(shim_credentials(black_box(b"Basic ,, a=1 ,, b=2 ,,".as_slice())) > 0);
+  // The HTAB that IS the OWS §5.6.1.2 hangs on the section's first comma, so
+  // the section opens on the empty first element in front of it.
+  assert!(shim_credentials(black_box(b"Basic \t, type=1".as_slice())) > 0);
+  // Exactly `MAX_PARAMS_PER_CREDENTIAL` names, and one past it.
+  assert!(
+    shim_credentials(black_box(
+      b"Basic a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10,k=11,l=12,m=13,n=14,o=15,p=16".as_slice()
+    )) > 0
+  );
+  assert_eq!(
+    shim_credentials(black_box(
+      b"Basic a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10,k=11,l=12,m=13,n=14,o=15,p=16,q=17"
+        .as_slice()
+    )),
+    0
+  );
+  // Each refusal on its own: no scheme, a scheme glued to an `=`, the HTAB
+  // after `1*SP` that reaches an element rather than the comma RFC 9110
+  // §5.6.1.2 would hang it on, a repeated name under
+  // §11.2's case-insensitive fold, the trailing comma this field has no list
+  // to make an empty element of, a second credential where a parameter name
+  // belongs, an unterminated quoted value, one that closed with bytes behind
+  // its close, a byte §5.6.4 forbids inside one, nothing at all, and bytes
+  // that are not ASCII.
+  for refused in [
+    b"=x".as_slice(),
+    b"Basic=1",
+    b"Basic \ta=1",
+    b"Basic a=1, A=2",
+    b"Basic dGVzdA==,",
+    b"Basic x=1, Digest y=2",
+    b"Basic a=\"1",
+    b"Basic a=\"x,y\"junk",
+    b"Basic a=\"\x00\"",
+    b"",
+    &[0xffu8, 0x20, 0x3d],
+  ] {
+    assert_eq!(shim_credentials(black_box(refused)), 0);
+  }
+}
+
+no_panic_shim! {
+  /// Shim over `auth::challenges` — RFC 9110 §11.6.1's `WWW-Authenticate` and
+  /// §11.7.1's `Proxy-Authenticate`, driven over the field's LINES and through
+  /// every step of the walk: the boundary rule that decides what each comma
+  /// separates, the §5.2 join between two lines, the region collection behind
+  /// a challenge, and the seek that finds where a FAILED challenge ends.
+  ///
+  /// The loop goes on past an error rather than stopping at the first, and
+  /// that is coverage rather than tidiness: this walk reports one fault per
+  /// challenge and continues, so a shim that broke would leave the recovery
+  /// path — `seek`, and the boundary rule run over a scan that collects
+  /// nothing — out of the binary and out of the proof.
+  ///
+  /// Returns the bytes it read, so nothing here is optimized out as unused.
+  fn shim_challenges(lines: &[&[u8]]) -> usize {
+    let mut seen = 0usize;
+    for challenge in challenges(lines.iter().copied()) {
+      let Ok(credential) = challenge else {
+        continue;
+      };
+      seen = seen.wrapping_add(credential.scheme().len());
+      seen = seen.wrapping_add(usize::from(credential.scheme_is("basic")));
+      seen = seen.wrapping_add(credential.token68().map_or(0, <[u8]>::len));
+      for param in credential.params() {
+        seen = seen.wrapping_add(param.name().len());
+        seen = seen.wrapping_add(match param.value() {
+          Ok(ParamValue::Token(bytes) | ParamValue::Quoted(bytes)) => bytes.len(),
+          Ok(_) => 0,
+          Err(_) => 1,
+        });
+      }
+    }
+    seen
+  }
+}
+
+#[test]
+fn challenges_is_panic_free() {
+  // RFC 9110 §11.6.1's own printed value, whose commas mean both things at
+  // once — a parameter of the challenge already open, and the scheme of the
+  // next one.
+  assert!(
+    shim_challenges(black_box(&[
+      br#"Basic realm="simple", Newauth realm="apps", type=1, title="Login to \"apps\"""#
+        .as_slice()
+    ]))
+      > 0
+  );
+  // One challenge split at an element boundary by §5.2's join, and a quoted
+  // value carried across that join — which `value()` reports and `name()`
+  // survives.
+  assert!(shim_challenges(black_box(&[b"Basic a=1".as_slice(), b"b=2"])) > 0);
+  assert!(shim_challenges(black_box(&[b"Basic a=\"long".as_slice(), b"tail\""])) > 0);
+  // A string left open at the join with its escape spent by the join's own
+  // comma, so the next line's leading DQUOTE closes it.
+  assert!(shim_challenges(black_box(&[b"Basic p=\"a\\".as_slice(), b"\", x=1"])) > 0);
+  // A value that closed across the join with bytes behind that close, which
+  // ends the first challenge's own reading and not the walk: those bytes are
+  // taken raw to the comma that ends them, so `Newauth` behind it is read.
+  assert!(
+    shim_challenges(black_box(&[
+      b"Basic a=\"x".as_slice(),
+      b"y\"junk, Newauth c=3"
+    ]))
+      > 0
+  );
+  // The same, with a DQUOTE among those bytes — which opens no string, at each
+  // of the three entrances to that rule: behind a close the join carried over,
+  // behind one on the line the element began on, and inside the run a seek
+  // recovers a refused challenge through.
+  assert!(
+    shim_challenges(black_box(&[
+      b"Basic realm=x, Broken a=\"q".as_slice(),
+      b"r\"junk\", Digest realm=z"
+    ]))
+      > 0
+  );
+  assert!(
+    shim_challenges(black_box(&[
+      b"Basic a=\"x\"ju\"nk, Digest realm=z".as_slice()
+    ]))
+      > 0
+  );
+  assert!(shim_challenges(black_box(&[b"=x\"j\x00unk, Digest realm=z".as_slice()])) > 0);
+  // A DQUOTE where RFC 9110 §11.2 admits no string at all, so the element ends
+  // at a RAW comma: on the line it began on, and across §5.2's join, where a
+  // string would otherwise have carried it over a whole field line.
+  assert!(shim_challenges(black_box(&[b"Basic a=x\"y, Digest realm=z".as_slice()])) > 0);
+  assert!(shim_challenges(black_box(&[b"Basic a=x\"y".as_slice(), b"Digest realm=z"])) > 0);
+  // Empty lines, OWS-only lines and empty elements, which spend no entry.
+  assert!(
+    shim_challenges(black_box(&[
+      b"Basic a=1".as_slice(),
+      b"",
+      b" ",
+      b",,",
+      b"b=2"
+    ]))
+      > 0
+  );
+  // A `token68` body, and the trailing comma this field DOES have a list to
+  // make an empty element of.
+  assert!(shim_challenges(black_box(&[b"Basic dGVzdA==,".as_slice()])) > 0);
+  // The OWS RFC 9110 §5.6.1.2 hangs on a comma, at each of the two edges that
+  // read it: behind the scheme, where the challenge is bare and the comma ends
+  // its element, and behind `1*SP`, where the parameter section opens on the
+  // empty first element in front of that comma.
+  assert!(shim_challenges(black_box(&[b"Basic\t, Newauth x=1".as_slice()])) > 0);
+  assert!(shim_challenges(black_box(&[b"Basic \t, type=1".as_slice()])) > 0);
+  // A fault, and the challenge behind it: the walk reports one and goes on,
+  // which is the seek this drives.
+  assert!(
+    shim_challenges(black_box(&[
+      b"Basic a=1, =x, type=b, Newauth c=1".as_slice()
+    ]))
+      > 0
+  );
+  // Exactly `MAX_CHALLENGE_LINES` lines of one challenge, then one past it.
+  let split: [&[u8]; 17] = [
+    b"Basic a=1",
+    b"b=2",
+    b"c=3",
+    b"d=4",
+    b"e=5",
+    b"f=6",
+    b"g=7",
+    b"h=8",
+    b"i=9",
+    b"j=10",
+    b"k=11",
+    b"l=12",
+    b"m=13",
+    b"n=14",
+    b"o=15",
+    b"p=16",
+    b"q=17",
+  ];
+  assert!(shim_challenges(black_box(&split[..16])) > 0);
+  assert_eq!(shim_challenges(black_box(&split[..])), 0);
+  // A scan that fails inside a quoted-string on a byte RFC 9110 §5.6.4
+  // forbids, and the challenge behind it: that fault refuses the challenge and
+  // the same seek runs, so this drives the recovery rather than an early
+  // return out of the walk.
+  assert!(shim_challenges(black_box(&[b"Basic a=\"\x00\", Digest b=2".as_slice()])) > 0);
+  // Its pair, which must NOT take that path: `obs-text` IS `qdtext`, so the
+  // string closes, the comma inside it is data, and one challenge with one
+  // parameter is what comes back.
+  assert!(shim_challenges(black_box(&[b"Basic a=\"\xff, Digest b=2\"".as_slice()])) > 0);
+  // Values with nothing to hand back: every element refused, no lines at all,
+  // one empty line, and bytes that are not ASCII.
+  assert_eq!(shim_challenges(black_box(&[b"=x".as_slice()])), 0);
+  assert_eq!(shim_challenges(black_box(&[])), 0);
+  assert_eq!(shim_challenges(black_box(&[b"".as_slice()])), 0);
+  assert_eq!(
+    shim_challenges(black_box(&[[0xffu8, 0x2c, 0x20].as_slice()])),
+    0
+  );
+}
+
+no_panic_shim! {
+  /// Shim over `auth::auth_info` — RFC 9110 §11.6.3's `Authentication-Info`,
+  /// which is a `#auth-param` list and nothing else: no scheme in front of it,
+  /// and so no `token68` reading to choose.
+  ///
+  /// Driven over the field's LINES, so the §5.2 join is crossed here too, and
+  /// through the one-name-once record this walk carries ACROSS the parameters
+  /// it hands out one at a time — the difference from the other two entry
+  /// points, which spend theirs before their value exists.
+  ///
+  /// RFC 9110 §11.6.3 gives this field's parameters the "syntax defined in
+  /// Section 11.3". They are not defined there: §11.3 is Challenge and
+  /// Response, and the production is in §11.2 — which is the section this file
+  /// and the module both cite.
+  ///
+  /// Returns the bytes it read, so nothing here is optimized out as unused.
+  fn shim_auth_info(lines: &[&[u8]]) -> usize {
+    let mut seen = 0usize;
+    for param in auth_info(lines.iter().copied()) {
+      let Ok(param) = param else { break };
+      seen = seen.wrapping_add(param.name().len());
+      seen = seen.wrapping_add(match param.value() {
+        Ok(ParamValue::Token(bytes) | ParamValue::Quoted(bytes)) => bytes.len(),
+        Ok(_) => 0,
+        Err(_) => 1,
+      });
+    }
+    seen
+  }
+}
+
+#[test]
+fn auth_info_is_panic_free() {
+  // A list on one line, and the same list split by §5.2's join at an element
+  // boundary and inside a quoted value.
+  assert!(shim_auth_info(black_box(&[br#"nextnonce="x", qop=auth"#.as_slice()])) > 0);
+  assert!(shim_auth_info(black_box(&[b"nextnonce=x".as_slice(), b"qop=auth"])) > 0);
+  assert!(shim_auth_info(black_box(&[b"rspauth=\"a".as_slice(), b"b\", qop=auth"])) > 0);
+  // Empty elements, empty lines and OWS-only lines, which spend no slot.
+  assert!(shim_auth_info(black_box(&[b", a=1 ,,".as_slice(), b"", b" ", b"b=2"])) > 0);
+  // Exactly `MAX_PARAMS_PER_CREDENTIAL` names, then one past it — the second is the
+  // refusal that constant documents, reported AT the parameter that broke it.
+  assert!(
+    shim_auth_info(black_box(&[
+      b"a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10,k=11,l=12,m=13,n=14,o=15,p=16".as_slice()
+    ]))
+      > 0
+  );
+  assert!(
+    shim_auth_info(black_box(&[
+      b"a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10,k=11,l=12,m=13,n=14,o=15,p=16,q=17".as_slice()
+    ]))
+      > 0
+  );
+  // A repeated name under RFC 9110 §11.2's case-insensitive fold. The walk
+  // reports it AT the parameter that broke the rule, so the one in front of
+  // the repeat was handed over already and this is not a value with nothing
+  // in it.
+  assert!(shim_auth_info(black_box(&[b"a=1, A=2".as_slice()])) > 0);
+  // Nothing to hand back: an element that is no parameter at the head of the
+  // list, a value that closed across RFC 9110 §5.2's join with bytes behind
+  // that close, a byte §5.6.4 forbids inside a quoted-string, no lines at all,
+  // one empty line, and bytes that are not ASCII.
+  assert_eq!(shim_auth_info(black_box(&[b"realm".as_slice()])), 0);
+  assert_eq!(
+    shim_auth_info(black_box(&[b"a=\"x".as_slice(), b"y\"junk"])),
+    0
+  );
+  // The same with a DQUOTE among those bytes, which opens no string of its
+  // own: once behind a close §5.2's join carried over, and once behind one on
+  // the line the element began on.
+  assert_eq!(
+    shim_auth_info(black_box(&[b"a=\"x".as_slice(), b"y\" \"z, b=2"])),
+    0
+  );
+  assert_eq!(
+    shim_auth_info(black_box(&[b"a=\"x\"ju\"nk, b=2".as_slice()])),
+    0
+  );
+  // And a DQUOTE at a position RFC 9110 §11.2 admits no value at, which opens
+  // no string either: the element ends at the raw comma and derives nothing.
+  assert_eq!(shim_auth_info(black_box(&[b"a=x\"y, b=2".as_slice()])), 0);
+  assert_eq!(shim_auth_info(black_box(&[b"a=\"\x00\"".as_slice()])), 0);
+  assert_eq!(shim_auth_info(black_box(&[])), 0);
+  assert_eq!(shim_auth_info(black_box(&[b"".as_slice()])), 0);
+  assert_eq!(
+    shim_auth_info(black_box(&[[0xffu8, 0x3d, 0x22].as_slice()])),
+    0
+  );
 }
 
 // ── the lie-check: this file's own guard against going vacuous ────────────────
