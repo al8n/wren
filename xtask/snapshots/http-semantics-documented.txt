@@ -18,6 +18,7 @@ http_semantics::auth::AuthInfo.exhausted
 http_semantics::auth::AuthInfo.seen
 http_semantics::auth::AuthInfo<I>::element
 http_semantics::auth::AuthInfo<I>::next_line
+http_semantics::auth::AuthInfo<I>::refuse
 http_semantics::auth::AuthParam
 http_semantics::auth::AuthParam.name
 http_semantics::auth::AuthParam.value
@@ -33,8 +34,11 @@ http_semantics::auth::BodyCheck::finish
 http_semantics::auth::BodyCheck::new
 http_semantics::auth::BodyCheck::settle
 http_semantics::auth::BodyLines
+http_semantics::auth::BodyLines.held
 http_semantics::auth::BodyLines.len
 http_semantics::auth::BodyLines.lines
+http_semantics::auth::BodyLines::cut
+http_semantics::auth::BodyLines::fmt
 http_semantics::auth::BodyLines::line
 http_semantics::auth::BodyLines::new
 http_semantics::auth::BodyLines::push
@@ -44,7 +48,6 @@ http_semantics::auth::Challenges.seeking
 http_semantics::auth::Challenges<I>::challenge
 http_semantics::auth::Challenges<I>::next_line
 http_semantics::auth::Challenges<I>::open_element
-http_semantics::auth::Challenges<I>::opens_a_challenge
 http_semantics::auth::Challenges<I>::refuse
 http_semantics::auth::Challenges<I>::seek
 http_semantics::auth::Challenges<I>::skip_element
@@ -75,11 +78,15 @@ http_semantics::auth::Rejoin::Ends.trails
 http_semantics::auth::Rejoin::Invalid
 http_semantics::auth::Rejoin::Open
 http_semantics::auth::Rejoin::Open.escape
+http_semantics::auth::Scanned
+http_semantics::auth::Scanned.at
+http_semantics::auth::Scanned.element
 http_semantics::auth::Section
 http_semantics::auth::Section.body
 http_semantics::auth::Section.end
 http_semantics::auth::Section.overrun
 http_semantics::auth::Section.start
+http_semantics::auth::Section::close
 http_semantics::auth::Section::opening_at
 http_semantics::auth::Section::outgrown
 http_semantics::auth::Section::spend
@@ -105,10 +112,12 @@ http_semantics::auth::credentials
 http_semantics::auth::element_end
 http_semantics::auth::ends_element
 http_semantics::auth::is_token68_byte
+http_semantics::auth::opens_a_challenge
 http_semantics::auth::param_value_at
 http_semantics::auth::raw_comma_end
 http_semantics::auth::read_credential
 http_semantics::auth::rejoin
+http_semantics::auth::scan_element
 http_semantics::auth::skip_sp
 http_semantics::auth::token68
 http_semantics::auth::token68_end

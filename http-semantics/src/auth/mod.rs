@@ -113,10 +113,34 @@
 //! opened, so where that string ends is unknown and every comma behind it is a
 //! guess; [`challenges`] says so where it says what follows an error.
 //!
-//! Names in this section are plain code spans rather than intra-doc links: the
-//! functions the rule lives in are private, and a link to one from a public
-//! module's own documentation is what `rustdoc::private_intra_doc_links`
-//! refuses under `-D warnings`. Each is documented where it is defined.
+//! # Where a boundary is derived, and how many times
+//!
+//! Once, in `scan_element`, and every walk in this module gets its elements
+//! from there: the `#challenge` walk while it is still cutting a body, the
+//! `#auth-param` walk a caller reaches through [`Credential::params`], and
+//! §11.6.3's bare list. A rule that is right at one entrance and absent at a
+//! second is how each of the three rounds above got in, and a boundary derived
+//! in three places is three entrances.
+//!
+//! The two walks over a CREDENTIAL are the pair that must agree, because one
+//! of them decides that the challenge parses and the other is what a caller
+//! then reads its parameters through — so a disagreement drops a parameter and
+//! reports nothing. They agree by construction and not by measurement: it is
+//! one function, and `BodyLines` hands it the same bytes both times by keeping
+//! each region uncut to the end of its field line, which is what the collecting
+//! walk read. `scan_element` reads its line from the cursor forward only, so
+//! two slices that agree from the cursor on cannot give different answers.
+//!
+//! Where the credential STOPS is not derived twice either. It is
+//! `BodyLines::held` — the collecting walk's own cursor, recorded — so a reader
+//! of the body stops where the walk that took it stopped rather than at a
+//! second opinion about the same bytes.
+//!
+//! Names in the two sections above are plain code spans rather than intra-doc
+//! links: the functions and types the rule lives in are private, and a link to
+//! one from a public module's own documentation is what
+//! `rustdoc::private_intra_doc_links` refuses under `-D warnings`. Each is
+//! documented where it is defined.
 // gate-exempt: realm = "x" — one field value shown in prose, carrying the BWS
 // this module accepts; not a production of any RFC.
 // gate-exempt: crate::validator — named for contrast: §8.8.3's `opaque-tag` is
@@ -236,11 +260,12 @@ pub const MAX_PARAMS_PER_CREDENTIAL: usize = 16;
 // that constant rather than a bare number a reader has to take on trust: the
 // body is a `[&[u8]; MAX_CHALLENGE_LINES]`, so raising the constant raises this
 // by one slice per line it admits. On a 64-bit target a slice is a fat pointer,
-// 16 bytes, so the array is 256 and `len` makes `BodyLines` 264; the scheme
-// slice and the `Option<&[u8]>` holding the `token68` reading — 16 too, with
-// `None` in the pointer's null niche rather than a discriminant of its own —
-// round `Credential` to 296. On a 32-bit one a slice is 8, so the array is 128,
-// `BodyLines` is 132, and `Credential` is 148.
+// 16 bytes, so the array is 256 and the two `usize`s beside it — `len`, and the
+// `held` that says where the credential stops in its last region — make
+// `BodyLines` 272; the scheme slice and the `Option<&[u8]>` holding the
+// `token68` reading — 16 too, with `None` in the pointer's null niche rather
+// than a discriminant of its own — round `Credential` to 304. On a 32-bit one a
+// slice is 8, so the array is 128, `BodyLines` is 136, and `Credential` is 152.
 //
 // `MAX_PARAMS_PER_CREDENTIAL` is the same 16 and buys that array a second time in
 // `SeenNames`, which is NOT in these figures: that record is spent inside
@@ -256,12 +281,12 @@ pub const MAX_PARAMS_PER_CREDENTIAL: usize = 16;
 // Both widths are pinned rather than bounded, because a bound set well above a
 // value asserts nothing about it.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(core::mem::size_of::<Credential<'_>>() == 296);
+const _: () = assert!(core::mem::size_of::<Credential<'_>>() == 304);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(core::mem::size_of::<AuthParam<'_>>() == 32);
 
 #[cfg(target_pointer_width = "32")]
-const _: () = assert!(core::mem::size_of::<Credential<'_>>() == 148);
+const _: () = assert!(core::mem::size_of::<Credential<'_>>() == 152);
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(core::mem::size_of::<AuthParam<'_>>() == 16);
 
@@ -553,6 +578,121 @@ struct Element<'a> {
   bytes: &'a [u8],
   /// What became of a quoted-string still open where that line ran out.
   tail: ValueTail,
+}
+
+/// What [`scan_element`] found: the element, and where the walk now stands.
+#[derive(Debug, Copy, Clone)]
+struct Scanned<'a> {
+  /// The element.
+  element: Element<'a>,
+  /// Where it ended on the field line the walk stands on when this is returned
+  /// — a LATER line than the element began on whenever a value crossed RFC
+  /// 9110 §5.2's join. The caller's own cursor takes it.
+  at: usize,
+}
+
+/// Walks the one RFC 9110 §5.6.1.2 list element that begins at `at` on `head`,
+/// crossing §5.2's joins for as long as a §5.6.4 quoted-string holds it open.
+///
+/// **The one place an element's boundary is derived.** Three walks in this
+/// module ask for one — the `#challenge` walk while it is still cutting a body
+/// ([`Challenges::skip_element`]), the `#auth-param` walk re-reading a body
+/// already cut ([`ParamWalk::element`]), and §11.6.3's bare list
+/// ([`AuthInfo::element`]) — and a boundary derived in three places is three
+/// answers a later edit can move apart. The first two produce the elements of
+/// ONE credential, one of them while deciding where that credential ends and
+/// the other when a caller asks for its parameters, so a disagreement between
+/// them would drop a parameter from a challenge that parsed and report
+/// nothing. There is nothing for them to disagree about while this is where
+/// both of them get the answer.
+///
+/// `next` hands over the field line behind the join, or `None` where the value
+/// runs out, and is where a caller does whatever crossing a line costs it —
+/// taking the region left behind, in the case of a walk collecting one.
+///
+/// # What it reads, and why two callers may hold different slices
+///
+/// `head` is read from `at` FORWARD, as far as the delimiter that ends the
+/// element and no further; [`trim_ows_end`] then walks back over the list's own
+/// `OWS`, which stands within the element's own span. Nothing here reads a byte
+/// before `at`.
+///
+/// Two slices that agree from `at` to their end therefore give the same
+/// element, and the END of a slice is read as the comma §5.2 puts at every
+/// join — which [`raw_comma_end`], [`after_close`], [`ends_element`] and
+/// [`param_value_at`] each answer for the byte they inspect. That is what lets
+/// [`Challenges`] scan a whole field line while [`ParamWalk`] scans the SAME
+/// line from the credential's first byte on it and get the same answer:
+/// [`BodyLines`] keeps its regions uncut for exactly that reason, and says so.
+///
+/// # Errors
+///
+/// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
+/// quoted-string, and nothing else. Every OTHER fault an element carries is
+/// [`auth_param`]'s to report over the [`Element`] this returns, because a
+/// boundary a walk has not yet found must not be decided by bytes behind a
+/// fault — and a walk cannot be handed a verdict before it has the element the
+/// verdict is about.
+fn scan_element<'a, N>(head: &'a [u8], at: usize, mut next: N) -> Result<Scanned<'a>, AuthError>
+where
+  N: FnMut() -> Option<&'a [u8]>,
+{
+  // What the element occupies on the line it began on — all a borrowing walk
+  // can hand back — plus, when a quoted-string held it open at that line's
+  // end, the escape state to continue that string with.
+  let (head_end, mut open) = match element_end(head, at) {
+    // The element ends here, so the `OWS` RFC 9110 §5.6.1.2 hangs on the comma
+    // in front of it belongs to the list rather than to the value.
+    Delim::At(end) => (trim_ows_end(head, end), None),
+    Delim::Open(escape) => (head.len(), Some(escape)),
+    Delim::Invalid => return Err(AuthError::InvalidQuotedString),
+  };
+  let mut cursor = head_end;
+
+  // A quoted-string still open where a field line ends does NOT end the
+  // element: RFC 9110 §5.2 joins the lines with a comma and §5.6.4 makes that
+  // comma data inside one, so the element runs on and ends wherever the string
+  // closes. `scan_quoted_after_join` is this crate's one implementation of that
+  // rule, and it feeds the join's comma THROUGH any pending escape before the
+  // next line's first byte — so the escape is spent on the comma, and a DQUOTE
+  // arriving first on that line closes the string.
+  let mut tail = ValueTail::Ends;
+  while let Some(escape) = open.take() {
+    let Some(line) = next() else {
+      // Nothing left to close the string on, so the combined value ends inside
+      // it. Whatever closed on an earlier line does not change that: what is
+      // still open is what the element ends in, and `auth_param` reports it
+      // over these same bytes.
+      tail = ValueTail::Ends;
+      break;
+    };
+    cursor = line.len();
+    match rejoin(line, escape) {
+      // Past the string, the rest of that line is the element's like any
+      // other, up to the comma that ends it — and only the list's own `OWS`
+      // may stand in between, which is what `trails` answers. A line that
+      // closed the value ENDS the element, so this is read once and there is
+      // no verdict from an earlier line to carry into it.
+      Rejoin::Ends { at: end, trails } => {
+        tail = if trails {
+          ValueTail::Trails
+        } else {
+          ValueTail::Continues
+        };
+        cursor = end;
+      }
+      Rejoin::Open { escape } => open = Some(escape),
+      Rejoin::Invalid => return Err(AuthError::InvalidQuotedString),
+    }
+  }
+
+  Ok(Scanned {
+    element: Element {
+      bytes: head.get(at..head_end).unwrap_or_default(),
+      tail,
+    },
+    at: cursor,
+  })
 }
 
 /// Reads one RFC 9110 §11.2 `auth-param` out of `element`.
@@ -888,16 +1028,53 @@ impl<'a> Credential<'a> {
 
 /// The field-line regions one credential's body occupies, in wire order.
 ///
-/// Each entry is already sliced to the credential's own bytes on that line —
-/// the first from where the body begins, the last to where the credential ends
-/// — so the walk over them needs no offsets, and the boundary between two
-/// entries is the comma RFC 9110 §5.2 joins field lines with.
-#[derive(Debug, Copy, Clone)]
+/// Each entry runs from the credential's first byte on that line to the END of
+/// the line, and is NOT cut where the credential stops. The boundary between
+/// two entries is the comma RFC 9110 §5.2 joins field lines with.
+///
+/// # Why the last region is not cut, and what says where it stops
+///
+/// Two walks produce this body's elements: [`Challenges::skip_element`] while
+/// it is still deciding where the challenge ends, and [`ParamWalk::element`]
+/// when a caller reads [`Credential::params`]. They are one walk —
+/// [`scan_element`] — and it reads its line only from the cursor forward, so
+/// the two agree on every element as long as they are handed the same bytes
+/// from that cursor on. An entry left uncut IS the same bytes: the field line
+/// the collecting walk scanned, offset by the credential's own start on it.
+/// Cutting it at the credential's end would leave the two reading slices of
+/// different lengths and the agreement resting on an argument about what lies
+/// past an element's delimiter.
+///
+/// [`held`](Self::held) is where the credential stops in the last entry, and it
+/// is the collecting walk's OWN cursor, recorded rather than derived a second
+/// time — so nothing about this body is decided twice. [`cut`](Self::cut) is
+/// how the bytes a credential holds are asked for, and the only reader of an
+/// entry past it is the walk that stops there.
+#[derive(Copy, Clone)]
 struct BodyLines<'a> {
   /// Empty past `len`.
   lines: [&'a [u8]; MAX_CHALLENGE_LINES],
   /// How many entries the credential spent.
   len: usize,
+  /// How many bytes of the LAST entry belong to the credential.
+  ///
+  /// One number and not one per entry, because only the last entry can stop
+  /// short. A walk takes an entry as it LEAVES the line, and leaving a line is
+  /// reaching its end — so every earlier entry was read to its end by the walk
+  /// that took it, and is read to its end here. The last entry is the only one
+  /// that walk stopped inside of, and so the only one that can hold the
+  /// challenge behind this one.
+  held: usize,
+}
+
+impl core::fmt::Debug for BodyLines<'_> {
+  /// The credential's own bytes, entry by entry — the same regions a reader of
+  /// this body sees, rather than the uncut lines they are stored as.
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_list()
+      .entries((0..self.len).map(|at| self.cut(at)))
+      .finish()
+  }
 }
 
 impl<'a> BodyLines<'a> {
@@ -906,10 +1083,13 @@ impl<'a> BodyLines<'a> {
     Self {
       lines: [&[]; MAX_CHALLENGE_LINES],
       len: 0,
+      held: 0,
     }
   }
 
-  /// Takes what one field line contributes to this credential.
+  /// Takes what one field line contributes to this credential: `region` from
+  /// the credential's first byte on that line to the line's end, of which the
+  /// first `held` bytes are the credential's own.
   ///
   /// A region of nothing but `OWS` and commas spends no entry, and that is
   /// checked BEFORE the bound: RFC 9110 §5.6.1.2 says "Empty elements do not
@@ -918,17 +1098,22 @@ impl<'a> BodyLines<'a> {
   /// longer. Counting them would put a number on the empty elements the same
   /// paragraph asks a recipient to "parse and ignore".
   ///
-  /// The test is on the region's BYTES. A line that begins no element still
-  /// spends an entry when it carries any other byte, because those bytes may
-  /// be the ones that close a quoted value — and every element behind it is
-  /// reached through them.
+  /// The test is on the bytes the credential HOLDS — `held` of them — and not
+  /// on the rest of the line, which may be the next challenge and is no part
+  /// of this one's length. A line that begins no element still spends an entry
+  /// when it holds any other byte, because those bytes may be the ones that
+  /// close a quoted value, and every element behind it is reached through them.
   ///
   /// # Errors
   ///
   /// [`AuthError::ChallengeSpansTooManyLines`] past [`MAX_CHALLENGE_LINES`]
   /// entries, which is a refusal and not a cap; that constant says why.
-  fn push(&mut self, region: &'a [u8]) -> Result<(), AuthError> {
-    if region
+  fn push(&mut self, region: &'a [u8], held: usize) -> Result<(), AuthError> {
+    // A `held` past the region's end is not reachable — it is a cursor into
+    // this same line — and taking the whole region for one is the direction
+    // that spends an entry rather than silently dropping the line's bytes.
+    let mine = region.get(..held).unwrap_or(region);
+    if mine
       .iter()
       .all(|&byte| byte == b' ' || byte == b'\t' || byte == b',')
     {
@@ -939,12 +1124,30 @@ impl<'a> BodyLines<'a> {
     };
     *slot = region;
     self.len = self.len.saturating_add(1);
+    self.held = held;
     Ok(())
   }
 
-  /// The region at `at`, or no bytes when there is not one.
+  /// The region at `at` as it was stored — to the end of its field line — or
+  /// no bytes when there is not one.
+  ///
+  /// This is what a walk over the body reads, because it is what the walk that
+  /// collected the body read. [`cut`](Self::cut) is what the credential HOLDS
+  /// of it.
   fn line(&self, at: usize) -> &'a [u8] {
     self.lines.get(at).copied().unwrap_or_default()
+  }
+
+  /// The bytes of region `at` that belong to this credential.
+  ///
+  /// Every region but the last is the credential's as far as its line runs;
+  /// the last stops at [`held`](Self::held).
+  fn cut(&self, at: usize) -> &'a [u8] {
+    let region = self.line(at);
+    if at.saturating_add(1) >= self.len {
+      return region.get(..self.held).unwrap_or(region);
+    }
+    region
   }
 }
 
@@ -1117,9 +1320,13 @@ impl<'a> BodyCheck<'a> {
   /// The first element's held verdict, where the body took the `#auth-param`
   /// alternative and that element is no parameter.
   fn finish(mut self, scheme: &'a [u8], body: BodyLines<'a>) -> Result<Credential<'a>, AuthError> {
+    // The credential's own bytes on its one region, and not the rest of the
+    // line behind them: a `token68` is the WHOLE body, so what the challenge
+    // behind this one wrote is not part of the question.
+    let only = body.cut(0);
     let token = match body.len {
-      1 => match token68(body.line(0), 0) {
-        Some(run) if skip_ows(body.line(0), run.len()) == body.line(0).len() => Some(run),
+      1 => match token68(only, 0) {
+        Some(run) if skip_ows(only, run.len()) == only.len() => Some(run),
         _ => None,
       },
       _ => None,
@@ -1207,6 +1414,15 @@ impl<'a> ParamWalk<'a> {
         return None;
       }
       let line = self.body.line(self.line);
+      // Where the credential stops on its last region, which is the one thing
+      // about this body that is not read from its bytes: `held` is the cursor
+      // of the walk that collected it, recorded there rather than derived
+      // again here. Asked before the `OWS` skip, so the byte it stops on is
+      // the one that walk stopped on.
+      if self.line.saturating_add(1) >= self.body.len && self.at >= self.body.held {
+        self.done = true;
+        return None;
+      }
       self.at = skip_ows(line, self.at);
       match line.get(self.at) {
         // This region is spent OUTSIDE a quoted-string, so RFC 9110 §5.2's
@@ -1230,70 +1446,36 @@ impl<'a> ParamWalk<'a> {
 
   /// Takes the element at the cursor, leaving the cursor on whatever ended it
   /// — which may be in a LATER region than the element began in.
+  ///
+  /// [`scan_element`] is the whole of it, over the region the cursor stands in
+  /// and the regions behind it. Those are the field lines the walk that
+  /// collected this body scanned, from the credential's own first byte on each
+  /// — [`BodyLines`] says why they are stored uncut — so this reads the same
+  /// bytes from the same cursor and produces the same element.
   fn element(&mut self) -> Result<Element<'a>, AuthError> {
     let head = self.body.line(self.line);
     let start = self.at;
-    // What the element occupies in the region it starts in — all a borrowing
-    // walk can hand out — plus, when a quoted-string held it open at that
-    // region's end, the escape state to continue that string with.
-    let (head_end, mut open) = match element_end(head, start) {
-      // The element ends here, so the `OWS` RFC 9110 §5.6.1.2 hangs on the
-      // comma in front of it belongs to the list rather than to the value.
-      Delim::At(end) => (trim_ows_end(head, end), None),
-      Delim::Open(escape) => (head.len(), Some(escape)),
-      Delim::Invalid => {
-        self.done = true;
-        return Err(AuthError::InvalidQuotedString);
-      }
+    let scanned = {
+      let walk = &mut *self;
+      scan_element(head, start, || {
+        let next = walk.line.saturating_add(1);
+        if next >= walk.body.len {
+          return None;
+        }
+        walk.line = next;
+        Some(walk.body.line(next))
+      })
     };
-    self.at = head_end;
-
-    // A quoted-string still open where a region ends does NOT end the element:
-    // §5.2 joins the lines with a comma and §5.6.4 makes that comma data
-    // inside the string, so the element runs on and ends wherever the string
-    // closes. `scan_quoted_after_join` is this crate's one implementation of
-    // that rule, and it feeds the join's comma THROUGH any pending escape
-    // before the next region's first byte — so the escape is spent on the
-    // comma, and a DQUOTE arriving first on that line closes the string.
-    let mut tail = ValueTail::Ends;
-    while let Some(escape) = open.take() {
-      let next_line = self.line.saturating_add(1);
-      if next_line >= self.body.len {
-        // No further region, so the combined value ends inside the string.
-        // Whatever closed on an earlier line does not change that: what is
-        // still open is what the element ends in, and `auth_param` reports it.
-        tail = ValueTail::Ends;
-        break;
+    match scanned {
+      Ok(scanned) => {
+        self.at = scanned.at;
+        Ok(scanned.element)
       }
-      self.line = next_line;
-      let next = self.body.line(next_line);
-      self.at = next.len();
-      match rejoin(next, escape) {
-        // Past the string, the rest of this region is the element's like any
-        // other, up to the comma that ends it — and only the list's own `OWS`
-        // may be in between, which is what `trails` answers. A region that
-        // closed the value ENDS the element, so this is read once and there is
-        // no verdict from an earlier region to carry into it.
-        Rejoin::Ends { at, trails } => {
-          tail = if trails {
-            ValueTail::Trails
-          } else {
-            ValueTail::Continues
-          };
-          self.at = at;
-        }
-        Rejoin::Open { escape } => open = Some(escape),
-        Rejoin::Invalid => {
-          self.done = true;
-          return Err(AuthError::InvalidQuotedString);
-        }
+      Err(fault) => {
+        self.done = true;
+        Err(fault)
       }
     }
-
-    Ok(Element {
-      bytes: head.get(start..head_end).unwrap_or_default(),
-      tail,
-    })
   }
 }
 
@@ -1430,8 +1612,9 @@ fn raw_comma_end(value: &[u8], at: usize) -> usize {
 /// question is settled inside ONE list element; and none can hold one across a
 /// §5.2 join either, since a `token` carries no comma and §5.2 puts one at
 /// every join, so an element that has not reached its `=` on the line it began
-/// on never will. [`Challenges::opens_a_challenge`] asks these same two
-/// questions of the same bytes for its own reason and gets the same answer.
+/// on never will. [`opens_a_challenge`] asks these same two questions of the
+/// same bytes for its own reason, and asks them by calling this: it IS this
+/// question answered `None`, rather than a second spelling of it.
 ///
 /// `Some` is no claim that the element parses. What stands at the offset may be
 /// neither of §11.2's two alternatives, and [`auth_param`] is the one place
@@ -1444,6 +1627,34 @@ fn param_value_at(value: &[u8], at: usize) -> Option<usize> {
     return None;
   }
   Some(skip_ows(value, eq.saturating_add(1)))
+}
+
+/// Whether the RFC 9110 §5.6.1.2 element at `at` is the `auth-scheme` of the
+/// NEXT challenge rather than another `auth-param` of the one already open.
+///
+/// RFC 9110 §11.6.1's ambiguity — the value "might contain more than one
+/// challenge, and each challenge can contain a comma-separated list of
+/// authentication parameters" — decided by the two terminals `auth-param` opens
+/// with. That is
+/// the same pair [`param_value_at`] reads, over the same bytes, so it IS that
+/// question asked the other way round and is written as one rather than as two
+/// spellings that could drift: an element §11.2 admits no value position in is
+/// an element no `auth-param` derives, which is exactly what makes it a scheme.
+/// [`auth_param`] refuses such an element on the same two checks, so what this
+/// answers `true` for is what that would call
+/// [`AuthError::MalformedParameter`].
+///
+/// An element with no leading token is not a parameter either, and this
+/// answers `true` for it: it opens a challenge, where
+/// [`AuthError::MissingScheme`] names what is wrong with it. Reporting a
+/// malformed parameter instead would blame a production the element was never
+/// being read by.
+///
+/// The `=` is looked for on THIS element's line, because a `token` carries no
+/// comma and RFC 9110 §5.2 puts one at every join — so an element that has not
+/// reached its `=` on the line it began on never will.
+fn opens_a_challenge(value: &[u8], at: usize) -> bool {
+  param_value_at(value, at).is_none()
 }
 
 /// Where the RFC 9110 §5.6.1.2 element starting at `at` ends — the comma that
@@ -1620,13 +1831,17 @@ where
     Some(_) => return Err(AuthError::MalformedScheme),
   };
   let mut body = BodyLines::new();
-  body.push(head.get(body_at..).unwrap_or_default())?;
+  // Every byte of every line is this credential's: the field holds ONE of them
+  // and there is no boundary in the value for a region to stop at, which is
+  // what the entry point above this says at length.
+  let first = head.get(body_at..).unwrap_or_default();
+  body.push(first, first.len())?;
   for line in lines {
     if !section {
       // §5.2 joins this line on with a comma, and a comma is not `1*SP`.
       return Err(AuthError::MalformedScheme);
     }
-    body.push(line)?;
+    body.push(line, line.len())?;
   }
   Credential::read(scheme, body)
 }
@@ -1787,6 +2002,29 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// anywhere else; one that never closes consumes the rest of the input, and
 /// the walk ends there.
 ///
+/// # How many faults one malformed value yields
+///
+/// Once per refused challenge, and a value can hold more refused challenges
+/// than a sender wrote. Getting past a refusal is done by RAW commas — no
+/// DQUOTE behind a fault opens a string, for the reason the section above
+/// gives — so a comma that a quote-aware recovery would have swallowed as data
+/// ends the refused run here instead, and what stands behind it is read as a
+/// challenge of its own and refused in its turn.
+/// `Basic<HTAB>Newauth realm="a, b"` is one such value: the scheme is refused,
+/// and the comma inside `"a, b"` — data to a recovery that reads that run as a
+/// quoted-string, a separator to this one, which does not read a refused run at
+/// all — ends the refused challenge, so what stands behind it is refused in its
+/// turn. Two [`AuthError::MalformedScheme`]s here, where such a recovery
+/// reports one.
+///
+/// This is the safe direction and the only one §11.4 admits: a run cut too
+/// EARLY shows a caller more elements than the sender wrote, each answered on
+/// its own, and a run cut too LATE hides them. No challenge is ever lost by it,
+/// and every `Ok` is the same `Ok`. But a caller that COUNTS the `Err`s of a
+/// malformed value rather than reading them is counting something this reader
+/// decides and not something the sender wrote, and will see a different number
+/// than a quote-aware recovery gives. Read the faults; do not total them.
+///
 /// Validation is eager — a challenge is walked to its end before it is yielded
 /// — which is what lets [`Credential::params`] be infallible and what lets one
 /// walk go on after a fault at all.
@@ -1899,18 +2137,50 @@ impl<'a> Section<'a> {
     self.body.len >= MAX_CHALLENGE_LINES
   }
 
-  /// Takes what the line being left behind contributes, up to `end`, and opens
-  /// a region at the start of the next one.
+  /// Takes what the line being left behind contributes — the challenge's bytes
+  /// on it reaching as far as `end` — and opens a region at the start of the
+  /// next one.
+  ///
+  /// The region taken is the line from this challenge's first byte on it to
+  /// the line's END, and `end` says how much of that the challenge holds.
+  /// [`BodyLines`] carries why the two are not the same slice: a region a later
+  /// walk reads has to be the bytes the walk that took it read, or the two
+  /// walks are deciding an element's boundary over different inputs.
   fn spend(&mut self, line: &'a [u8], end: usize) {
+    let region = line.get(self.start..).unwrap_or_default();
     if self
       .body
-      .push(line.get(self.start..end).unwrap_or_default())
+      .push(region, end.saturating_sub(self.start))
       .is_err()
     {
       self.overrun = true;
     }
     self.start = 0;
     self.end = 0;
+  }
+
+  /// Takes the region the challenge ENDS in, and hands over the body.
+  ///
+  /// The one reader of [`overrun`](Self::overrun), paired with the last
+  /// [`spend`](Self::spend) by consuming the section — so a walk cannot take
+  /// the final region and then hand over a body that is missing one. Every
+  /// EARLIER region is answered by [`outgrown`](Self::outgrown) instead,
+  /// before an element is read on it, and that method carries why the two
+  /// readers are not one.
+  ///
+  /// # Errors
+  ///
+  /// [`AuthError::ChallengeSpansTooManyLines`] where any region of this
+  /// challenge did not fit. It is reported with no seeking behind it: the
+  /// challenge's extent is complete by the time this is called, so the cursor
+  /// already stands on the next challenge's first byte and there is nothing
+  /// left of this one to get past.
+  fn close(mut self, line: &'a [u8], end: usize) -> Result<BodyLines<'a>, AuthError> {
+    self.spend(line, end);
+    if self.overrun {
+      return Err(AuthError::ChallengeSpansTooManyLines);
+    }
+    Ok(self.body)
   }
 }
 
@@ -2044,70 +2314,23 @@ where
   fn skip_element(&mut self, region: &mut Section<'a>) -> Result<Element<'a>, AuthError> {
     let head = self.line;
     let start = self.at;
-    let (head_end, mut open) = match element_end(head, start) {
-      // The element ends here, so the `OWS` RFC 9110 §5.6.1.2 hangs on the
-      // comma in front of it belongs to the list rather than to the value.
-      Delim::At(end) => (trim_ows_end(head, end), None),
-      Delim::Open(escape) => (head.len(), Some(escape)),
-      Delim::Invalid => return Err(AuthError::InvalidQuotedString),
+    let scanned = {
+      let walk = &mut *self;
+      let section = &mut *region;
+      scan_element(head, start, || {
+        let next = walk.next_line()?;
+        let spent = walk.line;
+        walk.line = next;
+        // The element is still open here, so ALL of the line being left is the
+        // challenge's — including the bytes that begin no element of their own
+        // but carry the close of this one.
+        section.spend(spent, spent.len());
+        Some(next)
+      })?
     };
-    self.at = head_end;
-    let mut tail = ValueTail::Ends;
-    while let Some(escape) = open.take() {
-      let Some(next) = self.next_line() else {
-        // Nothing left to close the string on, so the element ends inside it
-        // and `auth_param` reports that over these same bytes.
-        self.at = self.line.len();
-        break;
-      };
-      let spent = self.line;
-      self.line = next;
-      self.at = next.len();
-      // The element is still open here, so ALL of the line being left is the
-      // challenge's — including the bytes that begin no element of their own
-      // but carry the close of this one.
-      region.spend(spent, spent.len());
-      match rejoin(next, escape) {
-        // A line that closed the value ENDS the element, so this is read once
-        // and there is no verdict from an earlier line to carry into it.
-        Rejoin::Ends { at, trails } => {
-          tail = if trails {
-            ValueTail::Trails
-          } else {
-            ValueTail::Continues
-          };
-          self.at = at;
-        }
-        Rejoin::Open { escape } => open = Some(escape),
-        Rejoin::Invalid => return Err(AuthError::InvalidQuotedString),
-      }
-    }
+    self.at = scanned.at;
     region.end = self.at;
-    Ok(Element {
-      bytes: head.get(start..head_end).unwrap_or_default(),
-      tail,
-    })
-  }
-
-  /// Whether the element at the cursor is the `auth-scheme` of the NEXT
-  /// challenge rather than another `auth-param` of the one already open.
-  ///
-  /// RFC 9110 §11.2's `auth-param = token BWS "=" BWS ( token / quoted-string )`
-  /// opens with a `token` and an `=`, with only §5.6.3's `BWS` between them, so
-  /// those two are the whole question — and the `=` is looked for on THIS
-  /// element's line, because a `token` carries no comma and §5.2 puts one at
-  /// every join.
-  ///
-  /// An element with no leading token is not a parameter either, and this
-  /// answers `true` for it: it opens a challenge, where
-  /// [`AuthError::MissingScheme`] names what is wrong with it. Reporting a
-  /// malformed parameter instead would blame a production the element was
-  /// never being read by.
-  fn opens_a_challenge(&self) -> bool {
-    match token_end(self.line, self.at) {
-      None => true,
-      Some(end) => self.line.get(skip_ows(self.line, end)) != Some(&b'='),
-    }
+    Ok(scanned.element)
   }
 
   /// Reads the challenge at the cursor, leaving the cursor on the first byte
@@ -2197,7 +2420,7 @@ where
       match self.open_element(Some(&mut section)) {
         Step::End => break,
         Step::Element { after_comma } => {
-          if after_comma && self.opens_a_challenge() {
+          if after_comma && opens_a_challenge(self.line, self.at) {
             break;
           }
           // This element belongs to the challenge, so everything the challenge
@@ -2217,15 +2440,11 @@ where
         }
       }
     }
-    // The challenge closes at the end of its last element, and the region it
-    // is in is cut there: the bytes behind it are the next challenge's, or the
-    // empty elements between the two.
+    // The challenge closes at the end of its last element, and that is where
+    // the region it is in stops holding it: the bytes behind it are the next
+    // challenge's, or the empty elements between the two.
     let (line, end) = (self.line, section.end);
-    section.spend(line, end);
-    if section.overrun {
-      return Err(AuthError::ChallengeSpansTooManyLines);
-    }
-    check.finish(scheme, section.body)
+    check.finish(scheme, section.close(line, end)?)
   }
 
   /// Refuses the challenge the cursor stands inside, and says so by leaving
@@ -2283,7 +2502,7 @@ where
         // A comma was crossed by construction: the element just skipped ended
         // on one, or at the line end RFC 9110 §5.2 puts one at.
         Step::Element { .. } => {
-          if self.opens_a_challenge() {
+          if opens_a_challenge(self.line, self.at) {
             return;
           }
         }
@@ -2482,6 +2701,35 @@ where
   /// quoted value onto a further line, [`ValueTail::Continues`] is what says
   /// so, and [`AuthParam::value`] reports it over those same bytes.
   ///
+  /// # Why this may derive an element after finding its extent
+  ///
+  /// [`Challenges::challenge`] may not, and the module doc says why: a verdict
+  /// reached after the extent was found is a verdict the bytes behind a fault
+  /// helped decide, and in a `#challenge` value those bytes can steer the
+  /// boundary past a whole challenge. This walk is the same shape and is safe,
+  /// and it is safe for two reasons rather than by luck — both of which a
+  /// change here has to keep true.
+  ///
+  /// - **`Authentication-Info = #auth-param` has one level.** There is no
+  ///   production nested inside this list for a boundary to be moved past, so
+  ///   the most an element's extent can decide is where the NEXT `auth-param`
+  ///   of the same list begins. There is no §11.4 choice to be denied here,
+  ///   because there is no challenge to hide: the harm the `#challenge` rule
+  ///   exists against has nothing in this field to happen to.
+  /// - **The walk STOPS at the first fault**, so no byte behind one is ever
+  ///   read at all. [`refuse`](Self::refuse) is the one writer of `done` on a
+  ///   fault and every fault site goes through it, and
+  ///   `one_fault_ends_the_parameter_walk` is that stop pinned.
+  ///
+  /// The second premise is the load-bearing one. A change that let this walk
+  /// CONTINUE past a fault — a caller wanting the parameters behind a bad one
+  /// — would put bytes a production has already refused in front of the next
+  /// element's extent, which is round 3's shape arriving in this field. Such a
+  /// change has to bring [`Challenges::challenge`]'s discipline with it: derive
+  /// each element before the next element's bytes are read, and find the rest
+  /// of a refused run by raw commas. It is not enough to keep this function and
+  /// drop the `done`.
+  ///
   /// # Errors
   ///
   /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
@@ -2492,65 +2740,42 @@ where
   fn element(&mut self) -> Result<AuthParam<'a>, AuthError> {
     let head = self.line;
     let start = self.at;
-    // What the element occupies on the line it starts on, plus — when a
-    // quoted-string held it open at that line's end — the escape state to
-    // continue that string with.
-    let (head_end, mut open) = match element_end(head, start) {
-      // The element ends here, so the `OWS` RFC 9110 §5.6.1.2 hangs on the
-      // comma in front of it belongs to the list rather than to the value.
-      Delim::At(end) => (trim_ows_end(head, end), None),
-      Delim::Open(escape) => (head.len(), Some(escape)),
-      Delim::Invalid => {
-        self.done = true;
-        return Err(AuthError::InvalidQuotedString);
-      }
+    let scanned = {
+      let walk = &mut *self;
+      scan_element(head, start, || {
+        let next = walk.next_line()?;
+        walk.line = next;
+        Some(next)
+      })
     };
-    self.at = head_end;
+    let scanned = match scanned {
+      Ok(scanned) => scanned,
+      Err(fault) => return Err(self.refuse(fault)),
+    };
+    self.at = scanned.at;
 
-    let mut tail = ValueTail::Ends;
-    while let Some(escape) = open.take() {
-      let Some(next) = self.next_line() else {
-        // No further line, so the combined value ends inside the string.
-        // Whatever closed on an earlier one does not change that: what is
-        // still open is what the element ends in, and `auth_param` reports it.
-        tail = ValueTail::Ends;
-        break;
-      };
-      self.line = next;
-      self.at = next.len();
-      match rejoin(next, escape) {
-        // A line that closed the value ENDS the element, so this is read once
-        // and there is no verdict from an earlier line to carry into it.
-        Rejoin::Ends { at, trails } => {
-          tail = if trails {
-            ValueTail::Trails
-          } else {
-            ValueTail::Continues
-          };
-          self.at = at;
-        }
-        Rejoin::Open { escape } => open = Some(escape),
-        Rejoin::Invalid => {
-          self.done = true;
-          return Err(AuthError::InvalidQuotedString);
-        }
-      }
+    let read = auth_param(scanned.element.bytes, scanned.element.tail).and_then(|param| {
+      // RFC 9110 §11.2's one-name-once MUST, over the list this field IS. The
+      // record is the walk's rather than the element's, because the rule is
+      // about the list and a single element cannot see one.
+      self.seen.record(param.name())?;
+      Ok(param)
+    });
+    match read {
+      Ok(param) => Ok(param),
+      Err(fault) => Err(self.refuse(fault)),
     }
+  }
 
-    let element = head.get(start..head_end).unwrap_or_default();
-    let mut param = auth_param(element, tail);
-    // RFC 9110 §11.2's one-name-once MUST, over the list this field IS. The
-    // record is the walk's rather than the element's, because the rule is
-    // about the list and a single element cannot see one.
-    if let Ok(read) = param
-      && let Err(repeat) = self.seen.record(read.name())
-    {
-      param = Err(repeat);
-    }
-    if param.is_err() {
-      self.done = true;
-    }
-    param
+  /// Ends the walk, and hands the fault that ended it back.
+  ///
+  /// The one writer of `done` on a fault, so the pairing cannot be forgotten at
+  /// a new fault site: this walk derives each element after finding its extent,
+  /// and [`element`](Self::element) records that stopping here is what makes
+  /// that order safe.
+  fn refuse(&mut self, fault: AuthError) -> AuthError {
+    self.done = true;
+    fault
   }
 }
 

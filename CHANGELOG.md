@@ -12,9 +12,9 @@ had done. That caller can now select a challenge by its scheme and read that
 challenge's parameters to the last one, without allocating and without this
 crate implementing any scheme. Phase 1 of the #70 ledger.
 
-`xtask/snapshots/http-semantics-documented.txt` gains 111 lines and loses none:
-`grep -vc '^#'` counts 572 documented items on it at `6360957` and 683 here.
-`cargo test -p http-semantics --all-features` reports 376 unit tests passing, 78
+`xtask/snapshots/http-semantics-documented.txt` gains 120 lines and loses none:
+`grep -vc '^#'` counts 572 documented items on it at `6360957` and 692 here.
+`cargo test -p http-semantics --all-features` reports 379 unit tests passing, 81
 of them this module's, beside the no-panic harness's fifteen and one doctest.
 The crate is still `no_std`, allocation-free, clock-free and panic-free, on the
 same `std` / `alloc` / `no-atomic` tiers its siblings run, and
@@ -93,6 +93,26 @@ is green.
   true, and the `auth` module's own documentation states it as the invariant a
   change there has to keep.
 
+  **One derivation of an element's boundary, and every walk in the module gets
+  its elements from it.** The walk that cuts a challenge's body and the walk a
+  caller reads that challenge's parameters through are the same function over
+  the same bytes: a region is kept as the field line the collecting walk read,
+  from the credential's first byte on it, and where the credential stops is
+  that walk's own cursor recorded rather than a second reading of the same
+  bytes. A disagreement between the two would have dropped a parameter from a
+  challenge that parsed and reported nothing, and there is now nothing for them
+  to disagree about.
+
+  **A malformed value can yield more faults than a sender wrote, and that is
+  the safe direction.** Getting past a refused challenge is done by raw commas,
+  so a comma a quote-aware recovery would have swallowed as data ends the
+  refused run here and what stands behind it is refused in its turn:
+  `Basic<HTAB>Newauth realm="a, b"` is two `AuthError::MalformedScheme`s where
+  such a recovery reports one. No challenge is ever lost by it and every `Ok` is
+  the same `Ok`, but a caller counting the `Err`s of a malformed value is
+  counting something this reader decides. `challenges` says so where a caller
+  reads what it yields.
+
   **Which of RFC 9110 §11.2's two alternatives a body took is a recipient's
   decision, and this module writes its own down.** §11.2 says in prose that a
   scheme is followed by "either a comma-separated list of parameters or a single
@@ -142,9 +162,9 @@ is green.
   contribute to the count of elements present." — so a comma flood spends no
   slot, and a `token68` credential spends none either, holding no name that
   could repeat. The numbers are the storage: a slot is a `&[u8]`, so sixteen of
-  them is 256 bytes on a 64-bit target, which is what puts `Credential` at 296.
-  Both are parse-constants rather than knobs — the storage is in the binary, so
-  a caller cannot raise them.
+  them is 256 bytes on a 64-bit target, which with the two `usize`s beside the
+  array is what puts `Credential` at 304. Both are parse-constants rather than
+  knobs — the storage is in the binary, so a caller cannot raise them.
 
 - **Five leaves join the crate's `no-panic` link proof**, one per entry point
   plus the `auth-param` parser and the `token68` scanner, each proven

@@ -939,37 +939,130 @@ fn every_way_a_challenge_is_refused_hides_no_challenge_behind_it() {
 }
 
 #[test]
+fn the_regions_a_challenge_holds_are_the_lines_it_read() {
+  // The seam this closes, stated as the fact that closes it. Two walks produce
+  // a credential's elements — `Challenges::skip_element` while it is still
+  // deciding where the challenge ends, and `ParamWalk::element` when a caller
+  // reads `params()` — and they are one function over one set of bytes rather
+  // than two readings that happen to agree. That rests on `BodyLines` keeping
+  // each region as the walk that took it saw it: the field line from the
+  // credential's first byte on it to the LINE's end, never cut at the
+  // credential's end, with `held` saying where the credential stops.
+  //
+  // An edit that cut the regions instead would leave `scan_element` reading
+  // two different slices in the two walks, and the agreement would go back to
+  // being an argument about what lies past an element's delimiter. These are
+  // the assertions such an edit fails.
+  let line = &b"Basic a=1, Digest realm=z"[..];
+  let credential = walk::<3>([line])[0]
+    .expect("a challenge")
+    .expect("Basic reads");
+
+  // The stored region is the line from the body's first byte, and it runs on
+  // past this challenge into the next one.
+  assert_eq!(credential.body.len, 1);
+  assert_eq!(credential.body.line(0), &line[6..]);
+  assert_eq!(credential.body.line(0), b"a=1, Digest realm=z");
+  // What the credential HOLDS of it is where the collecting walk stopped, and
+  // that is a recorded cursor rather than a second reading of the same bytes.
+  assert_eq!(credential.body.held, 3);
+  assert_eq!(credential.body.cut(0), b"a=1");
+  assert!(credential.body.line(0).len() > credential.body.cut(0).len());
+  // And the walk over the uncut region stops exactly there. Asked of the walk
+  // itself as well as of `params()`, because `AuthParamIter` ends on a fault
+  // without reporting one: a walk that ran past this credential would meet
+  // `Digest realm=z`, refuse it as a parameter and stop anyway, so the names
+  // alone cannot tell a walk that stopped from one that overran and was
+  // swallowed.
+  assert_eq!(names::<2>(&credential), [Some(&b"a"[..]), None]);
+  let mut walk = ParamWalk::over(credential.body);
+  assert!(walk.step().is_some(), "the one parameter");
+  assert!(
+    walk.step().is_none(),
+    "the walk ends where the credential does, not at a fault behind it"
+  );
+
+  // A challenge that ends where its line does holds all of its region, so the
+  // two are the same slice and `held` is the whole of it.
+  let credential = one([&b"Basic a=1"[..]]);
+  assert_eq!(credential.body.held, credential.body.line(0).len());
+  assert_eq!(credential.body.cut(0), credential.body.line(0));
+}
+
+#[test]
 fn the_body_a_challenge_collected_reads_the_same_alone() {
-  // Two walks produce a body's elements — the one that CUTS the body while
-  // finding where the challenge ends, and the one `Credential::read` runs over
-  // a body already cut — and `Credential::params` hands a caller the second
-  // one's answer for a challenge the first one accepted. So the two must agree
-  // about what a body holds, and this is that claim executed rather than
-  // argued: over a brute force of the alphabet the round-3 oracle used, every
-  // challenge the walk yields is re-derived from its own regions and has to
-  // come back with the same names.
+  // The two producers, compared directly. `Credential::params` hands a caller
+  // the answer of the walk over the collected body for a challenge the
+  // COLLECTING walk accepted, so a disagreement between them would drop a
+  // parameter from a challenge that parsed and report nothing at all.
+  //
+  // They agree by construction — `scan_element` is the one derivation of an
+  // element's boundary and `the_regions_a_challenge_holds_are_the_lines_it_read`
+  // pins the bytes it is handed — and this is the check that the construction
+  // still holds. It compares one producer against the other rather than either
+  // against a reading of this test's own, so there is no oracle here to be
+  // written in the implementation's favour: what it reports is a disagreement,
+  // which is directly observable.
+  //
+  // Both shapes of arrival are driven, because they differ in what the two
+  // walks are handed: one field line, where a region is a suffix of the line
+  // the collecting walk scanned, and a value split at every interior position
+  // of the payload, where every region but the first IS that line.
   const ALPHABET: [u8; 8] = *b"a=\"x, \\\t";
   let mut checked = 0usize;
   let mut accepted = 0usize;
   let mut buf = [0u8; 5];
-  for len in 1..=4 {
+
+  /// A parameter's value, in a shape two of them can be compared in:
+  /// `ParamValue` carries no `PartialEq` and is `#[non_exhaustive]`.
+  fn shape<'a>(param: &AuthParam<'a>) -> (u8, &'a [u8]) {
+    match param.value() {
+      Ok(ParamValue::Token(value)) => (0, value),
+      Ok(ParamValue::Quoted(value)) => (1, value),
+      Ok(_) => (2, b""),
+      Err(ValueSpansFieldLines) => (3, b""),
+    }
+  }
+
+  let compare = |lines: &[&[u8]], accepted: &mut usize| {
+    for outcome in challenges(lines.iter().copied()) {
+      let Ok(collected) = outcome else { continue };
+      *accepted += 1;
+      let alone = Credential::read(collected.scheme, collected.body)
+        .expect("a body the walk accepted is a body that reads");
+      assert_eq!(alone.token68(), collected.token68(), "{lines:?}");
+      assert_eq!(names::<20>(&alone), names::<20>(&collected), "{lines:?}");
+      let mine = collected.params().map(|param| shape(&param));
+      let theirs = alone.params().map(|param| shape(&param));
+      assert!(mine.eq(theirs), "{lines:?}");
+    }
+  };
+
+  for len in 1..=5 {
     let mut idx = [0usize; 5];
     loop {
       for at in 0..len {
         buf[at] = ALPHABET[idx[at]];
       }
+      let payload = &buf[..len];
       let mut value = b"Basic ".to_vec();
-      value.extend_from_slice(&buf[..len]);
+      value.extend_from_slice(payload);
       value.extend_from_slice(b", Digest realm=z");
       checked += 1;
-      for outcome in challenges([value.as_slice()]) {
-        let Ok(credential) = outcome else { continue };
-        accepted += 1;
-        let alone = Credential::read(credential.scheme, credential.body)
-          .expect("a body the walk accepted is a body that reads");
-        assert_eq!(alone.token68(), credential.token68(), "{value:?}");
-        assert_eq!(names::<20>(&alone), names::<20>(&credential), "{value:?}");
+      compare(&[value.as_slice()], &mut accepted);
+
+      // The same payload split across RFC 9110 §5.2's join, at every position
+      // inside it — the shape in which a credential spans more than one region.
+      for at in 1..len {
+        let (head, tail) = payload.split_at(at);
+        let mut first = b"Basic ".to_vec();
+        first.extend_from_slice(head);
+        let mut second = tail.to_vec();
+        second.extend_from_slice(b", Digest realm=z");
+        checked += 1;
+        compare(&[first.as_slice(), second.as_slice()], &mut accepted);
       }
+
       let mut at = len;
       let carried = loop {
         if at == 0 {
@@ -987,8 +1080,10 @@ fn the_body_a_challenge_collected_reads_the_same_alone() {
       }
     }
   }
-  assert_eq!(checked, 4680, "8 + 64 + 512 + 4096");
-  assert!(accepted > 4000, "{accepted} challenges re-derived");
+  // 37448 one-line values (8 + 64 + 512 + 4096 + 32768) and 144448 split ones
+  // (1×64 + 2×512 + 3×4096 + 4×32768).
+  assert_eq!(checked, 181_896);
+  assert!(accepted > 150_000, "{accepted} challenges re-derived");
 }
 
 #[cfg(feature = "test-no-panic")]
@@ -1882,6 +1977,66 @@ fn a_challenge_past_the_line_bound_is_refused_and_the_next_one_is_read() {
   assert!(past.is_none());
 }
 
+#[test]
+fn the_region_a_challenge_ends_in_is_the_one_the_bound_is_read_at() {
+  // `MAX_CHALLENGE_LINES` has two readers and they are not symmetric.
+  // `Section::outgrown` answers for every region an element is read ON, which
+  // is asked before that element's bytes are, and `Section::close` reads the
+  // `overrun` flag for the LAST region — the one no element is read on,
+  // because the challenge ends there. A count cannot answer for that one: a
+  // challenge that just fits has spent every slot too.
+  //
+  // The test above drives `outgrown`, and drives `close` once through a
+  // seventeen-region fixture whose overrun is recorded while a line is being
+  // LEFT. These are the other half: the overrun recorded inside `close` itself,
+  // where the challenge's own final region is the one that does not fit. An
+  // edit that dropped either reader passes eleven of the twelve gates, so both
+  // are driven here by shapes that cannot be mistaken for each other.
+
+  // Seventeen regions and the value ends on the seventeenth. One quoted value
+  // spans them all, so no element is read past the first line and `outgrown` is
+  // never asked at all — the refusal exists only because `close` reads the flag
+  // its own `spend` just set.
+  let mut ends_there = [&b"j"[..]; 17];
+  ends_there[0] = b"Basic a=\"x";
+  ends_there[16] = b"y\"";
+  let [refused, past] = walk::<2>(ends_there);
+  assert!(past.is_none(), "the value ends with the refused challenge");
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+
+  // The same seventeenth region, now carrying the NEXT challenge behind the
+  // byte that closes the value. The refusal is still `close`'s, and the walk
+  // goes on to read what the region holds behind this challenge.
+  let mut shares_the_line = ends_there;
+  shares_the_line[16] = b"y\", Newauth z=1";
+  let [refused, newauth, past] = walk::<3>(shares_the_line);
+  assert!(past.is_none());
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+
+  // Sixteen regions of the same shape is what fits, in both spellings — the
+  // control that says the refusals above are the bound and not the fixture.
+  let mut fits = [&b"j"[..]; 16];
+  fits[0] = b"Basic a=\"x";
+  fits[15] = b"y\"";
+  assert_eq!(names::<2>(&one(fits)), [Some(&b"a"[..]), None]);
+
+  let mut fits_and_shares = fits;
+  fits_and_shares[15] = b"y\", Newauth z=1";
+  let [basic, newauth, past] = walk::<3>(fits_and_shares);
+  assert!(past.is_none());
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(names::<2>(&basic), [Some(&b"a"[..]), None]);
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+}
+
 // ── RFC 9110 §11.6.2's Authorization, which holds ONE credential ─────────────
 
 #[test]
@@ -2174,6 +2329,44 @@ fn one_fault_ends_the_parameter_walk() {
   // after it no comma can be told from data.
   let [fault, past] = info::<2>([&b"a=\"x\x00\", b=2"[..]]);
   assert_eq!(fault.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
+  assert!(past.is_none());
+}
+
+#[test]
+fn the_stop_at_a_fault_is_what_keeps_a_later_dquote_out_of_this_field() {
+  // `AuthInfo::element` derives an element AFTER computing its extent, which
+  // is the order `Challenges::challenge` was redesigned out of. It is safe
+  // here for two reasons, and this drives the load-bearing one: the walk stops
+  // at the first fault, so no byte behind one is ever read and no DQUOTE
+  // behind one can decide where anything ends.
+  //
+  // The shape is round 3's, spelled for `#auth-param`: an element that derives
+  // nothing, and a DQUOTE at §11.2's own value position in the element behind
+  // it. In a `#challenge` value that DQUOTE swallowed the comma in front of a
+  // later challenge; here the walk never reaches it, so `b` is never read at
+  // all and the fault reported is the one the SENDER committed at `a`.
+  let [fault, past] = info::<2>([&b"a, b=\", c=1"[..]]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none(), "nothing behind the fault is read");
+
+  // The same across RFC 9110 §5.2's join, where the fault and the trap are on
+  // different field lines.
+  let [fault, past] = info::<2>([&b"a"[..], b"b=\", c=1"]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none());
+
+  // The other reason, which needs no walk to state: this field is
+  // `Authentication-Info = #auth-param` and has no second level, so the most
+  // an extent can decide is where the next PARAMETER begins. A trap with
+  // nothing refused in front of it swallows the comma, exactly as §5.6.4 says
+  // it must — the parameter is real, its value simply never closes — and that
+  // is the control that says the two assertions above are the stop and not the
+  // trap failing to spring.
+  let [fault, past] = info::<2>([&b"b=\", c=1"[..]]);
+  assert_eq!(
+    fault.unwrap().unwrap_err(),
+    AuthError::UnterminatedQuotedString
+  );
   assert!(past.is_none());
 }
 
