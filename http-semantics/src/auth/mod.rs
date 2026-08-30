@@ -91,6 +91,16 @@
 //!   the latched fault returned. No DQUOTE behind the first definitive fault may
 //!   steer where the refused challenge ends.
 //!
+//! A refusal BINDS where it is met, and is never a fact left for a later reader
+//! to remember. The four faults an element carries are returned by the check
+//! that found them, one element at a time. The fifth — the line bound — is met
+//! at three crossings and binds at each: before an element is read on a line
+//! whose region cannot be held (`Section::outgrown`), at the crossing an element
+//! still OPEN makes, where the refusal IS the absence of a line so the scan
+//! cannot read one byte more (`Section::spend`), and on the region the challenge
+//! ends in (`Section::close`). A section that has refused holds no body at all,
+//! so a reader that went on regardless has nothing to be handed.
+//!
 //! Keeping the second scope true is a requirement on the WALK rather than on
 //! any one function: **a challenge's elements are derived in the order they
 //! arrive, and each verdict is in hand before the next element's bytes are
@@ -112,6 +122,12 @@
 //! [`AuthError::InvalidQuotedString`] is met INSIDE a string that legitimately
 //! opened, so where that string ends is unknown and every comma behind it is a
 //! guess; [`challenges`] says so where it says what follows an error.
+//!
+//! And one refusal is this READER's rather than the sender's, which makes it the
+//! one that can fire on a value some derivation still admits: a quoted value
+//! that would have closed on a field line this reader may not hold. Recovering
+//! raw from there can show a caller a challenge those bytes were the data of.
+//! [`MAX_CHALLENGE_LINES`] carries that trade and which half of it is safe.
 //!
 //! # Where a boundary is derived, and how many times
 //!
@@ -179,6 +195,26 @@ use crate::grammar::{
 /// parameters, so part of one is not a smaller answer but a wrong one — the
 /// trade [`MAX_TAGS`](crate::validator::MAX_TAGS) already made in this crate,
 /// and named there in the same words.
+///
+/// # What refusing here costs, and why it is the safe half
+///
+/// This is the one refusal in the `#challenge` walk that is the RECIPIENT's
+/// rather than the sender's, so it is the only one that can fire on a value
+/// some derivation still admits — a §5.6.4 quoted-string that would have closed
+/// on a line past the bound. The rest of such a challenge is then found by raw
+/// commas like every other refusal (`Challenges::seek`), and a comma the sender
+/// wrote INSIDE that value is read as the separator it is not: a caller can be
+/// shown a challenge those bytes were the data of.
+///
+/// The alternative is to end the walk, and that is the worse half. A value this
+/// reader cannot hold may carry a byte §5.6.4 forbids past the bound, in which
+/// case there is no reading of it at all — and ending the walk would then hide
+/// every challenge behind it for a string that never was one. RFC 9110 §11.4
+/// has a user agent select "the challenge with what it considers to be the most
+/// secure auth-scheme that it understands", which it cannot do over a challenge
+/// it was never shown; being shown one too many is the error a caller can see
+/// and answer, since the refusal is reported in front of it. `challenges` says
+/// what a caller does with a fault it is handed.
 ///
 /// # What it does not count
 ///
@@ -606,9 +642,14 @@ struct Scanned<'a> {
 /// nothing. There is nothing for them to disagree about while this is where
 /// both of them get the answer.
 ///
-/// `next` hands over the field line behind the join, or `None` where the value
-/// runs out, and is where a caller does whatever crossing a line costs it —
-/// taking the region left behind, in the case of a walk collecting one.
+/// `next` hands over the field line behind the join, `Ok(None)` where the value
+/// runs out, or the fault that crossing this one costs more than the caller may
+/// pay. It is where a caller does whatever crossing a line costs it — taking
+/// the region left behind, in the case of a walk collecting one — and the two
+/// are one operation for a reason: a caller that could not take the region has
+/// no line to hand back, so this scan cannot read one more byte of a challenge
+/// its collector has just refused. The two walks that re-read a body already
+/// collected pay nothing to cross and never answer with a fault.
 ///
 /// # What it reads, and why two callers may hold different slices
 ///
@@ -628,14 +669,15 @@ struct Scanned<'a> {
 /// # Errors
 ///
 /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
-/// quoted-string, and nothing else. Every OTHER fault an element carries is
+/// quoted-string — the only fault this raises of its own — and whatever `next`
+/// refuses to cross a join with. Every OTHER fault an element carries is
 /// [`auth_param`]'s to report over the [`Element`] this returns, because a
 /// boundary a walk has not yet found must not be decided by bytes behind a
 /// fault — and a walk cannot be handed a verdict before it has the element the
 /// verdict is about.
 fn scan_element<'a, N>(head: &'a [u8], at: usize, mut next: N) -> Result<Scanned<'a>, AuthError>
 where
-  N: FnMut() -> Option<&'a [u8]>,
+  N: FnMut() -> Result<Option<&'a [u8]>, AuthError>,
 {
   // What the element occupies on the line it began on — all a borrowing walk
   // can hand back — plus, when a quoted-string held it open at that line's
@@ -658,7 +700,7 @@ where
   // arriving first on that line closes the string.
   let mut tail = ValueTail::Ends;
   while let Some(escape) = open.take() {
-    let Some(line) = next() else {
+    let Some(line) = next()? else {
       // Nothing left to close the string on, so the combined value ends inside
       // it. Whatever closed on an earlier line does not change that: what is
       // still open is what the element ends in, and `auth_param` reports it
@@ -1541,10 +1583,10 @@ impl<'a> ParamWalk<'a> {
       scan_element(head, start, || {
         let next = walk.line.saturating_add(1);
         if next >= walk.body.len {
-          return None;
+          return Ok(None);
         }
         walk.line = next;
-        Some(walk.body.line(next))
+        Ok(Some(walk.body.line(next)))
       })
     };
     match scanned {
@@ -2100,8 +2142,13 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 ///
 /// This is the safe direction and the only one §11.4 admits: a run cut too
 /// EARLY shows a caller more elements than the sender wrote, each answered on
-/// its own, and a run cut too LATE hides them. No challenge is ever lost by it,
-/// and every `Ok` is the same `Ok`. But a caller that COUNTS the `Err`s of a
+/// its own, and a run cut too LATE hides them. No challenge a sender wrote is
+/// ever lost by it. What a caller can be shown that the sender did not write is
+/// one case and one only: [`MAX_CHALLENGE_LINES`] is this READER's refusal
+/// rather than a fault of the sender's, so it can refuse a value some
+/// derivation still admits, and a comma the sender put inside such a value is
+/// then read as the separator it is not. That constant carries the trade and
+/// why this half of it is the safe one. But a caller that COUNTS the `Err`s of a
 /// malformed value rather than reading them is counting something this reader
 /// decides and not something the sender wrote, and will see a different number
 /// than a quote-aware recovery gives. Read the faults; do not total them.
@@ -2160,8 +2207,24 @@ enum Step {
 /// One challenge's body as it is collected, across the field lines RFC 9110
 /// §5.2 joined into one value.
 struct Section<'a> {
-  /// The regions taken so far.
-  body: BodyLines<'a>,
+  /// The regions taken so far, or the refusal that a region of this challenge
+  /// did not fit in [`MAX_CHALLENGE_LINES`].
+  ///
+  /// A `Result` and not a body beside a flag, because a flag is a fact someone
+  /// has to remember to read and this is a body that is no longer there. What
+  /// was collected past the bound is not the whole challenge, so
+  /// [`AuthError::ChallengeSpansTooManyLines`] is the answer rather than
+  /// whatever a partial body happens to parse as — and with the body GONE,
+  /// [`close`](Self::close) can produce one only through `?` and
+  /// [`outgrown`](Self::outgrown) answers `true` for a section that has none.
+  /// There is no state in which a refused section still hands bytes over.
+  ///
+  /// [`spend`](Self::spend) RETURNS the refusal at every crossing but one, and
+  /// [`leave`](Self::leave) is that one — the crossing between two elements,
+  /// where RFC 9110 §5.2's join comma may already have ended the refused
+  /// challenge and only the element behind it says so. That method carries why
+  /// no verdict can be returned there, and which two readers answer for it.
+  body: Result<BodyLines<'a>, AuthError>,
   /// Where the current line's region begins.
   start: usize,
   /// Where the challenge ends in the current line: the end of the last element
@@ -2170,29 +2233,15 @@ struct Section<'a> {
   /// §5.6.1.2 puts between elements — and the boundary between two regions
   /// already stands for the one comma §5.2 put there.
   end: usize,
-  /// A region did not fit in [`MAX_CHALLENGE_LINES`].
-  ///
-  /// Recorded rather than returned, because a region is taken where a line is
-  /// left behind and that is not a place a verdict can be returned from. What
-  /// was collected is no longer the whole challenge, so
-  /// [`AuthError::ChallengeSpansTooManyLines`] is the answer rather than
-  /// whatever a partial body happens to parse as.
-  ///
-  /// Read at ONE place: the final region, after the challenge has ended. Every
-  /// earlier one is caught before an element is read on it, by
-  /// [`outgrown`](Self::outgrown), which is what keeps a challenge already past
-  /// the bound from letting its remaining elements choose their own extent.
-  overrun: bool,
 }
 
 impl<'a> Section<'a> {
   /// A body that begins at `at` on the line its scheme was read from.
   const fn opening_at(at: usize) -> Self {
     Self {
-      body: BodyLines::new(),
+      body: Ok(BodyLines::new()),
       start: at,
       end: at,
-      overrun: false,
     }
   }
 
@@ -2207,15 +2256,20 @@ impl<'a> Section<'a> {
   /// the bound rather than at the end of a walk whose later elements would by
   /// then have chosen their own extent.
   ///
-  /// `overrun` is deliberately NOT part of this. A region is refused only where
-  /// there is no slot left for it, so that flag is never true with fewer than
-  /// [`MAX_CHALLENGE_LINES`] regions spent and the count below already holds
-  /// wherever it is — a disjunct on it survives the suite, which is what
-  /// leaving it out says instead. The flag is read where it is not redundant:
-  /// on the LAST region, where a count that has reached the bound cannot tell a
-  /// challenge that just fits from one that did not.
+  /// A section whose body is already gone answers `true` here as well, and not
+  /// by a disjunct on a flag: a region is refused only where there is no slot
+  /// left for it, so the count below is at the bound wherever that has
+  /// happened. The refusal reaches this method through the missing body rather
+  /// than beside it, which is what leaving the disjunct out says.
+  ///
+  /// The count cannot answer for the LAST region, where a challenge that just
+  /// fits has spent every slot too — [`close`](Self::close) is what answers
+  /// there, and it does so by asking for a body that a refusal has taken away.
   const fn outgrown(&self) -> bool {
-    self.body.len >= MAX_CHALLENGE_LINES
+    match &self.body {
+      Ok(body) => body.len >= MAX_CHALLENGE_LINES,
+      Err(_) => true,
+    }
   }
 
   /// Takes what the line being left behind contributes — the challenge's bytes
@@ -2227,27 +2281,58 @@ impl<'a> Section<'a> {
   /// [`BodyLines`] carries why the two are not the same slice: a region a later
   /// walk reads has to be the bytes the walk that took it read, or the two
   /// walks are deciding an element's boundary over different inputs.
-  fn spend(&mut self, line: &'a [u8], end: usize) {
+  ///
+  /// # Errors
+  ///
+  /// [`AuthError::ChallengeSpansTooManyLines`] where this region did not fit,
+  /// or where an earlier one did not. The body is gone either way, so a caller
+  /// that goes on regardless has nothing left to collect INTO — which is the
+  /// point: a walk still inside an element crosses a join by asking for this,
+  /// and a walk that may not take the region may not have the line.
+  fn spend(&mut self, line: &'a [u8], end: usize) -> Result<(), AuthError> {
     let region = line.get(self.start..).unwrap_or_default();
-    if self
-      .body
-      .push(region, end.saturating_sub(self.start))
-      .is_err()
-    {
-      self.overrun = true;
-    }
+    let held = end.saturating_sub(self.start);
     self.start = 0;
     self.end = 0;
+    let taken = match &mut self.body {
+      Ok(body) => body.push(region, held),
+      Err(fault) => Err(*fault),
+    };
+    if let Err(fault) = taken {
+      self.body = Err(fault);
+      return Err(fault);
+    }
+    Ok(())
+  }
+
+  /// Takes the line being left BETWEEN two elements, where no verdict can be
+  /// returned.
+  ///
+  /// The one crossing of the three that may not refuse on the spot. RFC 9110
+  /// §5.2's join comma is a §5.6.1.2 separator here, so it may already have
+  /// ended a challenge this region overran — and only the element behind it
+  /// says which: an element that opens a challenge of its own ends this one's
+  /// extent, and an element that does not belongs to it. Refusing before that
+  /// is read would put the cursor inside a run that is no longer the refused
+  /// challenge's, and hand the element behind the join to
+  /// [`Challenges::seek`]'s raw-comma scan to swallow.
+  ///
+  /// The refusal is not dropped for that: [`spend`](Self::spend) leaves this
+  /// section with NO body, and both readers of it bind. Which one depends on
+  /// that same element — [`outgrown`](Self::outgrown) where it belongs to this
+  /// challenge, asked before its bytes are read, and [`close`](Self::close)
+  /// where it opens the next one and this challenge's extent is complete.
+  /// Neither can be handed a partial body instead.
+  fn leave(&mut self, line: &'a [u8], end: usize) {
+    let _kept = self.spend(line, end);
   }
 
   /// Takes the region the challenge ENDS in, and hands over the body.
   ///
-  /// The one reader of [`overrun`](Self::overrun), paired with the last
-  /// [`spend`](Self::spend) by consuming the section — so a walk cannot take
-  /// the final region and then hand over a body that is missing one. Every
-  /// EARLIER region is answered by [`outgrown`](Self::outgrown) instead,
-  /// before an element is read on it, and that method carries why the two
-  /// readers are not one.
+  /// Paired with the last [`spend`](Self::spend) by consuming the section — so
+  /// a walk cannot take the final region and then hand over a body that is
+  /// missing one — and it can hand over nothing at all where a region did not
+  /// fit, because a refused section holds no body to hand over.
   ///
   /// # Errors
   ///
@@ -2257,11 +2342,8 @@ impl<'a> Section<'a> {
   /// already stands on the next challenge's first byte and there is nothing
   /// left of this one to get past.
   fn close(mut self, line: &'a [u8], end: usize) -> Result<BodyLines<'a>, AuthError> {
-    self.spend(line, end);
-    if self.overrun {
-      return Err(AuthError::ChallengeSpansTooManyLines);
-    }
-    Ok(self.body)
+    self.spend(line, end)?;
+    self.body
   }
 }
 
@@ -2360,9 +2442,13 @@ where
           if let Some(section) = region.as_deref_mut() {
             // The cursor moves BEFORE the region is taken, so a body that
             // cannot hold this one leaves the walk standing on the new line
-            // rather than losing it with the error.
+            // rather than losing it with the error. `leave` and not `spend`
+            // because this is the crossing where the comma already passed may
+            // have ended the refused challenge, and the element behind it has
+            // not been read yet; that method names the two readers that bind
+            // instead.
             let end = section.end;
-            section.spend(spent, end);
+            section.leave(spent, end);
           }
         }
         Some(_) => return Step::Element { after_comma },
@@ -2383,15 +2469,29 @@ where
   /// the string.
   ///
   /// `region` is the body being collected. Every byte this crosses lands in it,
-  /// and the same bytes are what [`AuthParamIter`] hands a caller later.
+  /// and the same bytes are what [`AuthParamIter`] hands a caller later — so a
+  /// line this challenge may not hold is a line this scan may not read, and
+  /// taking the region and asking for the line are ONE operation for that
+  /// reason.
   ///
   /// # Errors
   ///
   /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
   /// quoted-string — the one fault that leaves the commas behind it unreadable
-  /// and so is the one this walk cannot continue past. Every OTHER fault the
-  /// element carries is in the [`Element`] this returns, because a boundary
-  /// this walk has not yet found must not be decided by bytes behind one.
+  /// and so is the one this walk cannot continue past, and the one reported
+  /// here without [`refuse`](Self::refuse), since nothing is sought after it.
+  ///
+  /// [`AuthError::ChallengeSpansTooManyLines`] where the line this element is
+  /// still open on cannot be held. It is refused THERE, through
+  /// [`refuse`](Self::refuse) and with the cursor on the first byte of the
+  /// line just fetched, so what is left of the challenge is found by raw
+  /// commas like every other refusal — rather than scanned on as a
+  /// quoted-string whose every later byte would decide a boundary for a
+  /// challenge already refused.
+  ///
+  /// Every OTHER fault the element carries is in the [`Element`] this returns,
+  /// because a boundary this walk has not yet found must not be decided by
+  /// bytes behind one.
   fn skip_element(&mut self, region: &mut Section<'a>) -> Result<Element<'a>, AuthError> {
     let head = self.line;
     let start = self.at;
@@ -2399,14 +2499,25 @@ where
       let walk = &mut *self;
       let section = &mut *region;
       scan_element(head, start, || {
-        let next = walk.next_line()?;
+        let Some(next) = walk.next_line() else {
+          return Ok(None);
+        };
         let spent = walk.line;
         walk.line = next;
+        // The cursor moves to the head of the line just fetched BEFORE the
+        // region is taken, so a refusal below leaves the walk standing where
+        // the challenge it refuses could not be held — and `seek` starts from
+        // a byte rather than from the middle of a line it never read.
+        walk.at = 0;
         // The element is still open here, so ALL of the line being left is the
         // challenge's — including the bytes that begin no element of their own
-        // but carry the close of this one.
-        section.spend(spent, spent.len());
-        Some(next)
+        // but carry the close of this one. A region that does not fit refuses
+        // the challenge on the spot: there is no line to hand back, which is
+        // what keeps this scan from reading one more byte of it.
+        section
+          .spend(spent, spent.len())
+          .map_err(|fault| walk.refuse(fault))?;
+        Ok(Some(next))
       })?
     };
     self.at = scanned.at;
@@ -2436,12 +2547,14 @@ where
   ///
   /// # Errors
   ///
-  /// [`AuthError::MissingScheme`] and [`AuthError::MalformedScheme`], and every
-  /// fault a parameter list carries, leave the cursor INSIDE the challenge that
-  /// failed, so [`refuse`](Self::refuse) sets `seeking` and the next boundary
-  /// is found there by raw commas. [`AuthError::InvalidQuotedString`] does not:
-  /// it leaves every comma behind it a guess, so the WALK ends rather than
-  /// recovering, which [`Challenges::next`] is where.
+  /// [`AuthError::MissingScheme`] and [`AuthError::MalformedScheme`], every
+  /// fault a parameter list carries, and the
+  /// [`AuthError::ChallengeSpansTooManyLines`] met while an element is still
+  /// open across a join, all leave the cursor INSIDE the challenge that failed,
+  /// so [`refuse`](Self::refuse) sets `seeking` and the next boundary is found
+  /// there by raw commas. [`AuthError::InvalidQuotedString`] does not: it leaves
+  /// every comma behind it a guess, so the WALK ends rather than recovering,
+  /// which [`Challenges::next`] is where.
   ///
   /// Two faults are reported with no seeking behind them, and both fire with
   /// the challenge's extent already complete: a body of exactly one element
@@ -2824,9 +2937,11 @@ where
     let scanned = {
       let walk = &mut *self;
       scan_element(head, start, || {
-        let next = walk.next_line()?;
+        let Some(next) = walk.next_line() else {
+          return Ok(None);
+        };
         walk.line = next;
-        Some(next)
+        Ok(Some(next))
       })
     };
     let scanned = match scanned {

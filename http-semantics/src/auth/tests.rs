@@ -924,6 +924,25 @@ fn every_way_a_challenge_is_refused_hides_no_challenge_behind_it() {
   assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
 
+  // The same bound, met at the crossing where the challenge's own value is
+  // still OPEN across §5.2's join. `TRAP` is not the trap for this one: the
+  // walk stands INSIDE a string that its DQUOTE would close, so it would spring
+  // a different case. What hides `Digest` here is the open string itself —
+  // every byte behind the bound is data of it, the comma in front of `Digest`
+  // included — so the line behind the bound is ordinary text and reaching
+  // `Digest` at all means the walk stopped where the challenge outgrew what it
+  // may hold.
+  let mut open_at_the_bound = [&b"j"[..]; 18];
+  open_at_the_bound[0] = b"Basic a=\"x";
+  open_at_the_bound[17] = b"p, Digest realm=z";
+  let [refused, digest, past] = walk::<3>(open_at_the_bound);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
   // And the fault that is NOT recovered from, because recovery would be a
   // guess: a byte §5.6.4 forbids INSIDE a string that legitimately opened
   // leaves nobody able to say where that string ends, so the walk stops. The
@@ -2098,24 +2117,25 @@ fn a_challenge_past_the_line_bound_is_refused_and_the_next_one_is_read() {
 
 #[test]
 fn the_region_a_challenge_ends_in_is_the_one_the_bound_is_read_at() {
-  // `MAX_CHALLENGE_LINES` has two readers and they are not symmetric.
-  // `Section::outgrown` answers for every region an element is read ON, which
-  // is asked before that element's bytes are, and `Section::close` reads the
-  // `overrun` flag for the LAST region — the one no element is read on,
-  // because the challenge ends there. A count cannot answer for that one: a
+  // `MAX_CHALLENGE_LINES` has two readers that answer for a crossing which
+  // could not return a verdict, and they are not symmetric. `Section::outgrown`
+  // answers for every region an element is read ON, asked before that element's
+  // bytes are; `Section::close` answers for the LAST region — the one no
+  // element is read on, because the challenge ends there — by asking for a body
+  // that a refusal has taken away. A count cannot answer for that one: a
   // challenge that just fits has spent every slot too.
   //
   // The test above drives `outgrown`, and drives `close` once through a
-  // seventeen-region fixture whose overrun is recorded while a line is being
-  // LEFT. These are the other half: the overrun recorded inside `close` itself,
+  // seventeen-region fixture whose refusal is met while a line is being LEFT.
+  // These are the other half: the refusal met inside `close`'s own `spend`,
   // where the challenge's own final region is the one that does not fit. An
   // edit that dropped either reader passes eleven of the twelve gates, so both
   // are driven here by shapes that cannot be mistaken for each other.
 
   // Seventeen regions and the value ends on the seventeenth. One quoted value
   // spans them all, so no element is read past the first line and `outgrown` is
-  // never asked at all — the refusal exists only because `close` reads the flag
-  // its own `spend` just set.
+  // never asked at all — the refusal exists only because `close` can hand over
+  // no body once its own `spend` has refused one.
   let mut ends_there = [&b"j"[..]; 17];
   ends_there[0] = b"Basic a=\"x";
   ends_there[16] = b"y\"";
@@ -2154,6 +2174,113 @@ fn the_region_a_challenge_ends_in_is_the_one_the_bound_is_read_at() {
   assert_eq!(basic.scheme(), b"Basic");
   assert_eq!(names::<2>(&basic), [Some(&b"a"[..]), None]);
   assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+}
+
+#[test]
+fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
+  // The THIRD crossing `MAX_CHALLENGE_LINES` is met at, and the only one where
+  // the challenge's own element is still OPEN: a quoted value RFC 9110 §5.2's
+  // join carries onto the next line takes that line with it, so a line this
+  // challenge may not hold is a line this reader may not read. The refusal is
+  // met at the crossing itself, and what is left of the challenge is found by
+  // raw commas like every other refusal.
+  //
+  // One value opens on the first line here and every continuation keeps it
+  // open, so the SEVENTEENTH region is the one that does not fit — and the
+  // line behind it carries a byte §5.6.4 forbids and then a challenge. Reading
+  // that byte would end the walk and take `Digest` with it, which is the harm
+  // the module doc's invariant exists against; it is never read, because the
+  // line it is on is one this challenge may not hold.
+  let mut too_many = [&b"j"[..]; 18];
+  too_many[0] = b"Basic a=\"x";
+  too_many[17] = b"\x00, Digest realm=z";
+  let [refused, digest, past] = walk::<3>(too_many);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // ONE line fewer is sixteen regions, and there the byte IS read — the region
+  // it stands on is one this challenge holds. `InvalidQuotedString` ends the
+  // walk and `Digest` goes with it, which is that fault's own answer and not
+  // this bound's. The two rows together say the refusal above is the bound
+  // being met FIRST rather than the byte being unreachable.
+  let mut within = [&b"j"[..]; 17];
+  within[0] = b"Basic a=\"x";
+  within[16] = b"\x00, Digest realm=z";
+  let [refused, past] = walk::<2>(within);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::InvalidQuotedString
+  );
+  assert!(past.is_none());
+
+  // The cursor stands at the FIRST byte of the line the challenge could not
+  // hold, so what that line carries in front of its first raw comma is still
+  // the refused challenge's. A `Digest` with no comma in front of it on that
+  // line is inside the refused run and is not yielded — the cost of recovering
+  // raw, and the assertion an edit that moved the cursor elsewhere fails.
+  let mut swallowed = [&b"j"[..]; 18];
+  swallowed[0] = b"Basic a=\"x";
+  swallowed[17] = b"Digest realm=z";
+  let [refused, past] = walk::<2>(swallowed);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert!(past.is_none());
+
+  // Sixteen regions of the conforming shape still parse, so the refusal above
+  // is the seventeenth region and not the fixture: one value spanning every
+  // line of the bound, closing on the last of them, with a challenge behind it.
+  let mut fits = [&b"j"[..]; 16];
+  fits[0] = b"Basic a=\"x";
+  fits[15] = b"y\", Digest realm=z";
+  let [basic, digest, past] = walk::<3>(fits);
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(names::<2>(&basic), [Some(&b"a"[..]), None]);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // A refusal a crossing could not RETURN still binds, and `Section::outgrown`
+  // is where. `Challenges::open_element` crosses a join BETWEEN two elements,
+  // where §5.2's comma may already have ended the challenge and only the
+  // element behind it says so, so the region it could not hold leaves the
+  // section with no body instead of a verdict. Here the element behind that
+  // join is a parameter of THIS challenge — so the challenge did not end at the
+  // join — and its value is a DQUOTE at the one position §11.2 admits one.
+  // Reading it would open a string that swallows the comma in front of
+  // `Digest`; `outgrown` answers for the missing body first, and refuses before
+  // that element's bytes are read.
+  let mut refused_at_the_join = [&b"j"[..]; 18];
+  refused_at_the_join[0] = b"Basic a=\"x";
+  refused_at_the_join[16] = b"y\"";
+  refused_at_the_join[17] = b"t=\"open, Digest realm=z";
+  let [refused, digest, past] = walk::<3>(refused_at_the_join);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // The control that says that trap really springs: the same last two lines
+  // with FIFTEEN regions in front of them, so nothing is refused and the walk
+  // reads `t="open, Digest realm=z` as the parameter it is. §5.6.4 makes every
+  // comma inside the string it opens data, and `Digest` is not reached at all.
+  let mut not_refused = [&b"j"[..]; 16];
+  not_refused[0] = b"Basic a=\"x";
+  not_refused[14] = b"y\"";
+  not_refused[15] = b"t=\"open, Digest realm=z";
+  let [refused, past] = walk::<2>(not_refused);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::UnterminatedQuotedString
+  );
+  assert!(past.is_none());
 }
 
 // ── RFC 9110 §11.6.2's Authorization, which holds ONE credential ─────────────

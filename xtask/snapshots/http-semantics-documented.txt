@@ -85,9 +85,9 @@ http_semantics::auth::Scanned.element
 http_semantics::auth::Section
 http_semantics::auth::Section.body
 http_semantics::auth::Section.end
-http_semantics::auth::Section.overrun
 http_semantics::auth::Section.start
 http_semantics::auth::Section::close
+http_semantics::auth::Section::leave
 http_semantics::auth::Section::opening_at
 http_semantics::auth::Section::outgrown
 http_semantics::auth::Section::spend

@@ -14,7 +14,7 @@ crate implementing any scheme. Phase 1 of the #70 ledger.
 
 `xtask/snapshots/http-semantics-documented.txt` gains 125 lines and loses none:
 `grep -vc '^#'` counts 572 documented items on it at `6360957` and 697 here.
-`cargo test -p http-semantics --all-features` reports 381 unit tests passing, 83
+`cargo test -p http-semantics --all-features` reports 382 unit tests passing, 84
 of them this module's, beside the no-panic harness's fifteen and one doctest.
 The crate is still `no_std`, allocation-free, clock-free and panic-free, on the
 same `std` / `alloc` / `no-atomic` tiers its siblings run, and
@@ -93,6 +93,21 @@ is green.
   true, and the `auth` module's own documentation states it as the invariant a
   change there has to keep.
 
+  **A refusal BINDS where it is met, and is never a fact left for a later
+  reader.** The four faults an element carries are returned by the check that
+  found them, one element at a time. The fifth — the line bound — is met at
+  three crossings and binds at each, and the one that matters is the crossing an
+  element still OPEN across §5.2's join makes: taking the region left behind and
+  asking for the next line are ONE operation there, so a challenge that may not
+  hold the line has no line to read, and `Basic a="x` followed by sixteen
+  continuation lines and then `\0, Digest realm=z` answers
+  `ChallengeSpansTooManyLines` and still yields `Digest` rather than reading a
+  byte §5.6.4 forbids on a line it had already refused and ending the walk
+  there. A section that has refused holds no body at all, so the two readers
+  that answer for a crossing which could not return a verdict — the bound asked
+  before the next element, and the region the challenge ends in — can be handed
+  nothing instead.
+
   **One derivation of an element's boundary, and every walk in the module gets
   its elements from it.** The walk that cuts a challenge's body and the walk a
   caller reads that challenge's parameters through are the same function over
@@ -108,10 +123,16 @@ is green.
   so a comma a quote-aware recovery would have swallowed as data ends the
   refused run here and what stands behind it is refused in its turn:
   `Basic<HTAB>Newauth realm="a, b"` is two `AuthError::MalformedScheme`s where
-  such a recovery reports one. No challenge is ever lost by it and every `Ok` is
-  the same `Ok`, but a caller counting the `Err`s of a malformed value is
-  counting something this reader decides. `challenges` says so where a caller
-  reads what it yields.
+  such a recovery reports one. No challenge a sender wrote is ever lost by it,
+  and a caller counting the `Err`s of a malformed value is counting something
+  this reader decides. What a caller can be shown that the sender did not write
+  is one case and one only: `MAX_CHALLENGE_LINES` is this recipient's refusal
+  rather than a fault of the sender's, so it is the only one that can refuse a
+  value some derivation still admits — a quoted-string that would have closed on
+  a line past the bound — and a comma the sender put inside such a value is then
+  read as the separator it is not. That constant carries the trade and why
+  ending the walk instead is the worse half of it; `challenges` says both where
+  a caller reads what it yields.
 
   **Which of RFC 9110 §11.2's two alternatives a body took is a recipient's
   decision, and this module writes its own down.** §11.2 says in prose that a
