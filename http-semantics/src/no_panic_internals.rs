@@ -42,27 +42,63 @@ pub fn parse_qvalue(v: &[u8]) -> Option<crate::media::Weight> {
 /// `auth-param = token BWS "=" BWS ( token / quoted-string )`, read over one
 /// list element with the list's own `OWS` already off both ends.
 ///
-/// `tail` is `crate::auth::ValueTail` spelled as a `u8` at this boundary. That
-/// enum answers what RFC 9110 §5.2's field-line join did with a quoted value
-/// the element leaves open, it is `pub(crate)` like the function itself, and a
-/// test crate cannot name it — so its three states cross as `1` for
-/// `Continues`, `2` for `Trails` and anything else for `Ends`, and the shim
-/// drives all three. A `bool` carried the two states this had before `Trails`
-/// separated a value that closed across the join from one that closed and then
-/// ran on past its close.
+/// `tail` is the `ValueTail` below, and the shim drives all three of its
+/// states. A `bool` carried the two this had before `Trails` separated a value
+/// that closed across RFC 9110 §5.2's join from one that closed and then ran on
+/// past its close.
 #[inline]
 pub fn auth_param(
   element: &[u8],
-  tail: u8,
+  tail: ValueTail,
 ) -> Result<crate::auth::AuthParam<'_>, crate::auth::AuthError> {
-  crate::auth::auth_param(
-    element,
+  crate::auth::auth_param(element, tail.inner())
+}
+
+/// What RFC 9110 §5.2's field-line join did with a quoted value an element
+/// leaves open, spelled so a test crate can name it.
+///
+/// `crate::auth::ValueTail` is the enum the walks pass and it is `pub(crate)`
+/// like the function it feeds, so a test crate cannot name it. This mirrors its
+/// three states, and mirrors them as an ENUM: the `u8` this replaced put values
+/// at the boundary that named no state at all and needed a fallback arm to
+/// swallow them, which is three states and a hole where the type should be.
+///
+/// `inner` is the whole of the crossing, and `From` is its inverse. That
+/// conversion matches exhaustively over the CRATE-PRIVATE enum, so a state
+/// added there stops this build rather than reaching the shim as one of the
+/// states already here;
+/// `every_value_tail_crosses_the_forwarder_as_itself` is where the two are
+/// checked to be the same three.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ValueTail {
+  /// Nothing was open where the element's line ended, or what was open never
+  /// closed on any later one.
+  Ends,
+  /// It closed on a later field line and the element ended there.
+  Continues,
+  /// It closed on a later field line and the element did NOT end there.
+  Trails,
+}
+
+impl ValueTail {
+  /// The crate-private state this one mirrors.
+  const fn inner(self) -> crate::auth::ValueTail {
+    match self {
+      Self::Ends => crate::auth::ValueTail::Ends,
+      Self::Continues => crate::auth::ValueTail::Continues,
+      Self::Trails => crate::auth::ValueTail::Trails,
+    }
+  }
+}
+
+impl From<crate::auth::ValueTail> for ValueTail {
+  fn from(tail: crate::auth::ValueTail) -> Self {
     match tail {
-      1 => crate::auth::ValueTail::Continues,
-      2 => crate::auth::ValueTail::Trails,
-      _ => crate::auth::ValueTail::Ends,
-    },
-  )
+      crate::auth::ValueTail::Ends => Self::Ends,
+      crate::auth::ValueTail::Continues => Self::Continues,
+      crate::auth::ValueTail::Trails => Self::Trails,
+    }
+  }
 }
 
 /// Forwards to `crate::auth::token68_end` — the RUN behind RFC 9110 §11.2's

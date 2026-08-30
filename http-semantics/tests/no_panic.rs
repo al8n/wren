@@ -199,7 +199,7 @@ macro_rules! no_panic_shim {
 use core::hint::black_box;
 
 use http_semantics::{
-  __no_panic_internals::{auth_param, parse_qvalue, token68_end},
+  __no_panic_internals::{ValueTail, auth_param, parse_qvalue, token68_end},
   auth::{auth_info, challenges, credentials},
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
   grammar::{ParamValue, parameterised_list},
@@ -1099,16 +1099,16 @@ no_panic_shim! {
   /// Reached through the `__no_panic_internals` forwarder: the walks above it
   /// are the crate's entry points and this is not, so it stays `pub(crate)`.
   ///
-  /// `tail` is the crate-private `ValueTail` the walk supplies, spelled as a
-  /// `u8` at the crate boundary and driven ALL THREE ways below — `1` for
-  /// `Continues`, `2` for `Trails`, anything else for `Ends`. It is what
+  /// `tail` is the `ValueTail` the `__no_panic_internals` forwarder mirrors the
+  /// crate-private one as, and it is driven ALL THREE ways below. It is what
   /// separates a quoted value RFC 9110 §5.2's field-line join closed on a
   /// later line from one that closed there and then ran on past its close, and
-  /// from one that never closes at all; the three take different exits.
+  /// from one that never closes at all; the three take different exits. An
+  /// enum, so there is no fourth value to drive and no arm that swallows one.
   ///
   /// Returns the bytes it read with `value()`'s answer folded in, so nothing
   /// here is optimized out as unused and neither accessor can be dropped.
-  fn shim_auth_param(element: &[u8], tail: u8) -> usize {
+  fn shim_auth_param(element: &[u8], tail: ValueTail) -> usize {
     let Ok(param) = auth_param(element, tail) else {
       return 0;
     };
@@ -1129,22 +1129,36 @@ fn auth_param_is_panic_free() {
   // RFC 9110 §11.2's two notations, and the §5.6.3 BWS a recipient removes
   // before interpreting the element — which is this production's own, and is
   // what §5.6.6's `parameter` walker refuses.
-  assert!(shim_auth_param(black_box(br#"realm="x""#.as_slice()), black_box(0)) > 0);
-  assert!(shim_auth_param(black_box(b"realm=x".as_slice()), black_box(0)) > 0);
-  assert!(shim_auth_param(black_box(b"realm \t = \t \"x\"".as_slice()), black_box(0)) > 0);
+  let ends = ValueTail::Ends;
+  assert!(shim_auth_param(black_box(br#"realm="x""#.as_slice()), black_box(ends)) > 0);
+  assert!(shim_auth_param(black_box(b"realm=x".as_slice()), black_box(ends)) > 0);
+  assert!(
+    shim_auth_param(
+      black_box(b"realm \t = \t \"x\"".as_slice()),
+      black_box(ends)
+    ) > 0
+  );
   // A `quoted-pair`, which an `auth-param` value admits.
-  assert!(shim_auth_param(black_box(br#"nonce="a\"b""#.as_slice()), black_box(0)) > 0);
+  assert!(shim_auth_param(black_box(br#"nonce="a\"b""#.as_slice()), black_box(ends)) > 0);
   // The join, all three ways: a value still open where the element ends is a
   // parameter when a later field line closed it and the element ended at that
   // close, a fault when bytes other than the list's own `OWS` stood behind the
   // close, and a fault when nothing closed it at all.
-  assert!(shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(1)) > 0);
+  assert!(
+    shim_auth_param(
+      black_box(b"opaque=\"a".as_slice()),
+      black_box(ValueTail::Continues)
+    ) > 0
+  );
   assert_eq!(
-    shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(2)),
+    shim_auth_param(
+      black_box(b"opaque=\"a".as_slice()),
+      black_box(ValueTail::Trails)
+    ),
     0
   );
   assert_eq!(
-    shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(0)),
+    shim_auth_param(black_box(b"opaque=\"a".as_slice()), black_box(ends)),
     0
   );
   // Each refusal on its own, and under every reading of the tail: no `=`, an
@@ -1160,7 +1174,7 @@ fn auth_param_is_panic_free() {
     b"",
     &[0xffu8, 0x3d, 0x22],
   ] {
-    for tail in [0u8, 1, 2, 3] {
+    for tail in [ValueTail::Ends, ValueTail::Continues, ValueTail::Trails] {
       assert_eq!(shim_auth_param(black_box(refused), black_box(tail)), 0);
     }
   }

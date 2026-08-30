@@ -12,9 +12,9 @@ had done. That caller can now select a challenge by its scheme and read that
 challenge's parameters to the last one, without allocating and without this
 crate implementing any scheme. Phase 1 of the #70 ledger.
 
-`xtask/snapshots/http-semantics-documented.txt` gains 98 lines and loses none:
-`grep -vc '^#'` counts 572 documented items on it at `6360957` and 670 here.
-`cargo test -p http-semantics --all-features` reports 372 unit tests passing, 74
+`xtask/snapshots/http-semantics-documented.txt` gains 111 lines and loses none:
+`grep -vc '^#'` counts 572 documented items on it at `6360957` and 683 here.
+`cargo test -p http-semantics --all-features` reports 376 unit tests passing, 78
 of them this module's, beside the no-panic harness's fifteen and one doctest.
 The crate is still `no_std`, allocation-free, clock-free and panic-free, on the
 same `std` / `alloc` / `no-atomic` tiers its siblings run, and
@@ -77,6 +77,21 @@ is green.
   comma in that run, and a malformed challenge cannot swallow the comma in
   front of the next one. The walk that gets PAST an already-reported challenge
   reads the same way, for the same reason.
+
+  **The whole of that rule, at both of its scopes: only bytes some production
+  still admits may decide where anything ends.** Within one element, a DQUOTE
+  opens a `quoted-string` only at the position §11.2 admits a value, and the
+  string that opens there closes the last thing the element may hold. Within a
+  `#challenge` value, the moment an element derives nothing, repeats a name,
+  fills the last slot there is, or takes the challenge past
+  `MAX_CHALLENGE_LINES`, **that challenge is refused and the rest of its extent
+  is found by raw commas alone** — so `Basic a="q` followed by
+  `r"junk, trap="open, Digest realm=z` reports one `MalformedParameter` and
+  still yields `Digest`, where a walk that found the boundary first and derived
+  the body afterwards let `trap="` swallow the comma in front of it. Deriving
+  each element before the next element's bytes are read is what makes that
+  true, and the `auth` module's own documentation states it as the invariant a
+  change there has to keep.
 
   **Which of RFC 9110 §11.2's two alternatives a body took is a recipient's
   decision, and this module writes its own down.** §11.2 says in prose that a
