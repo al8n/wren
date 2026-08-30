@@ -1,8 +1,10 @@
+mod auth_diff;
 mod doc_check;
 mod handshake_diff;
 mod qpack_data;
 mod quote_check;
 mod report;
+mod sha256;
 mod shim_check;
 mod symbols;
 
@@ -56,6 +58,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("too many qpack-codegen arguments".into());
       }
       qpack_codegen(check)?;
+    }
+    "auth-diff" => {
+      let Some(base) = args.next() else {
+        return Err("auth-diff needs a base revision".into());
+      };
+      let head = args.next();
+      if args.next().is_some() {
+        return Err("too many auth-diff arguments".into());
+      }
+      auth_diff::run(&base, head.as_deref())?;
     }
     "handshake-diff" => {
       let Some(base) = args.next() else {
@@ -115,10 +127,20 @@ fn print_help() {
 Usage:
   cargo run -p xtask -- qpack-codegen
   cargo run -p xtask -- qpack-codegen --check
+  cargo run -p xtask -- auth-diff <base-rev> [head-rev]
   cargo run -p xtask -- handshake-diff <base-rev> [head-rev]
   cargo run -p xtask -- quote-check [--fetch] [--include-ignored] [<spec-dir>]
   cargo run -p xtask -- doc-check [--require-all] [--bless]
   cargo run -p xtask -- shim-check
+
+`auth-diff` runs `auth-corpus` against two revisions of `http-semantics` and
+reports every answer that moved, grouped by what moved about it, plus a
+sha256 of the answer column taken by ONE binary over both sides and, per
+corpus and side, the axis tally: how many inputs hide a challenge a conforming
+reading would have shown, how many of those a quoted-string excuses, and how
+many challenges the reader shows that no derivation puts there. `head-rev`
+defaults to the working tree. It works in $TMPDIR and leaves the repository
+untouched.
 
 `handshake-diff` runs `handshake-corpus` against two revisions of
 `websocket-proto` and reports the verdicts that moved, grouped by

@@ -1,0 +1,11 @@
+[package]
+name = "auth-corpus"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+http-semantics = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

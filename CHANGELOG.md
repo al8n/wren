@@ -1,5 +1,278 @@
 # UNRELEASED
 
+## `http-semantics` — RFC 9110 §11's six authentication fields, and two bounds that refuse rather than truncate
+
+An `auth` module joins the crate: §11.2's `auth-param` and `token68`, and the
+one production §11.3 spells `challenge` and §11.4 spells `credentials`, over
+the six fields §11.6 and §11.7 define between them. Before this, a caller
+handed a 401 or a CONNECT 407 could hold `WWW-Authenticate`'s bytes and do
+nothing with them: the walk existed nowhere in this workspace, and
+`http1-proto`'s README listed §11.3's challenge walk among the work nobody here
+had done. That caller can now select a challenge by its scheme and read that
+challenge's parameters to the last one, without allocating and without this
+crate implementing any scheme. Phase 1 of the #70 ledger.
+
+`xtask/snapshots/http-semantics-documented.txt` gains 125 lines and loses none:
+`grep -vc '^#'` counts 572 documented items on it at `6360957` and 697 here.
+`cargo test -p http-semantics --all-features` reports 385 unit tests passing, 87
+of them this module's, beside the no-panic harness's fifteen and one doctest.
+The crate is still `no_std`, allocation-free, clock-free and panic-free, on the
+same `std` / `alloc` / `no-atomic` tiers its siblings run, and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+The walk's answers are also graded from OUTSIDE the crate. `auth-corpus` reads
+935 032 inputs through the three entry points and grades each against an oracle
+written from RFC 9110 rather than from this module — does a malformed challenge
+hide a well-formed one behind it? — and `cargo test -p auth-corpus`, a step in
+CI's `test` job, pins the per-corpus tally that answer produces, the fault each
+answer names, and a SHA-256 of the answers themselves. The tally is blind by
+construction to an answer that moves inside its own axis class; the digest is
+blind to nothing, and is the number `cargo run -p xtask -- auth-diff` publishes.
+So a change here that moves what a caller is shown moves a number in that diff,
+where a reviewer can ask which and why.
+
+### Added
+
+- **`auth` — one production, reached by three entry points that differ only in
+  how many of it a field holds.**
+
+  ```rust
+  pub fn challenges<'a, I>(lines: I) -> impl Iterator<Item = Result<Credential<'a>, AuthError>>
+  where I: IntoIterator<Item = &'a [u8]>;
+
+  pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError>;
+
+  pub fn auth_info<'a, I>(lines: I) -> impl Iterator<Item = Result<AuthParam<'a>, AuthError>>
+  where I: IntoIterator<Item = &'a [u8]>;
+
+  impl<'a> Credential<'a> {
+    pub const fn scheme(&self) -> &'a [u8];
+    pub fn scheme_is(&self, name: &str) -> bool;
+    pub const fn token68(&self) -> Option<&'a [u8]>;
+    pub const fn params(&self) -> AuthParamIter<'a>;
+  }
+
+  impl<'a> AuthParam<'a> {
+    pub const fn name(&self) -> &'a [u8];
+    pub fn value(&self) -> Result<ParamValue<'a>, ValueSpansFieldLines>;
+  }
+  ```
+
+  `challenges` reads §11.6.1's `WWW-Authenticate` and §11.7.1's
+  `Proxy-Authenticate`, the two fields whose value is a list of challenges;
+  `credentials` reads §11.6.2's `Authorization` and §11.7.2's
+  `Proxy-Authorization`, which hold exactly one; `auth_info` reads §11.6.3's
+  `Authentication-Info` and §11.7.3's `Proxy-Authentication-Info`, which are a
+  parameter list with no scheme in front of it. One `Credential` type serves the
+  first two because `challenge` and `credentials` are the same production
+  written twice.
+
+  **Two of the three take field LINES rather than a value, because a challenge
+  is not always one field line.** RFC 9110 §5.2 makes a repeated field one
+  value, its field line values "concatenated in order, with each field line
+  value separated by a comma", so a sender may split one challenge's parameter
+  list at any element boundary in it and the pieces arrive as separate lines. A
+  reader that borrows rather than joining has to name every line one challenge
+  landed on at once, which is what `Credential` does and what
+  `MAX_CHALLENGE_LINES` bounds. The one thing a join can still take away is a
+  single value's contiguity: a `quoted-string` that opens on one line and closes
+  on the next is reported at `AuthParam::value` as `ValueSpansFieldLines`, and
+  the parameter's own name is answered anyway. Closing is not ending, though —
+  `auth-param = token BWS "=" BWS ( token / quoted-string )` takes one
+  alternative whole, so only the `OWS` §5.6.1.2 hangs on the next comma may
+  follow that close, and `Basic realm="x` followed by `"junk` is
+  `AuthError::MalformedParameter` exactly as the same bytes written on one line
+  already were. A run behind such a close derives nothing, so it holds no
+  `quoted-string` for a DQUOTE in it to open: the element ends at the first RAW
+  comma in that run, and a malformed challenge cannot swallow the comma in
+  front of the next one. The walk that gets PAST an already-reported challenge
+  reads the same way, for the same reason.
+
+  **The whole of that rule, at both of its scopes: only bytes some production
+  still admits may decide where anything ends.** Within one element, a DQUOTE
+  opens a `quoted-string` only at the position §11.2 admits a value, and the
+  string that opens there closes the last thing the element may hold. Within a
+  `#challenge` value, the moment an element derives nothing, repeats a name,
+  fills the last slot there is, carries a byte §5.6.4 forbids inside a
+  quoted-string, or takes the challenge past `MAX_CHALLENGE_LINES`, **that
+  challenge is refused and the rest of its extent is found by raw commas
+  alone** — so `Basic a="q` followed by
+  `r"junk, trap="open, Digest realm=z` reports one `MalformedParameter` and
+  still yields `Digest`, where a walk that found the boundary first and derived
+  the body afterwards let `trap="` swallow the comma in front of it. Deriving
+  each element before the next element's bytes are read is what makes that
+  true, and the `auth` module's own documentation states it as the invariant a
+  change there has to keep.
+
+  **No fault ends the walk.** `AuthError::InvalidQuotedString` was the one
+  exception, on the argument that a scan which failed inside a quoted-string can
+  no longer tell which commas separate elements. That argument states the
+  premise of the invariant above and then declines its conclusion: raw-comma
+  recovery is what a walk which cannot trust a comma does. So
+  `Basic a="x\0, Digest realm=z` now reports `InvalidQuotedString` and still
+  yields `Digest`, where it used to hide it. Every byte that raises that fault
+  is a CTL other than HTAB, which §5.5 admits nowhere in a field value — it puts
+  a MUST on CR, LF and NUL and calls the rest "also invalid" — so there is no
+  derivation of the value for the recovery to be wrong about, and `obs-text` is
+  the pair that keeps the rule honest: `%x80-FF` IS `qdtext`, so
+  `Basic realm="a\xffb, Digest realm=z"` stays ONE challenge with ONE
+  parameter, comma and all.
+
+  Where that recovery starts is where the scan stood, which differs between a
+  forbidden byte met on the head field line and one met after §5.2's join — so
+  a value written on one line and the same value split across a join can yield
+  different numbers of challenges. Both yield at least what they yielded when
+  this fault ended the walk, and the challenge that differs is never one any
+  derivation of the value admits. `Challenges::skip_element` records it.
+
+  **A refusal BINDS where it is met, and is never a fact left for a later
+  reader.** The five faults an element carries are returned by the check or the
+  scan that found them, one element at a time. The sixth — the line bound — is
+  met at
+  three crossings and binds at each, and the one that matters is the crossing an
+  element still OPEN across §5.2's join makes: taking the region left behind and
+  asking for the next line are ONE operation there, so a challenge that may not
+  hold the line has no line to read, and `Basic a="x` followed by sixteen
+  continuation lines and then `\0, Digest realm=z` answers
+  `ChallengeSpansTooManyLines` and still yields `Digest` rather than reading a
+  byte §5.6.4 forbids on a line it had already refused and ending the walk
+  there. A section that has refused holds no body at all, so the two readers
+  that answer for a crossing which could not return a verdict — the bound asked
+  before the next element, and the region the challenge ends in — can be handed
+  nothing instead.
+
+  **One derivation of an element's boundary, and every walk in the module gets
+  its elements from it.** The walk that cuts a challenge's body and the walk a
+  caller reads that challenge's parameters through are the same function over
+  the same bytes: a region is kept as the field line the collecting walk read,
+  from the credential's first byte on it, and where the credential stops is
+  that walk's own cursor recorded rather than a second reading of the same
+  bytes. A disagreement between the two would have dropped a parameter from a
+  challenge that parsed and reported nothing, and there is now nothing for them
+  to disagree about.
+
+  **A malformed value can yield more faults than a sender wrote, and that is
+  the safe direction.** Getting past a refused challenge is done by raw commas,
+  so a comma a quote-aware recovery would have swallowed as data ends the
+  refused run here and what stands behind it is refused in its turn:
+  `Basic<HTAB>Newauth realm="a, b"` is two `AuthError::MalformedScheme`s where
+  such a recovery reports one. No challenge a sender wrote is ever lost by it,
+  and a caller counting the `Err`s of a malformed value is counting something
+  this reader decides. What a caller can be shown that the sender did not write
+  is two cases and two only, and they are not the same kind of thing.
+  `MAX_CHALLENGE_LINES` is this recipient's refusal rather than a fault of the
+  sender's, so it is the only one that can refuse a value some derivation still
+  admits — a quoted-string that would have closed on a line past the bound — and
+  a comma the sender put inside such a value is then read as the separator it is
+  not. `AuthError::InvalidQuotedString` can do the same arithmetic, but only on
+  a field value §5.5 admits nowhere, so what is recovered there was never a
+  value to be the data of. Both constants carry their trade and why ending the
+  walk instead is the worse half of it; `challenges` says both where a caller
+  reads what it yields.
+
+  **Which of RFC 9110 §11.2's two alternatives a body took is a recipient's
+  decision, and this module writes its own down.** §11.2 says in prose that a
+  scheme is followed by "either a comma-separated list of parameters or a single
+  sequence of characters capable of holding base64-encoded information", and
+  nothing in
+  `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` orders the two.
+  `Credential::token68` reports the answer this module reached: the run is a
+  `token68` when it matches that production AND ends the credential, so
+  `Scheme foo=` is a `token68` rather than a parameter missing its value, while
+  `Scheme foo=bar` is one parameter.
+
+  **Validation is eager, which is what makes `AuthParamIter` infallible.** A
+  challenge is walked to its end before it is yielded, so `Credential::params`
+  cannot fail and one `challenges` walk can go on after a fault — RFC 9110
+  §11.4 has a user agent choose by "selecting the challenge with what it
+  considers to be the most secure auth-scheme that it understands", and a list a
+  caller searches must not let one unreadable challenge hide the readable one
+  behind it. A
+  parameter list is not searched that way: `auth_info` reports its fault and
+  ends, as `grammar::parameterised_list` already does.
+
+  `AuthParamIter` is `core::iter::FusedIterator`, and the promise is not a
+  formality: the walk records WHY it has no next element, and a fault it can
+  only meet by reading past the credential it was built from is recorded rather
+  than dropped. Being infallible, this iterator can answer a fault only by
+  ending — so the two ways it can end are kept apart, and a debug build asserts
+  of every `Credential` this crate builds that walking its own parameters
+  reaches the end of the credential rather than a fault behind it.
+
+  **RFC 9110 §11.2's one-name-once MUST is checked, per parameter list.**
+  "Authentication parameters are name/value pairs, where the name token is
+  matched case-insensitively and each parameter name MUST only occur once per
+  challenge", so `realm` repeated as `Realm` is `AuthError::DuplicateParameter`.
+  Applying it across a whole `#challenge` value instead would refuse the RFC's
+  own §11.6.1 example, which carries `realm` in both of its challenges — that
+  example is a test here, asserted challenge by challenge and parameter by
+  parameter.
+
+- **`MAX_CHALLENGE_LINES` and `MAX_PARAMS_PER_CREDENTIAL`, both sixteen, and both a
+  refusal rather than a cap.** Each can refuse input the grammar allows, and
+  each says so at its own definition rather than leaving a caller to find out.
+
+  A challenge spread over a seventeenth field line is
+  `AuthError::ChallengeSpansTooManyLines` and not the first sixteen lines of
+  one: a challenge is chosen by its scheme and answered with its parameters, so
+  part of one is not a smaller answer but a wrong one. A seventeenth distinct
+  parameter name is `AuthError::TooManyParameters` and not a list read with the
+  MUST left unchecked past the last name that fit, which is the alternative and
+  is worse than a refusal rather than merely different: a walk that stopped
+  CHECKING at its last slot would hand back a list it never established was
+  duplicate-free. `validator::MAX_TAGS` already made that trade in this crate
+  and is named in the same words at both constants.
+
+  Neither counts what RFC 9110 §5.6.1.2 excuses — "Empty elements do not
+  contribute to the count of elements present." — so a comma flood spends no
+  slot, and a `token68` credential spends none either, holding no name that
+  could repeat. The numbers are the storage: a slot is a `&[u8]`, so sixteen of
+  them is 256 bytes on a 64-bit target, which with the two `usize`s beside the
+  array is what puts `Credential` at 304. Both are parse-constants rather than
+  knobs — the storage is in the binary, so a caller cannot raise them.
+
+- **Five leaves join the crate's `no-panic` link proof**, one per entry point
+  plus the `auth-param` parser and the `token68` scanner, each proven
+  non-vacuous by injecting a reachable panic and reading which shims the link
+  then names. Two omissions are written at the shim site rather than left to be
+  inferred: no shim covers a `Display` impl, and the two generic walks are
+  proven for the one monomorphization the test instantiates.
+
+### What this cycle does NOT do
+
+- **No authentication scheme, because RFC 9110 defines none.** §11.1: "Aside
+  from the general framework, this document does not specify any authentication
+  schemes." Basic and Digest are RFC 7617 and RFC 7616, and neither is here.
+  Nothing in this module computes a credential, verifies one, or decides whether
+  a challenge should be answered — `scheme_is` compares the scheme token
+  case-insensitively and that is the whole of what it knows about schemes.
+
+- **`realm` is a parameter like any other, and there is no `Realm` type.** §11.5
+  assigns the protection-space comparison to the scheme, and this crate
+  implements no scheme, so two challenges with the same scheme and different
+  realms are two `Credential`s and nothing merges them. §11.5's own two
+  sentences about `realm`'s syntax bind a sender or are permissive to a
+  recipient; what licenses reading `realm=x` here is RFC 9110 §11.2's production
+  plus its reason, that scheme definitions "need to accept both notations, both
+  for senders and recipients, to allow recipients to use generic parsing
+  components regardless of the authentication scheme", which is precisely what
+  this is.
+
+- **Nothing here honours §11.6.3's trailer sentence, and nothing here needs to.**
+  `auth_info` takes field lines and takes nothing else — no section reaches it,
+  so no branch in it can turn on one, and a trailer section's lines are read
+  identically to a header section's by construction rather than by a check that
+  could be got wrong. Whether the scheme allows the field there is the caller's.
+
+- **No caller is wired to it yet.** `http1-proto` re-exports `grammar` and
+  `media` from this crate and nothing else, so a driver reaches `auth` by naming
+  `http-semantics` in its own manifest and handing it the field values a
+  `HeadView` walked out. That crate's README said §11.3's challenge walk was
+  work nobody had done, three lines after saying the neighbouring derivations
+  were computed there; both sentences are rewritten to the true state, which is
+  unwired rather than unreachable, and §11.3 is no longer listed as missing.
+
 ## A fifth gate whose green was narrower than its name, and a vocabulary that is not closed
 
 ### Tooling
