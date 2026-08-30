@@ -85,21 +85,24 @@
 //!   byte of a run nothing derives, and such a run ends at the first RAW comma
 //!   — `raw_comma_end`.
 //! - **Within a `#challenge` value.** The moment an element of a challenge
-//!   derives nothing, repeats a name, fills the last slot there is, or takes
-//!   the challenge past [`MAX_CHALLENGE_LINES`], **that challenge is refused,
-//!   and the rest of its extent is found by raw commas alone** — `seek` — with
-//!   the latched fault returned. No DQUOTE behind the first definitive fault may
-//!   steer where the refused challenge ends.
+//!   derives nothing, repeats a name, fills the last slot there is, carries a
+//!   byte §5.6.4 forbids inside a quoted-string, or takes the challenge past
+//!   [`MAX_CHALLENGE_LINES`], **that challenge is refused, and the rest of its
+//!   extent is found by raw commas alone** — `seek` — with the latched fault
+//!   returned. No DQUOTE behind the first definitive fault may steer where the
+//!   refused challenge ends.
 //!
 //! A refusal BINDS where it is met, and is never a fact left for a later reader
 //! to remember. The four faults an element carries are returned by the check
-//! that found them, one element at a time. The fifth — the line bound — is met
-//! at three crossings and binds at each: before an element is read on a line
-//! whose region cannot be held (`Section::outgrown`), at the crossing an element
-//! still OPEN makes, where the refusal IS the absence of a line so the scan
-//! cannot read one byte more (`Section::spend`), and on the region the challenge
-//! ends in (`Section::close`). A section that has refused holds no body at all,
-//! so a reader that went on regardless has nothing to be handed.
+//! that found them, one element at a time. The fifth — the forbidden byte — is
+//! returned by the scan that met it, before that element is derived at all. The
+//! sixth — the line bound — is met at three crossings and binds at each: before
+//! an element is read on a line whose region cannot be held
+//! (`Section::outgrown`), at the crossing an element still OPEN makes, where the
+//! refusal IS the absence of a line so the scan cannot read one byte more
+//! (`Section::spend`), and on the region the challenge ends in
+//! (`Section::close`). A section that has refused holds no body at all, so a
+//! reader that went on regardless has nothing to be handed.
 //!
 //! Keeping the second scope true is a requirement on the WALK rather than on
 //! any one function: **a challenge's elements are derived in the order they
@@ -118,10 +121,14 @@
 //! verdict for an element that no later element's bytes are read past costs the
 //! invariant nothing.
 //!
-//! One fault ends the walk instead of recovering from it.
-//! [`AuthError::InvalidQuotedString`] is met INSIDE a string that legitimately
-//! opened, so where that string ends is unknown and every comma behind it is a
-//! guess; [`challenges`] says so where it says what follows an error.
+//! No fault ends the walk. An earlier revision let
+//! [`AuthError::InvalidQuotedString`] do so, on the argument that a scan which
+//! failed inside a quoted-string can no longer tell a separating comma from
+//! data — but that argument states the premise of this invariant and then
+//! declines its conclusion, since raw-comma recovery is what a walk that cannot
+//! trust a comma DOES. That variant's own documentation carries the rest: the
+//! byte it fires on is one RFC 9110 §5.5 admits nowhere in a field value, so
+//! there is no derivation for the recovered bytes to be the data of.
 //!
 //! And one refusal is this READER's rather than the sender's, which makes it the
 //! one that can fire on a value some derivation still admits: a quoted value
@@ -206,10 +213,12 @@ use crate::grammar::{
 /// wrote INSIDE that value is read as the separator it is not: a caller can be
 /// shown a challenge those bytes were the data of.
 ///
-/// The alternative is to end the walk, and that is the worse half. A value this
-/// reader cannot hold may carry a byte §5.6.4 forbids past the bound, in which
-/// case there is no reading of it at all — and ending the walk would then hide
-/// every challenge behind it for a string that never was one. RFC 9110 §11.4
+/// The alternative was to end the walk, and it is the worse half — which is
+/// measured rather than argued: a value this reader cannot hold may carry a
+/// byte §5.6.4 forbids past the bound, and ending the walk there hid every
+/// challenge behind it for a string that never was one. That is the same
+/// argument [`AuthError::InvalidQuotedString`] now carries for itself, and no
+/// fault in this walk ends it any more. RFC 9110 §11.4
 /// has a user agent select "the challenge with what it considers to be the most
 /// secure auth-scheme that it understands", which it cannot do over a challenge
 /// it was never shown; being shown one too many is the error a caller can see
@@ -397,10 +406,34 @@ pub enum AuthError {
   ///
   /// Kept apart from
   /// [`UnterminatedQuotedString`](Self::UnterminatedQuotedString) because the
-  /// two say different things about what may follow. An open string is the end
-  /// of the input and nothing follows it; a forbidden byte leaves a walker
-  /// unable to tell a separating comma from data, and every boundary behind it
-  /// is a guess.
+  /// two say different things about the value. An open string is the end of the
+  /// input, and the value it holds may be perfectly well formed as far as the
+  /// input goes; a forbidden byte means no derivation of that string exists at
+  /// all.
+  ///
+  /// # What the byte is, and why the field value is already lost
+  ///
+  /// Every byte that reaches this is a CTL other than HTAB — RFC 9110 §5.6.4's
+  /// `qdtext` admits HTAB, SP, `%x21`, `%x23-5B`, `%x5D-7E` and `obs-text`, and
+  /// its `quoted-pair` escapes HTAB, SP, VCHAR and `obs-text`, so nothing else
+  /// is left to forbid. §5.5's `field-vchar = VCHAR / obs-text` admits none of
+  /// them ANYWHERE in a field value, and it names the three worst: "a recipient
+  /// of CR, LF, or NUL within a field value MUST either reject the message or
+  /// replace each of those characters with SP before further processing or
+  /// forwarding of that message." Of the rest it says "Field values containing
+  /// other CTL characters are also invalid; however, recipients MAY retain such
+  /// characters for the sake of robustness when they appear within a safe
+  /// context (e.g., an application-specific quoted string that will not be
+  /// processed by any downstream HTTP parser)." This IS a downstream HTTP
+  /// parser, so that exception is not this reader's to take.
+  ///
+  /// **So this fault refuses the challenge and the walk goes on**, like every
+  /// other refusal, and the rest of that challenge's extent is found by raw
+  /// commas. That is not a guess about a value: it is a recovery over bytes
+  /// that ARE no value, since a field value carrying one of them derives
+  /// nothing at §5.5 before §11 is reached at all. `obs-text` is the pair to
+  /// this and is deliberately not here — a high byte IS `qdtext`, so a value
+  /// carrying one stays one value and its commas stay data.
   #[error("byte forbidden inside a quoted-string")]
   InvalidQuotedString,
   /// One challenge's bytes are spread over more than [`MAX_CHALLENGE_LINES`]
@@ -2104,26 +2137,30 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 ///
 /// # What follows an error
 ///
-/// One `Result` per challenge, and the walk continues exactly while the comma
-/// structure is still trustworthy. Every boundary it finds is a comma OUTSIDE
-/// a quoted-string, so [`AuthError::InvalidQuotedString`] ends it: once a
-/// quoted-string scan has failed, no later comma can be told from data. Every
-/// other fault leaves the boundaries known and the walk goes on, because
-/// §11.4 has a user agent choose among challenges by "selecting the challenge
-/// with what it considers to be the most secure auth-scheme that it
-/// understands" — and one unreadable challenge must not hide the readable one
-/// behind it. That is a deliberate divergence from
+/// One `Result` per challenge, and **no fault ends the walk**. Every one of
+/// them refuses the challenge it was met in and the rest of that challenge's
+/// extent is found by raw commas, because §11.4 has a user agent choose among
+/// challenges by "selecting the challenge with what it considers to be the most
+/// secure auth-scheme that it understands" — and one unreadable challenge must
+/// not hide the readable one behind it. That is a deliberate divergence from
 /// [`crate::grammar::parameterised_list`], which poisons on any `Err`: a
 /// parameter list is not a list a caller searches.
 ///
+/// [`AuthError::InvalidQuotedString`] was the one exception until it was
+/// measured, on the argument that a scan which failed inside a quoted-string
+/// can no longer tell which commas separate. Raw-comma recovery is the answer
+/// to exactly that, and the byte that fault fires on is one RFC 9110 §5.5
+/// admits nowhere in a field value — so there is no reading of those bytes for
+/// the recovery to be wrong about. That variant's own documentation carries the
+/// derivation; ending the walk there hid every later challenge for a string
+/// that never was one.
+///
 /// A failed challenge is reported ONCE. The walk then seeks the next boundary
-/// over the same clean scan and does not re-read what is left of the failed
-/// challenge as challenges of its own, so in `Basic a=1, =x, type=b, Newauth
-/// c=1` the `type=b` is part of the failure already reported rather than a
-/// second one. A `QuotedScan::Invalid` met during that seek reports
-/// [`AuthError::InvalidQuotedString`] and stops the walk, exactly as it does
-/// anywhere else; one that never closes consumes the rest of the input, and
-/// the walk ends there.
+/// by raw commas and does not re-read what is left of the failed challenge as
+/// challenges of its own, so in `Basic a=1, =x, type=b, Newauth c=1` the
+/// `type=b` is part of the failure already reported rather than a second one.
+/// That seek reports no fault of its own and can report none: it opens no
+/// quoted-string, so there is none for a forbidden byte to be inside of.
 ///
 /// # How many faults one malformed value yields
 ///
@@ -2144,11 +2181,15 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// EARLY shows a caller more elements than the sender wrote, each answered on
 /// its own, and a run cut too LATE hides them. No challenge a sender wrote is
 /// ever lost by it. What a caller can be shown that the sender did not write is
-/// one case and one only: [`MAX_CHALLENGE_LINES`] is this READER's refusal
-/// rather than a fault of the sender's, so it can refuse a value some
-/// derivation still admits, and a comma the sender put inside such a value is
-/// then read as the separator it is not. That constant carries the trade and
-/// why this half of it is the safe one. But a caller that COUNTS the `Err`s of a
+/// two cases and two only, and they are not the same kind of thing.
+/// [`MAX_CHALLENGE_LINES`] is this READER's refusal rather than a fault of the
+/// sender's, so it can refuse a value some derivation still admits, and a comma
+/// the sender put inside such a value is then read as the separator it is not;
+/// that constant carries the trade and why this half of it is the safe one.
+/// [`AuthError::InvalidQuotedString`] can do the same arithmetic on a value NO
+/// derivation admits — the field value carries a byte §5.5 forbids anywhere in
+/// one — so what a caller is shown there is built out of bytes that were never
+/// a value to begin with. But a caller that COUNTS the `Err`s of a
 /// malformed value rather than reading them is counting something this reader
 /// decides and not something the sender wrote, and will see a different number
 /// than a quote-aware recovery gives. Read the faults; do not total them.
@@ -2169,8 +2210,8 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// [`MAX_PARAMS_PER_CREDENTIAL`] names in one of them; and whatever else that
 /// challenge's parameter list carries —
 /// [`AuthError::MalformedParameter`], [`AuthError::UnterminatedQuotedString`]
-/// or [`AuthError::InvalidQuotedString`]. One per challenge, and the section
-/// above says which of them the walk continues past.
+/// or [`AuthError::InvalidQuotedString`]. One per challenge, and the walk
+/// continues past every one of them.
 #[inline]
 pub fn challenges<'a, I>(lines: I) -> impl Iterator<Item = Result<Credential<'a>, AuthError>>
 where
@@ -2383,16 +2424,12 @@ where
         self.done = true;
         None
       }
-      Step::Element { .. } => {
-        let read = self.challenge();
-        // Every boundary this walk finds is a comma outside a quoted-string,
-        // so a scan that failed inside one leaves every comma behind it a
-        // guess. Nothing further is read.
-        if matches!(read, Err(AuthError::InvalidQuotedString)) {
-          self.done = true;
-        }
-        Some(read)
-      }
+      // Every refusal is recovered from the same way, so there is no fault to
+      // test for here: `challenge` hands each one to `refuse`, and the next
+      // step seeks the refused challenge's end by raw commas. A walk that
+      // ended on one of them would be deciding, from bytes it has already
+      // refused, that no challenge stands behind them.
+      Step::Element { .. } => Some(self.challenge()),
     }
   }
 }
@@ -2477,17 +2514,27 @@ where
   /// # Errors
   ///
   /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
-  /// quoted-string — the one fault that leaves the commas behind it unreadable
-  /// and so is the one this walk cannot continue past, and the one reported
-  /// here without [`refuse`](Self::refuse), since nothing is sought after it.
+  /// quoted-string, and [`AuthError::ChallengeSpansTooManyLines`] where the
+  /// line this element is still open on cannot be held. Both leave the cursor
+  /// INSIDE the challenge they refuse and both are refused by the caller, at
+  /// the one place every fault this can raise passes through — so what is left
+  /// of that challenge is found by raw commas like every other refusal, rather
+  /// than scanned on as a quoted-string whose every later byte would decide a
+  /// boundary for a challenge already refused.
   ///
-  /// [`AuthError::ChallengeSpansTooManyLines`] where the line this element is
-  /// still open on cannot be held. It is refused THERE, through
-  /// [`refuse`](Self::refuse) and with the cursor on the first byte of the
-  /// line just fetched, so what is left of the challenge is found by raw
-  /// commas like every other refusal — rather than scanned on as a
-  /// quoted-string whose every later byte would decide a boundary for a
-  /// challenge already refused.
+  /// Where the cursor stands differs between the two faults, and between the
+  /// two entrances of the first. A bound met at a join leaves it on the first
+  /// byte of the line just fetched, since that is the line the challenge could
+  /// not hold. A forbidden byte met on the head line leaves it on the first
+  /// byte of the ELEMENT, which the scan never advanced past; met after a join,
+  /// on the first byte of the line the scan choked on, since the bytes in front
+  /// of it are on a line this walk no longer holds. So a value written on one
+  /// field line and the same value split across a join can recover from
+  /// different points and yield different numbers of challenges — never fewer
+  /// than [`Challenges::next`] yielded before this fault refused rather than
+  /// ended the walk, and never one any derivation admits, but not the same.
+  /// Making them agree needs the OFFSET the scan choked at, which
+  /// `QuotedScan::Invalid` does not carry.
   ///
   /// Every OTHER fault the element carries is in the [`Element`] this returns,
   /// because a boundary this walk has not yet found must not be decided by
@@ -2513,10 +2560,10 @@ where
         // challenge's — including the bytes that begin no element of their own
         // but carry the close of this one. A region that does not fit refuses
         // the challenge on the spot: there is no line to hand back, which is
-        // what keeps this scan from reading one more byte of it.
-        section
-          .spend(spent, spent.len())
-          .map_err(|fault| walk.refuse(fault))?;
+        // what keeps this scan from reading one more byte of it. The refusal
+        // itself is `challenge`'s, at the one place every fault this function
+        // can raise passes through.
+        section.spend(spent, spent.len())?;
         Ok(Some(next))
       })?
     };
@@ -2539,8 +2586,9 @@ where
   ///
   /// The module doc's invariant, and this is the walk it is about. The moment
   /// an element of this challenge derives nothing, or repeats a name, or fills
-  /// the last slot there is, or overruns [`MAX_CHALLENGE_LINES`], the challenge
-  /// is refused — and the rest of it is handed to [`Challenges::seek`], which
+  /// the last slot there is, or carries a byte §5.6.4 forbids inside a
+  /// quoted-string, or overruns [`MAX_CHALLENGE_LINES`], the challenge is
+  /// refused — and the rest of it is handed to [`Challenges::seek`], which
   /// finds the next challenge by raw commas alone. Nothing behind that first
   /// fault opens a quoted-string, so nothing behind it can swallow the comma in
   /// front of the next challenge.
@@ -2548,13 +2596,11 @@ where
   /// # Errors
   ///
   /// [`AuthError::MissingScheme`] and [`AuthError::MalformedScheme`], every
-  /// fault a parameter list carries, and the
-  /// [`AuthError::ChallengeSpansTooManyLines`] met while an element is still
-  /// open across a join, all leave the cursor INSIDE the challenge that failed,
-  /// so [`refuse`](Self::refuse) sets `seeking` and the next boundary is found
-  /// there by raw commas. [`AuthError::InvalidQuotedString`] does not: it leaves
-  /// every comma behind it a guess, so the WALK ends rather than recovering,
-  /// which [`Challenges::next`] is where.
+  /// fault a parameter list carries, the [`AuthError::InvalidQuotedString`] a
+  /// scan raises, and the [`AuthError::ChallengeSpansTooManyLines`] met while
+  /// an element is still open across a join, all leave the cursor INSIDE the
+  /// challenge that failed, so [`refuse`](Self::refuse) sets `seeking` and the
+  /// next boundary is found there by raw commas.
   ///
   /// Two faults are reported with no seeking behind them, and both fire with
   /// the challenge's extent already complete: a body of exactly one element
@@ -2627,7 +2673,14 @@ where
           if let Err(fault) = check.settle() {
             return Err(self.refuse(fault));
           }
-          let element = self.skip_element(&mut section)?;
+          // Both faults the scan can raise leave the cursor INSIDE the
+          // challenge they refuse — on the line the bound was met at, or on
+          // the element the forbidden byte stands in — so both are refused
+          // here and neither ends the walk.
+          let element = match self.skip_element(&mut section) {
+            Ok(element) => element,
+            Err(fault) => return Err(self.refuse(fault)),
+          };
           if let Err(fault) = check.element(element) {
             return Err(self.refuse(fault));
           }

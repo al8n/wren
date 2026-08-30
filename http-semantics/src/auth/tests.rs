@@ -760,8 +760,10 @@ fn a_quote_where_no_string_may_open_hides_no_challenge() {
 
   // The control, at the one position RFC 9110 §11.2 does admit a string: the
   // DQUOTE opens, the %x00 IS inside a quoted-string, and §5.6.4 forbids it —
-  // in all three walks, and the `#challenge` one stops there, since after that
-  // fault every comma behind it is a guess.
+  // in all three walks. The two that poison say so and stop; the `#challenge`
+  // one refuses that challenge and reads the next, because the byte it choked
+  // on is one §5.5 admits nowhere in a field value and so nothing behind the
+  // fault is any value's data.
   assert_eq!(
     read_credential([&b"Basic a=\"x\x00y\""[..]]).unwrap_err(),
     AuthError::InvalidQuotedString
@@ -769,8 +771,9 @@ fn a_quote_where_no_string_may_open_hides_no_challenge() {
   let [first, past] = info::<2>([&b"a=\"x\x00y\", b=2"[..]]);
   assert_eq!(first.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
   assert!(past.is_none());
-  let [broken, past] = walk::<2>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
+  let [broken, newauth, past] = walk::<3>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
   assert_eq!(broken.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
   assert!(past.is_none());
 
   // And what the rule may not cost: at that admitted position the string still
@@ -943,18 +946,142 @@ fn every_way_a_challenge_is_refused_hides_no_challenge_behind_it() {
   assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
 
-  // And the fault that is NOT recovered from, because recovery would be a
-  // guess: a byte §5.6.4 forbids INSIDE a string that legitimately opened
-  // leaves nobody able to say where that string ends, so the walk stops. The
-  // trap is never reached, and that is the answer rather than an oversight.
+  // And the way that used to be the exception: a byte RFC 9110 §5.6.4 forbids
+  // INSIDE a string that legitimately opened. It is recovered from like every
+  // other refusal now, and `TRAP` is the trap for it exactly as it is for the
+  // rows above — the DQUOTE in `trap="open` swallows the comma in front of
+  // `Digest` for any recovery that reads a refused run as a quoted-string, and
+  // this one does not read a refused run at all.
   let mut value = b"Basic a=\"x\x00y\", ".to_vec();
   value.extend_from_slice(TRAP);
-  let [refused, past] = walk::<2>([value.as_slice()]);
+  let [refused, digest, past] = walk::<3>([value.as_slice()]);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::InvalidQuotedString
   );
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
+
+  // The same byte met on the far side of §5.2's join, where the string opened
+  // on one field line and the forbidden byte stands first on the next.
+  let [refused, digest, past] = walk::<3>([&b"Basic a=\"x"[..], b"\x00, Digest realm=z"]);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::InvalidQuotedString
+  );
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+}
+
+#[test]
+fn a_forbidden_byte_is_the_one_thing_a_high_byte_is_not() {
+  // The pair that says the recovery above is about the bytes RFC 9110 §5.6.4
+  // forbids and not about DQUOTEs. `obs-text` IS `qdtext` — the production is
+  // `qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text` — so a high byte
+  // inside a value leaves that value deriving, the comma inside it data, and
+  // the whole thing ONE challenge with ONE parameter. Nothing is yielded behind
+  // it, because there is nothing behind it: it is all the realm.
+  for high in [0x80_u8, 0xFF] {
+    let mut line = b"Basic realm=\"a".to_vec();
+    line.push(high);
+    line.extend_from_slice(b"b, Digest realm=z\"");
+    let [only, past] = walk::<2>([line.as_slice()]);
+    let only = only.unwrap().unwrap();
+    assert_eq!(only.scheme(), b"Basic", "{high:#04x}");
+    assert_eq!(
+      names::<2>(&only),
+      [Some(&b"realm"[..]), None],
+      "{high:#04x}"
+    );
+    assert!(
+      past.is_none(),
+      "{high:#04x} must not yield a second challenge"
+    );
+
+    // And escaped, which `quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )`
+    // admits for the same reason.
+    let mut escaped = b"Basic realm=\"a\\".to_vec();
+    escaped.push(high);
+    escaped.extend_from_slice(b"b, Digest realm=z\"");
+    let [only, past] = walk::<2>([escaped.as_slice()]);
+    assert_eq!(
+      only.unwrap().unwrap().scheme(),
+      b"Basic",
+      "{high:#04x} escaped"
+    );
+    assert!(past.is_none(), "{high:#04x} escaped");
+  }
+
+  // The control, one byte apart: a CTL is neither `qdtext` nor an octet a
+  // `quoted-pair` may escape, so the value derives nothing, the challenge is
+  // refused, and the comma the sender wrote inside the realm ends the refused
+  // run. What the recovery reaches here is a fault and not a challenge —
+  // `realm=z"` is no parameter, since the DQUOTE that would have closed the
+  // realm is still in the run — and the `obs-text` rows above are never
+  // recovered from at all.
+  let [refused, malformed, past] = walk::<3>([&b"Basic realm=\"a\x00b, Digest realm=z\""[..]]);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::InvalidQuotedString
+  );
+  assert_eq!(
+    malformed.unwrap().unwrap_err(),
+    AuthError::MalformedParameter
+  );
+  assert!(past.is_none());
+}
+
+#[test]
+fn where_a_forbidden_byte_is_recovered_from_is_where_the_scan_stood() {
+  // A KNOWN cost of recovering by raw commas from where the scan stands, kept
+  // visible rather than left to be found: RFC 9110 §5.2 makes these two field
+  // line lists ONE value, and they do not answer the same.
+  //
+  // On one line the scan never advanced past the element, so the cursor is on
+  // the element's first byte and the first raw comma from there is the one
+  // inside the realm — `Digest realm=z` stands behind it and is yielded.
+  let one_line = &b"Basic realm=\"ab, Digest realm=z, \x00c\""[..];
+  let [refused, digest, missing, past] = walk::<4>([one_line]);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::InvalidQuotedString
+  );
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert_eq!(missing.unwrap().unwrap_err(), AuthError::MissingScheme);
+  assert!(past.is_none());
+
+  // Split at that same comma, the element's earlier bytes are on a field line
+  // this walk no longer holds, so the cursor is on the first byte of the line
+  // the scan choked on — and `Digest realm=z` stands in FRONT of the first raw
+  // comma there, which puts it inside the refused run.
+  let split: [&[u8]; 2] = [b"Basic realm=\"ab", b" Digest realm=z, \x00c\""];
+  let [refused, missing, past] = walk::<3>(split);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::InvalidQuotedString
+  );
+  assert_eq!(missing.unwrap().unwrap_err(), AuthError::MissingScheme);
+  assert!(past.is_none());
+
+  // What makes it a cost and not a defect: the challenge the split spelling
+  // does not show is one NO derivation of the value puts there either. The
+  // value carries a byte RFC 9110 §5.5 admits nowhere in one, so
+  // `Digest realm=z` is neither a challenge nor the data of a value. Both
+  // spellings show at least what they showed before this fault refused rather
+  // than ended the walk, which was nothing. Making them agree needs the OFFSET
+  // the scan choked at, which `QuotedScan::Invalid` does not carry.
+  //
+  // The control that says the two spellings are otherwise one value: with the
+  // forbidden byte gone, both are one challenge with one realm.
+  let clean_one_line: [&[u8]; 1] = [b"Basic realm=\"ab, Digest realm=z, c\""];
+  let clean_split: [&[u8]; 2] = [b"Basic realm=\"ab", b" Digest realm=z, c\""];
+  for lines in [&clean_one_line[..], &clean_split[..]] {
+    let [only, past] = walk::<2>(lines.iter().copied());
+    let only = only.unwrap().unwrap();
+    assert_eq!(only.scheme(), b"Basic", "{lines:?}");
+    assert_eq!(names::<2>(&only), [Some(&b"realm"[..]), None], "{lines:?}");
+    assert!(past.is_none(), "{lines:?}");
+  }
 }
 
 #[test]
@@ -1963,12 +2090,20 @@ fn the_walk_continues_while_the_commas_are_still_trustworthy() {
     assert_eq!(last.unwrap().scheme(), b"Newauth", "{value:?}");
   }
 
-  // And the row that does not continue. Every boundary this walk finds is a
-  // comma outside a quoted-string, so once a quoted-string scan has failed it
-  // can no longer tell which commas were separators.
-  let [fault, past] = walk::<2>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
+  // And the row that used to be the one that did not continue. It does now:
+  // the argument for stopping was that a failed quoted-string scan can no
+  // longer tell which commas were separators, which is the premise raw-comma
+  // recovery answers — and the byte it fails on is one RFC 9110 §5.5 admits
+  // nowhere in a field value, so there is no reading of what follows for the
+  // recovery to be wrong about.
+  let [fault, newauth, past] = walk::<3>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
   assert_eq!(fault.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
-  assert!(past.is_none(), "nothing behind a forbidden byte is read");
+  assert_eq!(
+    newauth.unwrap().unwrap().scheme(),
+    b"Newauth",
+    "§11.4's user agent is shown the challenge behind a forbidden byte too"
+  );
+  assert!(past.is_none());
 
   // Which is a rule about the walk that READS a challenge, and there is one
   // walk it cannot be a rule about. A SEEK past an already-reported challenge
@@ -2187,10 +2322,9 @@ fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
   //
   // One value opens on the first line here and every continuation keeps it
   // open, so the SEVENTEENTH region is the one that does not fit — and the
-  // line behind it carries a byte §5.6.4 forbids and then a challenge. Reading
-  // that byte would end the walk and take `Digest` with it, which is the harm
-  // the module doc's invariant exists against; it is never read, because the
-  // line it is on is one this challenge may not hold.
+  // line behind it carries a byte §5.6.4 forbids and then a challenge. The
+  // fault reported is the bound and not the byte, because the bound is met at
+  // the crossing and the byte stands on the line that crossing could not hold.
   let mut too_many = [&b"j"[..]; 18];
   too_many[0] = b"Basic a=\"x";
   too_many[17] = b"\x00, Digest realm=z";
@@ -2203,18 +2337,20 @@ fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
   assert!(past.is_none());
 
   // ONE line fewer is sixteen regions, and there the byte IS read — the region
-  // it stands on is one this challenge holds. `InvalidQuotedString` ends the
-  // walk and `Digest` goes with it, which is that fault's own answer and not
-  // this bound's. The two rows together say the refusal above is the bound
-  // being met FIRST rather than the byte being unreachable.
+  // it stands on is one this challenge holds. Both faults refuse and recover,
+  // so `Digest` survives either way and the FAULT is the whole of what tells
+  // the two rows apart: this pair says the refusal above is the bound being met
+  // FIRST rather than the byte being unreachable, and an edit that made the
+  // bound fire a line late would answer `InvalidQuotedString` here as well.
   let mut within = [&b"j"[..]; 17];
   within[0] = b"Basic a=\"x";
   within[16] = b"\x00, Digest realm=z";
-  let [refused, past] = walk::<2>(within);
+  let [refused, digest, past] = walk::<3>(within);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::InvalidQuotedString
   );
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
 
   // The cursor stands at the FIRST byte of the line the challenge could not

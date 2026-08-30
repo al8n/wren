@@ -14,7 +14,7 @@ crate implementing any scheme. Phase 1 of the #70 ledger.
 
 `xtask/snapshots/http-semantics-documented.txt` gains 125 lines and loses none:
 `grep -vc '^#'` counts 572 documented items on it at `6360957` and 697 here.
-`cargo test -p http-semantics --all-features` reports 382 unit tests passing, 84
+`cargo test -p http-semantics --all-features` reports 384 unit tests passing, 86
 of them this module's, beside the no-panic harness's fifteen and one doctest.
 The crate is still `no_std`, allocation-free, clock-free and panic-free, on the
 same `std` / `alloc` / `no-atomic` tiers its siblings run, and
@@ -83,9 +83,10 @@ is green.
   opens a `quoted-string` only at the position §11.2 admits a value, and the
   string that opens there closes the last thing the element may hold. Within a
   `#challenge` value, the moment an element derives nothing, repeats a name,
-  fills the last slot there is, or takes the challenge past
-  `MAX_CHALLENGE_LINES`, **that challenge is refused and the rest of its extent
-  is found by raw commas alone** — so `Basic a="q` followed by
+  fills the last slot there is, carries a byte §5.6.4 forbids inside a
+  quoted-string, or takes the challenge past `MAX_CHALLENGE_LINES`, **that
+  challenge is refused and the rest of its extent is found by raw commas
+  alone** — so `Basic a="q` followed by
   `r"junk, trap="open, Digest realm=z` reports one `MalformedParameter` and
   still yields `Digest`, where a walk that found the boundary first and derived
   the body afterwards let `trap="` swallow the comma in front of it. Deriving
@@ -93,9 +94,31 @@ is green.
   true, and the `auth` module's own documentation states it as the invariant a
   change there has to keep.
 
+  **No fault ends the walk.** `AuthError::InvalidQuotedString` was the one
+  exception, on the argument that a scan which failed inside a quoted-string can
+  no longer tell which commas separate elements. That argument states the
+  premise of the invariant above and then declines its conclusion: raw-comma
+  recovery is what a walk which cannot trust a comma does. So
+  `Basic a="x\0, Digest realm=z` now reports `InvalidQuotedString` and still
+  yields `Digest`, where it used to hide it. Every byte that raises that fault
+  is a CTL other than HTAB, which §5.5 admits nowhere in a field value — it puts
+  a MUST on CR, LF and NUL and calls the rest "also invalid" — so there is no
+  derivation of the value for the recovery to be wrong about, and `obs-text` is
+  the pair that keeps the rule honest: `%x80-FF` IS `qdtext`, so
+  `Basic realm="a\xffb, Digest realm=z"` stays ONE challenge with ONE
+  parameter, comma and all.
+
+  Where that recovery starts is where the scan stood, which differs between a
+  forbidden byte met on the head field line and one met after §5.2's join — so
+  a value written on one line and the same value split across a join can yield
+  different numbers of challenges. Both yield at least what they yielded when
+  this fault ended the walk, and the challenge that differs is never one any
+  derivation of the value admits. `Challenges::skip_element` records it.
+
   **A refusal BINDS where it is met, and is never a fact left for a later
-  reader.** The four faults an element carries are returned by the check that
-  found them, one element at a time. The fifth — the line bound — is met at
+  reader.** The five faults an element carries are returned by the check or the
+  scan that found them, one element at a time. The sixth — the line bound — is
+  met at
   three crossings and binds at each, and the one that matters is the crossing an
   element still OPEN across §5.2's join makes: taking the region left behind and
   asking for the next line are ONE operation there, so a challenge that may not
@@ -126,13 +149,16 @@ is green.
   such a recovery reports one. No challenge a sender wrote is ever lost by it,
   and a caller counting the `Err`s of a malformed value is counting something
   this reader decides. What a caller can be shown that the sender did not write
-  is one case and one only: `MAX_CHALLENGE_LINES` is this recipient's refusal
-  rather than a fault of the sender's, so it is the only one that can refuse a
-  value some derivation still admits — a quoted-string that would have closed on
-  a line past the bound — and a comma the sender put inside such a value is then
-  read as the separator it is not. That constant carries the trade and why
-  ending the walk instead is the worse half of it; `challenges` says both where
-  a caller reads what it yields.
+  is two cases and two only, and they are not the same kind of thing.
+  `MAX_CHALLENGE_LINES` is this recipient's refusal rather than a fault of the
+  sender's, so it is the only one that can refuse a value some derivation still
+  admits — a quoted-string that would have closed on a line past the bound — and
+  a comma the sender put inside such a value is then read as the separator it is
+  not. `AuthError::InvalidQuotedString` can do the same arithmetic, but only on
+  a field value §5.5 admits nowhere, so what is recovered there was never a
+  value to be the data of. Both constants carry their trade and why ending the
+  walk instead is the worse half of it; `challenges` says both where a caller
+  reads what it yields.
 
   **Which of RFC 9110 §11.2's two alternatives a body took is a recipient's
   decision, and this module writes its own down.** §11.2 says in prose that a

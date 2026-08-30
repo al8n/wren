@@ -1474,14 +1474,18 @@ fn challenges_is_panic_free() {
   ];
   assert!(shim_challenges(black_box(&split[..16])) > 0);
   assert_eq!(shim_challenges(black_box(&split[..])), 0);
-  // Values with nothing to hand back: every element refused, a scan that fails
-  // inside a quoted-string and makes every comma behind it a guess, no lines
-  // at all, one empty line, and bytes that are not ASCII.
+  // A scan that fails inside a quoted-string on a byte RFC 9110 §5.6.4
+  // forbids, and the challenge behind it: that fault refuses the challenge and
+  // the same seek runs, so this drives the recovery rather than an early
+  // return out of the walk.
+  assert!(shim_challenges(black_box(&[b"Basic a=\"\x00\", Digest b=2".as_slice()])) > 0);
+  // Its pair, which must NOT take that path: `obs-text` IS `qdtext`, so the
+  // string closes, the comma inside it is data, and one challenge with one
+  // parameter is what comes back.
+  assert!(shim_challenges(black_box(&[b"Basic a=\"\xff, Digest b=2\"".as_slice()])) > 0);
+  // Values with nothing to hand back: every element refused, no lines at all,
+  // one empty line, and bytes that are not ASCII.
   assert_eq!(shim_challenges(black_box(&[b"=x".as_slice()])), 0);
-  assert_eq!(
-    shim_challenges(black_box(&[b"Basic a=\"\x00\", Digest b=2".as_slice()])),
-    0
-  );
   assert_eq!(shim_challenges(black_box(&[])), 0);
   assert_eq!(shim_challenges(black_box(&[b"".as_slice()])), 0);
   assert_eq!(
