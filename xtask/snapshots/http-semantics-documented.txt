@@ -92,8 +92,9 @@ http_semantics::auth::credentials
 http_semantics::auth::element_end
 http_semantics::auth::ends_element
 http_semantics::auth::is_token68_byte
+http_semantics::auth::param_value_at
+http_semantics::auth::raw_comma_end
 http_semantics::auth::read_credential
-http_semantics::auth::recover_to_comma
 http_semantics::auth::rejoin
 http_semantics::auth::skip_sp
 http_semantics::auth::token68

@@ -1405,6 +1405,11 @@ fn challenges_is_panic_free() {
       > 0
   );
   assert!(shim_challenges(black_box(&[b"=x\"j\x00unk, Digest realm=z".as_slice()])) > 0);
+  // A DQUOTE where RFC 9110 §11.2 admits no string at all, so the element ends
+  // at a RAW comma: on the line it began on, and across §5.2's join, where a
+  // string would otherwise have carried it over a whole field line.
+  assert!(shim_challenges(black_box(&[b"Basic a=x\"y, Digest realm=z".as_slice()])) > 0);
+  assert!(shim_challenges(black_box(&[b"Basic a=x\"y".as_slice(), b"Digest realm=z"])) > 0);
   // Empty lines, OWS-only lines and empty elements, which spend no entry.
   assert!(
     shim_challenges(black_box(&[
@@ -1550,6 +1555,9 @@ fn auth_info_is_panic_free() {
     shim_auth_info(black_box(&[b"a=\"x\"ju\"nk, b=2".as_slice()])),
     0
   );
+  // And a DQUOTE at a position RFC 9110 §11.2 admits no value at, which opens
+  // no string either: the element ends at the raw comma and derives nothing.
+  assert_eq!(shim_auth_info(black_box(&[b"a=x\"y, b=2".as_slice()])), 0);
   assert_eq!(shim_auth_info(black_box(&[b"a=\"\x00\"".as_slice()])), 0);
   assert_eq!(shim_auth_info(black_box(&[])), 0);
   assert_eq!(shim_auth_info(black_box(&[b"".as_slice()])), 0);

@@ -674,6 +674,151 @@ fn a_refused_run_hides_no_challenge_behind_it() {
 }
 
 #[test]
+fn a_quote_where_no_string_may_open_hides_no_challenge() {
+  // RFC 9110 §11.2's `auth-param = token BWS "=" BWS ( token / quoted-string )`
+  // admits a quoted-string at ONE position, the first byte of the value; and
+  // §5.6.2's `tchar`, §11.2's `token68` alphabet and §5.6.3's `BWS` each
+  // exclude DQUOTE. So a DQUOTE standing anywhere else in an element is a byte
+  // no production admits: it begins no string, and every comma behind it is
+  // still the §5.6.1.2 separator it looks like.
+  //
+  // §11.4 has a user agent select "the challenge with what it considers to be
+  // the most secure auth-scheme that it understands", so one DQUOTE written
+  // where no value begins must not take `Digest` away. Each value below places
+  // one at a different such position, and each is the same answer.
+  for value in [
+    // Behind a value that already took the `token` alternative.
+    &b"Basic a=x\"y, Digest realm=z"[..],
+    // The same, spelled with the BWS §11.2 puts around the `=`.
+    b"Basic a = x\"y, Digest realm=z",
+    // Behind a backslash, which is as little a `tchar` as the DQUOTE is, and
+    // which escapes nothing outside a quoted-string.
+    b"Basic a=x\\\"y, Digest realm=z",
+    // The same backslash with no `=` in front of the DQUOTE at all. One byte
+    // that is not the `=` stands between the name and the DQUOTE, which is as
+    // far from §11.2's value position as a hundred would be.
+    b"Basic a\\\"x, Digest realm=z",
+    // Inside the name, where the element has not reached its `=` yet.
+    b"Basic a\"b=1, Digest realm=z",
+    // At the element's first byte, with no name token at all.
+    b"Basic \"x, Digest realm=z",
+    // Behind an `=` with nothing in front of it to be a name.
+    b"Basic =\"x, Digest realm=z",
+    // Behind a `token68` run — the other alternative §11.3 admits after a
+    // scheme, and one whose alphabet holds no DQUOTE either.
+    b"Basic dGVzdA==\"x, Digest realm=z",
+    // And in a LATER element, once a well-formed one has been read.
+    b"Basic r=1, a=x\"y, Digest realm=z",
+  ] {
+    let [broken, digest, past] = walk::<3>([value]);
+    assert_eq!(
+      broken.unwrap().unwrap_err(),
+      AuthError::MalformedParameter,
+      "{value:?}"
+    );
+    let digest = digest.unwrap().unwrap();
+    assert_eq!(digest.scheme(), b"Digest", "{value:?}");
+    assert_eq!(
+      names::<2>(&digest),
+      [Some(&b"realm"[..]), None],
+      "{value:?}"
+    );
+    assert!(past.is_none(), "{value:?}");
+  }
+
+  // The same shape across RFC 9110 §5.2's join, where the reach is longer: a
+  // string opened there would have held the element past the join comma and
+  // swallowed the whole of the next field line with it.
+  let [broken, digest, past] = walk::<3>([&b"Basic a=x\"y"[..], b"Digest realm=z"]);
+  assert_eq!(broken.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // All three of this module's walks find an element's end with the same scan,
+  // and the two that are not the `#challenge` walk show its reach in the FAULT
+  // instead of in a challenge. A %x00 behind a DQUOTE that opens nothing is
+  // not inside a quoted-string, so RFC 9110 §5.6.4 has nothing there to
+  // forbid: the element is refused for deriving nothing, which is what the
+  // DQUOTE and the %x00 both are.
+  assert_eq!(
+    read_credential([&b"Basic a=x\"\x00y\""[..]]).unwrap_err(),
+    AuthError::MalformedParameter
+  );
+  assert_eq!(
+    read_credential([&b"Basic a=x\"y"[..], b"\x00\""]).unwrap_err(),
+    AuthError::MalformedParameter
+  );
+  let [first, past] = info::<2>([&b"a=x\"\x00y\", b=2"[..]]);
+  assert_eq!(first.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none());
+  // The `#challenge` walk goes on past that element, because it met no string:
+  // a comma outside one is a boundary it can still trust.
+  let [broken, newauth, past] = walk::<3>([&b"Basic a=x\"\x00y\", Newauth b=1"[..]]);
+  assert_eq!(broken.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  assert!(past.is_none());
+
+  // The control, at the one position RFC 9110 §11.2 does admit a string: the
+  // DQUOTE opens, the %x00 IS inside a quoted-string, and §5.6.4 forbids it —
+  // in all three walks, and the `#challenge` one stops there, since after that
+  // fault every comma behind it is a guess.
+  assert_eq!(
+    read_credential([&b"Basic a=\"x\x00y\""[..]]).unwrap_err(),
+    AuthError::InvalidQuotedString
+  );
+  let [first, past] = info::<2>([&b"a=\"x\x00y\", b=2"[..]]);
+  assert_eq!(first.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
+  assert!(past.is_none());
+  let [broken, past] = walk::<2>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
+  assert_eq!(broken.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
+  assert!(past.is_none());
+
+  // And what the rule may not cost: at that admitted position the string still
+  // opens, so the comma between its DQUOTEs is data and this is ONE challenge
+  // carrying ONE parameter rather than two of either. The position is reached
+  // by reading RFC 9110 §11.2's `BWS` off BOTH sides of the `=`, so each
+  // spelling of that whitespace has to arrive at the same DQUOTE.
+  for spelling in [
+    &b"Basic realm=\"a, b\""[..],
+    b"Basic realm = \"a, b\"",
+    b"Basic realm =\"a, b\"",
+    b"Basic realm= \"a, b\"",
+    b"Basic realm\t=\t\"a, b\"",
+  ] {
+    let credential = one([spelling]);
+    assert_eq!(
+      names::<2>(&credential),
+      [Some(&b"realm"[..]), None],
+      "{spelling:?}"
+    );
+    assert!(
+      matches!(credential.params().next().unwrap().value(), Ok(ParamValue::Quoted(v)) if v == b"a, b"),
+      "{spelling:?}"
+    );
+  }
+
+  // And what it does cost, which is one shape and not the axis. An unadmitted
+  // DQUOTE no longer pairs with a later one, so a DQUOTE that used to CLOSE a
+  // refused run now leaves the next admitted position free to OPEN.
+  // `Basic ",a=", Digest realm=z` reached `Digest` while its first DQUOTE
+  // swallowed its second; the first element is now the one refused byte `"`
+  // that the challenge is reported for, and the second is `a=` whose value is a
+  // quoted-string nothing closes, so the field ends inside it. That is §11.2's
+  // own reading of those bytes, and RFC 9110 §5.6.4 makes the comma in front of
+  // `Digest` data either way — which is the answer the control has always
+  // given, for a string admitted at the element's first value position.
+  let [broken, past] = walk::<2>([&b"Basic \",a=\", Digest realm=z"[..]]);
+  assert_eq!(broken.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert!(past.is_none());
+  let [control, past] = walk::<2>([&b"Basic a=\"x, Digest realm=z"[..]]);
+  assert_eq!(
+    control.unwrap().unwrap_err(),
+    AuthError::UnterminatedQuotedString
+  );
+  assert!(past.is_none());
+}
+
+#[test]
 fn a_field_line_carrying_no_element_bytes_spends_no_entry() {
   // RFC 9110 §5.6.1.2 opens "Empty elements do not contribute to the count of
   // elements present.", so a line that carries only OWS and commas is a run of

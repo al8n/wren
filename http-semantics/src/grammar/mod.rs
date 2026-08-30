@@ -1402,13 +1402,18 @@ pub(crate) enum Delim {
 ///
 /// Private to this module, and once was not: RFC 9110 §11.2's `#auth-param`
 /// walk asked this same question until it turned out to be asking a narrower
-/// one. An `auth-param` value is `( token / quoted-string )` taken WHOLE, so
-/// the first string to close in one of its elements closes the last thing that
-/// element may hold, and a scan that went on hunting delimiters past that
-/// close would read a DQUOTE among proven-underivable bytes as opening a
-/// second string. That module's `element_end` is where its narrower answer
-/// lives; the rule neither walk may restate is what a quoted-string IS, and
-/// both take it from [`scan_quoted`].
+/// one, in two ways. A DQUOTE opens a string only at the one position §11.2
+/// admits one — the first byte of an `auth-param` value, since `tchar`,
+/// `token68`'s alphabet and `BWS` all exclude DQUOTE — and everywhere else in
+/// an element it is a byte no production admits, which decides no boundary.
+/// And an `auth-param` value is `( token / quoted-string )` taken WHOLE, so the
+/// string that closes closes the last thing that element may hold, and a scan
+/// that went on hunting delimiters behind that close would read a DQUOTE among
+/// proven-underivable bytes as opening a second string. Either reading lets a
+/// malformed challenge swallow the comma in front of a well-formed one. That
+/// module's `element_end` is where its narrower answer lives; the rule neither
+/// walk may restate is what a quoted-string IS, and both take it from
+/// [`scan_quoted`].
 fn scan_to_delim(value: &[u8], at: usize, delim: u8) -> Delim {
   let mut at = at;
   loop {

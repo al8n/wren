@@ -1180,7 +1180,7 @@ fn rejoin(next: &[u8], escape: bool) -> Rejoin {
 ///
 /// Reaching anything ELSE, the remainder of the line derives nothing — and a
 /// run that derives nothing contains no quoted-string, so a DQUOTE in it opens
-/// none. [`recover_to_comma`] therefore takes the rest RAW, and this reports
+/// none. [`raw_comma_end`] therefore takes the rest RAW, and this reports
 /// `trails` for the element.
 ///
 /// Granting those bytes quoted-string semantics is what an earlier revision
@@ -1195,34 +1195,67 @@ fn after_close(value: &[u8], end: usize) -> (usize, bool) {
   let at = skip_ows(value, end);
   match value.get(at) {
     None | Some(&b',') => (at, false),
-    Some(_) => (recover_to_comma(value, at), true),
+    Some(_) => (raw_comma_end(value, at), true),
   }
 }
 
-/// Where the run at `at` — bytes some production has already refused — gives
-/// way to whatever the walk reads next: the first RAW comma, or the end of
-/// `value`.
+/// Where the run at `at` ends when no RFC 9110 §5.6.4 quoted-string is
+/// ADMITTED anywhere in it: the first comma, read raw, or the end of `value`.
 ///
-/// The one recovery this module has, and it reads no RFC 9110 §5.6.4
-/// quoted-string. A quoted-string is something a production ADMITS at a
-/// position, and no production admits anything here; a DQUOTE among refused
-/// bytes is one more refused byte. So every comma in the run is the §5.6.1.2
-/// separator it looks like, and the first of them is where the refused run
-/// stops.
+/// A quoted-string is something a production admits at a POSITION. Where none
+/// does, a DQUOTE is one more byte of the run — it opens nothing — so every
+/// comma in the run is the §5.6.1.2 separator it looks like, and the first of
+/// them is where the run stops.
+///
+/// Two kinds of run are read this way, and each caller says which one it holds.
+/// [`after_close`] and [`Challenges::seek`] hold bytes some production has
+/// already REFUSED, where nothing at all is admitted. [`element_end`] holds an
+/// element whose grammar puts no quoted-string in it: one that is no
+/// `auth-param`, or one whose value took §11.2's `token` alternative.
 ///
 /// Stopping at the end of the line rather than crossing §5.2's join is the
 /// same answer: the join IS a comma, so the run ends there either way.
 ///
-/// The direction this errs in is the one §11.4 needs. A recovery that ends too
-/// EARLY shows the caller more elements than the sender wrote, each answered
-/// on its own; one that ends too LATE hides them, and a hidden challenge is a
-/// challenge the caller cannot select.
-fn recover_to_comma(value: &[u8], at: usize) -> usize {
+/// The direction this errs in is the one §11.4 needs. A run cut too EARLY
+/// shows the caller more elements than the sender wrote, each answered on its
+/// own; one cut too LATE hides them, and a hidden challenge is a challenge the
+/// caller cannot select.
+fn raw_comma_end(value: &[u8], at: usize) -> usize {
   let mut at = at;
   while !matches!(value.get(at), None | Some(&b',')) {
     at = at.saturating_add(1);
   }
   at
+}
+
+/// Where RFC 9110 §11.2's `auth-param` admits the VALUE of the element that
+/// begins at `at`, or `None` for an element that is no `auth-param` and so
+/// admits a value nowhere in itself.
+///
+/// ```text
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// Three terminals stand in front of that value and all three are read here:
+/// the name `token`, the `=`, and the `BWS` RFC 9110 §5.6.3 defines as `OWS`'s
+/// own bytes, on either side of it. None of them can hold a comma, so the
+/// question is settled inside ONE list element; and none can hold one across a
+/// §5.2 join either, since a `token` carries no comma and §5.2 puts one at
+/// every join, so an element that has not reached its `=` on the line it began
+/// on never will. [`Challenges::opens_a_challenge`] asks these same two
+/// questions of the same bytes for its own reason and gets the same answer.
+///
+/// `Some` is no claim that the element parses. What stands at the offset may be
+/// neither of §11.2's two alternatives, and [`auth_param`] is the one place
+/// that is decided. This answers about POSITION alone, which is all a boundary
+/// scan may take from it.
+fn param_value_at(value: &[u8], at: usize) -> Option<usize> {
+  let name_end = token_end(value, at)?;
+  let eq = skip_ows(value, name_end);
+  if value.get(eq) != Some(&b'=') {
+    return None;
+  }
+  Some(skip_ows(value, eq.saturating_add(1)))
 }
 
 /// Where the RFC 9110 §5.6.1.2 element starting at `at` ends — the comma that
@@ -1232,29 +1265,58 @@ fn recover_to_comma(value: &[u8], at: usize) -> usize {
 /// a quoted-string IS, and the answer here is taken from it, so a comma inside
 /// one is data here exactly as it is everywhere else in the crate.
 ///
-/// What this adds over a plain delimiter scan is [`after_close`]'s rule: an
-/// `auth-param` value is one alternative taken whole, so the FIRST string to
-/// close in an element closes the last thing the element may hold. A scan that
-/// went on looking for delimiters past that close would read a DQUOTE in the
-/// bytes behind it as opening a second string — bytes that are already proven
-/// to derive nothing, deciding where the element ends.
-// gate-exempt: crate::grammar::scan_to_delim — the generic form, named for
-// contrast: §5.6.6's `parameters` and this module's own `=` splits still use
-// it, and it is deliberately NOT what an `#auth-param` element ends by.
+/// # A DQUOTE opens nothing where no string may begin
+///
+/// What a quoted-string is, is not where one may START, and the productions an
+/// `auth-scheme` may be followed by leave exactly one such position:
+///
+/// ```text
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// token68    = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+/// ```
+///
+/// RFC 9110 §5.6.2's `tchar` excludes DQUOTE, `token68`'s alphabet excludes it,
+/// and §5.6.3's `BWS` is SP and HTAB — so the first byte of an `auth-param`
+/// value is the only place any of these admits one. [`param_value_at`] is that
+/// position. Anywhere else a DQUOTE is a byte no production admits: it opens
+/// no string, and the element ends at the first RAW comma like any other run
+/// that holds none, which is what [`raw_comma_end`] answers.
+///
+/// Reading a DQUOTE as an opener wherever it fell is how a malformed challenge
+/// hid a well-formed one. In `Basic a=x"y, Digest realm=z` the value of `a`
+/// already took the `token` alternative, so the DQUOTE behind it begins
+/// nothing — yet it opened a string that swallowed the comma in front of
+/// `Digest`, and RFC 9110 §11.4 has a user agent select "the challenge with
+/// what it considers to be the most secure auth-scheme that it understands",
+/// which it cannot do over a challenge it was never shown.
+///
+/// # And a close is not an end
+///
+/// [`after_close`]'s rule, for the one string that may open here: an
+/// `auth-param` value is one alternative taken WHOLE, so the string that closes
+/// closes the last thing the element may hold, and the scan does not go on
+/// hunting delimiters behind it.
+///
+/// # What the rule costs
+///
+/// An unadmitted DQUOTE no longer pairs with a later one, so a DQUOTE that
+/// used to CLOSE a refused run now leaves the next admitted position free to
+/// OPEN. `Basic ",a=", Digest realm=z` reached `Digest` while its first DQUOTE
+/// swallowed its second, and hides it now that the value of `a` is the
+/// quoted-string §11.2 says it is, with nothing to close it. That is not this
+/// rule erring: a string opened where one IS admitted runs to wherever it
+/// closes and §5.6.4 makes every comma inside it data, which is why
+/// `Basic a="x, Digest realm=z` has always answered the same way.
 fn element_end(value: &[u8], at: usize) -> Delim {
-  let mut at = at;
-  loop {
-    match value.get(at) {
-      None | Some(&b',') => return Delim::At(at),
-      Some(&b'"') => {
-        return match scan_quoted(value, at.saturating_add(1), false) {
-          QuotedScan::Closed(end) => Delim::At(after_close(value, end).0),
-          QuotedScan::Open { escape } => Delim::Open(escape),
-          QuotedScan::Invalid => Delim::Invalid,
-        };
-      }
-      Some(_) => at = at.saturating_add(1),
-    }
+  let opens = param_value_at(value, at).filter(|&value_at| value.get(value_at) == Some(&b'"'));
+  let Some(quote) = opens else {
+    return Delim::At(raw_comma_end(value, at));
+  };
+  match scan_quoted(value, quote.saturating_add(1), false) {
+    QuotedScan::Closed(end) => Delim::At(after_close(value, end).0),
+    QuotedScan::Open { escape } => Delim::Open(escape),
+    QuotedScan::Invalid => Delim::Invalid,
   }
 }
 
@@ -1930,7 +1992,7 @@ where
   ///
   /// # A refused challenge decides no boundary
   ///
-  /// The commas are found by [`recover_to_comma`] and not by the element walk
+  /// The commas are found by [`raw_comma_end`] and not by the element walk
   /// [`Challenges::skip_element`] runs, and that is the whole difference
   /// between reading a challenge and getting past one. This walk collects
   /// nothing, so nothing it crosses is ever validated — and every byte it
@@ -1951,7 +2013,7 @@ where
   /// a §5.6.1.2 comma or the end of the value is all it ever stops at.
   fn seek(&mut self) {
     loop {
-      self.at = recover_to_comma(self.line, self.at);
+      self.at = raw_comma_end(self.line, self.at);
       match self.open_element(None) {
         Step::End => return,
         // A comma was crossed by construction: the element just skipped ended
