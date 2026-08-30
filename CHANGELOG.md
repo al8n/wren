@@ -12,9 +12,9 @@ had done. That caller can now select a challenge by its scheme and read that
 challenge's parameters to the last one, without allocating and without this
 crate implementing any scheme. Phase 1 of the #70 ledger.
 
-`xtask/snapshots/http-semantics-documented.txt` gains 120 lines and loses none:
-`grep -vc '^#'` counts 572 documented items on it at `6360957` and 692 here.
-`cargo test -p http-semantics --all-features` reports 379 unit tests passing, 81
+`xtask/snapshots/http-semantics-documented.txt` gains 125 lines and loses none:
+`grep -vc '^#'` counts 572 documented items on it at `6360957` and 697 here.
+`cargo test -p http-semantics --all-features` reports 381 unit tests passing, 83
 of them this module's, beside the no-panic harness's fifteen and one doctest.
 The crate is still `no_std`, allocation-free, clock-free and panic-free, on the
 same `std` / `alloc` / `no-atomic` tiers its siblings run, and
@@ -133,6 +133,14 @@ is green.
   behind it. A
   parameter list is not searched that way: `auth_info` reports its fault and
   ends, as `grammar::parameterised_list` already does.
+
+  `AuthParamIter` is `core::iter::FusedIterator`, and the promise is not a
+  formality: the walk records WHY it has no next element, and a fault it can
+  only meet by reading past the credential it was built from is recorded rather
+  than dropped. Being infallible, this iterator can answer a fault only by
+  ending — so the two ways it can end are kept apart, and a debug build asserts
+  of every `Credential` this crate builds that walking its own parameters
+  reaches the end of the credential rather than a fault behind it.
 
   **RFC 9110 §11.2's one-name-once MUST is checked, per parameter list.**
   "Authentication parameters are name/value pairs, where the name token is

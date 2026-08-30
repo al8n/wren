@@ -245,7 +245,7 @@ pub const MAX_PARAMS_PER_CREDENTIAL: usize = 16;
 // What the slot counts cost, checked at module scope so that every `cargo
 // check` on every tier enforces it. A `#[test]` would assert it only where a
 // test harness runs, which is every tier EXCEPT `thumbv6m-none-eabi` — the one
-// these numbers are written down for, where a 296-byte `Credential` is a real
+// these numbers are written down for, where a 304-byte `Credential` is a real
 // share of the stack budget. (`crate::validator`'s `TagList` assertions and
 // `crate::range`'s `RangesSpecifier` ones are written against the same
 // argument.)
@@ -1012,15 +1012,18 @@ impl<'a> Credential<'a> {
         body: self.body,
         line: 0,
         at: 0,
-        // Inert by construction, and kept because it says what it means: no
-        // element a `token68` was taken from is an `auth-param`, which
-        // `the_two_branches_are_never_both_derivable` is the argument for, so
-        // a walk started over that body would refuse the one element it found
-        // and this iterator would drop the fault and end anyway. A mutation of
-        // this initialiser therefore survives the suite for the same reason
-        // `rejoin`'s escape flag does, and is named here rather than left to
-        // be rediscovered.
-        done: self.token68.is_some(),
+        // A `token68` body is spent before this walk begins: §11.2's two
+        // alternatives are exclusive and no element a `token68` was taken from
+        // is an `auth-param`, which `the_two_branches_are_never_both_derivable`
+        // is the argument for. A walk started over that body instead would find
+        // the one element it holds, be refused there, and stop on
+        // `Stop::Fault`. Both spellings yield no parameters and only the ENDING
+        // tells them apart, which is what
+        // `a_walk_that_stops_on_a_fault_says_so` asserts of this initialiser.
+        stop: match self.token68 {
+          Some(_) => Some(Stop::Spent),
+          None => None,
+        },
       },
     }
   }
@@ -1334,11 +1337,13 @@ impl<'a> BodyCheck<'a> {
     if token.is_none() {
       self.settle()?;
     }
-    Ok(Credential {
+    let credential = Credential {
       scheme,
       body,
       token68: token,
-    })
+    };
+    walks_to_its_end(&credential);
+    Ok(credential)
   }
 }
 
@@ -1358,26 +1363,101 @@ impl<'a> Iterator for AuthParamIter<'a> {
   type Item = AuthParam<'a>;
 
   fn next(&mut self) -> Option<Self::Item> {
-    // Both `Err`s this discards are unreachable over a `Credential` that
+    // Both faults this can meet are unreachable over a `Credential` that
     // exists: every element of its body was read and derived once before that
     // value was built, and every fault either could carry was returned there
-    // instead. Dropping one ends the walk, which is the answer a fault would
-    // deserve anyway — a walker that met one can no longer say which of the
-    // commas behind it were separators — so this is an answer rather than an
-    // assertion that it cannot happen. Being unreachable, the `done` written
-    // below is inert: a mutation dropping it survives the suite, for the same
-    // reason `Credential::params`'s `done` initialiser does, and it is kept
-    // because it says what this walk's answer to a fault is.
-    let element = self.walk.step()?.ok()?;
+    // instead. Ending the walk is the answer a fault deserves anyway — a
+    // walker that met one can no longer say which of the commas behind it were
+    // separators — but ending is not ALL that happens to it. Neither fault is
+    // dropped: `ParamWalk::element` recorded the first and this records the
+    // second, so a walk that ran past its credential and was refused on the
+    // next challenge's first element is not the same state as one that reached
+    // the credential's last byte. `Stop` is why that distinction is the one
+    // thing here a mistake would otherwise be silent about.
+    let element = match self.walk.step()? {
+      Ok(element) => element,
+      // `ParamWalk::element` recorded it. There is nothing to add.
+      Err(_) => return None,
+    };
     match auth_param(element.bytes, element.tail) {
       Ok(param) => Some(param),
-      Err(_) => {
-        self.walk.done = true;
+      Err(fault) => {
+        self.walk.stop = Some(Stop::Fault(fault));
         None
       }
     }
   }
 }
+
+// Every `None` this iterator answers is a `Stop` written down, and nothing
+// clears one — so the walk is over for good, which is what `FusedIterator`
+// promises. Declaring the promise is what makes those writes load-bearing
+// rather than lines only their own comment argues for:
+// `a_walk_that_stops_on_a_fault_says_so` calls `next` again past both endings.
+impl core::iter::FusedIterator for AuthParamIter<'_> {}
+
+/// Why a walk over a credential's `#auth-param` list has no next element.
+///
+/// Two endings, and they are not one fact. A walk that reached the credential's
+/// own last byte has read every element there was. A walk that stopped on a
+/// fault read an element no production derives — and over a [`Credential`] that
+/// exists there is no such element, since every one of them was derived once
+/// before that value was built.
+///
+/// So [`Fault`](Self::Fault) is unreachable, and it carries the fault rather
+/// than folding into [`Spent`](Self::Spent) for exactly that reason: it is the
+/// one ending here a mistake could reach in silence. A walk that read one
+/// element too many meets the NEXT challenge's first element, [`auth_param`]
+/// refuses it, and the walk ends — leaving a parameter list that looks complete
+/// and a fault nobody was told about. [`BodyLines`]'s `held` is what stops the
+/// walk before it can happen; recording WHICH ending occurred is what keeps the
+/// two apart for a test and for a later edit, and [`walks_to_its_end`] is what
+/// asserts it of every credential this crate builds.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Stop {
+  /// The cursor reached the credential's own last byte: [`BodyLines`]'s `held`
+  /// on the last region, or the end of the regions it holds.
+  Spent,
+  /// An element the walk read derives nothing, and the fault it carried.
+  Fault(AuthError),
+}
+
+/// Asserts that a walk over `credential`'s own parameter list ends where the
+/// credential does.
+///
+/// The invariant [`Stop`] exists for, checked where every [`Credential`] this
+/// crate builds is built rather than only where one test looks. Each element of
+/// a body was derived once as the value was assembled — by
+/// [`BodyCheck::element`], over the elements the collecting walk produced — so
+/// re-deriving them through [`Credential::params`] reads the same elements and
+/// must reach [`Stop::Spent`]. Reaching [`Stop::Fault`] instead is a walk that
+/// read an element PAST the credential, which is the one way being wrong here
+/// is silent: the caller is handed a parameter list that looks complete and no
+/// fault is reported anywhere.
+///
+/// `the_body_a_challenge_collected_reads_the_same_alone` measures that
+/// agreement over a brute force of its own. This asserts it of every credential
+/// every fixture in the suite builds, and of every credential a debug build of
+/// a caller's own program builds.
+///
+/// Compiled away where `debug_assertions` are off, so the release build the
+/// no-panic link proof is taken over carries neither the walk nor the
+/// assertion, and neither does any other release build. A debug build carries
+/// it the way it carries every other debug assertion, on every tier.
+#[cfg(debug_assertions)]
+fn walks_to_its_end(credential: &Credential<'_>) {
+  let mut params = credential.params();
+  while params.next().is_some() {}
+  debug_assert!(
+    params.walk.stop == Some(Stop::Spent),
+    "a credential's own parameter list stopped on a fault rather than at its end"
+  );
+}
+
+/// The same check where `debug_assertions` are off, which is nothing at all.
+#[cfg(not(debug_assertions))]
+#[inline]
+const fn walks_to_its_end(_credential: &Credential<'_>) {}
 
 /// One walk of a credential's `#auth-param` list, as far as the next element.
 ///
@@ -1393,7 +1473,8 @@ struct ParamWalk<'a> {
   line: usize,
   /// Where in that region.
   at: usize,
-  done: bool,
+  /// Why the walk has no next element, or `None` while it still has one.
+  stop: Option<Stop>,
 }
 
 impl<'a> ParamWalk<'a> {
@@ -1403,14 +1484,14 @@ impl<'a> ParamWalk<'a> {
       body,
       line: 0,
       at: 0,
-      done: false,
+      stop: None,
     }
   }
 
   /// The next element of the list, or `None` at the end of it.
   fn step(&mut self) -> Option<Result<Element<'a>, AuthError>> {
     loop {
-      if self.done {
+      if self.stop.is_some() {
         return None;
       }
       let line = self.body.line(self.line);
@@ -1420,7 +1501,7 @@ impl<'a> ParamWalk<'a> {
       // again here. Asked before the `OWS` skip, so the byte it stops on is
       // the one that walk stopped on.
       if self.line.saturating_add(1) >= self.body.len && self.at >= self.body.held {
-        self.done = true;
+        self.stop = Some(Stop::Spent);
         return None;
       }
       self.at = skip_ows(line, self.at);
@@ -1430,7 +1511,7 @@ impl<'a> ParamWalk<'a> {
         // a new element.
         None => {
           if self.line.saturating_add(1) >= self.body.len {
-            self.done = true;
+            self.stop = Some(Stop::Spent);
             return None;
           }
           self.line = self.line.saturating_add(1);
@@ -1472,7 +1553,7 @@ impl<'a> ParamWalk<'a> {
         Ok(scanned.element)
       }
       Err(fault) => {
-        self.done = true;
+        self.stop = Some(Stop::Fault(fault));
         Err(fault)
       }
     }

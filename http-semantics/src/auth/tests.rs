@@ -990,6 +990,125 @@ fn the_regions_a_challenge_holds_are_the_lines_it_read() {
 }
 
 #[test]
+fn a_walk_that_stops_on_a_fault_says_so() {
+  // `Credential::params` is infallible because the list was derived once
+  // already, so the ONE thing a fault can do to that walk is end it. What it
+  // must not do is end it the way running out of credential does. A walk that
+  // read one element too many meets the NEXT challenge's first element,
+  // `auth_param` refuses it, the walk stops — and the caller is handed a
+  // parameter list that looks complete with no fault reported anywhere. That is
+  // the one place in this module where being wrong is silent, and `Stop` is
+  // what makes the two endings two states rather than one `bool`.
+  //
+  // `BodyLines`'s `held` is what keeps the overrun from happening, and
+  // `walks_to_its_end` asserts the ending of every credential this crate
+  // builds. This is what fails if the two endings become one again.
+
+  // The ordinary ending: the cursor reached the credential's own last byte.
+  let credential = one([&b"Basic a=1, b=2"[..]]);
+  let mut params = credential.params();
+  assert_eq!(params.next().map(|p| p.name()), Some(&b"a"[..]));
+  assert_eq!(params.next().map(|p| p.name()), Some(&b"b"[..]));
+  assert!(params.next().is_none());
+  assert_eq!(params.walk.stop, Some(Stop::Spent));
+  assert!(params.next().is_none(), "an ended walk stays ended");
+
+  // The fault ending, which only a body built by hand can reach: a region whose
+  // bytes run PAST the credential, so the walk meets `Digest realm=z` — the
+  // next challenge's first element, which no `auth-param` derives — and a
+  // parameter behind THAT which a walk not stopped by the fault would hand
+  // over as if it belonged here.
+  let line = &b"a=1, Digest realm=z, b=2"[..];
+  let mut body = BodyLines::new();
+  body.push(line, line.len()).expect("one region");
+  let overrun = Credential {
+    scheme: b"Basic",
+    body,
+    token68: None,
+  };
+  let mut params = overrun.params();
+  assert_eq!(params.next().map(|p| p.name()), Some(&b"a"[..]));
+  assert!(params.next().is_none(), "`Digest realm=z` is no parameter");
+  assert_eq!(
+    params.walk.stop,
+    Some(Stop::Fault(AuthError::MalformedParameter)),
+    "the fault that ended the walk is recorded, not dropped"
+  );
+  assert!(
+    params.next().is_none(),
+    "and the walk stays ended, so `b=2` behind the fault is never handed over"
+  );
+
+  // The other fault this walk can meet, and the other place it was dropped: a
+  // byte RFC 9110 §5.6.4 forbids INSIDE a quoted-string, which `scan_element`
+  // reports and `ParamWalk::element` records. It reaches `AuthParamIter` as a
+  // `Some(Err(_))` that yields nothing, so this is the ending the iterator
+  // itself never sees — and the walk still says which one it was.
+  let line = &b"a=\"\x00\""[..];
+  let mut body = BodyLines::new();
+  body.push(line, line.len()).expect("one region");
+  let forbidden = Credential {
+    scheme: b"Basic",
+    body,
+    token68: None,
+  };
+  let mut params = forbidden.params();
+  assert!(params.next().is_none());
+  assert_eq!(
+    params.walk.stop,
+    Some(Stop::Fault(AuthError::InvalidQuotedString)),
+    "the scan's own fault is recorded too"
+  );
+
+  // A `token68` body is spent before its walk begins, and that is the ordinary
+  // ending rather than a refusal — `Credential::params` initialises it so. Both
+  // spellings yield no parameters, and the ENDING is the whole of what tells
+  // them apart.
+  let token = one([&b"Basic dGVzdA=="[..]]);
+  assert!(token.token68().is_some());
+  let mut params = token.params();
+  assert!(params.next().is_none());
+  assert_eq!(params.walk.stop, Some(Stop::Spent));
+}
+
+/// Tests that read a formatted value: gated to the tiers with a heap, since the
+/// bare `no_std` tier has neither an allocator nor the `alloc as std` alias.
+#[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
+#[test]
+fn the_debug_of_a_body_prints_what_the_credential_holds() {
+  // `BodyLines`'s `Debug` is hand-written, and what it is written to do is
+  // print the CUT regions rather than the uncut lines they are stored as — so a
+  // `Credential` in a log or a failing assertion shows the bytes that
+  // credential holds and not the next challenge's behind them. A hand-written
+  // formatter is a second reader of `held`, and this is what says which of the
+  // two slices it reads.
+  let line = &b"Basic a=1, Digest realm=z"[..];
+  let credential = walk::<3>([line])[0]
+    .expect("a challenge")
+    .expect("Basic reads");
+  assert_eq!(
+    std::format!("{:?}", credential.body),
+    std::format!("{:?}", [&b"a=1"[..]]),
+    "the cut region, which is what this credential holds"
+  );
+  assert_ne!(
+    std::format!("{:?}", credential.body),
+    std::format!("{:?}", [credential.body.line(0)]),
+    "and not the stored line, which runs on into the next challenge"
+  );
+
+  // Every region but the last is the credential's as far as its line runs, so a
+  // body that crossed a join prints one whole region and one cut one.
+  let spanning = walk::<3>([&b"Basic a=\"x"[..], b"y\", Digest realm=z"])[0]
+    .expect("a challenge")
+    .expect("Basic reads");
+  assert_eq!(
+    std::format!("{:?}", spanning.body),
+    std::format!("{:?}", [&b"a=\"x"[..], &b"y\""[..]]),
+  );
+}
+
+#[test]
 fn the_body_a_challenge_collected_reads_the_same_alone() {
   // The two producers, compared directly. `Credential::params` hands a caller
   // the answer of the walk over the collected body for a challenge the

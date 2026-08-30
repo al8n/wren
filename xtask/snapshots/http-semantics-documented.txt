@@ -68,6 +68,7 @@ http_semantics::auth::MAX_PARAMS_PER_CREDENTIAL
 http_semantics::auth::ParamWalk
 http_semantics::auth::ParamWalk.at
 http_semantics::auth::ParamWalk.line
+http_semantics::auth::ParamWalk.stop
 http_semantics::auth::ParamWalk::element
 http_semantics::auth::ParamWalk::over
 http_semantics::auth::ParamWalk::step
@@ -99,6 +100,9 @@ http_semantics::auth::Step
 http_semantics::auth::Step::Element
 http_semantics::auth::Step::Element.after_comma
 http_semantics::auth::Step::End
+http_semantics::auth::Stop
+http_semantics::auth::Stop::Fault
+http_semantics::auth::Stop::Spent
 http_semantics::auth::ValueSpansFieldLines
 http_semantics::auth::ValueTail
 http_semantics::auth::ValueTail::Continues
@@ -122,6 +126,7 @@ http_semantics::auth::skip_sp
 http_semantics::auth::token68
 http_semantics::auth::token68_end
 http_semantics::auth::trim_ows_end
+http_semantics::auth::walks_to_its_end
 http_semantics::conditional
 http_semantics::conditional::DateField
 http_semantics::conditional::DateField::Absent
