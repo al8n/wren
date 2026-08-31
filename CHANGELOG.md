@@ -1,5 +1,899 @@
 # UNRELEASED
 
+## `http-semantics` — a boundary no reading ended in front of
+
+The previous commit proved that no reading of the bytes behind a fault holds the
+candidate comma inside an RFC 9110 §5.6.4 quoted-string. That is a proof about
+where the member ENDS only where no reading had already ended it at an EARLIER
+comma: a reading that stopped behind the candidate reads the bytes between the
+two as a member of its own, and certifying the candidate hides it.
+`scan_parameters` was asking about a comma some reading had already stopped in
+front of.
+
+```text
+transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+parameters         = *( OWS ";" OWS [ parameter ] )
+parameter          = parameter-name "=" parameter-value
+parameter-value    = ( token / quoted-string )
+quoted-string      = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+```
+
+`gzip;p="a, chunked;q="x", br` is the input. `grammar::parameter_end` cuts the
+faulting repetition's extent by OPENING the string at the first parameter's
+value position — it must, since that extent is what `grammar::ParamIter` hands
+the caller — and that string closes at the DQUOTE at the second parameter's
+value position, so the extent reaches the comma in front of `br`. Every reading
+stands outside a string at THAT comma, so the analysis certified it and the walk
+resumed at `br`. The reading that never opens the first string ended the member
+at the comma behind `"a`, and reads `chunked;q="x"` as a `transfer-coding` of
+its own. On `TE` and `Transfer-Encoding` that is a framing decision — RFC 9112
+§6.1 makes `chunked` the coding that says where the message body ends — and
+hiding one is the harm inventing one is.
+
+So the candidate comes from the FAULT and from nowhere else. The earliest comma
+from the fault is where the member ends under the reading that opens nothing,
+and no reading ends it earlier, since an open string only ever hides a comma —
+so every reading's own end lies at or behind that comma and none can have
+terminated in front of it.
+
+### Fixed
+
+- **`grammar::refused_member_end` takes its candidate comma from the fault.**
+  It no longer takes a cursor as well: the earliest comma from the fault is the
+  only offset that can be certified, so the parameter that let a caller name a
+  later one is gone. `scan_parameters` passes the `;` that opened the refused
+  repetition and keeps that repetition's greedy extent for the refused member's
+  SLICE alone — where the boundary is not derivable, the extent is handed back
+  as an extent and `Refusal::Unbounded` says everything behind it is unread.
+  `seek` and the arm of `member` behind RFC 9110 §5.2's join already stood on
+  the fault and are unchanged in behaviour.
+
+- **The three recovery entrances answer alike again.** They did not:
+  `gzip;p="a, chunked;q="x", br` was a bounded refusal from `scan_parameters`
+  and `ListError::MemberBoundaryUnknown` from both of the others, because only
+  `scan_parameters` had a greedily cut extent to take a candidate from.
+  `the_three_entrances_reach_one_verdict` carries that tail as a seventh row.
+
+- **The brute force asks the rule as a rule.** `every_reading_ends_at` walks
+  every opener choice and returns the offset only where EVERY reading ends the
+  member there, which is the half a coverage question cannot state, and
+  `every_reading_is_carried_over_a_generated_corpus` asserts
+  `grammar::refused_member_end` against it over all 1,111,460 sections. The old
+  corpus already held the shape — `;t=","t` is seven bytes over family A's own
+  alphabet — and 2,039 of the sections stand in it; that count is asserted, so a
+  corpus that stopped reaching the shape would red rather than pass quietly.
+  The two entrance shapes the old test asked at were one question asked twice,
+  which is why it never saw them: its refusal count halves exactly, 29,076 to
+  14,538, and nothing else about the corpus moves.
+
+- **And the corpus reaches that shape through the WALK, not only through the
+  analysis asked directly.** Both of the spellings above stand where the walk
+  dies: a section led by a `;` has an empty member name, which
+  `grammar::parameterised_list` refuses before `scan_parameters` is entered. So
+  every section is spelled a third way, with one `tchar` written in front of
+  that `;`, and walked end to end — 585,730 of them, 1,831 standing in the
+  shape and 775 deferring on it, each count asserted. The four counts the other
+  two spellings assert do not move, and
+  `the_shortest_named_section_in_the_shape_is_pinned` holds one such input on
+  its own, measured offset by offset, so the shape outlives any change to the
+  generator.
+
+- **Why the walk carries the same underivable-boundary guard twice is
+  asserted.** `a_joined_refusal_leaves_the_cursor_where_no_member_opens` sweeps
+  every string family A's alphabet spells to seven bytes at every offset a
+  quoted-string could close at: where `after_close` leaves a cursor no boundary
+  is derivable from, that cursor is on a `;` and the element there is empty, so
+  the walk reaches `seek` and asks the same question at the same offset. 858
+  cursors reach it, and the count is asserted so the sweep cannot go quiet.
+
+### Changed
+
+- **Twenty-nine probed answers move and none of the previous commit's 410
+  does.** Re-run byte for byte, the previous round's whole probe is identical;
+  every mover is a shape this round adds, and every one is a refused repetition
+  whose string swallows a comma.
+
+- **Nineteen of them were hiding a `transfer-coding` the sender wrote.**
+  Measured by walking the bytes behind the candidate comma on their own, which
+  is what the reading that leaves the string shut reads there: ` chunked;q="x",
+  br` is `chunked` and then `br` under both productions. That spelling appears
+  at every entrance, mid-line, on a later line, behind §5.2's join, with the
+  `BWS` §10.1.4 admits, with a settled repetition in front of the fault, and
+  with a parameter fault of its own. The cost is that the `br` behind it — a
+  member under every reading — is no longer reported either: the walk is
+  ordered, and yielding `br` after `gzip` states a member sequence no reading
+  has.
+
+- **Eight were reporting a member only the greedy reading admits.**
+  `gzip;p="a, b"c, chunked` yielded `chunked`, and the shut reading reads
+  `b"c` there, which is no `token` and no member at all. So did
+  `gzip;p="a, chunked"x, br` and `t;t=","t,t`, the shortest spelling over the
+  generated corpus's own alphabet.
+
+- **Two `media::media_type` answers change which refusal they report.**
+  `text/plain;p="a, text/html;q="x", text/css` was `MediaError::NotASingleton`
+  and is now `MediaError::Parameters(ListError::NotAToken)`. `has_bare_comma`
+  reports no bare comma behind an unbounded refusal — the rule `698b8e9`
+  established — so the value is refused for the parameter that does not parse
+  rather than for a second media type whose comma the walk can no longer place.
+  Both are refusals of the same value.
+
+- **A member behind a refused repetition whose extent crosses no comma is still
+  reported.** `gzip;p="a"x, chunked`, `gzip;p="a chunked"x, br` and
+  `gzip;;x="a", chunked` are unchanged, and so are `gzip;q, chunked` and
+  `m;;a="x;b="y,chunked,z",w`: where the extent reaches no comma the fault does
+  not, the candidate is the same offset either way.
+
+`cargo test -p http-semantics --all-features` reports 424 unit tests passing,
+beside the no-panic harness's fifteen and one doctest; `--no-default-features`
+reports 404. `http1-proto`'s 409 and `websocket-proto`'s 277 are unchanged, and
+`xtask/snapshots/http-semantics-documented.txt` does not move — no documented
+item is added or removed. The crate is still `no_std`, allocation-free and
+panic-free on every tier, and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+## `http-semantics` — a comma some reading holds inside a string is no boundary
+
+The previous commit decided a member's end behind a fault by COMPARING two
+readings of the bytes in front of it: one that opens no RFC 9110 §5.6.4
+quoted-string and one that opens every string the field's own production
+admits. Two readings agreeing is not every reading agreeing, and the readings
+between them are readings too.
+
+```text
+transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+parameters         = *( OWS ";" OWS [ parameter ] )
+parameter          = parameter-name "=" parameter-value
+parameter-value    = ( token / quoted-string )
+quoted-string      = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+```
+
+`m;;a="x;b="y,chunked,z",w` is the input. The empty slot RFC 9110 §10.1.4
+refuses is a fault, and behind it two positions admit a string. The greedy
+reading opens the one at the `a` parameter's value — which swallows the DQUOTE
+that would have opened the one at the `b` parameter's — so it and the raw
+reading both end the member at the comma behind `y`, they agreed, and the walk
+took it and yielded `chunked`. The reading that leaves the first shut opens the
+second, and holds that comma and the `chunked` behind it inside a value the
+sender wrote. On `TE` and `Transfer-Encoding` that is a framing decision made
+up out of the sender's data, which is the one thing this walk exists not to do.
+
+So the rule is no longer a comparison. It is a subset construction over every
+choice of which admitted strings a reading opens, carried one byte at a time,
+and the comma is taken only where NO reachable state holds it inside a string.
+
+### Fixed
+
+- **A member behind a fault is reported only where no reading of the bytes in
+  front of it covers the comma.** `grammar::refused_member_end` takes the
+  earliest comma `grammar::raw_comma_end` reaches — which is where the member
+  ends under the reading that opens nothing, and no reading ends it earlier,
+  since an open string only ever hides a comma — and hands it back only where
+  the new `grammar::readings_at` reports every reading outside a string there.
+  That walk carries `grammar::Readings`, three flags wide: some reading inside
+  a string, some reading inside one with a `quoted-pair` backslash pending, and
+  some reading holding one that reached a byte RFC 9110 §5.6.4 forbids and so
+  can never close. The reading outside every string is the fourth state and
+  needs no flag, because it is reachable at every offset. Each byte is stepped
+  through `grammar::scan_quoted`, this crate's one implementation of what a
+  quoted-string is, so no second spelling of `qdtext` and `quoted-pair` exists
+  to drift from it.
+
+- **The state walk starts at the FAULT, not at the offset the walk stands on.**
+  `scan_parameters` finds its fault at a repetition whose own extent was already
+  cut by opening that repetition's string, so it now passes the `;` that opened
+  the refused repetition as well as its end. Without it
+  `m;;a="x;b="y,chunked,z",w` read as RFC 9110 §5.6.6's `parameter` still
+  yielded `chunked` — §5.6.6
+  brackets the empty slot, so the fault there is the `a` repetition itself and
+  the greedy cut of that repetition stood in front of the walk. `seek` and the
+  arm behind §5.2's join stand on the fault already and pass it for both.
+
+- **The property is brute-forced, since it is now provable rather than
+  compared.** `every_reading_is_carried_over_a_generated_corpus` runs 1,111,460
+  generated parameter sections — exhaustive over two alphabets, pseudorandom and
+  longer over a third — and asserts, at both entrance shapes and under both
+  productions, that the subset construction agrees with an independent
+  enumeration of every opener choice, and that no member the walk yields over
+  those bytes begins at an offset that enumeration says a reading covers. The
+  corpus size, the 29,076 refusals it reaches and the 150,209 members it yields
+  are asserted too, so a generator that produced nothing cannot pass it.
+
+### Changed
+
+- **Twenty-two of 410 probed answers move, every one of them the same way.** A
+  boundary the previous commit took because two readings agreed is now refused
+  because a third does not, and `ListError::MemberBoundaryUnknown` says so. None
+  moves the other way and no answer moves between `Ok` and `Err` on the first
+  member. **Eighteen stop yielding a `chunked` that stood inside a parameter
+  value** — the reviewer's counterexample at every entrance, under both
+  productions, with two admitted positions and with three.
+
+- **The other four are members that were real, and boundaries that were not.**
+  `m;;a="x;b="y, z", w` is one of the twenty-nine the previous commit restored,
+  and its release note recorded that it recovered because both extremes cut at
+  the same comma. The `w` behind that comma is a member under every reading; the
+  COMMA is a separator under only some of them, and the same bytes with
+  `chunked` in place of `z` turn that same boundary into an invented transfer
+  coding. A boundary that is right by luck is not one this walk may take, so it
+  is refused with the rest of its class, and `gzip;;a="x;b="y, chunked", br` and
+  the RFC 9110 §5.6.6 spellings of both go with it. What a reading disputes here
+  is where the member ENDS, which is exactly what
+  `ListError::MemberBoundaryUnknown` reports.
+
+- **A member whose boundary every reading agrees about is still reported.**
+  `gzip;;x="a", chunked` and `gzip;q, chunked` are unchanged, and so is
+  `gzip;;a="x;b="y", chunked` — the same shape as the counterexample with the
+  exposed string CLOSING in front of the comma, where the readings differ about
+  which strings open and agree about where the member ends anyway.
+
+`cargo test -p http-semantics --all-features` reports 423 unit tests passing,
+beside the no-panic harness's fifteen and one doctest; `--no-default-features`
+reports 403. `grammar::quoted_comma_end` is replaced by `grammar::readings_at`
+and `grammar::Readings`, so
+`xtask/snapshots/http-semantics-documented.txt` goes from 734 documented items
+to 741 — one deletion and eight additions. `http1-proto`'s 409 and
+`websocket-proto`'s 277 are unchanged. The crate is still `no_std`,
+allocation-free and panic-free on every tier — the state set is three `bool`s
+and no collection — and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+## `http-semantics` — a string that closes before the comma moves no boundary
+
+The previous commit stopped `grammar::parameterised_list` manufacturing a member
+out of a parameter value, and stopped it too widely. Its trigger was a POSITION:
+a repetition behind the refused one whose value BEGAN with a DQUOTE. RFC 9110
+§10.1.4 and §5.6.4:
+
+```text
+transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+quoted-string      = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+```
+
+For `gzip;;x="a", chunked` the empty slot RFC 9110 §10.1.4 does not admit is a
+fault, and `x`'s string does open at the position that production names — but it
+CLOSES in front of the only comma, so both readings of the value end the member
+there. `chunked` was knowable and was suppressed anyway, on one field line and
+across §5.2's join alike. A DQUOTE where a string MAY open is not a string that
+DOES cover the delimiter.
+
+Two triggers have now been wrong in opposite directions: stopping at any fault
+hid `chunked` in `gzip;q, chunked`, which holds no DQUOTE for any production to
+open a string with, and stopping at a value position hid it above. So this one
+is stated as a comparison of two computations rather than as a property of the
+bytes, which is a thing that can be decided rather than judged.
+
+### Fixed
+
+- **A member behind a fault is reported whenever the two readings of the bytes
+  in front of it agree.** `grammar::refused_member_end` now asks
+  `grammar::raw_comma_end`, which opens no string at all, and the new
+  `grammar::quoted_comma_end`, which opens every RFC 9110 §5.6.4 quoted-string
+  the field's own `parameter` production admits, of the same bytes from the same
+  offset. Where the two answer the same comma the member ends there: that comma
+  is §5.6.1.2's separator whichever reading is the sender's, so the boundary is
+  known WITHOUT deciding which one that is. Where they answer different commas,
+  or the quoted one closes no string and so answers none,
+  `ListError::MemberBoundaryUnknown` says the end is not derivable, exactly as
+  before. `gzip;;x="a, chunked, b", br` still yields no `chunked`: there the two
+  readings end the member 13 bytes apart.
+
+- **One function, three entrances, and a test that reds if they part.**
+  `scan_parameters`, the arm of the walk that handles a value which closed on a
+  later field line and ran on past that close, and `seek` all ask
+  `refused_member_end`, and none of them asks either scan directly — so the
+  comparison cannot be half-applied. `the_three_entrances_reach_one_verdict`
+  spells four tails at all three entrances under both `ParamSyntax` values and
+  asserts one verdict for each of the twenty-four walks.
+
+### Changed
+
+- **Twenty-nine of 375 probed answers move, every one of them the same way.** A
+  member the previous commit stopped yielding is yielded again, because both
+  readings place its start at the same offset. None moves the other way, none is
+  a member read out of a quoted-string, and no answer moves between `Ok` and
+  `Err`. One of the twenty-nine, `gzip;;x="chunked", br`, is one of the thirty
+  members that commit had lost; the other twenty-eight are shapes this round
+  added to the probe, including the reviewer's `gzip;;x="a", chunked` at every
+  entrance and under both productions.
+
+- **Twenty-nine of those thirty stay lost, and each for a stated reason.**
+  Twenty-five hold an admitted string that COVERS the earliest raw comma, so the
+  two readings end the member at different offsets — `gzip;;q="a,b", chunked`
+  ends it at offset 10 read raw and at 13 with the string open. Four hold one
+  that never closes on the line in hand, so the quoted reading reaches no comma
+  to be compared. Both are the underivable case and neither is a widening this
+  commit could have taken without guessing.
+
+- **A reading in which SOME admitted strings open is not asked.** The two scans
+  are the extremes, and the previous commit's own counterexample —
+  `m;;a="x;b="y, z", w`, where opening `a`'s string exposes a comma that the
+  string the `b` parameter would open covers — now recovers, because both extremes cut at
+  that same comma. The third reading is recorded in `refused_member_end`'s doc
+  rather than left for the next reader to find.
+
+`cargo test -p http-semantics --all-features` reports 422 unit tests passing,
+two of them this change's, beside the no-panic harness's fifteen and one
+doctest; `--no-default-features` reports 402. No older test moved with an
+answer: every one of the twenty-nine had been measured by probe and pinned by
+none. `http1-proto`'s 409 and `websocket-proto`'s 277 are unchanged.
+`xtask/snapshots/http-semantics-documented.txt` goes from 733 documented items
+to 734, one addition and no deletion. The crate is still `no_std`,
+allocation-free and panic-free on every tier, and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+## `http-semantics` — what a fault leaves unknown is not the walk's to invent
+
+`grammar::parameterised_list` cut a refused member at the first RAW comma behind
+the repetition that earned the refusal, on the ground that a `parameters` which
+has failed to derive opens no quoted-string behind itself. That reading cuts
+inside bytes the sender wrote as a value. RFC 9110 §10.1.4:
+
+```text
+transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+```
+
+For `gzip;;x="a, chunked, b", br` the walk reported the malformed `gzip`, then a
+`chunked` that had stood inside `x`'s quoted-string, then a `b"` that is no
+`token` — which ends the walk and buries the `br` the sender really did write. On
+the field that decides framing, manufacturing a coding and hiding one are the
+same harm, and this input did both at once.
+
+The other reading is no better. Admitting the string takes the comma in front of
+`chunked` as data, and where that string never closes — `gzip;;q="oops, chunked`
+— it swallows a coding the sender did send. Behind a fault neither reading is
+derivable, and this stops offering either.
+
+### Fixed
+
+- **A member is never manufactured out of a parameter value.** The new
+  `grammar::refused_member_end` crosses only the runs in which no
+  `parameter-value` position stands: RFC 9110 §5.6.4's
+  `quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE` opens at a DQUOTE,
+  §5.6.6 and §10.1.4 admit one at the first byte of a `parameter-value` and
+  nowhere else, §5.6.2's `tchar` excludes DQUOTE and §5.6.3's `OWS` is SP and
+  HTAB. A comma with no such position in front of it is §5.6.1.2's separator
+  under EVERY reading of the value, and the member behind it is reported.
+  Reaching a repetition that does open one, there is no rule left to pick
+  between the two readings: the walk yields the member the fault was found in,
+  with that fault on it, and then the new `ListError::MemberBoundaryUnknown`.
+  Everything behind an unresolved boundary is unread, and the walk says so
+  rather than ending as though the value had.
+
+- **The same question, asked at the two other places a refusal recovers.**
+  `after_close` now stops a run-on value at its own repetition's end rather than
+  running to the comma, so the cross-repetition question is asked once; and the
+  walk's `seek` asks it of each element of a refused member it crosses, since
+  `y"z;w="a, chunked, b"` standing behind one would otherwise resume the walk
+  wherever that string's commas fall.
+
+- **A comma the walk cannot vouch for is not evidence of a list.** RFC 9110 §8.3
+  makes `Content-Type` a singleton, and `grammar::has_bare_comma` answers that
+  through the same `member_end` the walk uses so the two cannot disagree. Where
+  the boundary is underivable it now reports no comma, and `media_type` reports
+  the parameter fault the value certainly does have:
+  `text/plain;p x;q="a,b"` is `Parameters(NotAToken)` again, where the previous
+  commit had made it `NotASingleton`. Three more values of that shape move with
+  it, which retires that commit's second recorded concern.
+
+### Changed
+
+- **`ListError` gains `MemberBoundaryUnknown`.** The enum is `#[non_exhaustive]`,
+  so no exhaustive match a caller wrote is broken. `media` needs no variant of
+  its own: `MediaError::Parameters` carries it, as it carries every other walker
+  detail. No public signature changes.
+
+- **Fifty-six of 317 probed answers move**, measured over the public API against
+  `ba20db0` and this tree. Fifty-one are the walk's, and every one of them is a
+  refusal before and a refusal after. 19 stop yielding a member that had been
+  read out of a quoted-string the field's own `parameter` admits — the finding,
+  retired. 4 stop yielding one that stood behind a DQUOTE at such a position
+  whose string never closes. 26 stop yielding one written outside every such
+  string, whose position only a cross-reading argument establishes and which the
+  walk therefore declines to place. 2 gain the trailing error alone, with
+  nothing behind them to hide. The remaining five are `media_type`'s and each
+  restores the answer it gave at `76617f6`. No value that parsed stopped
+  parsing, and no answer moved from `Err` to `Ok`.
+
+`cargo test -p http-semantics --all-features` reports 420 unit tests passing,
+two of them this change's, beside the no-panic harness's fifteen and one
+doctest; `--no-default-features` reports 400. Five older tests moved with the
+answer they pinned, each of which had asserted that a member behind an
+underivable boundary is yielded. `http1-proto`'s 409 and `websocket-proto`'s 277
+are unchanged. `xtask/snapshots/http-semantics-documented.txt` goes from 725
+documented items to 733, eight additions and no deletion. The crate is still
+`no_std`, allocation-free and panic-free on every tier, and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+## `http-semantics` — a verdict taken after the boundary is a verdict that can move it
+
+`grammar::parameterised_list` found a member's extent and then verdicted the
+parameters inside it, in that order and in two passes. Three rounds of review
+had each carried a little more information across RFC 9110 §5.2's field-line
+join, and each time the boundary pass had already used bytes the verdict pass
+would go on to refuse. This replaces the two passes with one: a repetition is
+derived the moment its extent is settled and BEFORE the next repetition's bytes
+are read, so no refusal can arrive after the boundary it is a refusal about.
+
+### Fixed
+
+- **A refused parameter could still hide the member written behind it.**
+  RFC 9110 §10.1.4 brackets nothing —
+  `transfer-coding = token *( OWS ";" OWS transfer-parameter )` — so `gzip;;q=…`
+  states an empty `transfer-parameter` slot and is malformed. The walk said so.
+  It then went on reading, admitted the quoted-string the `q=` behind that slot
+  opened, and let it swallow the §5.6.1.2 comma in front of the next coding:
+  `gzip;;q="oops, chunked` reported the fault on `gzip` and never said that
+  `chunked` had been sent. A recipient that frames a body from
+  `Transfer-Encoding` was told about one coding of the two.
+
+  Once a repetition is refused, `parameters` has already failed to derive and
+  nothing behind it derives either — so nothing behind it opens a quoted-string,
+  and every comma behind it is the separator it looks like. `scan_parameters`
+  now stops at the first refusal and recovers the member's extent with
+  `grammar::raw_comma_end`, which is the rule `raw_run_end` and `after_close`
+  already applied INSIDE a refused run, one level out. It is the same rule
+  `auth::Challenges` settles a refused challenge with.
+
+  Both spellings of the shape are fixed together, because one pass answers both:
+  the joined `gzip;p="a` + `";;q="oops, chunked` the external reviewer wrote, and
+  the single-line `gzip;;q="oops, chunked` that had the same hole and that no
+  round had looked at.
+
+- **What is left of a refused member is got past, not read.** A raw comma can
+  fall inside bytes the sender wrote as a quoted-string, so cutting the member
+  there leaves a tail — `b"` in `gzip;;q="a,b", chunked` — that is no member of
+  anyone's. The walk crosses such elements by raw commas and resumes at the
+  first one whose NAME its own grammar admits, so cutting early costs no member:
+  `chunked` is still yielded. This also RETIRES a documented cost. At `76617f6`,
+  `m;p ="a,b", second` read as `m` with a parameter fault and then
+  `Err(NotAToken)` for a member `b"` the sender never wrote, and the `second`
+  behind it was never reached; it now yields `m` and `second`.
+
+- **A parameter behind the join is verdicted by the field, not only by the
+  grammar.** `ListMember::params` can hand out only the repetitions on the line
+  the member BEGAN on, so a rule a field applies to the pairs it is shown is a
+  rule §5.2's join gets past. The rule is now DECLARED with the list instead.
+  RFC 9110 §5.6.6 and §10.1.4:
+  ```text
+  parameter          = parameter-name "=" parameter-value
+  parameter-name     = token
+  parameter-value    = ( token / quoted-string )
+  transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+  ```
+
+  Neither brackets the `=`, so a bare name is always somebody's refusal. `TE` and
+  `Transfer-Encoding` spell no grammar of their own over §10.1.4, so
+  `parameterised_list` refuses one there — the new
+  `ListError::MissingParameterValue`, at every entrance, `gzip;p="a` + `";q`
+  included, where the value used to read `ValueSpansFieldLines`: well formed, and
+  merely not contiguous, for a value §10.1.4 does not admit. §5.6.6's
+  `parameters` is the production other fields EXTEND, and one whose own
+  `parameter` brackets the value reads a bare name rather than refusing it, so
+  the shape is still handed over as `ParamValue::None` there. `media` says which
+  it is and gets `MediaError::ValuelessParameter` for `text/plain;p="a` + `";q`,
+  the same answer `text/plain;charset` earns on one field line.
+
+### Changed
+
+- **`ListError` gains `MissingParameterValue`**, and `grammar::has_bare_comma`
+  and `grammar::parameterised_list_with` — both crate-internal — take the field's
+  answer for a valueless parameter beside its `ParamSyntax`. The public
+  signature of `parameterised_list` is unchanged; what moves under it is
+  §10.1.4's reading of a bare `transfer-parameter`, from a shape to a fault, at
+  every entrance rather than at one.
+
+- **Twenty-four of 240 probed answers move**, measured over the public API
+  against `76617f6` and this tree. Every one is `Err` or a shape §10.1.4 does not
+  admit before, and `Err` after; no member that was yielded stopped being
+  yielded, and eleven answers gained a member that had been hidden. The §5.6.6
+  callers move four: `accept(["text/plain;p=\"a", "\";q"])` is
+  `ValuelessParameter` where it was `ValueSpansFieldLines`, and three
+  `media_type` values whose parameter section is refused in FRONT of a quoted
+  comma — `text/plain;p x;q="a,b"` among them — are `NotASingleton` where they
+  were `Parameters(NotAToken)`. That last is the singleton check and the walk
+  agreeing about which commas separate members, which is why both ask
+  `member_end`; RFC 9110 §8.3 is what makes the singleton the first thing such a
+  value violates.
+
+`cargo test -p http-semantics --all-features` reports 418 unit tests passing,
+two of them this change's, beside the no-panic harness's fifteen and one
+doctest; `--no-default-features` reports 398. Four older tests moved with the
+answer they pinned — two that expected a manufactured member behind a raw cut,
+and two that expected a bare `transfer-parameter` to be a shape. `http1-proto`'s
+409 and `websocket-proto`'s 277 are unchanged.
+`xtask/snapshots/http-semantics-documented.txt` goes from 713 documented items
+to 725, thirteen additions and one deletion — `ParamIter::resumed`, whose
+deferred second pass this replaces. The crate is still `no_std`,
+allocation-free and panic-free on every tier, and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+## `http-semantics` — one walk, two `parameter` productions, and the extent that may not come from the narrower
+
+`grammar::parameterised_list` derived a member's extent from RFC 9110 §5.6.6's
+`parameter`, whose `=` admits no whitespace on either side. That is the right
+reading for the fields §5.6.6 governs. It is the wrong one for the two it does
+not: RFC 9110 §10.1.4 spells `TE` out of a wider `parameter`, and RFC 9112 §7
+gives `Transfer-Encoding` the same `transfer-coding`.
+
+```text
+TE                 = #t-codings
+t-codings          = "trailers" / ( transfer-coding [ weight ] )
+transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+```
+
+Reading that whitespace is not leniency. RFC 9110 §5.6.3 makes it a recipient's
+obligation: "A recipient MUST parse for such bad whitespace and remove it before
+interpreting the protocol element."
+
+So `gzip;p = "a,b", chunked` — one conforming coding, one parameter whose quoted
+value holds a comma, and a second coding behind it — was read with the narrower
+production. `p ` is no `parameter-name` there, so no quoted-string opened, the
+member ended at the comma INSIDE `"a,b"`, a member `b"` the sender never wrote
+was invented, and because this walk stops at its first `Err` the `chunked` was
+never yielded at all. Measured on `3a1a8ce`: `Ok(gzip)`, then `Err(NotAToken)`,
+and nothing behind it. Measured on `9dd8708`, before either of the two commits
+below: `Ok(gzip)`, then `Ok(chunked)`. **This branch introduced that**, and
+hiding the final coding of a `Transfer-Encoding` from the reader that frames the
+body is the same harm those two commits exist to close, one production over.
+
+A boundary may never be derived from a production narrower than the value's own.
+Getting an extent wrong hides bytes; getting a validity verdict wrong is a
+lesser fault, and one the caller can tighten. The production is therefore
+carried by the walk, and BOTH questions — where the member ends, and whether its
+parameters parse — are answered from it, so the two can never come from
+different grammars.
+
+### Every difference between the two productions, and what each one costs
+
+Introducing a second syntax mode means the two grammars diverge everywhere they
+diverge, not once per review round. Derived from the ABNF rather than from the
+code — RFC 9110 §5.6.6 at `rfc9110.txt:1818` and §10.1.4 at `:4647`:
+
+```text
+parameters      = *( OWS ";" OWS [ parameter ] )
+parameter       = parameter-name "=" parameter-value
+parameter-name  = token
+parameter-value = ( token / quoted-string )
+```
+
+```text
+transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+```
+
+They differ in three places and no others.
+
+1. **`BWS` around the `=`.** §10.1.4 admits it on both sides; §5.6.6 admits
+   none, and RFC 9110 §5.6.6 says so: "Parameters do not allow whitespace (not
+   even `bad` whitespace) around the `=` character." Carried by `ParamSyntax`,
+   which decides where a quoted-string may open and so where a member ends.
+2. **Whether the slot may be EMPTY.** §5.6.6 brackets it; §10.1.4 does not.
+   Carried by `ParamSyntax` too, but in `ParamIter` rather than in the boundary
+   scan — an empty slot ends at the same byte under both, so only the verdict
+   moves.
+3. **Whether the head token is part of the rule.** §10.1.4 puts it inside
+   `transfer-coding`, so a `TE` member name is §5.6.2's `token` and nothing
+   else. §5.6.6's `parameters` has no head at all and takes one from whatever
+   rule concatenates it — §8.3.1's `type "/" subtype`, for `media-type`. This
+   one is carried by the member-name grammar each entry point supplies, and
+   `parameterised_list`, the only door to `ParamSyntax::TransferParameter`,
+   supplies `is_token`.
+
+Everything else is the same rule written twice, and was compared rather than
+assumed: the `*( OWS ";" OWS … )` repetition and its `OWS` on both sides of the
+`;`; the `token` a parameter names; the `( token / quoted-string )` it values,
+one alternative taken whole; §5.6.4's quoted-string inside that, so a comma in
+one is data under both; and that neither production spells a bare name with no
+`=`.
+
+The `#`-list around them is RFC 9110 §5.6.1's under both, and §5.6.1.2's "A
+recipient MUST parse and ignore a reasonable number of empty list elements"
+governs both — a different level from difference 2, and conflating the two is
+exactly what let `gzip;` pass. The optional `weight` that may follow a member is
+§12.4.2's `weight = OWS ";" OWS "q=" qvalue` for `Accept` and for `TE` alike, so
+`q` is spelled like a parameter under both and neither production resolves it;
+this walk yields it as a parameter and the field separates it.
+
+Two sentences §5.6.6 carries have no counterpart in §10.1.4 — RFC 9110 §5.6.6's
+"Parameter names are case-insensitive." and its "A parameter value that matches
+the token production can be transmitted either as a token or within a
+quoted-string.  The quoted and unquoted values are equivalent." — and the walk
+honours the difference by deciding neither: it hands over the bytes as written
+under both, and `ListMember` and `ParamValue` derive no equality for that
+reason. RFC 9112 §7's "All transfer-coding names are case-insensitive" is about
+the coding NAME, not about a `transfer-parameter`.
+
+### Breaking (unreleased)
+
+- **`grammar::parameterised_list` takes a `ParamSyntax`.** There is no default,
+  because there is no safe one: the two productions differ in where a
+  quoted-string may open, that decides which commas are data, and a caller
+  cannot repair the answer afterwards. A reader of `Content-Type` or `Accept`
+  passes `ParamSyntax::Parameter`; a reader of `Transfer-Encoding` or `TE`
+  passes `ParamSyntax::TransferParameter`. The new enum's own documentation
+  carries the two ABNF productions and what picking the narrower costs.
+
+### Fixed
+
+- **A `transfer-parameter`'s `BWS` no longer splits a quoted value.**
+  `gzip;p = "a,b", chunked` walked as `ParamSyntax::TransferParameter` is one
+  coding whose parameter `p` is the quoted-string `a,b`, and `chunked` behind
+  it; every spelling of the whitespace — either side of the `=`, SP or HTAB —
+  answers alike, since RFC 9110 §5.6.3's `BWS = OWS` and `OWS = *( SP / HTAB )`.
+  The `parameters` repetition RFC 9110 §5.2's join re-enters on a later field
+  line uses the caller's production too, so a value that closed across the join
+  and is followed by another parameter is delimited by the same rule that
+  delimited the first.
+- **A `transfer-parameter` is no longer optional.** RFC 9110 §5.6.6 writes its
+  slot `[ parameter ]` and §10.1.4 writes `transfer-parameter` with no brackets,
+  and the walk reused §5.6.6's unconditional skip for both — so `gzip;`,
+  `gzip;;p=x` and `gzip;p=x;` produced no error under
+  `ParamSyntax::TransferParameter`. `gzip;` was worse than accepted: the member
+  dropped its `;` and stored an empty parameter slice, making it
+  indistinguishable through `name()` and `params()` from a well-formed `gzip`,
+  so a malformed `Transfer-Encoding` was reported as a conforming one to the
+  reader that frames the body with it. A member now records whether it had a `;`
+  at all, one with none walks no parameters under either production, and an
+  empty slot — leading, interior or trailing — is `ListError::NotAToken` under
+  `TransferParameter` and ends that member's parameter walk. §5.6.6 keeps its
+  brackets: `text/plain;` and `text/plain;;charset=utf-8` are the media types
+  they were.
+
+- **RFC 9110 §5.2's join is not a way past a parameter's grammar.** §5.2 makes a
+  field's lines one value, "concatenated in order, with each field line value
+  separated by a comma", and a quoted-string open at a line's end carries its
+  member across that comma — so the rest of that member's `parameters` are read
+  on a LATER field line. `ListMember` holds only what the member occupies on the
+  line it BEGAN on, which is all a borrowing walk can hand out, so `ParamIter`
+  never reached those repetitions and nothing else verdicted them. `gzip;p="a` +
+  `";;q=x, chunked` and `gzip;p="a` + `";q=x, chunked` therefore read alike
+  through every public accessor — member `gzip`, one parameter reported as
+  `ListError::ValueSpansFieldLines`, then member `chunked` — and the first of
+  them states an empty `transfer-parameter` slot §10.1.4 does not admit.
+  `ValueSpansFieldLines` names a value that is well formed and merely not one
+  contiguous slice, so a recipient may recover from it and go on to frame a body
+  with a `Transfer-Encoding` the RFC refuses.
+
+  Those repetitions are now walked by `ParamIter` where they are cut, under the
+  member's own production, and the first fault among them is carried on the
+  member and reported in place of `ValueSpansFieldLines` — the one verdict this
+  walk gives that would otherwise call the member well formed. Every other
+  verdict already refuses the member and is left where the sender's order put
+  it. The fault is CARRIED rather than returned from the member walk: an `Err`
+  there ends the walk, and the member written BEHIND this one would be hidden by
+  a fault in a parameter of this one, which is the harm the two entries above
+  exist to close. The empty-slot rule itself is now stated once, in
+  `grammar::empty_slot`, and read at both places a repetition is cut.
+
+  The three answers `QuotedTail` gives the member's own value are the three a
+  parameter behind the join now gets: one that closes across a later join and
+  runs on past the close is `NotAToken`, since RFC 9110 §5.6.6's
+  `parameter-value = ( token / quoted-string )` takes one alternative whole; one
+  whose string is still open when the lines run out is
+  `UnterminatedQuotedString`; and one that merely spans the join is no fault at
+  all. A bare name is no fault behind the join either, for the reason it is none
+  in front of it — neither production spells one, and this walk reports the
+  shape and leaves the refusal to the field.
+
+### Changed
+
+- **What moves for a `ParamSyntax::Parameter` caller, and what does not.**
+  `media::media_type`, `media::accept` and `grammar::has_bare_comma` name
+  §5.6.6's production, which is what §8.3.1 and §12.5.1 give them. Every answer
+  they give for a value on ONE field line is the one they gave at `3a1a8ce` —
+  including the cost the entry below documents, that `m;p ="a,b", second` ends
+  its member at the raw comma. That value is refused by §5.6.6 before the cut is
+  reached; `gzip;p = "a,b", chunked` is not refused by §10.1.4 at all, and
+  telling the two apart is the whole of the first change above.
+  `media::media_type` and `has_bare_comma` read a single value and cannot reach
+  the §5.2 join at all, so no `Content-Type` answer can move.
+- **`media::accept` names the fault behind the join instead of the join.** It
+  takes the field's LINES, so it is the one §5.6.6 caller the join is reachable
+  from, and three of its answers move — each an `Err` before and an `Err` after,
+  none turning a range that parsed into one that does not. `text/plain;p="a` +
+  `";q = 0.5` and `text/plain;p="a` + `";q="0.5"j` are
+  `MediaError::Parameters(NotAToken)` where they were
+  `MediaError::ValueSpansFieldLines`, and `text/plain;p="a` + `";q="0` is
+  `Parameters(UnterminatedQuotedString)`. What changes is that a value §5.6.6
+  refuses is no longer reported as one it admits. `text/plain;p="a` +
+  `";;q=0.5` does not move, because §5.6.6 brackets its slot and the empty one
+  is a parameter it does not state rather than a fault.
+
+`cargo test -p http-semantics --all-features` reports 416 unit tests passing,
+twenty-two of them this change's — six for the `BWS`, six for the brackets and
+the head token, and ten for the join — beside the no-panic harness's fifteen
+and one doctest. Two older tests moved with the answer they pinned, both of them
+about a fault standing BEHIND the join:
+`a_later_parameters_trailing_bytes_are_not_the_head_parameters_fault` (from
+`093ffa6`) is now `a_later_parameters_trailing_bytes_are_reported_and_not_as_its_own`
+and expects `NotAToken`, and the §5.6.6 half of
+`the_join_re_enters_the_callers_own_parameter_production` (from `7160a20`)
+expects `NotAToken` where it expected `ValueSpansFieldLines`. Neither walk
+changed and no boundary moved; what moved is whether a member holding a
+malformed parameter reads as well formed. Every other test that stood at
+`3a1a8ce` still passes, unrenamed and unedited, as do `http1-proto`'s 409 and
+`websocket-proto`'s 277, both unchanged.
+`xtask/snapshots/http-semantics-documented.txt` goes from 701 documented items
+to 713, twelve additions and no deletions. The crate is still
+`no_std`, allocation-free and panic-free on every tier — the `no_panic` shim
+over this walk now drives the production as an OPAQUE argument, so both arms are
+proved rather than one folded away — and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+## `http-semantics` — a `1#token` list has no quoted-string for a DQUOTE to open
+
+`grammar::sender_list_shape` is the RFC 9110 §5.6.1.1 gate every outbound
+`Connection` and `Upgrade` value passes, and it delimited its elements by
+reading every DQUOTE as opening a §5.6.4 quoted-string. §7.6.1 spells
+`Connection = #connection-option` with `connection-option = token`, and §7.8
+spells `Upgrade = #protocol` out of `protocol-name` and `protocol-version`,
+both `token`s — and §5.6.2's `tchar` excludes DQUOTE, so neither value admits a
+quoted-string at any position. Every comma in one of them is the §5.6.1 separator
+it looks like.
+
+So a phantom string hid the very thing that gate exists to refuse. The value
+`keep-alive",,", close` answered `Sendable` while carrying the `,,` RFC 9110
+§5.6.1.1 forbids: "a sender MUST NOT generate empty list elements". 336 values
+of length six or less did the same. And in the other direction, an unpaired
+DQUOTE made a perfectly shaped list report as no list at all —
+`keep-alive"x, close` is two elements, one of which is not a token, which is the
+field's own grammar's business and not the shape check's.
+
+`is_protocol_list` read the same walk. Its answers cannot move under either
+reading — an element that differs between them always contains a DQUOTE, which
+is no `tchar` — so the change there is to the reasoning alone, and its comment
+now carries it.
+
+The recipient half of the pair, `grammar::list_elements`, was already a raw comma
+split and was already right; so were `token_list_contains`, `lists_a_protocol`,
+`RangesSpecifier` and `http1-proto`'s `Content-Length` fold, none of which ever
+entered this walker. `Expect` and `Transfer-Encoding` are the two lists whose
+elements DO admit a quoted-string, via §5.6.6 `parameters`; both already delimit
+their own and answer §5.6.1.1 from their own accumulators, and both stay there.
+
+### Fixed
+
+- **`grammar::sender_list_shape` counts the elements a `1#token` value really
+  has.** Elements are delimited by the raw comma scan `grammar::raw_comma_end`
+  already performed for a run §5.6.6 had refused; its documentation now names
+  both kinds of run and each caller says which one it holds, the way
+  `auth::raw_comma_end` does for §11.2's list. `grammar::is_protocol_list` is
+  delimited the same way. `list_element_end` and `quoted_string_end` are gone:
+  with the scan raw the first was a duplicate of `raw_comma_end`, and the second
+  had no other caller.
+- **`http1-proto` reports the empty element ahead of the grammar fault for a
+  value that states both.** `Connection: a",,",b` and `Upgrade: a",` were
+  refused with `an interpreted field states its own grammar`; they are now
+  refused with `a list field states no empty element`, which is the fault the
+  sender's bytes carry first. Both were refusals before and after; no message
+  this core would have written becomes writable, and none that was writable is
+  refused.
+
+### Changed
+
+- **BREAKING (unreleased): `grammar::ListShape` loses its `Unparseable` variant.**
+  A downstream `match` on this public enum stops compiling; `http1-proto`'s, the
+  only one in the tree, is exhaustive again with the two variants that remain.
+  It meant "not a list at all — a quoted-string opens and never closes", and
+  with no quoted-string admitted anywhere in the two lists this reader serves,
+  nothing can produce it.
+  The distinction it drew is real and still lives where it belongs: `Expect` and
+  `Transfer-Encoding` keep a `parsed` answer separate from an empty-element one,
+  because a value ending inside an open string genuinely has no boundary to call
+  empty.
+
+`cargo test -p http-semantics --all-features` reports 394 unit tests passing,
+one of them this change's, beside the no-panic harness's fifteen and one
+doctest; every one of the 393 that stood at `093ffa6` still passes, unrenamed and
+unedited, as do `http1-proto`'s 409 (one new) and `websocket-proto`'s 277
+(unchanged). `xtask/snapshots/http-semantics-documented.txt` goes from 704
+documented items to 701. The crate is still `no_std`, allocation-free and
+panic-free on every tier, and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
+## `http-semantics` — a §5.6.6 member's extent is not for its refused bytes to decide
+
+`grammar::parameterised_list` is the walk `media_type` and `accept` — so
+`Content-Type` and `Accept` — enter through, and it decided where a member
+stopped by reading EVERY DQUOTE as opening an RFC 9110 §5.6.4 quoted-string.
+(`TE`, `Transfer-Encoding` and `Sec-WebSocket-Extensions` were named here when
+this was written and do not enter through it: the first two are `http1-proto`'s
+`CodingList` and the third is `websocket-proto`'s own §9.1 walk, which
+`negotiation.rs` says in as many words why. The entry below this one is what
+that mistake cost.) §5.6.6 admits one at a single position — the first byte of a
+`parameter-value` — and three defects followed from that difference (#71).
+
+**Bytes consumed without validation.** `parameterised_list(["m;p=\"a", "\"junk"])`
+joins to `m;p="a,"junk`: the string closes across §5.2's join and `junk` stood
+behind it, dropped without a word while the parameter reported
+`ValueSpansFieldLines` — the variant that says a value is well formed and merely
+not one contiguous slice. RFC 9110 §5.6.6 spells
+`parameter-value = ( token / quoted-string )`, one alternative taken WHOLE, so
+that value is not derivable and it now reports `NotAToken`: the same fault the
+walk already reported when the close and the bytes behind it lay on one field
+line.
+
+**Bytes already proven invalid still steering the boundary.**
+`parameterised_list(["m;p=\"a", "r\"ju\"nk, second"])` dropped `second`
+entirely. Once `p`'s value has closed and non-`OWS` stands behind it the
+remainder derives nothing — and a run that derives nothing holds no
+quoted-string, so the DQUOTE inside `ju"nk` opens none and the comma in front of
+`second` is the §5.6.1.2 separator it looks like. Recovery now runs to the first
+RAW comma and the hidden member is yielded.
+
+**A DQUOTE where the grammar admits no string at all.** The third entrance the
+#71 comment predicted is present here, and was measured in four shapes:
+`m;p=x"y, second`, the value having already taken the `token` alternative;
+`m;p="a""b, second`, behind a value that already closed; `m;p"x, second`, at a
+`parameter-name`; and `["m;p=x\"y", "second"]`, where the unadmitted DQUOTE held
+the member open across §5.2's join and swallowed the whole next field line. Each
+hid the member written behind it.
+
+The rule is stated at BOTH of this grammar's delimiter levels, which is what
+`auth`'s single-level version of it did not have to be. RFC 9110 §5.6.6's
+`parameters = *( OWS ";" OWS [ parameter ] )` repeats, so a value that closes
+across the join may be followed by another `parameter` — and that one admits a
+quoted-string of its own, commas and all. `ext;p="a` + `"; q="b, c", other` is one member and two
+parameters, and a boundary scan that answered the close with a raw-comma scan
+would cut it inside `q`'s value. So the close re-enters the `parameters` loop
+where §5.6.6 says it may, and only a remainder that has been REFUSED is read raw.
+
+RFC 9110 §5.6.6's `parameter` has no `BWS`, and this reads it that way:
+"Parameters do not allow whitespace (not even "bad" whitespace) around the "="
+character." §11.2's `auth-param` does have it, so `crate::auth`'s helpers keep
+their own reading and are NOT refactored into a shared primitive with this one;
+the two `param_value_at`s and the two `after_close`s each name the other in
+their doc comments so a reader finds both. **What that reasoning missed is that
+§10.1.4's `transfer-parameter` has the `BWS` too**, and this one walk serves it
+— which is the entry above this one, and the reason `parameterised_list` now
+takes the production as an argument.
+
+### Fixed
+
+- **`grammar::parameterised_list` — a member ends where the productions the
+  sender's bytes actually reach say it ends.** A DQUOTE opens a quoted-string
+  only at a `parameter-value`'s first byte; a value that closed is not a value
+  that ended, and only `OWS` may stand between the close and the `;` or `,`
+  behind it; and a run some production has already refused is recovered to the
+  first raw comma, granting no DQUOTE in it any standing. `QuotedTail` gains a
+  third answer for the one verdict a member's own slice cannot carry — a value
+  that closed across §5.2's join with bytes behind that close — and
+  `parse_param` reports it as the `NotAToken` it is.
+
+### Changed
+
+- **`media::media_type` reports `NotASingleton` where it used to report a
+  parameter fault, for a comma no quoted-string admits.**
+  `text/plain;p=x"y,z"` names two members: `p`'s value took the `token`
+  alternative, so the DQUOTE opens nothing and the comma is §5.6.1.2's. §8.3's
+  singleton violation is what such a value breaks first, and `has_bare_comma`
+  now answers through the same `member_end` the walk behind it uses rather than
+  through a scan with a rule of its own.
+
+`cargo test -p http-semantics --all-features` reports 393 unit tests passing,
+eight of them this change's, beside the no-panic harness's fifteen and one
+doctest; every one of the 385 that stood at `9dd8708` still passes, unrenamed
+and unedited. `xtask/snapshots/http-semantics-documented.txt` goes from 697
+documented items to 704: `scan_to_delim` is gone, and `param_value_at`,
+`raw_run_end`, `raw_comma_end`, `after_close`, `parameter_end`,
+`scan_parameters`, `member_end` and `QuotedTail::Trails` replace it. The crate is
+still `no_std`, allocation-free and panic-free on every tier, and
+`cargo check -p http-semantics --no-default-features --target thumbv6m-none-eabi`
+is green.
+
 ## `http-semantics` — RFC 9110 §11's six authentication fields, and two bounds that refuse rather than truncate
 
 An `auth` module joins the crate: §11.2's `auth-param` and `token68`, and the

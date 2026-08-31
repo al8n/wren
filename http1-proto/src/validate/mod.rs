@@ -788,7 +788,11 @@ impl CodingList {
     // `parsed` first: an element BOUNDARY is a fact about a value that parsed,
     // and a value ending inside an open `quoted-string` has none to call empty.
     // Reporting one as §5.6.1.1's empty element named a rule the caller had not
-    // broken — the same confusion `ListShape::Unparseable` exists to prevent.
+    // broken. This is the distinction that keeps `Transfer-Encoding` out of
+    // `grammar::sender_list_shape`: a `transfer-coding` carries §5.6.6
+    // `parameters`, whose value admits a quoted-string, so this list has to
+    // delimit its own elements and answer §5.6.1.1 here, where `parsed` is the
+    // separate answer for a value that never parsed.
     self.present && self.parsed() && (self.saw_empty || self.expecting)
   }
 

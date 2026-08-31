@@ -79,6 +79,61 @@ fn content_type_refuses_a_comma_outside_a_quoted_string() {
   assert_eq!(m.subtype(), "form-data");
 }
 
+// The comma a DQUOTE hides from that check is a comma the walk behind it does
+// not hide. RFC 9110 §5.6.6 admits a quoted-string only at the first byte of a
+// `parameter-value`, and in `p=x"y,z"` that value already took the `token`
+// alternative — so the DQUOTE opens nothing, the comma is §5.6.1.2's separator,
+// and this value names two members. Reported as the singleton violation §8.3
+// warns about rather than as a parameter fault, because the singleton is what
+// it violates first.
+#[test]
+fn content_type_refuses_a_comma_no_quoted_string_admits() {
+  assert_eq!(
+    media_type(b"text/plain;p=x\"y,z\"").unwrap_err(),
+    MediaError::NotASingleton
+  );
+  // The same where the DQUOTE stands behind a value that already closed: those
+  // bytes derive nothing, so nothing in them opens a string either.
+  assert_eq!(
+    media_type(b"text/plain;p=\"a\"junk,z").unwrap_err(),
+    MediaError::NotASingleton
+  );
+  // One repetition further out the answer is the parameter fault instead, and
+  // for a reason this check states rather than works around. `p x` is no
+  // `parameter` under RFC 9110 §5.6.6, so `parameters` has failed to derive
+  // when the `q=` behind it is reached — and `q=` puts a DQUOTE at the one
+  // position §5.6.6 admits a `quoted-string` at, whose string COVERS the comma
+  // inside `"a,b"`. Read raw the member ends at that comma; read with the
+  // string open it ends behind the close. Two answers, and no rule to pick
+  // between them. A comma that may not be there is no evidence of a list, so
+  // this reports the violation the value certainly does have. The walk behind
+  // this check reads it the same way, which is the whole reason both ask
+  // `member_end`.
+  assert_eq!(
+    media_type(b"text/plain;p x;q=\"a,b\"").unwrap_err(),
+    MediaError::Parameters(ListError::NotAToken)
+  );
+  // And with the same `q` parameter behind a comma the walk CAN vouch for, the
+  // singleton violation is reported again: nothing between `p x` and the comma
+  // in front of `text/html` opens a string under either reading, so both end
+  // the member at that comma.
+  assert_eq!(
+    media_type(b"text/plain;p x, text/html;q=\"a,b\"").unwrap_err(),
+    MediaError::NotASingleton
+  );
+  // With no comma to find, the same refusal is reported as what it is.
+  assert_eq!(
+    media_type(b"text/plain;p x;q=z").unwrap_err(),
+    MediaError::Parameters(ListError::NotAToken)
+  );
+  // And a value that runs on past its close, with no comma anywhere, is still
+  // the parameter fault it always was.
+  assert_eq!(
+    media_type(b"text/plain;p=\"a\"junk").unwrap_err(),
+    MediaError::Parameters(ListError::NotAToken)
+  );
+}
+
 #[test]
 fn a_parameter_named_q_is_ordinary_in_a_content_type() {
   // Content-Type has no weight grammar: §12.4.2's q is a content-negotiation
@@ -120,6 +175,109 @@ fn a_valueless_parameter_is_refused_by_the_media_grammar() {
   assert_eq!(
     media_type(b"text/html;charset").unwrap_err(),
     MediaError::ValuelessParameter
+  );
+}
+
+// RFC 9110 §8.3.1's `media-type = type "/" subtype parameters` inherits
+// §5.6.6's brackets — `parameters = *( OWS ";" OWS [ parameter ] )` — so a `;`
+// that introduces nothing states no parameter and violates nothing. §10.1.4's
+// `transfer-coding = token *( OWS ";" OWS transfer-parameter )` brackets
+// nothing and refuses the same bytes; `MEDIA_PARAMETERS` is what keeps this
+// module on the production §8.3.1 actually gives it, and this is the half of
+// that constant a `BWS` test cannot reach.
+#[test]
+fn an_empty_parameter_slot_is_admitted_by_the_media_grammar() {
+  for value in [b"text/plain;".as_slice(), b"text/plain; ", b"text/plain;;"] {
+    let m = media_type(value).expect("§5.6.6 brackets its slot");
+    assert_eq!(m.ty(), "text", "{value:?}");
+    assert_eq!(m.subtype(), "plain", "{value:?}");
+    assert!(m.params().next().is_none(), "{value:?}");
+  }
+
+  for value in [
+    b"text/plain;;charset=utf-8".as_slice(),
+    b"text/plain;charset=utf-8;",
+    b"text/plain; ;charset=utf-8",
+  ] {
+    let m = media_type(value).expect("§5.6.6 brackets its slot");
+    let mut params = m.params();
+    assert!(
+      matches!(
+        params.next().expect("one").expect("well formed"),
+        (b"charset", ParamValue::Token(b"utf-8"))
+      ),
+      "{value:?}"
+    );
+    assert!(params.next().is_none(), "{value:?}");
+  }
+}
+
+// The same constant, at the entrance RFC 9110 §5.2's join opens. `accept` takes
+// the field's LINES, so a range's parameters may be read on a line after the one
+// it began on — and they are read there under `MEDIA_PARAMETERS` too, which is
+// what keeps the empty slot §8.3.1 inherits admitted and the whitespace §5.6.6
+// refuses around its `=` refused, on both sides of the join.
+//
+// Every row here already answered `Err`; what moves is WHICH error. A range
+// whose parameters are malformed under §5.6.6 must not be reported as
+// `ValueSpansFieldLines`, which names a value that is well formed and merely
+// not one contiguous slice.
+#[test]
+fn a_range_parameter_behind_the_join_is_read_under_the_media_production() {
+  // RFC 9110 §5.6.6 brackets its slot, so the empty one states no parameter and
+  // the only thing to report is the value that is not contiguous.
+  let empty_slot: [&[u8]; 2] = [b"text/plain;p=\"a", b"\";;q=0.5"];
+  assert_eq!(
+    accept(empty_slot).next().expect("a range").unwrap_err(),
+    MediaError::ValueSpansFieldLines
+  );
+
+  // "Parameters do not allow whitespace (not even `bad` whitespace) around the
+  // `=` character." (RFC 9110 §5.6.6) — behind the join as in front of it.
+  let bws: [&[u8]; 2] = [b"text/plain;p=\"a", b"\";q = 0.5"];
+  assert_eq!(
+    accept(bws).next().expect("a range").unwrap_err(),
+    MediaError::Parameters(ListError::NotAToken)
+  );
+
+  // RFC 9110 §5.6.6's `parameter-value = ( token / quoted-string )` takes one
+  // alternative WHOLE.
+  let trailing: [&[u8]; 2] = [b"text/plain;p=\"a", b"\";q=\"0.5\"j"];
+  assert_eq!(
+    accept(trailing).next().expect("a range").unwrap_err(),
+    MediaError::Parameters(ListError::NotAToken)
+  );
+
+  // RFC 9110 §5.6.4's string is asked of the whole value, and this one has no
+  // closing DQUOTE anywhere in it.
+  let unterminated: [&[u8]; 2] = [b"text/plain;p=\"a", b"\";q=\"0"];
+  assert_eq!(
+    accept(unterminated).next().expect("a range").unwrap_err(),
+    MediaError::Parameters(ListError::UnterminatedQuotedString)
+  );
+
+  // A parameter with no value at all. RFC 9110 §5.6.6's
+  // `parameter = parameter-name "=" parameter-value` requires the `=`, and this
+  // module says so to the walk — `MEDIA_VALUELESS` — rather than over the pairs
+  // the walk hands back, because behind the join there are no pairs to say it
+  // over. So the answer is the one `text/plain;charset` earns on one field line
+  // and not the `ValueSpansFieldLines` that had stood in for it.
+  let valueless: [&[u8]; 2] = [b"text/plain;p=\"a", b"\";q"];
+  assert_eq!(
+    accept(valueless).next().expect("a range").unwrap_err(),
+    MediaError::ValuelessParameter
+  );
+  assert_eq!(
+    media_type(b"text/plain;charset").unwrap_err(),
+    MediaError::ValuelessParameter
+  );
+
+  // And the value with nothing wrong in it still reads as the one thing it is:
+  // a range whose parameter is not one contiguous slice.
+  let clean: [&[u8]; 2] = [b"text/plain;p=\"a", b"\";q=0.5"];
+  assert_eq!(
+    accept(clean).next().expect("a range").unwrap_err(),
+    MediaError::ValueSpansFieldLines
   );
 }
 

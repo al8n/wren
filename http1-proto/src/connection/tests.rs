@@ -758,6 +758,45 @@ fn a_general_connection_opens_no_upgrade_offer() {
   );
 }
 
+// RFC 9110 §5.6.1.1's empty element, hidden between two DQUOTEs — and found,
+// because §7.6.1's `connection-option` and §7.8's `protocol` are `token`s and
+// §5.6.2's `tchar` excludes DQUOTE, so nothing in either value opens a §5.6.4
+// quoted-string and every comma in one is the separator it looks like.
+//
+// The reason this is asked end to end rather than left to `grammar`'s own test:
+// `declared` checks the SHAPE before the members, so which of the two refusals
+// the caller is told about is decided here. While a phantom string spanned the
+// commas the shape looked clean, and the caller was told about a grammar it
+// broke second instead of the `,,` it wrote first.
+#[test]
+fn a_list_field_states_no_empty_element_a_dquote_hid() {
+  let mut out = [0xAAu8; 192];
+  for name in ["Connection", "Upgrade"] {
+    for buried in [&b"a\",,\", b"[..], b"a\",", b"a\", ,\"b"] {
+      let headers: &[(&str, &[u8])] = &[("Host", b"h"), (name, buried)];
+      let mut c = Connection::<Client, General>::new();
+      assert_eq!(
+        c.open_request("GET", &ORIGIN, headers, BodyPlan::None, &mut out),
+        Err(Error::InvalidState(SENDER_LIST_EMPTY_ELEMENT)),
+        "{name}: {buried:?} states the empty element §5.6.1.1 forbids"
+      );
+      assert_eq!(out, [0xAAu8; 192], "a refused open wrote into the buffer");
+    }
+    // An unpaired DQUOTE with no empty element behind it keeps the OTHER
+    // refusal: the value is a list, and what is wrong with it is that a DQUOTE
+    // is no `tchar`.
+    for shaped in [&b"a\""[..], b"keep-alive\"x, close"] {
+      let headers: &[(&str, &[u8])] = &[("Host", b"h"), (name, shaped)];
+      let mut c = Connection::<Client, General>::new();
+      assert_eq!(
+        c.open_request("GET", &ORIGIN, headers, BodyPlan::None, &mut out),
+        Err(Error::InvalidState(FIELD_STATES_ITS_GRAMMAR)),
+        "{name}: {shaped:?} breaks the element grammar, not §5.6.1.1"
+      );
+    }
+  }
+}
+
 /// A fresh client General connection under default `Limits` — refuses every
 /// §7.8 offer, the ceiling [`Connection::new`] always builds.
 fn client_general() -> Connection<Client, General> {
