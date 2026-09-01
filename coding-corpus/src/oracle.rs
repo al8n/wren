@@ -47,6 +47,24 @@
 //! transfer-parameter = token BWS "=" BWS ( token / quoted-string )
 //! ```
 //!
+//! And RFC 9110 §10.1.4's OTHER container over that same element, which is the
+//! whole of the field it is written in:
+//!
+//! ```text
+//! TE                 = #t-codings
+//! t-codings          = "trailers" / ( transfer-coding [ weight ] )
+//! transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+//! transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+//! ```
+//!
+//! with RFC 9110 §12.4.2's weight, whose `qvalue` this module has to spell
+//! because the ambiguity below turns on it:
+//!
+//! ```text
+//! weight = OWS ";" OWS "q=" qvalue
+//! qvalue = ( "0" [ "." 0*3DIGIT ] )
+//!        / ( "1" [ "." 0*3("0") ] )
+//! ```
 //!
 //! RFC 9110 §5.6.6, whose `parameters` has no head of its own and takes one
 //! from whatever rule concatenates it — §5.6.2's `token`, for the walk this
@@ -142,6 +160,11 @@
 //! issue #79's defect class; it cannot tell a member that ended where the list
 //! ends from one that ended in front of a `;` and threw the rest away.
 //!
+//! One production answers the fourth question with TWO sequences rather than
+//! one, and that is the ambiguity issue #80 was filed over rather than a
+//! failure of the argument above: the two readings share the element's single
+//! boundary-ending END and disagree about what the bytes in front of it WERE.
+//! See [`Production::TCodings`].
 //!
 //! # Where the OWS at the value's two ends is admitted, and why
 //!
@@ -176,6 +199,26 @@ pub enum Production {
   TokenParameters,
   /// RFC 9110 §10.1.1's `expectation`.
   Expectation,
+  /// RFC 9110 §10.1.4's `t-codings` — the element of the `TE` field, which is
+  /// `transfer-coding` with §12.4.2's `[ weight ]` behind it and the literal
+  /// `"trailers"` beside it.
+  ///
+  /// **It derives exactly the strings [`TransferCoding`](Self::TransferCoding)
+  /// does**, and both halves of that are facts about RFC 9110 §5.6.2's `token`
+  /// rather than simplifications. `"trailers"` is spelled by `token`, so the
+  /// first alternative adds no string the second does not already derive. And
+  /// every `weight` is spelled by `OWS ";" OWS transfer-parameter`: `"q="` is a
+  /// `token` and an `=`, and every §12.4.2 `qvalue` is DIGIT and `.`, both of
+  /// which §5.6.2 admits as `tchar`. So `derives`, `element_starts` and
+  /// `string_data` are `TransferCoding`'s, byte for byte.
+  ///
+  /// **What is different is the fourth question, and only there.** Because the
+  /// two alternatives derive one string, a member ending in a `q` that a
+  /// `weight` derives has TWO parameter readings and one end: the `q` is the
+  /// last `transfer-parameter`, or it is the `weight` and the member has one
+  /// parameter fewer. [`Reading::member_params`] carries both, and this module
+  /// picks neither — see its own doc for why nothing in RFC 9110 picks one.
+  TCodings,
   /// RFC 9110 §12.5.1's `media-range` — the SAME §5.6.6 `parameters`, behind a
   /// `type "/" subtype` head and behind no bracket at all.
   ///
@@ -205,10 +248,29 @@ pub struct Reading {
   /// offset. An offset with no row is one no derivation of an element there
   /// carries all the way to a `,` or to the value's end.
   ///
-  /// One sequence, because at most one end of an element is a list boundary —
-  /// the module doc carries that argument. It is a `Vec` of them anyway,
-  /// because a production whose alternatives derive one string at one end would
-  /// have several, and reporting one would be picking between them.
+  /// Normally one sequence, because at most one end of an element is a list
+  /// boundary — the module doc carries that argument. Two under
+  /// [`Production::TCodings`], where RFC 9110 §10.1.4's `[ weight ]` and its
+  /// `*( OWS ";" OWS transfer-parameter )` reach the same end over the same
+  /// bytes and disagree about what the last of them was.
+  ///
+  /// # What no clause of RFC 9110 settles
+  ///
+  /// A reader of `TE` has to decide whether the `q` in a member ending
+  /// `;q=0.5` is that member's last `transfer-parameter` or its `weight`, and
+  /// the ABNF derives it both ways. RFC 9110 settles it for `Accept` and for
+  /// nothing else: §12.5.1 tells a recipient to "process any parameter named
+  /// "q" as weight, regardless of parameter ordering", which is a rule about a
+  /// PARAMETER's name and not about where the parameter section stops, and
+  /// which §12.5.1's own note grounds in the media type registry — a registry
+  /// that governs media types and not transfer codings. §12.4.2 calls the
+  /// weight a "common parameter, named "q" (case-insensitive)" and says only
+  /// what it means, not which rule derived it. §10.1.4 says nothing about it at
+  /// all.
+  ///
+  /// So this module reports both readings and grades a reader against either.
+  /// `main` records which one each reader took, so a `TE` reader added later is
+  /// held to a reading somebody chose rather than inventing a third.
   pub member_params: BTreeMap<usize, Vec<Vec<ParamName>>>,
 }
 
@@ -220,6 +282,24 @@ pub struct ParamName {
   pub at: usize,
   /// One past its last.
   pub end: usize,
+  /// Whether the repetition this name heads is ALSO derived by RFC 9110
+  /// §12.4.2's `weight`, taken as a fact about those bytes alone.
+  ///
+  /// ```text
+  /// weight = OWS ";" OWS "q=" qvalue
+  /// ```
+  ///
+  /// So: the name is `q`, case-insensitively, since RFC 5234 §2.3 makes a
+  /// quoted ABNF literal case-insensitive and §12.4.2 says so again in prose;
+  /// no `BWS` stands on either side of the `=`, because `weight` writes `"q="`
+  /// as one literal and admits none; the value is a `token` rather than a
+  /// §5.6.4 `quoted-string`, which `weight` has no alternative for; and its
+  /// bytes are a `qvalue`.
+  ///
+  /// It says nothing about POSITION. Only a repetition standing last in its
+  /// element can be the `[ weight ]` RFC 9110 §10.1.4 brackets behind
+  /// `transfer-coding`, and [`read`] is what applies that.
+  pub weight: bool,
 }
 
 impl Reading {
@@ -291,7 +371,16 @@ pub fn read(value: &[u8], production: Production) -> Reading {
         continue;
       }
       let read = chain.get(..taken).unwrap_or_default().to_vec();
-      member_params.entry(at).or_default().push(read);
+      let readings = member_params.entry(at).or_default();
+      // RFC 9110 §10.1.4's `t-codings = "trailers" / ( transfer-coding
+      // [ weight ] )`: the bracket sits behind the whole repetition, so only
+      // the LAST parameter can be the `weight`, and when it is, the same end is
+      // reached by an element carrying one parameter fewer.
+      if production == Production::TCodings && read.last().is_some_and(|last| last.weight) {
+        let shorter = read.get(..read.len().saturating_sub(1)).unwrap_or_default();
+        readings.push(shorter.to_vec());
+      }
+      readings.push(read);
     }
     // The empty element §5.6.1.2 admits: `[ element ]` with nothing in it.
     // It contributes no element and ends nothing, so the boundary is asked at
@@ -403,7 +492,7 @@ fn element_ends(
     let Some(name_end) = token_end(value, slot) else {
       // Only §5.6.6 brackets the slot. §10.1.4 does not, so a `;` that
       // introduces no `transfer-parameter` derives nothing.
-      if production == Production::TransferCoding {
+      if is_transfer(production) {
         return;
       }
       cursor = semicolon.saturating_add(1);
@@ -412,7 +501,7 @@ fn element_ends(
     };
     // The `=`, with the BWS §10.1.4 admits on both sides of it and §5.6.6
     // admits on neither.
-    let bws = production == Production::TransferCoding;
+    let bws = is_transfer(production);
     let eq = if bws {
       skip_ows(value, name_end)
     } else {
@@ -426,13 +515,71 @@ fn element_ends(
     let Some(after) = argument_end(value, start, data) else {
       return;
     };
+    // Whether these bytes are ALSO RFC 9110 §12.4.2's
+    // `weight = OWS ";" OWS "q=" qvalue`. See [`ParamName::weight`]; whether
+    // the repetition stands where `[ weight ]` may be is [`read`]'s to say.
+    let named_q = value
+      .get(slot..name_end)
+      .is_some_and(|name| name.eq_ignore_ascii_case(b"q"));
+    let unspaced = eq == name_end && start == eq.saturating_add(1);
+    let weight = named_q && unspaced && value.get(start..after).is_some_and(is_qvalue);
     chain.push(ParamName {
       at: slot,
       end: name_end,
+      weight,
     });
     cursor = after;
     ends.push((cursor, chain.len()));
   }
+}
+
+/// Whether `production` reads its repetitions as RFC 9110 §10.1.4's
+/// `transfer-parameter` — with the `BWS` around the `=` that rule admits, and
+/// without the empty slot §5.6.6's brackets are the whole of.
+///
+/// Both containers §10.1.4 is written with, and no others: `#transfer-coding`
+/// for RFC 9112 §7's `Transfer-Encoding`, and `#t-codings` for `TE`.
+const fn is_transfer(production: Production) -> bool {
+  matches!(
+    production,
+    Production::TransferCoding | Production::TCodings
+  )
+}
+
+/// Whether `token` is RFC 9110 §12.4.2's `qvalue`.
+///
+/// ```text
+/// qvalue = ( "0" [ "." 0*3DIGIT ] )
+///        / ( "1" [ "." 0*3("0") ] )
+/// ```
+///
+/// The fraction's length is bounded and its digits differ between the two
+/// alternatives, so `1.5` is no `qvalue` and neither is `0.5000` — which is
+/// what makes a `q` that cannot be a `weight` a shape this corpus can write.
+fn is_qvalue(token: &[u8]) -> bool {
+  let Some(&lead) = token.first() else {
+    return false;
+  };
+  let rest = token.get(1..).unwrap_or_default();
+  let zero = match lead {
+    b'0' => true,
+    b'1' => false,
+    _ => return false,
+  };
+  if rest.is_empty() {
+    return true;
+  }
+  let Some(fraction) = rest.strip_prefix(b".") else {
+    return false;
+  };
+  fraction.len() <= 3
+    && fraction.iter().all(|&byte| {
+      if zero {
+        byte.is_ascii_digit()
+      } else {
+        byte == b'0'
+      }
+    })
 }
 
 /// The end of the element's HEAD at `at` — the piece in front of the `;` every
@@ -443,6 +590,12 @@ fn element_ends(
 /// subtype`, which is a token on each side of ONE solidus. A second solidus
 /// ends no token — `/` is not a `tchar` — so `a/b/c` heads nothing, which is
 /// what the reader this grades says too.
+///
+/// §10.1.4's `t-codings` takes the same `token` head and needs no alternative
+/// for the `"trailers"` it names beside `transfer-coding`: `token = 1*tchar`
+/// spells those eight letters, so the literal derives nothing the head does not
+/// already reach. What tells a `trailers` member apart is the FIELD's meaning
+/// and not this grammar, which is why `main` counts it rather than deriving it.
 fn head_end(value: &[u8], at: usize, production: Production) -> Option<usize> {
   let end = token_end(value, at)?;
   if production != Production::MediaRange {

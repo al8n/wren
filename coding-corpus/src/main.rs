@@ -159,6 +159,29 @@
 //! unasked, and the second is not a licensed residue but the shape of a corpus
 //! four fifths of which is deliberately malformed.
 //!
+//! **It reads a `TE`, and grades it against `t-codings` rather than against
+//! `#transfer-coding`.** RFC 9110 §10.1.4's productions are `TE`'s as well as
+//! RFC 9112 §7's, and `TE = #t-codings` with
+//! `t-codings = "trailers" / ( transfer-coding [ weight ] )` adds two things
+//! that container has not: the literal, and §12.4.2's weight hanging off the
+//! element rather than sitting inside its parameters. Corpus F writes them.
+//!
+//! **What no clause of RFC 9110 settles, this corpus does not settle either.**
+//! `gzip;q=0.5` is a `transfer-coding` carrying a `transfer-parameter` named
+//! `q` and a `transfer-coding` followed by a `weight`, over one string ending
+//! at one offset. §12.5.1 settles it for `Accept` — "Recipients SHOULD process
+//! any parameter named "q" as weight, regardless of parameter ordering" — and
+//! nothing settles it for `TE`. So the oracle admits both readings, the grading
+//! accepts either, and `tests` records which one each reader takes: the walk
+//! reads the `q` as a `transfer-parameter` on all 125 such members, and
+//! `media::accept` drops it as weight on all 14 of its own. A `TE` reader
+//! landing later is held to a reading somebody chose.
+//!
+//! **It still compares no `TE` PAIR.** There is no second reader of `TE` here,
+//! so corpus F is one walk against an oracle and not two walks against each
+//! other. That is issue #80's own sequencing — the oracle first, so the reader
+//! arrives into a graded production rather than as a fourth uncompared walk.
+//!
 //! Two smaller ones, argued in `tests`'s own module doc: a digest that moves
 //! names the corpus and not the record, and only the manufactured subset of
 //! `recovered-member` is a zero-target.
@@ -171,7 +194,7 @@
 //! corpus <TAB> case <TAB> spelling <TAB> grade <TAB> answer
 //! ```
 //!
-//! - `corpus` — which generator produced the input: `A`..`E`.
+//! - `corpus` — which generator produced the input: `A`..`F`.
 //! - `case` — the field lines, escaped, `|`-separated. `(corpus, case,
 //!   spelling)` is the record's key and is unique; `tests` asserts it.
 //! - `spelling` — which readers answered and over what shape.
@@ -266,6 +289,54 @@ const CODINGS: [&[u8]; 6] = [
   b"",
 ];
 
+/// The `t-codings` corpus F builds its RFC 9110 §10.1.4 `TE` lists out of.
+///
+/// ```text
+/// TE                 = #t-codings
+/// t-codings          = "trailers" / ( transfer-coding [ weight ] )
+/// transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+/// transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// A vocabulary of whole members and not an alphabet of bytes, for the reason
+/// [`CODINGS`] is one: the shapes this field has and `Transfer-Encoding` does
+/// not are the literal `"trailers"` and §12.4.2's `weight`, and a brute force
+/// over nine bytes spells neither. Corpus A already brute-forces the bytes
+/// INSIDE a `transfer-coding`, which is the part the two fields share.
+///
+/// Every member below is a `transfer-coding` — `"trailers"` included, since
+/// §5.6.2's `token` spells those eight letters — so what separates them is
+/// which of the two readings of `[ weight ]` each admits:
+///
+/// - `trailers`, `gzip` and `chunked` carry no `q` at all.
+/// - `gzip;q=0.5`, `gzip;q=1`, `gzip;q=0` and `chunked;Q=0.001` end in a
+///   repetition `weight` derives, so `t-codings` reads them two ways.
+/// - `gzip;q=1.5` is no §12.4.2 `qvalue` — the fraction's digits are the
+///   alternative's, and `1` admits only zeroes behind the point.
+/// - `gzip;q="0.5"` spells the value as a §5.6.4 `quoted-string`, which
+///   `weight` has no alternative for.
+/// - `gzip;q = 0.5` puts §5.6.3's `BWS` where `weight` writes the one literal
+///   `"q="` and admits none, and where `transfer-parameter` admits it.
+/// - `gzip;p=1;q=0.5` is the ordering §12.5.1 tells an `Accept` sender to use,
+///   and `gzip;q=0.5;p=1` is the one it tells a recipient to accept anyway —
+///   here, the second puts a repetition BEHIND the `q`, so `[ weight ]` cannot
+///   reach it and only one reading is left.
+/// - The last is the empty element §5.6.1.2 admits.
+const T_CODINGS: [&[u8]; 12] = [
+  b"trailers",
+  b"gzip",
+  b"chunked",
+  b"gzip;q=0.5",
+  b"gzip;q=1",
+  b"gzip;q=0",
+  b"chunked;Q=0.001",
+  b"gzip;q=1.5",
+  b"gzip;q=\"0.5\"",
+  b"gzip;q = 0.5",
+  b"gzip;p=1;q=0.5",
+  b"gzip;q=0.5;p=1",
+];
+
 fn main() {
   let mut args = env::args().skip(1);
   let out = args.next();
@@ -293,7 +364,10 @@ fn main() {
 fn emit(out: &mut impl Write) -> std::io::Result<()> {
   let mut sink = Sink::new(out);
   sink.run()?;
-  for (name, count) in ["A", "B", "C", "D", "E"].iter().zip(sink.tally.per_corpus) {
+  for (name, count) in ["A", "B", "C", "D", "E", "F"]
+    .iter()
+    .zip(sink.tally.per_corpus)
+  {
     eprintln!("coding-corpus: {name} {count}");
   }
   eprintln!("coding-corpus: total {}", sink.tally.records);
@@ -318,6 +392,28 @@ fn coding_lists() -> impl Iterator<Item = Vec<u8>> {
           value.extend_from_slice(b", ");
         }
         value.extend_from_slice(CODINGS.get(*coding).copied().unwrap_or_default());
+      }
+      value
+    })
+  })
+}
+
+/// Every RFC 9110 §10.1.4 `TE` value corpus F writes: one or two [`T_CODINGS`],
+/// joined by RFC 9110 §5.6.1.2's `OWS "," OWS`.
+///
+/// A free function for the reason [`coding_lists`] is one — so `tests` can
+/// assert what THIS family reaches without restating how it is built. Two
+/// members and not three: what a second member adds is a `q` that is not the
+/// value's last, and a third adds repetitions of an answer already given.
+fn t_codings_lists() -> impl Iterator<Item = Vec<u8>> {
+  (1..=2).flat_map(|len| {
+    payload_indices(T_CODINGS.len(), len).map(|shape| {
+      let mut value = Vec::new();
+      for (index, member) in shape.iter().enumerate() {
+        if index > 0 {
+          value.extend_from_slice(b", ");
+        }
+        value.extend_from_slice(T_CODINGS.get(*member).copied().unwrap_or_default());
       }
       value
     })
@@ -1146,6 +1242,18 @@ struct Extents {
   /// value, the value derives under no reading, the member began where no
   /// derivation begins an element, or its own parameter walk faulted.
   unasked: usize,
+  /// Graded members the oracle offered more than one parameter reading of.
+  ///
+  /// RFC 9110 §10.1.4's `[ weight ]` and nothing else: no other production here
+  /// has two derivations reaching one end. See `oracle::Production::TCodings`.
+  ambiguous: usize,
+  /// Of those, the members the reader read the `q` as a `transfer-parameter`
+  /// on — the longer of the two readings.
+  q_as_parameter: usize,
+  /// Of those, the members the reader read it as §12.4.2's `weight` on.
+  q_as_weight: usize,
+  /// Graded members whose derivation names a parameter `q`, case-insensitively.
+  q_named: usize,
   /// Graded members where a `q` the grammar derives as a parameter was dropped
   /// from what the reader handed over, because `weight_is_a_parameter_name` is
   /// how that reader answers RFC 9110 §12.5.1.
@@ -1200,6 +1308,10 @@ fn grade_extents(
     }
     out.graded = out.graded.saturating_add(1);
     let readings = reading.member_params(extent.at);
+    if readings.len() > 1 {
+      out.ambiguous = out.ambiguous.saturating_add(1);
+    }
+    let longest = readings.iter().map(Vec::len).max().unwrap_or_default();
     let mut matched = None;
     for admitted in readings {
       let dropped =
@@ -1210,16 +1322,29 @@ fn grade_extents(
         .map(|name| name.at)
         .collect();
       if wanted == extent.params {
-        matched = Some(dropped);
+        matched = Some((admitted.len(), dropped));
         break;
       }
     }
-    let Some(dropped) = matched else {
+    let Some((taken, dropped)) = matched else {
       out.wrong = true;
       continue;
     };
+    if readings
+      .iter()
+      .any(|admitted| admitted.iter().any(|name| is_weight_name(value, name)))
+    {
+      out.q_named = out.q_named.saturating_add(1);
+    }
     if dropped {
       out.q_dropped = out.q_dropped.saturating_add(1);
+    }
+    if readings.len() > 1 {
+      if taken == longest {
+        out.q_as_parameter = out.q_as_parameter.saturating_add(1);
+      } else {
+        out.q_as_weight = out.q_as_weight.saturating_add(1);
+      }
     }
   }
   out
@@ -1355,7 +1480,7 @@ struct PairCount {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Tally {
   /// Records written, per corpus.
-  per_corpus: [usize; 5],
+  per_corpus: [usize; 6],
   /// Records written.
   records: usize,
   /// Records where two readers of one production parted.
@@ -1380,6 +1505,15 @@ struct Tally {
   /// Member extents nothing could be asked about. See [`grade_extents`] for the
   /// four reasons, each of which is unaskable rather than excused.
   extents_unasked: usize,
+  /// Graded extents the oracle offered two parameter readings of — RFC 9110
+  /// §10.1.4's `[ weight ]`, and nothing else here.
+  extents_ambiguous: usize,
+  /// Of those, the ones the reader read the `q` as a `transfer-parameter` on.
+  extents_q_as_parameter: usize,
+  /// Of those, the ones it read as §12.4.2's `weight`. The reading no reader in
+  /// this workspace takes today, counted so that a reader which starts taking
+  /// it says so.
+  extents_q_as_weight: usize,
   /// Graded extents where `media::accept` dropped a `q` the grammar derives as
   /// a parameter, per RFC 9110 §12.5.1.
   media_q_dropped: usize,
@@ -1448,6 +1582,11 @@ impl Tally {
   fn extents(&mut self, extents: &Extents) {
     self.extents_graded = self.extents_graded.saturating_add(extents.graded);
     self.extents_unasked = self.extents_unasked.saturating_add(extents.unasked);
+    self.extents_ambiguous = self.extents_ambiguous.saturating_add(extents.ambiguous);
+    self.extents_q_as_parameter = self
+      .extents_q_as_parameter
+      .saturating_add(extents.q_as_parameter);
+    self.extents_q_as_weight = self.extents_q_as_weight.saturating_add(extents.q_as_weight);
   }
 
   /// Counts one comparison of `pair`, and whether its two halves parted on it.
@@ -1472,7 +1611,7 @@ struct Sink<'a, W: Write> {
   /// dump. It is the same hash `xtask` publishes with, reached by path rather
   /// than copied, so the two cannot disagree while both stay green.
   #[cfg(test)]
-  answers: [sha256::Sha256; 6],
+  answers: [sha256::Sha256; 7],
 }
 
 impl<'a, W: Write> Sink<'a, W> {
@@ -1493,6 +1632,7 @@ impl<'a, W: Write> Sink<'a, W> {
     self.corpus_c()?;
     self.corpus_d()?;
     self.corpus_e()?;
+    self.corpus_f()?;
     self.out.flush()
   }
 
@@ -1669,6 +1809,32 @@ impl<'a, W: Write> Sink<'a, W> {
     Ok(())
   }
 
+  /// RFC 9110 §10.1.4 read as the element of `TE`, which is the field that
+  /// production is written in and not the one this corpus had been reading it
+  /// as.
+  ///
+  /// `Transfer-Encoding = #transfer-coding` is RFC 9112 §7's container over the
+  /// same element; `TE = #t-codings` is RFC 9110's own, and it adds the two
+  /// things corpora A, D and E cannot spell — the literal `"trailers"` and
+  /// §12.4.2's `weight` hanging off the element rather than sitting inside its
+  /// parameters. Issue #80 is the record of their being ungraded.
+  ///
+  /// Each value once as one field line, and each member once cut across RFC
+  /// 9110 §5.2's join, so the offsets the extent grading consumes are asked of
+  /// a value the reader never saw whole.
+  fn corpus_f(&mut self) -> std::io::Result<()> {
+    for value in t_codings_lists() {
+      self.te_codings("F", &[&value], "te-codings")?;
+    }
+    for member in T_CODINGS {
+      let cut = member.len().checked_div(2).unwrap_or_default();
+      let head = member.get(..cut).unwrap_or_default();
+      let tail = member.get(cut..).unwrap_or_default();
+      self.te_codings("F", &[head, tail], "te-codings-split")?;
+    }
+    Ok(())
+  }
+
   /// Writes one record and counts it.
   fn record(
     &mut self,
@@ -1683,7 +1849,8 @@ impl<'a, W: Write> Sink<'a, W> {
       "B" => 1,
       "C" => 2,
       "D" => 3,
-      _ => 4,
+      "E" => 4,
+      _ => 5,
     };
     if let Some(slot) = self.tally.per_corpus.get_mut(index) {
       *slot = slot.saturating_add(1);
@@ -1712,7 +1879,7 @@ impl<'a, W: Write> Sink<'a, W> {
       .residue_valueless
       .saturating_add(usize::from(grade.residue_valueless));
     #[cfg(test)]
-    for slot in [index, 5] {
+    for slot in [index, 6] {
       if let Some(digest) = self.answers.get_mut(slot) {
         digest.update(answer.as_bytes());
         digest.update(b"\n");
@@ -1810,6 +1977,73 @@ impl<'a, W: Write> Sink<'a, W> {
       empty_as_dash(&lenient.rendered),
       list.rendered
     );
+    self.record(corpus, lines, spelling, grade, &answer)
+  }
+
+  /// One RFC 9110 §10.1.4 `TE` value: the walk under
+  /// `ParamSyntax::TransferParameter`, graded against `t-codings`.
+  ///
+  /// **One reader and no pair, said here rather than left to be noticed.**
+  /// `TE` has no second reader in this workspace, so nothing can be held to
+  /// equality over it and this record is a reader against an oracle. That is
+  /// the state issue #80 describes and the reason it asks for the oracle
+  /// production FIRST: a `TE` reader landing later is wired in beside this walk
+  /// and held to it, rather than arriving as a fourth uncompared walk over
+  /// §10.1.4 — which is issue #76's shape exactly.
+  ///
+  /// The walk is the one such a reader would be built on: `t-codings` wraps
+  /// `transfer-coding`, and that arm reads `transfer-coding`.
+  fn te_codings(&mut self, corpus: &str, lines: &[&[u8]], spelling: &str) -> std::io::Result<()> {
+    let joined = join(lines);
+    let walked = walk(lines, ParamSyntax::TransferParameter);
+    let reading = oracle::read(&joined, Production::TCodings);
+    let mut grade = grade_walk(&walked, &reading, false);
+    let extents = grade_extents(
+      &joined,
+      &walked.extents,
+      &reading,
+      walked.well_formed,
+      false,
+    );
+    grade.member_extent |= extents.wrong;
+    self.count_extents(&extents);
+    self.count_faults(&walked, "te-codings");
+    self.tally.unplaced = self.tally.unplaced.saturating_add(walked.unplaced);
+
+    // RFC 5234 §2.3 makes a quoted ABNF literal case-insensitive, and
+    // `t-codings` writes `"trailers"` as one, so the comparison is too. Nothing
+    // in the grammar tells this member from any other `token` — the FIELD's
+    // meaning does — so it is counted rather than derived.
+    if walked
+      .names
+      .iter()
+      .any(|name| name.eq_ignore_ascii_case(b"trailers"))
+    {
+      self.tally.state("te-trailers");
+    }
+    if extents.ambiguous > 0 {
+      // The member RFC 9110 leaves undecided: a `q` that `[ weight ]` reaches
+      // and `transfer-parameter` derives, at one end, over one string.
+      self.tally.state("te-weight-ambiguous");
+    }
+    if extents.q_named > extents.ambiguous {
+      // A `q` no `[ weight ]` reaches — the value is no §12.4.2 `qvalue`, or it
+      // is a §5.6.4 `quoted-string`, or §5.6.3's `BWS` stands where `weight`
+      // writes one literal, or a repetition stands behind it. One reading, and
+      // the corpus writes all four.
+      self.tally.state("te-q-no-weight");
+    }
+    if extents.q_as_parameter > 0 {
+      self.tally.state("te-q-read-as-parameter");
+    }
+    if extents.q_as_weight > 0 {
+      // No reader in this workspace reaches this today, so it has no row in
+      // `tests`'s table. `the_te_walk_reads_q_as_a_transfer_parameter` is what
+      // pins that as a decision rather than an absence.
+      self.tally.state("te-q-read-as-weight");
+    }
+
+    let answer = format!("tc={}", empty_as_dash(&walked.rendered));
     self.record(corpus, lines, spelling, grade, &answer)
   }
 

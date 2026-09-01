@@ -1,5 +1,85 @@
 # UNRELEASED
 
+## `coding-corpus` — `TE` is read, and the reading RFC 9110 leaves open is recorded rather than picked
+
+RFC 9110 §10.1.4's productions are `TE`'s as well as RFC 9112 §7's, and every
+§10.1.4 value this corpus wrote was a `Transfer-Encoding`. So the literal
+`"trailers"` and §12.4.2's weight — the two things `TE`'s container has that
+`#transfer-coding` has not — were bytes nothing here asserted anything about,
+and a `TE` reader landing later would have been a fourth uncompared walk over
+one production, which is issue #76's shape exactly. Closes #80.
+
+### Added
+
+- **Corpus F, and `Production::TCodings`.** 168 records: every one- and
+  two-member `TE` list over a twelve-member vocabulary, and each member once cut
+  across RFC 9110 §5.2's join. `every_te_shape_arises_from_the_te_generator`
+  asserts the shapes arise from the GENERATOR and not from a hand-written value,
+  for the reason `every_verdict_arises_from_the_list_generator` does.
+
+- **The `t-codings` oracle derives exactly what `transfer-coding` does, and both
+  halves of that are facts about §5.6.2's `token`.** `"trailers"` is spelled by
+  `token`, and every `weight` is spelled by `OWS ";" OWS transfer-parameter`
+  because `"q="` is a `token` and an `=` and every §12.4.2 `qvalue` is DIGIT and
+  `.`, both `tchar`. What differs is only what a member's parameters ARE — which
+  is why this needed the extent question the commit below adds, and could not
+  have been graded before it.
+
+- **The ambiguity, recorded and not settled.** `gzip;q=0.5` is a
+  `transfer-coding` carrying a `transfer-parameter` named `q` AND a
+  `transfer-coding` followed by a `weight`, over one string ending at one
+  offset. The oracle admits both, the grading accepts either, and `tests` pins
+  which one each reader takes: the walk reads it as a `transfer-parameter` on
+  all **125** such members (`extents_q_as_parameter`), and the weight reading is
+  asserted at **zero** rather than left as an absent row, so a reader that
+  starts taking it says so. `media::accept` takes the other reading on its own
+  field and drops the `q` on **14** members (`media-q-dropped`).
+
+- **Reachability rows, so a vocabulary edit reds rather than going quiet.**
+  `te-trailers` 24, `te-weight-ambiguous` 100, `te-q-read-as-parameter` 100, and
+  `te-q-no-weight` 84 — a `q` no `weight` reaches, which the vocabulary spells
+  four ways: a value that is no `qvalue`, a §5.6.4 `quoted-string` where `weight`
+  has no alternative, §5.6.3's `BWS` where `weight` writes one literal, and a
+  repetition standing behind the `q` where the bracket cannot reach. Without the
+  last row the ambiguity row could not be told from a corpus that writes one `q`
+  and never varies it.
+
+### Why the `q` is not settled here, and what was checked
+
+The obvious ruling — that a `q` terminates the parameter section and begins the
+weight, RFC 9110 §12.5.1 stating as much for `Accept` and §10.1.4 inheriting it
+— does not survive reading §12.5.1. That section says the opposite of a
+positional rule: "Recipients SHOULD process any parameter named "q" as weight,
+regardless of parameter ordering", which tells a recipient to recognise a `q`
+that has parameters BEHIND it. And the grammar the ruling leans on is not in
+this RFC at all — §12.5.1 records: "The accept extension grammar (accept-params,
+accept-ext) has been removed"; it was RFC 7231 §5.3.2's. What §12.5.1 does carry
+is scoped to `Accept`, and its own note grounds it in the media type registry
+disallowing a parameter named `q` — a registry that governs media types and not
+transfer codings. §12.4.2 calls the weight a common parameter named `q` and says
+only what it means. §10.1.4 says nothing. No verified erratum touches any of
+them.
+
+So no clause settles it for `TE`, and this corpus grades both readings rather
+than choosing one on a reader's behalf.
+
+### Changed
+
+- The corpus is 245 049 → 245 217 records. Corpora `A`..`E` digest identically;
+  corpus F's and the whole run's are new.
+- `recovered-member` 11 719 → 11 721. Both are corpus F's split spelling putting
+  RFC 9110 §5.2's comma inside a parameter, which the walk recovers past.
+- Two fault rows, `te-codings:MissingParameterValue` 2 and
+  `te-codings:NotAToken` 7 — the same arm `te` uses, so they are new witnesses
+  and not new variants.
+
+### What this still does not say
+
+There is no `TE` PAIR, because there is no second reader of `TE` in this
+workspace: corpus F is one walk against an oracle. That is issue #80's own
+sequencing — the oracle first, so a reader arrives into a graded production and
+is held to it.
+
 ## `coding-corpus` — a member's extent, graded exactly, and the column that was its own baseline
 
 Every axis this harness carried was a question about where a member BEGINS, so a
