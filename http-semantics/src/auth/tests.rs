@@ -1,5 +1,5 @@
 use super::*;
-use crate::grammar::{ListError, parameterised_list};
+use crate::grammar::{ListError, ParamSyntax, parameterised_list};
 
 /// [`auth_param`] over an element held whole — one field line's worth, with
 /// nothing behind it that RFC 9110 §5.2's join could add. A quoted-string this
@@ -49,7 +49,7 @@ fn a_bws_parameter_is_what_the_semicolon_walker_refuses() {
   // The module doc's claim, executed. §5.6.6's `parameter` has no BWS, so the
   // walker for it reads `realm ` as the name and refuses a token that is not
   // one; §11.2's `auth-param` has the BWS, and the same bytes are a parameter.
-  let mut members = parameterised_list([&br#"m;realm = "x""#[..]]);
+  let mut members = parameterised_list([&br#"m;realm = "x""#[..]], ParamSyntax::Parameter);
   let member = members.next().unwrap().unwrap();
   assert!(matches!(
     member.params().next(),

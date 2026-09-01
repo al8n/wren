@@ -1537,14 +1537,19 @@ impl Declared {
 }
 
 impl Declared {
-  /// Records what one interpreted field's value is as a list, in §5.6.1.1's
-  /// terms — and records a value that is not a list at all as the grammar fault
-  /// it is, rather than as the empty element it has no elements to have.
+  /// Records what one interpreted field's value is as a list, in RFC 9110
+  /// §5.6.1.1's terms.
+  ///
+  /// Only the two fields whose grammar admits no §5.6.4 quoted-string come
+  /// here — `Connection` and `Upgrade`, both `token`-built — which is what lets
+  /// [`sender_list_shape`] read their commas raw and answer the emptiness
+  /// question over every boundary the value has. `Transfer-Encoding` and
+  /// `Expect` carry §5.6.6 `parameters` and so answer §5.6.1.1 from their own
+  /// accumulators instead, over the COMBINED value; both are folded in below.
   fn note_shape(&mut self, value: &[u8]) {
     match sender_list_shape(value) {
       ListShape::Sendable => {}
       ListShape::EmptyElement => self.list_fault = true,
-      ListShape::Unparseable => self.grammar_fault = true,
     }
   }
 }

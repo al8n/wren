@@ -71,8 +71,46 @@
 //! been.
 
 use crate::grammar::{
-  ListError, ListMember, ParamIter, ParamValue, has_bare_comma, is_token, parameterised_list_with,
+  ListError, ListMember, ParamIter, ParamSyntax, ParamValue, ValuelessParameter, has_bare_comma,
+  is_token, parameterised_list_with,
 };
+
+/// The `parameter` production RFC 9110 §8.3.1's `media-type` carries.
+///
+/// `media-type = type "/" subtype parameters`, and those `parameters` are
+/// §5.6.6's, which admits no whitespace around a `parameter`'s `=` —
+/// "Parameters do not allow whitespace (not even "bad" whitespace) around the
+/// "=" character." §12.5.1's `media-range` inherits the same ones, so both
+/// entry points in this module walk with this and neither may widen it, for two
+/// reasons rather than one.
+///
+/// Reading §10.1.4's `BWS` here would admit a quoted-string where §5.6.6 puts
+/// none, and a comma inside it would stop being the §5.6.1.2 separator
+/// `Content-Type`'s singleton rule is asked about.
+///
+/// And §5.6.6's parameter slot is OPTIONAL where §10.1.4's is not —
+/// `parameters = *( OWS ";" OWS [ parameter ] )` against
+/// `transfer-coding = token *( OWS ";" OWS transfer-parameter )` — so widening
+/// would refuse `text/plain;`, `text/plain;;charset=utf-8` and
+/// `text/plain;charset=utf-8;`, each of which RFC 9110 §8.3.1 admits by
+/// inheriting those brackets.
+const MEDIA_PARAMETERS: ParamSyntax = ParamSyntax::Parameter;
+
+/// What a media parameter with no value is, declared to the walk rather than
+/// applied to what the walk hands back.
+///
+/// `media-type = type "/" subtype parameters` (RFC 9110 §8.3.1) puts no grammar
+/// of this module's own over §5.6.6's `parameter`, and that production requires
+/// its `=` — `parameter = parameter-name "=" parameter-value`. So `text/html;charset`
+/// is no media type, and the two entry points here have always said so.
+///
+/// Saying it HERE rather than over the pairs the walk yields is what makes it
+/// true at every entrance. A parameter that stands behind an RFC 9110 §5.2
+/// field-line join is not one of those pairs — it lies on a line the member
+/// hands no slice of — so a refusal made out here would hold for
+/// `text/plain;charset` and not for `text/plain;p="a` + `";charset`, which is
+/// §5.2's join turned into a way past §5.6.6's `=`.
+const MEDIA_VALUELESS: ValuelessParameter = ValuelessParameter::Refused;
 
 /// Why a media-type or `Accept` walk stopped.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
@@ -87,12 +125,17 @@ pub enum MediaError {
   Parameters(ListError),
   /// A parameter with no `=`, such as `charset` in `text/html;charset`.
   ///
-  /// RFC 9110 §5.6.6's `parameter` grammar requires the `=`; the walker
-  /// admits a bare name only for fields that define their own parameter
-  /// grammar — RFC 6455 §9.1's extension parameters are one such field. A
-  /// media type defines no such grammar, so this is the entry points' own
-  /// refusal rather than something the walker itself reports as
-  /// [`Parameters`](Self::Parameters).
+  /// RFC 9110 §5.6.6's `parameter` grammar requires the `=`; the walker admits
+  /// a bare name only for fields that define their own parameter grammar — RFC
+  /// 6455 §9.1's extension parameters are one such field. A media type defines
+  /// no such grammar, and this module says so to the walker once
+  /// (`MEDIA_VALUELESS`) rather than refusing the shapes it hands back. That is
+  /// what makes the refusal reach a parameter standing behind an RFC 9110 §5.2
+  /// field-line join, which this module is never shown. It arrives as
+  /// [`ListError::MissingParameterValue`] and is lifted out of
+  /// [`Parameters`](Self::Parameters) here, so that one condition keeps one
+  /// representation — the same rule that lifts
+  /// [`ValueSpansFieldLines`](Self::ValueSpansFieldLines).
   #[error("parameter has no value")]
   ValuelessParameter,
   /// A parameter named `q` whose value is not RFC 9110 §12.4.2's `qvalue`.
@@ -132,6 +175,9 @@ impl From<ListError> for MediaError {
     match e {
       // One condition, one representation.
       ListError::ValueSpansFieldLines => Self::ValueSpansFieldLines,
+      // The refusal `MEDIA_VALUELESS` asked the walk for, named in this
+      // module's own words on the way back out.
+      ListError::MissingParameterValue => Self::ValuelessParameter,
       other => Self::Parameters(other),
     }
   }
@@ -154,7 +200,9 @@ pub(crate) fn split_solidus(name: &[u8]) -> Option<(&[u8], &[u8])> {
 /// `type = token` and `subtype = token`.
 ///
 /// This is the member-name grammar the media entry points hand the walker, in
-/// place of the `token` a transfer-parameter list uses.
+/// place of the `token` a transfer-coding list uses. The other half of what
+/// they hand it is [`MEDIA_PARAMETERS`], since a field picks its name grammar
+/// and its `parameter` grammar separately.
 pub(crate) fn is_media_name(name: &[u8]) -> bool {
   match split_solidus(name) {
     Some((ty, subtype)) => is_token(ty) && is_token(subtype),
@@ -386,10 +434,10 @@ impl<'a> MediaType<'a> {
 /// single line has no second line to join with — [`accept`], which walks a
 /// field's several lines, is where it is reachable.
 pub fn media_type(value: &[u8]) -> Result<MediaType<'_>, MediaError> {
-  if has_bare_comma(value) {
+  if has_bare_comma(value, MEDIA_PARAMETERS, MEDIA_VALUELESS) {
     return Err(MediaError::NotASingleton);
   }
-  let member = parameterised_list_with([value], is_media_name)
+  let member = parameterised_list_with([value], is_media_name, MEDIA_PARAMETERS, MEDIA_VALUELESS)
     .next()
     .ok_or(MediaError::NotAMediaType)?
     .map_err(|e| match e {
@@ -397,14 +445,12 @@ pub fn media_type(value: &[u8]) -> Result<MediaType<'_>, MediaError> {
       other => MediaError::from(other),
     })?;
   let (ty, subtype) = split_solidus(member.name()).ok_or(MediaError::NotAMediaType)?;
-  // The media grammar's `parameter` requires its `=` (§5.6.6); the walker
-  // admits a bare name for the fields that define their own grammar, so this
-  // entry point rejects what those fields keep.
+  // Every parameter is read here rather than left to `MediaType::params`,
+  // because this entry point promises a value that parsed. The bare-name
+  // refusal among them is `MEDIA_VALUELESS`, declared once and applied by the
+  // walk at every entrance it has.
   for param in member.params() {
-    let (_, value) = param.map_err(MediaError::from)?;
-    if matches!(value, ParamValue::None) {
-      return Err(MediaError::ValuelessParameter);
-    }
+    param.map_err(MediaError::from)?;
   }
   Ok(MediaType {
     ty,
@@ -592,7 +638,8 @@ fn mime_type_and_subtype(value: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
 /// alternative without one, so [`ParamValue::None`] is a value this walk never
 /// yields. [`media_type`] reaches the same answer for its own grammar by a
 /// different route — the walker admits the bare-name form for the fields that
-/// define it, and that entry point rejects what those fields keep.
+/// define it, and `MEDIA_VALUELESS` tells it that this module is not one of
+/// them.
 ///
 /// # Its `Err` is a fault this crate refuses whole
 ///
@@ -1241,19 +1288,39 @@ fn range_from(member: ListMember<'_>) -> Result<MediaRange<'_>, MediaError> {
     // always reads back as the `type/*` wildcard's `None`, never as a token.
     _ => (Some(ty), Some(subtype)),
   };
-  // A valueless parameter is refused here exactly as `media_type` refuses one
-  // (`MediaError::ValuelessParameter`). Every parameter named `q` that DOES
-  // carry a value is weight, in wire order, last one wins.
+  // A valueless parameter is refused exactly as `media_type` refuses one
+  // (`MediaError::ValuelessParameter`), and by the same declaration —
+  // `MEDIA_VALUELESS`, which the walk applies at every entrance it has and
+  // reports as `ListError::MissingParameterValue`. It arrives through the `?`
+  // below, ahead of §12.5.1's weight question, because a bare name fails
+  // §5.6.6's `parameter` grammar outright whatever it is called: a bare `q` is a
+  // missing value, not a bad `qvalue`. Every parameter named `q` that DOES carry
+  // a value is weight, in wire order, last one wins.
+  //
+  // # Why a weight is never judged behind RFC 9110 §5.2's field-line join
+  //
+  // `MediaError::BadWeight` is this function's, and this function is only ever
+  // shown the parameters on the line the member BEGAN on. A weight standing
+  // behind that join is therefore reported as `ValueSpansFieldLines` — the
+  // fault of the parameter that crossed — rather than as the bad `qvalue` it
+  // may be. That is settled rather than open. RFC 9110 §12.4.2 writes
+  // `weight = OWS ";" OWS "q=" qvalue` and
+  // `qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )`, which name
+  // no quoted-string and no OWS inside the value — so a weight cannot itself
+  // span the comma §5.2 inserts, and only a DIFFERENT parameter's quoted value
+  // can, which is then the parameter the walk refuses. What is left is a
+  // conforming `q=0.5` standing behind such a parameter, and the reason it is
+  // not read is not this rule but the contiguous-borrow one: the crossing value
+  // is not one slice, so `ParamValue` cannot hand it over and the parameter
+  // walk ends at it. Reading the weight behind it would need a segmented or
+  // streaming `ParamValue`, or a lending visitor in place of the iterator — a
+  // public change, bought for a weight on a field line whose earlier parameter
+  // is already unreadable. The harm is bounded meanwhile: `accept` latches on
+  // the first fault, so no range is handed over and nothing malformed is
+  // accepted.
   let mut weight = Weight::ONE;
   for param in member.params() {
     let (name, value) = param.map_err(MediaError::from)?;
-    // Checked BEFORE the `q`-name check below, deliberately: a bare name
-    // fails §5.6.6's `parameter` grammar outright, whatever it is called, and
-    // that fault is more fundamental than §12.5.1's weight question — a bare
-    // `q` is a missing value, not a bad `qvalue`.
-    if matches!(value, ParamValue::None) {
-      return Err(MediaError::ValuelessParameter);
-    }
     if name.eq_ignore_ascii_case(b"q") {
       // A quoted qvalue is the same value as a bare one (§5.6.6: "The quoted
       // and unquoted values are equivalent."), so unquote before parsing.
@@ -1296,6 +1363,14 @@ fn range_from(member: ListMember<'_>) -> Result<MediaRange<'_>, MediaError> {
 /// able to continue, and stopping there is a decision made here rather than one
 /// inherited.
 ///
+/// A weight standing BEHIND that join is reported as the crossing parameter's
+/// `ValueSpansFieldLines` rather than as [`MediaError::BadWeight`], and that is
+/// settled rather than open: RFC 9110 §12.4.2's `qvalue` holds no
+/// quoted-string, so a weight cannot itself span the comma §5.2 inserts, and a
+/// conforming one behind a parameter that does is unread for the
+/// contiguous-borrow reason instead. `range_from`'s own comment carries the
+/// argument and what reading it would cost.
+///
 /// # Errors
 ///
 /// Each item is [`MediaError`]: [`NotAMediaType`](MediaError::NotAMediaType),
@@ -1308,7 +1383,7 @@ where
   I: IntoIterator<Item = &'a [u8]>,
 {
   Accept {
-    members: parameterised_list_with(lines, is_media_name),
+    members: parameterised_list_with(lines, is_media_name, MEDIA_PARAMETERS, MEDIA_VALUELESS),
     done: false,
   }
 }

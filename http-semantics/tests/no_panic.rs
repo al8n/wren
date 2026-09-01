@@ -17,10 +17,13 @@
 //! `ContentRange::parse`, `ContentRange::encode`, `auth::auth_param`,
 //! `auth::token68_end`, `auth::credentials`, `auth::challenges` and
 //! `auth::auth_info` are each link-checked via
-//! `#[no_panic]` shims — the join-aware RFC 9110 §5.6.6 list walk, whose
-//! cursors run over borrowed field lines the caller supplies and whose member
-//! boundaries cross the §5.2 join; the §12.4.2 `qvalue` reader, whose
-//! position-scaled accumulation is this crate's only checked accumulation; the
+//! `#[no_panic]` shims — the join-aware RFC 9110 §5.6.1 list walk, whose
+//! cursors run over borrowed field lines the caller supplies, whose member
+//! boundaries cross the §5.2 join, and whose `parameter` production is chosen
+//! per field (§5.6.6's or §10.1.4's) and driven here as an OPAQUE argument so
+//! that both arms are proved rather than one folded away; the §12.4.2 `qvalue`
+//! reader, whose position-scaled accumulation is this crate's only checked
+//! accumulation; the
 //! §12.5.1 weight selection, driven over the whole walk (the field's lines and
 //! the §5.2 join between them, the range iterator, each range's parameter walk
 //! and the candidate's, and the bounded per-instance match between the two);
@@ -202,7 +205,7 @@ use http_semantics::{
   __no_panic_internals::{ValueTail, auth_param, parse_qvalue, token68_end},
   auth::{auth_info, challenges, credentials},
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
-  grammar::{ParamValue, parameterised_list},
+  grammar::{ParamSyntax, ParamValue, parameterised_list},
   media::{media_type, weight_for},
   range::{ContentRange, RangesSpecifier, Resolved},
   validator::{EntityTag, TagList},
@@ -211,16 +214,24 @@ use http_semantics::{
 // ── parameterised-list walk ───────────────────────────────────────────────────
 
 no_panic_shim! {
-  /// Shim over `grammar::parameterised_list` — the RFC 9110 §5.6.6 list walk,
-  /// driven through BOTH its levels, since the member iterator hands its work
-  /// to a `ParamIter` the caller drives separately.
+  /// Shim over `grammar::parameterised_list` — the join-aware list walk, driven
+  /// through BOTH its levels, since the member iterator hands its work to a
+  /// `ParamIter` the caller drives separately.
+  ///
+  /// `syntax` is an ARGUMENT rather than a constant, and `black_box`ed at every
+  /// call site like every other one here, for a reason particular to it: it
+  /// selects between RFC 9110 §5.6.6's `parameter` and §10.1.4's
+  /// `transfer-parameter` at four `match` sites inside the walk, and a shim that
+  /// handed it a constant would let LLVM fold the other arm away and prove
+  /// nothing about it. Opaque, both arms are compiled and both are covered by
+  /// the one symbol.
   ///
   /// Returns the bytes it read, so nothing here can be optimized out as
   /// unused: a call whose result is dead takes the shim's body with it and
   /// proves nothing.
-  fn shim_parameterised_list(lines: &[&[u8]]) -> usize {
+  fn shim_parameterised_list(lines: &[&[u8]], syntax: ParamSyntax) -> usize {
     let mut seen = 0usize;
-    for member in parameterised_list(lines.iter().copied()) {
+    for member in parameterised_list(lines.iter().copied(), syntax) {
       let Ok(member) = member else { break };
       seen = seen.wrapping_add(member.name().len());
       for param in member.params() {
@@ -242,39 +253,158 @@ no_panic_shim! {
 fn parameterised_list_is_panic_free() {
   // One line, with a quoted comma and a quoted semicolon that are data.
   assert!(
-    shim_parameterised_list(black_box(&[
-      b"permessage-deflate; client_max_window_bits=10, x-private; note=\"a,b;c\"".as_slice(),
-    ]))
-      > 0
+    shim_parameterised_list(
+      black_box(&[
+        b"permessage-deflate; client_max_window_bits=10, x-private; note=\"a,b;c\"".as_slice(),
+      ]),
+      black_box(ParamSyntax::Parameter)
+    ) > 0
   );
   // A value that spans the §5.2 join, and the member behind it.
-  assert!(shim_parameterised_list(black_box(&[b"ext; q=\"a".as_slice(), b"b\", other"])) > 0);
+  assert!(
+    shim_parameterised_list(
+      black_box(&[b"ext; q=\"a".as_slice(), b"b\", other"]),
+      black_box(ParamSyntax::Parameter)
+    ) > 0
+  );
   // The same string left open when the LAST line ends.
-  assert!(shim_parameterised_list(black_box(&[b"ext; q=\"a".as_slice(), b"b"])) > 0);
+  assert!(
+    shim_parameterised_list(
+      black_box(&[b"ext; q=\"a".as_slice(), b"b"]),
+      black_box(ParamSyntax::Parameter)
+    ) > 0
+  );
   // Empty elements, empty lines, and OWS-only lines.
   assert!(
-    shim_parameterised_list(black_box(&[
-      b", ext ,, other,".as_slice(),
-      b"",
-      b" ",
-      b"last"
-    ]))
-      > 0
+    shim_parameterised_list(
+      black_box(&[b", ext ,, other,".as_slice(), b"", b" ", b"last"]),
+      black_box(ParamSyntax::Parameter)
+    ) > 0
   );
+  // The other production, over the `BWS` only it admits — the arm a shim
+  // driven with a constant would have folded away, and the RFC 9110 §10.1.4
+  // value whose boundary the §5.6.6 reading once cut inside a quoted-string.
+  assert!(
+    shim_parameterised_list(
+      black_box(&[b"gzip;p = \"a,b\", chunked".as_slice()]),
+      black_box(ParamSyntax::TransferParameter)
+    ) > 0
+  );
+  assert!(
+    shim_parameterised_list(
+      black_box(&[b"gzip;p\t=\t\"a".as_slice(), b"b\" ; q = c, chunked"]),
+      black_box(ParamSyntax::TransferParameter)
+    ) > 0
+  );
+  // The slot RFC 9110 §10.1.4 does not bracket, empty in each of the three
+  // places — the arm that reports a missing `transfer-parameter` and stops.
+  for field in [b"gzip;".as_slice(), b"gzip;;p=x", b"gzip;p=x;", b"gzip; ;"] {
+    assert!(
+      shim_parameterised_list(
+        black_box(&[field]),
+        black_box(ParamSyntax::TransferParameter)
+      ) > 0
+    );
+  }
+  // The parameters RFC 9110 §5.2's join leaves on a LATER field line, which are
+  // walked where they are cut rather than out of the member's own slice: an
+  // empty slot behind the join, a value that closed across a SECOND join and
+  // ran on past the close, and a string a later parameter left open when the
+  // lines ran out. Driven under both productions, since the walk that reads
+  // them takes the member's own.
+  for syntax in [ParamSyntax::Parameter, ParamSyntax::TransferParameter] {
+    assert!(
+      shim_parameterised_list(
+        black_box(&[b"gzip;p=\"a".as_slice(), b"\";;q=x, chunked"]),
+        black_box(syntax)
+      ) > 0
+    );
+    assert!(
+      shim_parameterised_list(
+        black_box(&[
+          b"gzip;p=\"a".as_slice(),
+          b"\";q=\"b",
+          b"\"junk;r=x, chunked"
+        ]),
+        black_box(syntax)
+      ) > 0
+    );
+    assert!(
+      shim_parameterised_list(
+        black_box(&[b"gzip;p=\"a".as_slice(), b"\";q=\"b"]),
+        black_box(syntax)
+      ) > 0
+    );
+    assert!(
+      shim_parameterised_list(
+        black_box(&[b"gzip;p=\"a".as_slice(), b"\";q = \"b\"junk, chunked"]),
+        black_box(syntax)
+      ) > 0
+    );
+    // A repetition refused with a quoted-string written behind it, which is the
+    // arm that recovers the member's extent by a raw comma and then gets past
+    // what is left of the member — one where that string never closes, one where
+    // it closes and holds a comma, and one where what is left of the member is
+    // no `token` and is crossed rather than read.
+    assert!(
+      shim_parameterised_list(
+        black_box(&[b"gzip;p=\"a".as_slice(), b"\";;q=\"oops, chunked"]),
+        black_box(syntax)
+      ) > 0
+    );
+    assert!(
+      shim_parameterised_list(
+        black_box(&[b"gzip;@=1;q=\"a,b\", x\"y, chunked".as_slice()]),
+        black_box(syntax)
+      ) > 0
+    );
+    // A parameter with no value, in front of RFC 9110 §5.2's join and behind
+    // it: the arm `ValuelessParameter` picks between.
+    assert!(
+      shim_parameterised_list(
+        black_box(&[b"gzip;q, chunked".as_slice()]),
+        black_box(syntax)
+      ) > 0
+    );
+    assert!(
+      shim_parameterised_list(
+        black_box(&[b"gzip;p=\"a".as_slice(), b"\";q, chunked"]),
+        black_box(syntax)
+      ) > 0
+    );
+  }
   // A name that is not a token, a forbidden byte inside a quoted-string, no
   // lines at all, an empty line, and garbage: Err or nothing, never a panic.
   assert_eq!(
-    shim_parameterised_list(black_box(&[b"ext@1".as_slice()])),
+    shim_parameterised_list(
+      black_box(&[b"ext@1".as_slice()]),
+      black_box(ParamSyntax::Parameter)
+    ),
     0
   );
   assert_eq!(
-    shim_parameterised_list(black_box(&[b"ext; q=\"a\x00b\"".as_slice()])),
+    shim_parameterised_list(
+      black_box(&[b"ext; q=\"a\x00b\"".as_slice()]),
+      black_box(ParamSyntax::Parameter)
+    ),
     0
   );
-  assert_eq!(shim_parameterised_list(black_box(&[])), 0);
-  assert_eq!(shim_parameterised_list(black_box(&[b"".as_slice()])), 0);
   assert_eq!(
-    shim_parameterised_list(black_box(&[[0xff, 0xfe, 0x00].as_slice()])),
+    shim_parameterised_list(black_box(&[]), black_box(ParamSyntax::TransferParameter)),
+    0
+  );
+  assert_eq!(
+    shim_parameterised_list(
+      black_box(&[b"".as_slice()]),
+      black_box(ParamSyntax::Parameter)
+    ),
+    0
+  );
+  assert_eq!(
+    shim_parameterised_list(
+      black_box(&[[0xff, 0xfe, 0x00].as_slice()]),
+      black_box(ParamSyntax::TransferParameter)
+    ),
     0
   );
 }
