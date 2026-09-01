@@ -167,6 +167,32 @@ jobs:
       # What the digest still cannot say is WHICH record moved — it names the
       # corpus, and its failure names the command that names the record.
       - run: cargo test -p auth-corpus
+      # The transfer-coding differential's own suite, and the reason it is a
+      # WHOLE-corpus run rather than a subset: it is 245 049 records over four
+      # readers and an oracle, and it takes seven seconds in a debug build.
+      # There is therefore no coverage caveat to remember here either.
+      #
+      # It is the only gate in this workspace that asks whether two readers of
+      # one RFC 9110 production agree. `grammar::parameterised_list` under
+      # `ParamSyntax::TransferParameter`, `http1-proto`'s `Transfer-Encoding`
+      # accumulator, `grammar::Expectations` and `media::accept` each have their
+      # own tests, each written from the same reading that produced the
+      # implementation beside it, so a divergence between two of them was
+      # invisible to every other job here — and one lived until an external
+      # reviewer read the ABNF (#76).
+      #
+      # What a green run here is worth is split rather than summed: four of its
+      # five pairs are two independent walks (319 359 comparisons) and one is
+      # `parameterised_list` against itself at a second configuration (80 434),
+      # which proves the configuration and not the reading. The tally keys every
+      # pair by that kind, so the two never add up into one coverage number.
+      #
+      # Its zero-targets are zero-targets rather than pinned constants, and
+      # every state it is meant to reach carries the exact count of records that
+      # reach it, so a generator edit that makes one unreachable reds here
+      # instead of shortening the run and staying green. That is #77's finding
+      # about `auth-corpus` above, applied to the corpus written after it.
+      - run: cargo test -p coding-corpus
 
   no-std:
     runs-on: ubuntu-latest

@@ -28,6 +28,12 @@ alloc = ["http-semantics/alloc"]
 # becomes a `compile_error!` is a decision for the change that attaches the
 # backends above, not a claim to make ahead of it.
 no-atomic = ["http-semantics/no-atomic"]
+# Internal: exposes the crate-private `Transfer-Encoding` reader to the
+# workspace's `transfer-coding` differential (`coding-corpus`). Doc-hidden and
+# exempt from semver; it adds no rule and enables no dependency, and it is a
+# feature rather than an unconditional `#[doc(hidden)] pub` so the crate's real
+# public surface does not grow a module that only a test crate reaches.
+differential = []
 # Internal: exposes leaf hot paths for `tests/no_panic.rs`. Implies `std`.
 test-no-panic = ["std"]
 # Internal, and MUST-FAIL by design: adds one `#[no_panic]` shim to
