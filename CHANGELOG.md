@@ -169,6 +169,252 @@ before it was written down. Closes #75 and #73.
 
 Both were found by the paragraph extractor on its first run, and neither was
 reachable before it: each is written across two comment lines.
+## `coding-corpus` — the third §5.6.6 reader's extent, graded through what a fold can still state
+
+The two commits below put the walk and `media::accept` into an extent
+comparison and left `Expectations` out of it, because that reader hands out no
+member. A branch that closes "a fourth uncompared walk" while leaving a third
+reader uncompared has not closed the class — it is the shape #76 was filed
+over. Measured before anything was changed: RFC 9110 §10.1.1's reader mutated
+so that a member's extent stops at its name left **all 35 tests green, exit 0**.
+
+### The obstacle, stated rather than worked around
+
+`Expectations` is a fold over eight bits with **no lifetime parameter**. It
+borrows no field line and retains no slice, so issue #79's argument — that the
+borrowed subslice `place` needs is already handed out — does not transfer, and
+the offset grading the other two readers get cannot be asked of it at any
+surface short of turning it into a borrowing walk. No accessor was added, and
+none was `differential`-gated.
+
+What it does state about an extent is `expects_continue()`, which is
+`parsed() && bare`, and `bare` is set only where a member parsed WHOLE as the
+bare `100-continue`. RFC 9110 §10.1.1 puts everything behind the `token` inside
+one optional group, so a member that is its head and nothing else is exactly the
+distinction that flag carries — and exactly what a reader whose member ended
+early gets wrong.
+
+### Added
+
+- **`projected_expectation`**, deriving §10.1.1's two verdicts from the one
+  derivation the oracle admits, and holding the reader to them. The same shape
+  `projected_verdict` already is, for the reason its own doc gives: a reader
+  with a verdict and no member list, and an oracle with members and no verdict,
+  can otherwise only be compared on whether the value parsed.
+
+- **`Reading::member_heads`**, the oracle's record of where each element's head
+  ends and whether the boundary-reaching derivation ends there. When the value
+  derives, those keys are exactly the members of its one derivation — each start
+  has at most one end the list admits, so the chain from the first start is
+  unique.
+
+- **Corpus G, 120 records.** The §5.6.6 comparison already handed
+  `Expectations` a value on every record, but writes the head `x=1` in front of
+  every element, so no member is ever named `100-continue` and both verdicts are
+  constants no extent decision moves. Corpus G writes the names — bare, shouted,
+  with an argument, with a quoted argument, with an argument and parameters, and
+  with parameters and no argument — as one- and two-member lists and across the
+  RFC 9110 §5.2 join.
+
+- **The number that says what this is worth: 70.** 86 477 records have the bit
+  compared (`EXPECT_EXTENT_GRADED`); on **70** of them a `100-continue` member's
+  extent is what decides it (`EXPECT_EXTENT_DECISIVE`), and those are the only
+  records the comparison can fail on. Both are asserted, and
+  `the_extent_grading_was_asked_this_much` requires the second to be non-zero.
+  Reading the first as coverage would be reading a tautology: everywhere else
+  both sides answer the same way whatever the reader thinks a member's extent
+  is.
+
+  **This half is one bit per value where the other two are an offset per
+  parameter.** That is the hole, stated in the same asserted form as the 37 772
+  / 225 779 split beside it. Closing it means `Expectations` handing out a
+  member, which is a public API decision this corpus does not make on a reader's
+  behalf.
+
+- **The control.**
+  `the_expectation_extent_projection_reds_on_a_reader_that_truncates` runs the
+  projection against a reader whose member ends at its name and requires the
+  live one to stay green, in both directions (`100-continue=1` and
+  `100-continue`) and case-insensitively.
+  `the_expectation_reader_borrows_nothing_to_place` pins the obstacle as
+  something the compiler checks, so if the type ever gains a lifetime the test
+  stops compiling and whoever changed it can replace the projection with
+  offsets.
+
+- **Reachability**, as the other families have it:
+  `every_expectation_shape_arises_from_the_expect_generator` asserts the set of
+  shapes reached — `decisive` among them — arises from the generator, so a
+  vocabulary edit that stopped writing a `100-continue` with something behind it
+  reds instead of turning the comparison into an equality between two constants.
+  `expect-continue` 34, `expect-other` 107, `expect-extent-decisive` 70.
+
+### Changed
+
+- The corpus is 245 217 → 245 337 records. Corpora `A`..`F` digest identically;
+  corpus G's and the whole run's are new.
+- `expect-parsed` 6 323 → 6 420, `expect-refused` 80 034 → 80 057,
+  `expect-empty-element` 2 751 → 2 771 — corpus G's contribution to rows that
+  already existed.
+- `member_extent`'s failure message names the head as well as the parameter
+  offsets, so a red says which of the three readers it is about.
+
+## `coding-corpus` — `TE` is read, and the reading RFC 9110 leaves open is recorded rather than picked
+
+RFC 9110 §10.1.4's productions are `TE`'s as well as RFC 9112 §7's, and every
+§10.1.4 value this corpus wrote was a `Transfer-Encoding`. So the literal
+`"trailers"` and §12.4.2's weight — the two things `TE`'s container has that
+`#transfer-coding` has not — were bytes nothing here asserted anything about,
+and a `TE` reader landing later would have been a fourth uncompared walk over
+one production, which is issue #76's shape exactly. Closes #80.
+
+### Added
+
+- **Corpus F, and `Production::TCodings`.** 168 records: every one- and
+  two-member `TE` list over a twelve-member vocabulary, and each member once cut
+  across RFC 9110 §5.2's join. `every_te_shape_arises_from_the_te_generator`
+  asserts the shapes arise from the GENERATOR and not from a hand-written value,
+  for the reason `every_verdict_arises_from_the_list_generator` does.
+
+- **The `t-codings` oracle derives exactly what `transfer-coding` does, and both
+  halves of that are facts about §5.6.2's `token`.** `"trailers"` is spelled by
+  `token`, and every `weight` is spelled by `OWS ";" OWS transfer-parameter`
+  because `"q="` is a `token` and an `=` and every §12.4.2 `qvalue` is DIGIT and
+  `.`, both `tchar`. What differs is only what a member's parameters ARE — which
+  is why this needed the extent question the commit below adds, and could not
+  have been graded before it.
+
+- **The ambiguity, recorded and not settled.** `gzip;q=0.5` is a
+  `transfer-coding` carrying a `transfer-parameter` named `q` AND a
+  `transfer-coding` followed by a `weight`, over one string ending at one
+  offset. The oracle admits both, the grading accepts either, and `tests` pins
+  which one each reader takes: the walk reads it as a `transfer-parameter` on
+  all **125** such members (`extents_q_as_parameter`), and the weight reading is
+  asserted at **zero** rather than left as an absent row, so a reader that
+  starts taking it says so. `media::accept` takes the other reading on its own
+  field and drops the `q` on **14** members (`media-q-dropped`).
+
+- **Reachability rows, so a vocabulary edit reds rather than going quiet.**
+  `te-trailers` 24, `te-weight-ambiguous` 100, `te-q-read-as-parameter` 100, and
+  `te-q-no-weight` 84 — a `q` no `weight` reaches, which the vocabulary spells
+  four ways: a value that is no `qvalue`, a §5.6.4 `quoted-string` where `weight`
+  has no alternative, §5.6.3's `BWS` where `weight` writes one literal, and a
+  repetition standing behind the `q` where the bracket cannot reach. Without the
+  last row the ambiguity row could not be told from a corpus that writes one `q`
+  and never varies it.
+
+### Why the `q` is not settled here, and what was checked
+
+The obvious ruling — that a `q` terminates the parameter section and begins the
+weight, RFC 9110 §12.5.1 stating as much for `Accept` and §10.1.4 inheriting it
+— does not survive reading §12.5.1. That section says the opposite of a
+positional rule: "Recipients SHOULD process any parameter named "q" as weight,
+regardless of parameter ordering", which tells a recipient to recognise a `q`
+that has parameters BEHIND it. And the grammar the ruling leans on is not in
+this RFC at all — §12.5.1 records: "The accept extension grammar (accept-params,
+accept-ext) has been removed"; it was RFC 7231 §5.3.2's. What §12.5.1 does carry
+is scoped to `Accept`, and its own note grounds it in the media type registry
+disallowing a parameter named `q` — a registry that governs media types and not
+transfer codings. §12.4.2 calls the weight a common parameter named `q` and says
+only what it means. §10.1.4 says nothing. No verified erratum touches any of
+them.
+
+So no clause settles it for `TE`, and this corpus grades both readings rather
+than choosing one on a reader's behalf.
+
+### Changed
+
+- The corpus is 245 049 → 245 217 records. Corpora `A`..`E` digest identically;
+  corpus F's and the whole run's are new.
+- `recovered-member` 11 719 → 11 721. Both are corpus F's split spelling putting
+  RFC 9110 §5.2's comma inside a parameter, which the walk recovers past.
+- Two fault rows, `te-codings:MissingParameterValue` 2 and
+  `te-codings:NotAToken` 7 — the same arm `te` uses, so they are new witnesses
+  and not new variants.
+
+### What this still does not say
+
+There is no `TE` PAIR, because there is no second reader of `TE` in this
+workspace: corpus F is one walk against an oracle. That is issue #80's own
+sequencing — the oracle first, so a reader arrives into a graded production and
+is held to it.
+
+## `coding-corpus` — a member's extent, graded exactly, and the column that was its own baseline
+
+Every axis this harness carried was a question about where a member BEGINS, so a
+reader that ended its LAST member one well-formed parameter early — and yielded
+nothing behind it — satisfied all of them. Issue #79 measured it: a walk patched
+to do exactly that moved 6 050 records' `answer` and left every `grade` byte
+identical over all 245 049. The only thing watching that column was a SHA-256
+taken OVER it, so a reader that shipped truncating would have had the baseline
+computed from the truncation. Closes #79.
+
+### Added
+
+- **The extent axis, `member-extent`, a zero-target.** For every member a reader
+  began where RFC 9110 licenses an element to begin, the offsets of the
+  parameter names it handed over must be the offsets of the parameter names of
+  the derivation of that element which reaches a list boundary. Graded on 37 466
+  members over 25 623 records.
+
+  **Exact, and not a bound.** A bound — no parameter the grammar does not
+  admit — is passed by a member that stopped a parameter early, because a
+  truncation reads a strict PREFIX of what the grammar admits. That prefix is
+  the whole of the defect class, so the comparison is equality.
+
+- **A fourth question in the oracle: `Reading::member_params`.** The first three
+  are about the bytes in FRONT of an offset, which is issue #77's finding; an
+  extent is about the bytes BEHIND one, and it can be answered exactly because
+  at most one end of an element is a list boundary. Every step the element walk
+  takes past an end needs a particular byte to stand at it — `;` for a
+  repetition, `=` for RFC 9110 §10.1.1's argument — and a boundary needs `,` or
+  the value's end, so an end the element continues past is one the list does not
+  admit.
+
+- **No new public item, and none was needed.** Issue #79 costed an accessor on
+  `ListMember` and `MediaRange` — a semver surface pinning where a member ends,
+  a widening of two `Copy` types on the no-panic path, a borrow promise across
+  RFC 9110 §5.2's join, and a `doc-check` snapshot move. None of it is required:
+  a parameter's NAME is already a borrowed subslice, which is what `ParamIter`
+  yields, and `place` already maps any such subslice to its offset in the
+  §5.2-joined value. The offsets come through the public API as it stands.
+
+- **The control that says the axis bites.**
+  `the_extent_axis_reds_on_a_reader_that_truncates` runs the grader against the
+  truncation issue #79 measured and against three shapes a truncation is not,
+  and requires the honest reading to stay green in the same test. Re-run over
+  the whole corpus, the mutation now reds `nothing_this_corpus_grades_is_a_defect`
+  at **2 564 records**; before this change it redded the digest and one control
+  and nothing else.
+
+- **What the grading is NOT asked, counted rather than argued.** 225 768 member
+  extents over 200 764 records are unasked: the reader refused the value, its
+  production does not derive it, the member began where the grammar begins no
+  element, or the member's own parameter walk faulted. Behind a fault a reader
+  is recovering and its members are a derivation of nothing, so the question has
+  no answer rather than an excused one.
+  `the_extent_question_is_declined_only_where_nothing_could_answer_it` shows
+  each reason to be the case it claims.
+
+- **`media-q-dropped` (14).** `MediaRange::params` hands over every parameter
+  except one named `q`, at any position, which is that reader's answer to RFC
+  9110 §12.5.1. The extent grading has to know it to grade `accept` at all, so
+  it is a licensed difference with a count rather than a silent subtraction.
+
+### Changed
+
+- `unplaced` now covers a parameter's name as well as a member's, and stays a
+  zero-target: a `token` cannot cross RFC 9110 §5.2's join, because the join
+  writes a comma and §5.6.2's `tchar` excludes it.
+- No record's `answer` moved, so every digest and every per-corpus count is
+  unchanged. The extent grading reads offsets the records never carried.
+
+### What this still does not say
+
+A member's extent is graded only where a derivation of the whole value exists to
+settle it, which is a fifth of the members this corpus sees; the rest are
+deliberately malformed. Where a reader recovers past a fault, the RFC 9112 §6.3
+item 4 verdict projection remains the only thing narrowing where its members
+stop, and the RFC 9110 §5.6.6 pairs have no verdict at all.
 
 ## `coding-corpus` — a pair is two walks or one walk twice, and the tally says which
 
