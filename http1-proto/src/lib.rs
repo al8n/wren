@@ -110,3 +110,12 @@ pub use media::{
 #[doc(hidden)]
 #[path = "no_panic_internals.rs"]
 pub mod __no_panic_internals;
+
+/// Reader forwarders for the workspace's `transfer-coding` differential. Gated
+/// behind `differential`, doc-hidden, and exempt from semver.
+// The module name carries the same leading-underscore marker the forwarders
+// above do, and the FILE is named without it, so the path is spelled out.
+#[cfg(feature = "differential")]
+#[doc(hidden)]
+#[path = "differential.rs"]
+pub mod __differential;

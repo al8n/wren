@@ -1,0 +1,12 @@
+[package]
+name = "coding-corpus"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+http-semantics = { workspace = true, features = ["std"] }
+http1-proto = { workspace = true, features = ["std", "differential"] }
+
+[lints]
+workspace = true

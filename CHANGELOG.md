@@ -1,5 +1,256 @@
 # UNRELEASED
 
+## `coding-corpus` — a pair is two walks or one walk twice, and the tally says which
+
+A differential that counts a same-engine pair beside a cross-implementation one
+overstates its own coverage, and a reader of a green run cannot tell which kind
+produced it. That is the disease this harness exists to catch, in the harness.
+It was concern 1 of the three the third reader was landed with; 5 and 6 are here
+too.
+
+### Added
+
+- **A pair kind, in the key every pair is counted under.** `media::accept` is
+  `parameterised_list_with(lines, is_media_name, …)` — the same walk the RFC
+  9110 §5.6.6 comparison's first reader is, at a different member-name rule — so
+  the (walk, `accept`) pair proves the CONFIGURATION is wired the way each field
+  needs and proves nothing about whether that reading of §5.6.6 is right: a
+  defect in the walk is in both halves. It is now `one-walk-twice`, and the four
+  pairs whose halves decide a member's boundaries with separate loops are
+  `cross-walk`. Four of the five pairs are the second kind. **The two totals are
+  asserted apart** — 319 359 comparisons by two walks against 80 434 by one walk
+  twice — so a pair filed under the wrong kind moves its own row AND both
+  totals, and reds naming them.
+
+  The kind says WALK and not implementation on purpose: every reader here
+  reaches the same `http_semantics::grammar` primitives for §5.6.2's `tchar`,
+  §5.6.3's `OWS` and §5.6.4's quoted-string scan — `http1-proto`'s accumulator
+  imports `token_end`, `skip_ows`, `scan_quoted` and `scan_quoted_after_join`
+  rather than spelling its own — so no pair here would part on a wrong `tchar`
+  table. The oracle is what grades that layer.
+
+- **`asked` beside `parted`, per pair.** A pair driven to zero partings by a
+  comparability filter that stopped comparing anything looks exactly like a pair
+  that agrees. The coverage is now a number: `te-walk-accumulator` 147 921,
+  the three §5.6.6 pairs 80 434 each, `empty-accumulator-expect` 10 570.
+
+- **How much weaker `accept`'s half of the boundary comparison is, measured.**
+  It latches at its first faulting member, so on a faulting value it reports the
+  starts in front of the fault and no others. Over the §5.6.6 comparison it put
+  **24 200 member starts up for grading where the walk put 42 223** — 57 % — and
+  the 18 023 it did not report fall on 15 904 records. The opposite direction is
+  zero, asserted, which is what makes this half the weaker one rather than
+  merely the different one. Nothing here can grade a start wrongly: an
+  unreported start is one nothing was said about.
+
+- **RFC 9110 §12.5.1's wildcard name shapes, and the trap they were.**
+  `MediaRange::ty` is `None` for `"*/*"`, so a range of that shape would have
+  been counted `unplaced` — a zero-target for a member whose name lay in none of
+  the lines — and the first person to write a wildcard case would have got a red
+  naming the wrong fact. Verified rather than argued: with the wildcard folded
+  back into `unplaced`, the new cases red `nothing_this_corpus_grades_is_a_defect`
+  at 4. Corpus D now writes all three shapes (`*/*`, `x/*`, `*/y`) behind five
+  payloads, the wildcard is counted apart as `media-wildcard` (4), and its cost
+  is stated: that member's start is graded by nothing. `x/*` and `*/y` both
+  place their type, because the distinction is §12.5.1's ALTERNATIVE and not the
+  asterisk.
+
+### Changed
+
+- `params-pair-parts`, `params-media-parts` and `params-expect-media-parts` are
+  gone as states. They were pair partings counted in the same table as
+  reachability states, with nothing saying which pair was which kind; they are
+  now rows of the pair table, keyed by kind.
+- Corpus D 329 → 344 records, and the corpus 245 034 → 245 049. Digest and
+  per-corpus counts move with it; nothing else does.
+- CI's comment on the `coding-corpus` job carried 239 420 records over three
+  readers from the first commit of the branch. It is 245 049 over four, and it
+  now names the pair-kind split as what a green run is worth.
+
+### What this still does not say
+
+`boundary-walk-short` has no row in the state table, and its absence is asserted
+at zero rather than left to be noticed. The wildcard's ungraded start is a third
+narrowing of the boundary comparison beside the two the crate doc already named.
+And the (walk, `accept`) pair remains worth what a one-walk-twice pair is worth —
+splitting the tally does not make it independent, it makes the run say so.
+
+## `coding-corpus` — a third reader for §5.6.6, and the blind spot written where it cannot be missed
+
+A harness built to remove blind spots must not ship with a known one it could
+have closed, and must say plainly which one it could not. Two of the seven
+concerns the differential was landed with are answered here.
+
+### Added
+
+- **A third RFC 9110 §5.6.6 reader: `media::accept`.** The §5.6.6 comparison
+  could not be asked about a list of more than one element, because an element
+  the payload's own comma opens carries no head, and a head is exactly where
+  the readers' grammars differ. §12.5.1 is the rule that makes it askable:
+
+  ```text
+  media-range    = ( "*/*"
+                     / ( type "/" "*" )
+                     / ( type "/" subtype )
+                   ) parameters
+  ```
+
+  Its `parameters` sit behind a name and behind NO bracket, which is the shape
+  the walk's element has and §10.1.1's — `expectation = token [ "="
+  ( token / quoted-string ) parameters ]` — does not. So the corpus writes one
+  head per reader in front of EVERY element it intends (`x`, `x=1`, `x/y`), and
+  holds all three to equal well-formedness pairwise over the one payload behind
+  them. No product code changed: `media::accept` is already public.
+
+- **Two-element spellings, and the count that says they are compared.** Each
+  §5.6.6 payload is now also written as the first and as the second element of
+  a two-element list, with a `parameters` payload of its own behind the head on
+  the other side of the comma. `params-comparable-multi` counts the comparable
+  records that are lists, and `params-comparable-multi-parameterised` (4 903)
+  counts the ones where an element other than the first carries parameters —
+  the question the comparison had never been asked. A change that reverted the
+  two-element spellings leaves the first count looking healthy and reds the
+  second.
+
+- **Corpus E, so no verdict rests on a name.** Three of the eight RFC 9112 §6.3
+  item 4 verdicts were reached once, twice and twice, entirely from hand-written
+  values: an alphabet of nine bytes spells no second `chunked`. Corpus E
+  enumerates one- to three-element coding lists over a small vocabulary and
+  reaches all eight on its own, and `every_verdict_arises_from_the_list_generator`
+  asserts that property rather than the numbers — which are asserted anyway. The
+  three now stand at 17, 34 and 73.
+
+- **Two licensed differences the third reader brings, both counted.**
+  `axis-media-weight` (28) is §12.4.2's `qvalue` under the parameter name `q`,
+  a rule §5.6.6 does not carry; `axis-media-borrow` (4) is a quoted value that
+  crosses §5.2's field-line join, which is a fact about the LINES that the
+  oracle — grading the one value §5.2 joins them into — cannot see. Both must be
+  non-zero, or the licenses would be exempting nothing.
+
+### What the differential does and does not compare, stated at the top
+
+The crate doc now opens on it, in the words a maintainer needs: a green run says
+whether a value parsed, where each member BEGINS, and the §6.3 item 4 verdict of
+the one pair that has one. It does not say where a member ENDS — no reader hands
+out a member's extent, so a walk that ended its LAST member early satisfies every
+assertion. Measured rather than asserted: with the §5.6.6 walk patched to end its
+last member one well-formed parameter short, the `grade` column is byte-identical
+on all 245 034 records and every state, fault and verdict count is unchanged;
+6 050 records render a different `answer`, so only the digest moves — and a
+digest is a baseline a reader shipping with the defect would have been pinned to.
+That needs a reader to EXPOSE extents, which is a public API decision rather than
+a test fix; **#79** carries it with what it would cost. **#80** carries the other
+one the doc now names: every §10.1.4 value here is a `Transfer-Encoding`, so
+`TE`'s `weight` and its `"trailers"` alternative are ungraded.
+
+### Changed
+
+- The comparability filter is decided from the offsets the GENERATOR wrote a
+  head at, rather than from the value's length and a `tailed` flag. Same rule,
+  spelled as what it always meant, and it extends to lists of any length.
+  75 503 comparable records became 80 419; 5 741 excluded became 5 923, which is
+  6.9 % of the §5.6.6 records rather than 7.1 %. The remainder is exactly the
+  payloads that open a head-less element, and it cannot go to zero: RFC 9110
+  §5.6.2's `tchar` admits no solidus, so a name §12.5.1 derives is one the two
+  token-headed readers refuse, and the other way round. There is no third
+  choice, and `the_five_six_six_comparison_reaches_a_second_element_and_stops_at_a_headless_one`
+  pins both halves.
+
+## `coding-corpus` — three readers of two productions, and the first gate that asks whether they agree
+
+Three walks in this workspace parse RFC 9110 §10.1.4's `transfer-coding` and
+§5.6.6's `parameters`, and nothing asserted that any pair of them answers alike:
+
+```text
+transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+parameters         = *( OWS ";" OWS [ parameter ] )
+parameter          = parameter-name "=" parameter-value
+parameter-name     = token
+parameter-value    = ( token / quoted-string )
+expectation        = token [ "=" ( token / quoted-string ) parameters ]
+#element => [ element ] *( OWS "," OWS [ element ] )
+```
+
+`grammar::parameterised_list` under `ParamSyntax::TransferParameter` is the
+public API for the first pair of rules; `http1-proto`'s `Transfer-Encoding`
+accumulator is what actually reads the field off the wire; `grammar::Expectations`
+reads the third. Each has its own tests, each passes, and each test was written
+from the same reading that produced the implementation beside it — so a
+divergence between two of them was invisible to every gate, and `gzip;` was
+accepted by one and refused by another until an external reviewer read the ABNF.
+Nine commits on the branch that fixed it said a differential would have found it.
+
+### Added
+
+- **`coding-corpus`, a differential over 239 420 records.** One corpus, every
+  reader, and an assertion per pair. §10.1.4's two readers are held to EQUALITY,
+  on well-formedness and on the RFC 9112 §6.3 item 4 verdict both — the second
+  projected from the walk's member names, so a divergence in where a member ENDS
+  is visible and not only one in whether the value parsed. §5.6.6's two readers
+  are held to equality over one shared `parameters` payload written behind each
+  reader's own head, because §10.1.1 puts `parameters` inside
+  `[ "=" ( token / quoted-string ) parameters ]` and §5.6.6's has no head at
+  all. §5.6.1.1's two readers are held to equality over values whose elements
+  both element grammars derive. The two `ParamSyntax` arms are held to NO
+  relation: each is graded against its own production, so the four differences
+  PR #78 enumerated fall out as counted states rather than as exceptions.
+
+- **An oracle written from the productions, not from any of the three.** It
+  answers three questions and names what each is asked ABOUT, because #77
+  records an oracle that asked whether the WHOLE value derives and answered "no
+  reading licenses this" about a locally-admitted quoted string: whether the
+  whole value derives, which offsets some derivation of a PREFIX begins an
+  element at, and which offsets some prefix derivation reads as a
+  quoted-string's data.
+
+- **Zero-targets that are zero, and states that carry their count.** #77 records
+  that `auth-corpus` pins `over-yield` at a non-zero constant instead of driving
+  it to zero, and reaches `TooManyParameters` zero times because one generator
+  always fires a different bound first. Neither happens here: five axes are
+  zero-targets, every state carries the exact number of records that reach it,
+  and the one residue — the bare parameter name §5.6.6 does not derive and
+  `ParamSyntax::Parameter` hands over as `ParamValue::None` — is held to an
+  exact characterisation in both directions rather than to a number.
+
+- **A negative control for the strongest axis.** `manufactured-member` is zero
+  over the whole corpus, and a zero nothing asks is worth nothing, so the grader
+  is run against a reader written to commit the defect: one that splits the RFC
+  9110 §5.2-joined value on every raw comma and takes each element's leading
+  token, which reads a `chunked` out of a parameter value's own data. The axis
+  has to fire on it, and must not fire on either arm that is live today.
+
+- **The demonstration against the divergence #76 was filed over.** The pre-#78
+  reading of a `Transfer-Encoding` is not stubbed, it is selected: before #78
+  the walk had one parameter production — §5.6.6's — and read a
+  `Transfer-Encoding` with it, so today's `ParamSyntax::Parameter` arm applied
+  to one IS that reading on both axes the two productions differ on.
+  `the_transfer_coding_pair_reds_on_the_pre_78_reading` asserts the pair parts
+  on thirteen of the named values, `gzip;` among them, and that the arm live
+  today parts on none.
+
+- **`http1-proto`'s `differential` feature.** One doc-hidden, semver-exempt
+  wrapper over the crate-private `Transfer-Encoding` accumulator, so the corpus
+  can hand it the same field lines the §10.1.4 walk is handed. It adds no rule:
+  every method forwards one call, and its verdict enum is an exhaustive
+  re-spelling, so a variant added to the crate's own classification stops it
+  compiling rather than being folded onto an existing row of the record.
+
+### What the differential still cannot see
+
+A member's EXTENT, except through the offset the next member begins at and
+through the `Transfer-Encoding` verdict: no reader hands out where a member
+ends, so a walk that ended its LAST member early and yielded nothing behind it
+would satisfy every assertion. `recovered-member` — a member shown past a fault
+at an offset no derivation reaches and no reading holds inside a string — is a
+counted state and not a zero-target, because that is the walk not letting a
+malformed member hide the members behind it; only the subset a reading DOES hold
+inside a string is a defect. And a tally of grades cannot see an answer that
+moves within its grade, which is what the SHA-256 over the `answer` column is
+for; there is no two-revision driver for this corpus as `xtask auth-diff` is one
+for `auth-corpus`, so finding WHICH record moved means running the binary at both
+revisions and diffing.
+
 ## `http-semantics` — a boundary no reading ended in front of
 
 The previous commit proved that no reading of the bytes behind a fault holds the
