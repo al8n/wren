@@ -1,5 +1,94 @@
 # UNRELEASED
 
+## `coding-corpus` — the third §5.6.6 reader's extent, graded through what a fold can still state
+
+The two commits below put the walk and `media::accept` into an extent
+comparison and left `Expectations` out of it, because that reader hands out no
+member. A branch that closes "a fourth uncompared walk" while leaving a third
+reader uncompared has not closed the class — it is the shape #76 was filed
+over. Measured before anything was changed: RFC 9110 §10.1.1's reader mutated
+so that a member's extent stops at its name left **all 35 tests green, exit 0**.
+
+### The obstacle, stated rather than worked around
+
+`Expectations` is a fold over eight bits with **no lifetime parameter**. It
+borrows no field line and retains no slice, so issue #79's argument — that the
+borrowed subslice `place` needs is already handed out — does not transfer, and
+the offset grading the other two readers get cannot be asked of it at any
+surface short of turning it into a borrowing walk. No accessor was added, and
+none was `differential`-gated.
+
+What it does state about an extent is `expects_continue()`, which is
+`parsed() && bare`, and `bare` is set only where a member parsed WHOLE as the
+bare `100-continue`. RFC 9110 §10.1.1 puts everything behind the `token` inside
+one optional group, so a member that is its head and nothing else is exactly the
+distinction that flag carries — and exactly what a reader whose member ended
+early gets wrong.
+
+### Added
+
+- **`projected_expectation`**, deriving §10.1.1's two verdicts from the one
+  derivation the oracle admits, and holding the reader to them. The same shape
+  `projected_verdict` already is, for the reason its own doc gives: a reader
+  with a verdict and no member list, and an oracle with members and no verdict,
+  can otherwise only be compared on whether the value parsed.
+
+- **`Reading::member_heads`**, the oracle's record of where each element's head
+  ends and whether the boundary-reaching derivation ends there. When the value
+  derives, those keys are exactly the members of its one derivation — each start
+  has at most one end the list admits, so the chain from the first start is
+  unique.
+
+- **Corpus G, 120 records.** The §5.6.6 comparison already handed
+  `Expectations` a value on every record, but writes the head `x=1` in front of
+  every element, so no member is ever named `100-continue` and both verdicts are
+  constants no extent decision moves. Corpus G writes the names — bare, shouted,
+  with an argument, with a quoted argument, with an argument and parameters, and
+  with parameters and no argument — as one- and two-member lists and across the
+  RFC 9110 §5.2 join.
+
+- **The number that says what this is worth: 70.** 86 477 records have the bit
+  compared (`EXPECT_EXTENT_GRADED`); on **70** of them a `100-continue` member's
+  extent is what decides it (`EXPECT_EXTENT_DECISIVE`), and those are the only
+  records the comparison can fail on. Both are asserted, and
+  `the_extent_grading_was_asked_this_much` requires the second to be non-zero.
+  Reading the first as coverage would be reading a tautology: everywhere else
+  both sides answer the same way whatever the reader thinks a member's extent
+  is.
+
+  **This half is one bit per value where the other two are an offset per
+  parameter.** That is the hole, stated in the same asserted form as the 37 772
+  / 225 779 split beside it. Closing it means `Expectations` handing out a
+  member, which is a public API decision this corpus does not make on a reader's
+  behalf.
+
+- **The control.**
+  `the_expectation_extent_projection_reds_on_a_reader_that_truncates` runs the
+  projection against a reader whose member ends at its name and requires the
+  live one to stay green, in both directions (`100-continue=1` and
+  `100-continue`) and case-insensitively.
+  `the_expectation_reader_borrows_nothing_to_place` pins the obstacle as
+  something the compiler checks, so if the type ever gains a lifetime the test
+  stops compiling and whoever changed it can replace the projection with
+  offsets.
+
+- **Reachability**, as the other families have it:
+  `every_expectation_shape_arises_from_the_expect_generator` asserts the set of
+  shapes reached — `decisive` among them — arises from the generator, so a
+  vocabulary edit that stopped writing a `100-continue` with something behind it
+  reds instead of turning the comparison into an equality between two constants.
+  `expect-continue` 34, `expect-other` 107, `expect-extent-decisive` 70.
+
+### Changed
+
+- The corpus is 245 217 → 245 337 records. Corpora `A`..`F` digest identically;
+  corpus G's and the whole run's are new.
+- `expect-parsed` 6 323 → 6 420, `expect-refused` 80 034 → 80 057,
+  `expect-empty-element` 2 751 → 2 771 — corpus G's contribution to rows that
+  already existed.
+- `member_extent`'s failure message names the head as well as the parameter
+  offsets, so a red says which of the three readers it is about.
+
 ## `coding-corpus` — `TE` is read, and the reading RFC 9110 leaves open is recorded rather than picked
 
 RFC 9110 §10.1.4's productions are `TE`'s as well as RFC 9112 §7's, and every

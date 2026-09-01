@@ -52,7 +52,16 @@
 //! reader is recovering past a fault, nothing here says where its members
 //! stop, and the `Transfer-Encoding` verdict projection remains the only thing
 //! that narrows it: a coding lost off the end of that list changes
-//! `final_is_chunked`, and the §5.6.6 pairs have no verdict at all.
+//! `final_is_chunked`.
+//!
+//! **The third RFC 9110 §5.6.6 reader is graded at a coarser resolution than
+//! the other two, and [`EXPECT_EXTENT_DECISIVE`] is how much coarser.**
+//! `Expectations` borrows nothing — [`the_expectation_reader_borrows_nothing_to_place`]
+//! pins that as a compiler-checked fact — so the finest extent statement it
+//! makes is one bit per value, and 70 records of 86 477 are the ones that bit
+//! is actually decided by a member's extent on.
+//! [`the_expectation_extent_projection_reds_on_a_reader_that_truncates`] is the
+//! control that says those 70 can fail.
 //!
 //! Of the member starts that ARE compared, the media reader contributes fewer
 //! than the walk does, on two counts that are measured here rather than argued:
@@ -67,8 +76,8 @@ use std::{collections::BTreeSet, sync::OnceLock};
 use http_semantics::{grammar::ParamSyntax, media::MediaError};
 
 use crate::{
-  Grade, ParamValue, Tally, join, oracle, oracle::Production, parameterised_list, sha256::Sha256,
-  walk,
+  Expect, Grade, ParamValue, Tally, join, oracle, oracle::Production, parameterised_list,
+  sha256::Sha256, walk,
 };
 
 /// The whole corpus, run once for every test in this file.
@@ -79,7 +88,7 @@ struct Corpus {
   tally: Tally,
   /// The SHA-256 of the `answer` column, per corpus and then over the whole
   /// run.
-  digests: [String; 7],
+  digests: [String; 8],
 }
 
 /// Runs every generator into memory, once.
@@ -105,7 +114,7 @@ fn corpus() -> &'static Corpus {
 /// Asserted rather than narrated: a generator that stops generating shortens
 /// every count below it and would otherwise leave every one of them still
 /// green.
-const PER_CORPUS: [usize; 6] = [147_618, 86_103, 10_468, 344, 516, 168];
+const PER_CORPUS: [usize; 7] = [147_618, 86_103, 10_468, 344, 516, 168, 120];
 
 /// Nothing this corpus grades is a defect.
 ///
@@ -117,7 +126,7 @@ const PER_CORPUS: [usize; 6] = [147_618, 86_103, 10_468, 344, 516, 168];
 #[test]
 #[cfg_attr(
   miri,
-  ignore = "walks 245 217 records through four readers and an O(n^2) oracle; \
+  ignore = "walks 245 337 records through four readers and an O(n^2) oracle; \
             seconds natively, hours interpreted, and it exercises no unsafe code"
 )]
 fn nothing_this_corpus_grades_is_a_defect() {
@@ -140,7 +149,8 @@ fn nothing_this_corpus_grades_is_a_defect() {
   );
   assert_eq!(
     tally.member_extent, 0,
-    "a reader stated a member whose parameters are no derivation's"
+    "a reader stated a member no derivation of the element ends where it did — \
+     the walk or `accept` at a parameter offset, or `Expectations` at the head"
   );
   assert_eq!(
     tally.unplaced, 0,
@@ -327,9 +337,16 @@ fn the_extent_grading_was_asked_this_much() {
      `te-q-read-as-weight` is a row EXPECTED_STATES now needs"
   );
   assert_eq!(tally.media_q_dropped, MEDIA_Q_DROPPED);
+  assert_eq!(tally.expect_extent_graded, EXPECT_EXTENT_GRADED);
+  assert_eq!(tally.expect_extent_decisive, EXPECT_EXTENT_DECISIVE);
   assert!(
     tally.extents_graded > 0,
     "no member's extent was graded, so the zero-target beside this is about nothing"
+  );
+  assert!(
+    tally.expect_extent_decisive > 0,
+    "no record's RFC 9110 §10.1.1 verdict was decided by a member's extent, so \
+     that comparison is an equality between two constants"
   );
   assert_eq!(
     tally.extents_ambiguous,
@@ -359,6 +376,35 @@ const EXTENTS_Q_AS_WEIGHT: usize = 0;
 /// Graded members where `media::accept` dropped a `q` the grammar derives as a
 /// parameter, per RFC 9110 §12.5.1. See [`EXTENTS_GRADED`].
 const MEDIA_Q_DROPPED: usize = 14;
+
+/// Records where RFC 9110 §10.1.1's two extent-bearing verdicts were compared
+/// with the derivation's, and the ones a `100-continue` member's EXTENT decided.
+///
+/// **These two are not in the same unit as the four above, and the difference
+/// is the hole this comparison leaves.** The walk and `media::accept` hand over
+/// borrowed parameter names, so their extents are graded offset by offset —
+/// 37 772 members, every parameter of every one of them. `Expectations` hands
+/// over nothing borrowed: it is a fold over eight bits with no lifetime
+/// parameter, so the finest thing it says about where a member ends is whether
+/// SOME member parsed whole as the bare `100-continue`, and the projection can
+/// grade that and no more. One bit per value, against a member-by-member,
+/// offset-by-offset answer for the other two.
+///
+/// So `EXPECT_EXTENT_GRADED` counts records the bit was compared on, and
+/// `EXPECT_EXTENT_DECISIVE` counts the ones where a member's extent DECIDED
+/// it — the only records on which the comparison can fail at all. 70 of 86 477
+/// is what this closure is worth, and it is written here rather than inferred,
+/// because a reader who took the first number for coverage would be reading a
+/// tautology: on every other record both sides answer the same way whatever the
+/// reader thinks a member's extent is.
+///
+/// Raising the second number means writing more `100-continue` members with
+/// something behind them. Making the comparison finer than one bit means
+/// `Expectations` handing out a member, which is a public API decision this
+/// branch declined to make on its own — see the crate doc.
+const EXPECT_EXTENT_GRADED: usize = 86_477;
+/// See [`EXPECT_EXTENT_GRADED`].
+const EXPECT_EXTENT_DECISIVE: usize = 70;
 
 /// Every state worth counting, and how many records reach it.
 ///
@@ -445,9 +491,13 @@ const EXPECTED_STATES: &[(&str, usize)] = &[
   ("boundary-media-short", 15_904),
   ("empty-comparable", 10570),
   ("empty-comparable-empty", 8149),
-  ("expect-empty-element", 2751),
-  ("expect-parsed", 6323),
-  ("expect-refused", 80_034),
+  ("expect-continue", 34),
+  ("expect-empty-element", 2771),
+  ("expect-extent-decisive", 70),
+  ("expect-extent-graded", 86_477),
+  ("expect-other", 107),
+  ("expect-parsed", 6420),
+  ("expect-refused", 80_057),
   ("extent-graded", 25_782),
   ("extent-unasked", 200_773),
   ("media-parsed", 3711),
@@ -698,7 +748,7 @@ fn the_answer_column_reproduces_its_digest() {
   assert_eq!(corpus().digests, EXPECTED_DIGESTS);
 }
 
-/// The SHA-256 of the `answer` column: corpora `A`..`F`, then the whole run.
+/// The SHA-256 of the `answer` column: corpora `A`..`G`, then the whole run.
 ///
 /// **This is a baseline and not an oracle, and the difference is the whole of
 /// what issue #79 measured.** The digest is taken OVER the column it grades, so
@@ -718,14 +768,15 @@ fn the_answer_column_reproduces_its_digest() {
 /// than moving a hash of itself. What the digest still catches, and what
 /// nothing else here can, is an answer that moves INSIDE its grade — which is
 /// why it stays.
-const EXPECTED_DIGESTS: [&str; 7] = [
+const EXPECTED_DIGESTS: [&str; 8] = [
   "c332e6a3b291e0cb4058278f734d1f83b1ae6973bc03a7fd23743f37931e23ab",
   "423e2030881e41bb83c38138263b7f9b1082b0fe4e092202ff099899e25472ba",
   "51f9d92b22ce3964c13440fe10bfa492bfe0276b72f4602944148aa6cfc038e5",
   "08645d53859eed3b531a1f3208edea6642bb7a337ed395c43973743e7f4e93dc",
   "79c07685f39633513470396ca6eb351ec495878c39a2d73b172cedb9c484f636",
   "3a1f5f1a46d184513eabf7fe6ccdb1a30375b21d7a10ebd8e3a4c7c48c019efa",
-  "d00a5df8f14f7b99e0901df97158c4e8e6abce000bfa90a178c5d97505661bd0",
+  "969b7ebc994c655417c0e1f00750d2dd86089f228f5833f6180150bce2b394c9",
+  "332e4eec5def31878db25e61d1b77b6930f272d4d35bf4d3a7b12b9a29c79070",
 ];
 
 // ─────────────────────── the demonstration against #78 ───────────────────────
@@ -1583,6 +1634,154 @@ fn the_extent_question_is_declined_only_where_nothing_could_answer_it() {
   assert!(!reading.licenses_member_at(3));
   assert_eq!(graded.graded, 0);
   assert!(!graded.wrong);
+}
+
+// ───────────── RFC 9110 §10.1.1, and the extent a fold can still state ───────
+
+/// `Expectations` borrows nothing, which is WHY its extent is graded through a
+/// projection instead of through offsets.
+///
+/// The obstacle stated as something the compiler checks rather than as a
+/// sentence in a doc. Issue #79's argument — that a reader already hands out
+/// the borrowed subslice `place` needs — does not transfer to this one, and the
+/// reason is structural: the type has no lifetime parameter, so it retains no
+/// part of any field line and there is nothing to place. If it ever gains one,
+/// this test stops compiling and whoever changed it can replace the projection
+/// with the offset grading the other two readers get.
+#[test]
+fn the_expectation_reader_borrows_nothing_to_place() {
+  const fn borrows_no_input<T: Copy + 'static>() {}
+  borrows_no_input::<http_semantics::grammar::Expectations>();
+}
+
+/// The RFC 9110 §10.1.1 projection REDS on a reader whose member ends at its
+/// name, and stays green on the one that does not.
+///
+/// The control the `member_extent` zero-target needs for its third reader.
+/// Before this comparison existed, the same truncation applied to
+/// `Expectations` itself left every one of this crate's tests green — measured,
+/// not assumed — because nothing here read `expects_continue` at all.
+///
+/// `100-continue=1` is the whole demonstration. RFC 9110 §10.1.1 writes
+/// `expectation = token [ "=" ( token / quoted-string ) parameters ]`, so the
+/// derivation of that member runs past its head and into the optional group:
+/// the member is not the bare token the field defines. A reader that stopped at
+/// the head would say it is.
+#[test]
+fn the_expectation_extent_projection_reds_on_a_reader_that_truncates() {
+  let value: &[u8] = b"100-continue=1";
+  let reading = oracle::read(value, Production::Expectation);
+  assert!(reading.derives);
+  let head = reading
+    .member_head(0)
+    .expect("the member reaches the list boundary");
+  assert_eq!(head.end, 12, "the head is the token");
+  assert!(
+    !head.bare,
+    "the derivation runs past it into the optional group"
+  );
+  assert_eq!(crate::projected_expectation(&reading, value), (false, true));
+
+  let read = crate::expectations(&[value]);
+  assert!(!read.expects_continue);
+  assert!(read.has_other);
+  let graded = crate::grade_expectation(value, &read, &reading);
+  assert!(!graded.wrong, "the live reader is not the truncating one");
+  assert!(graded.graded);
+  assert!(
+    graded.decisive,
+    "a member's extent decides this record, which is what makes the red possible"
+  );
+
+  // The same reader with its member ended at the name: this IS the bare token,
+  // and there is no other expectation in the value.
+  let truncating = Expect {
+    rendered: read.rendered.clone(),
+    parsed: read.parsed,
+    empty_element: read.empty_element,
+    expects_continue: true,
+    has_other: false,
+  };
+  assert!(
+    crate::grade_expectation(value, &truncating, &reading).wrong,
+    "the axis did not fire on a reader whose member ended at its name"
+  );
+
+  // And the bare token itself, where the two verdicts swap. Without this half
+  // the control would pass on a projection that always answers `(false, true)`.
+  let bare: &[u8] = b"100-continue";
+  let reading = oracle::read(bare, Production::Expectation);
+  assert!(
+    reading
+      .member_head(0)
+      .is_some_and(|head| head.bare && head.end == 12)
+  );
+  assert_eq!(crate::projected_expectation(&reading, bare), (true, false));
+  let read = crate::expectations(&[bare]);
+  assert!(read.expects_continue);
+  assert!(!read.has_other);
+  assert!(!crate::grade_expectation(bare, &read, &reading).wrong);
+
+  // RFC 5234 §2.3 makes a quoted ABNF literal case-insensitive, and §10.1.1
+  // names `100-continue` as one. Both sides have to agree about that too, or
+  // the projection would red on a value the reader reads correctly.
+  let shouted: &[u8] = b"100-CONTINUE";
+  let reading = oracle::read(shouted, Production::Expectation);
+  assert_eq!(
+    crate::projected_expectation(&reading, shouted),
+    (true, false)
+  );
+  assert!(!crate::grade_expectation(shouted, &crate::expectations(&[shouted]), &reading).wrong);
+}
+
+/// Every shape the `Expect` family exists to write arises from its GENERATOR.
+///
+/// The property beside the counts, for the reason
+/// [`every_verdict_arises_from_the_list_generator`] is one. `decisive` is the
+/// row that matters most: a vocabulary edit that stopped writing a
+/// `100-continue` with something behind it would leave every count in
+/// [`EXPECTED_STATES`] looking healthy and turn the §10.1.1 comparison into an
+/// equality between two constants.
+#[test]
+fn every_expectation_shape_arises_from_the_expect_generator() {
+  let mut seen = BTreeSet::new();
+  for value in crate::expectation_lists() {
+    let lines: Vec<&[u8]> = vec![&value];
+    let read = crate::expectations(&lines);
+    let reading = oracle::read(&value, Production::Expectation);
+    let graded = crate::grade_expectation(&value, &read, &reading);
+    assert!(!graded.wrong, "{}", String::from_utf8_lossy(&value));
+    if graded.graded {
+      seen.insert("graded");
+    }
+    if graded.decisive {
+      seen.insert("decisive");
+    }
+    if read.expects_continue {
+      seen.insert("continue");
+    }
+    if read.expects_continue && read.has_other {
+      seen.insert("continue-and-other");
+    }
+    if !read.parsed {
+      seen.insert("refused");
+    }
+    if read.empty_element {
+      seen.insert("empty-element");
+    }
+  }
+  assert_eq!(
+    seen,
+    BTreeSet::from([
+      "continue",
+      "continue-and-other",
+      "decisive",
+      "empty-element",
+      "graded",
+      "refused",
+    ]),
+    "the Expect generator does not reach the shapes the corpus counts"
+  );
 }
 
 // ──────────────────── `TE`, and the reading RFC 9110 leaves ──────────────────

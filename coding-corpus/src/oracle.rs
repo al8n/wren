@@ -272,6 +272,46 @@ pub struct Reading {
   /// `main` records which one each reader took, so a `TE` reader added later is
   /// held to a reading somebody chose rather than inventing a third.
   pub member_params: BTreeMap<usize, Vec<Vec<ParamName>>>,
+  /// For each of those same offsets: where the element's HEAD ends, and whether
+  /// the derivation reaching the list boundary ends there too.
+  ///
+  /// The extent question asked of a reader that hands out no offsets. RFC 9110
+  /// §10.1.1's `Expectations` is a fold over eight bits with no lifetime
+  /// parameter — it borrows no field line and can hand over no subslice — so
+  /// nothing it says can be `place`d. What it does say is whether some member
+  /// parsed WHOLE as the bare `100-continue`, which is a statement about where
+  /// that member ENDED, and this is what that is graded against.
+  ///
+  /// **When [`derives`](Self::derives) holds, these keys are exactly the
+  /// members of the value's one derivation.** Each start has at most one end
+  /// the list admits, so it has at most one successor, so the chain from the
+  /// first start is unique and the reachable set is that chain. A start that
+  /// reaches no boundary has no row here at all, which is the same fact from
+  /// the other side.
+  pub member_heads: BTreeMap<usize, MemberHead>,
+}
+
+/// Where one element's head ends, and whether the element does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberHead {
+  /// One past the head's last byte — the `token` for RFC 9110 §10.1.4, §5.6.6
+  /// and §10.1.1, and `type "/" subtype` for §12.5.1.
+  pub end: usize,
+  /// The derivation that reaches the list boundary ends AT the head, so the
+  /// member is its head and nothing else.
+  ///
+  /// For RFC 9110 §10.1.1 this is the whole of what distinguishes the
+  /// expectation the field defines from one it does not:
+  ///
+  /// ```text
+  /// Expect      = #expectation
+  /// expectation = token [ "=" ( token / quoted-string ) parameters ]
+  /// ```
+  ///
+  /// The bracket is optional and holds everything behind the `token`, so a
+  /// member that is its head and nothing else is the bare token, and a member
+  /// that is not took the bracket.
+  pub bare: bool,
 }
 
 /// One parameter name a derivation reads, as its offsets in the value RFC 9110
@@ -333,6 +373,15 @@ impl Reading {
       None => &[],
     }
   }
+
+  /// Where the element at `at` ends its head, and whether it ends there.
+  ///
+  /// `None` where no derivation of an element beginning there reaches a list
+  /// boundary — the same absence [`member_params`](Self::member_params) reports
+  /// as an empty slice.
+  pub fn member_head(&self, at: usize) -> Option<MemberHead> {
+    self.member_heads.get(&at).copied()
+  }
 }
 
 /// Reads `value` under `production` and answers the four questions.
@@ -340,6 +389,7 @@ pub fn read(value: &[u8], production: Production) -> Reading {
   let mut element_starts = BTreeSet::new();
   let mut string_data = BTreeSet::new();
   let mut member_params: BTreeMap<usize, Vec<Vec<ParamName>>> = BTreeMap::new();
+  let mut member_heads: BTreeMap<usize, MemberHead> = BTreeMap::new();
   let mut derives = false;
 
   // §5.5 removes the field value's leading whitespace, so the list begins past
@@ -352,7 +402,7 @@ pub fn read(value: &[u8], production: Production) -> Reading {
   while let Some(at) = queue.pop() {
     let mut ends = Vec::new();
     let mut chain = Vec::new();
-    element_ends(
+    let head = element_ends(
       value,
       at,
       production,
@@ -369,6 +419,15 @@ pub fn read(value: &[u8], production: Production) -> Reading {
     for &(end, taken) in &ends {
       if boundary(value, end).is_none() {
         continue;
+      }
+      if let Some(head_end) = head {
+        member_heads.insert(
+          at,
+          MemberHead {
+            end: head_end,
+            bare: end == head_end,
+          },
+        );
       }
       let read = chain.get(..taken).unwrap_or_default().to_vec();
       let readings = member_params.entry(at).or_default();
@@ -400,6 +459,7 @@ pub fn read(value: &[u8], production: Production) -> Reading {
     element_starts,
     string_data,
     member_params,
+    member_heads,
   }
 }
 
@@ -453,10 +513,8 @@ fn element_ends(
   ends: &mut Vec<(usize, usize)>,
   chain: &mut Vec<ParamName>,
   data: &mut BTreeSet<usize>,
-) {
-  let Some(head_end) = head_end(value, at, production) else {
-    return;
-  };
+) -> Option<usize> {
+  let head_end = head_end(value, at, production)?;
   let mut cursor = head_end;
 
   if production == Production::Expectation {
@@ -467,10 +525,10 @@ fn element_ends(
     // reading.
     ends.push((head_end, chain.len()));
     if value.get(head_end) != Some(&b'=') {
-      return;
+      return Some(head_end);
     }
     let Some(after) = argument_end(value, head_end.saturating_add(1), data) else {
-      return;
+      return Some(head_end);
     };
     ends.push((after, chain.len()));
     cursor = after;
@@ -486,14 +544,14 @@ fn element_ends(
   loop {
     let semicolon = skip_ows(value, cursor);
     if value.get(semicolon) != Some(&b';') {
-      return;
+      return Some(head_end);
     }
     let slot = skip_ows(value, semicolon.saturating_add(1));
     let Some(name_end) = token_end(value, slot) else {
       // Only §5.6.6 brackets the slot. §10.1.4 does not, so a `;` that
       // introduces no `transfer-parameter` derives nothing.
       if is_transfer(production) {
-        return;
+        return Some(head_end);
       }
       cursor = semicolon.saturating_add(1);
       ends.push((cursor, chain.len()));
@@ -508,12 +566,12 @@ fn element_ends(
       name_end
     };
     if value.get(eq) != Some(&b'=') {
-      return;
+      return Some(head_end);
     }
     let start = eq.saturating_add(1);
     let start = if bws { skip_ows(value, start) } else { start };
     let Some(after) = argument_end(value, start, data) else {
-      return;
+      return Some(head_end);
     };
     // Whether these bytes are ALSO RFC 9110 §12.4.2's
     // `weight = OWS ";" OWS "q=" qvalue`. See [`ParamName::weight`]; whether

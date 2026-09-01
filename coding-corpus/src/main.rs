@@ -119,7 +119,9 @@
 //! reader of it. **It compares where a member BEGINS**, against the offsets the
 //! oracle licenses an element to start at. **It compares what a member is made
 //! of all the way to where it ENDS**, against the parameter names of the one
-//! derivation of that element which reaches a list boundary. **It compares the
+//! derivation of that element which reaches a list boundary — and, for the
+//! reader that hands out no offsets, against whether that derivation ends at
+//! the member's head. **It compares the
 //! RFC 9112 §6.3 item 4 verdict** of the one pair that has one. And it hashes
 //! every reader's rendered answer, so an answer that moves inside its grade
 //! moves the digest.
@@ -137,6 +139,26 @@
 //! and the opposite direction — a start `accept` reported and the walk did not —
 //! is zero, which is what makes this half the weaker one rather than the
 //! different one.
+//!
+//! **All three RFC 9110 §5.6.6 readers are in the extent comparison, and one of
+//! them is in it through a projection.** The walk and `media::accept` hand over
+//! borrowed parameter names, so their extents are graded offset by offset.
+//! `Expectations` hands over nothing borrowed — it is a fold over eight bits
+//! with no lifetime parameter, so it retains no part of any field line and
+//! there is nothing for `place` to place. What it DOES state about where a
+//! member ends is whether some member parsed WHOLE as the bare `100-continue`,
+//! and that is graded against §10.1.1's own derivation. It is the shape
+//! `projected_verdict` already is, for the reason that doc gives.
+//!
+//! **That third half is one bit per value where the other two are an offset per
+//! parameter, and the number that says what it is worth is 70.** 86 477 records
+//! have the bit compared; on 70 of them a `100-continue` member's extent is
+//! what DECIDES it, and those are the only records the comparison can fail on.
+//! Reading the first number as coverage would be reading a tautology. Making it
+//! finer means `Expectations` handing out a member, which is a public API
+//! decision this corpus does not get to make on a reader's behalf — the same
+//! ruling issue #79 got, reached the other way, because there the accessor
+//! already existed and here it does not.
 //!
 //! **The extent comparison needs no accessor, and it is asked of 37 772
 //! members.** Issue #79 costed a public one — a `Range<usize>` or a slice on
@@ -194,7 +216,7 @@
 //! corpus <TAB> case <TAB> spelling <TAB> grade <TAB> answer
 //! ```
 //!
-//! - `corpus` — which generator produced the input: `A`..`F`.
+//! - `corpus` — which generator produced the input: `A`..`G`.
 //! - `case` — the field lines, escaped, `|`-separated. `(corpus, case,
 //!   spelling)` is the record's key and is unique; `tests` asserts it.
 //! - `spelling` — which readers answered and over what shape.
@@ -337,6 +359,47 @@ const T_CODINGS: [&[u8]; 12] = [
   b"gzip;q=0.5;p=1",
 ];
 
+/// The `expectation`s corpus G builds its RFC 9110 §10.1.1 `Expect` lists out
+/// of.
+///
+/// ```text
+/// Expect      = #expectation
+/// expectation = token [ "=" ( token / quoted-string ) parameters ]
+/// ```
+///
+/// A vocabulary of whole members, for the reason [`CODINGS`] and [`T_CODINGS`]
+/// are ones: what this field has that no other corpus here writes is a member
+/// NAME the field gives a meaning to, and a brute force over nine bytes spells
+/// no `100-continue`.
+///
+/// The members are chosen around the one thing this reader says about where a
+/// member ends — whether it parsed WHOLE as the bare `100-continue`:
+///
+/// - `100-continue` ends AT its head, so it is that bare token.
+/// - `100-CONTINUE` is the same member, since §10.1.1 names it as an RFC 5234
+///   §2.3 literal and a literal is case-insensitive.
+/// - `100-continue=1`, `100-continue="x"` and `100-continue=1;p=1` each take
+///   the optional group, so each is a member the field does NOT define — and
+///   each is a record where a reader whose member stopped at the name would
+///   answer differently. They are the whole of why this family exists.
+/// - `100-continue;p=1` takes a `parameters` with no argument in front of it,
+///   which the bracket does not admit, so the value derives nothing.
+/// - `x`, `x=1;p=1` and `x=1;` are members of the other kind, the last of them
+///   over §5.6.6's empty slot.
+/// - The last is the empty element §5.6.1.2 admits.
+const EXPECTATIONS: [&[u8]; 10] = [
+  b"100-continue",
+  b"100-CONTINUE",
+  b"100-continue=1",
+  b"100-continue=\"x\"",
+  b"100-continue=1;p=1",
+  b"100-continue;p=1",
+  b"x",
+  b"x=1;p=1",
+  b"x=1;",
+  b"",
+];
+
 fn main() {
   let mut args = env::args().skip(1);
   let out = args.next();
@@ -364,7 +427,7 @@ fn main() {
 fn emit(out: &mut impl Write) -> std::io::Result<()> {
   let mut sink = Sink::new(out);
   sink.run()?;
-  for (name, count) in ["A", "B", "C", "D", "E", "F"]
+  for (name, count) in ["A", "B", "C", "D", "E", "F", "G"]
     .iter()
     .zip(sink.tally.per_corpus)
   {
@@ -414,6 +477,29 @@ fn t_codings_lists() -> impl Iterator<Item = Vec<u8>> {
           value.extend_from_slice(b", ");
         }
         value.extend_from_slice(T_CODINGS.get(*member).copied().unwrap_or_default());
+      }
+      value
+    })
+  })
+}
+
+/// Every RFC 9110 §10.1.1 `Expect` value corpus G writes: one or two
+/// [`EXPECTATIONS`], joined by RFC 9110 §5.6.1.2's `OWS "," OWS`.
+///
+/// A free function for the reason [`coding_lists`] and [`t_codings_lists`] are
+/// ones — so `tests` can assert what THIS family reaches without restating how
+/// it is built. Two members, because what a second adds is a `100-continue`
+/// standing beside a member of the other kind, which is where the two verdicts
+/// are both true at once.
+fn expectation_lists() -> impl Iterator<Item = Vec<u8>> {
+  (1..=2).flat_map(|len| {
+    payload_indices(EXPECTATIONS.len(), len).map(|shape| {
+      let mut value = Vec::new();
+      for (index, member) in shape.iter().enumerate() {
+        if index > 0 {
+          value.extend_from_slice(b", ");
+        }
+        value.extend_from_slice(EXPECTATIONS.get(*member).copied().unwrap_or_default());
       }
       value
     })
@@ -869,6 +955,17 @@ struct Expect {
   parsed: bool,
   /// Its answer to RFC 9110 §5.6.1.1, over the combined value.
   empty_element: bool,
+  /// `Expectations::expects_continue` — the field's one defined expectation.
+  ///
+  /// **This reader's only statement about where a member ENDS.** It is
+  /// `parsed() && bare`, and `bare` is set where a member parsed WHOLE as the
+  /// bare `100-continue` — so a member that ended at its name and one that ran
+  /// on into RFC 9110 §10.1.1's `[ "=" ( token / quoted-string ) parameters ]`
+  /// are told apart here and nowhere else in this type.
+  expects_continue: bool,
+  /// `Expectations::has_other` — a value stating an expectation this core does
+  /// not implement. The other half of the same partition.
+  has_other: bool,
 }
 
 /// Pushes `lines` into `Expectations` and records everything it said.
@@ -878,16 +975,88 @@ fn expectations(lines: &[&[u8]]) -> Expect {
     read.push(line);
   }
   let (parsed, empty_element) = (read.parsed(), read.empty_element());
+  let (expects_continue, has_other) = (read.expects_continue(), read.has_other());
   Expect {
     rendered: format!(
-      "parsed={parsed} empty={empty_element} cont={} other={} fault={}",
-      read.expects_continue(),
-      read.has_other(),
+      "parsed={parsed} empty={empty_element} cont={expects_continue} \
+       other={has_other} fault={}",
       read.grammar_fault()
     ),
     parsed,
     empty_element,
+    expects_continue,
+    has_other,
   }
+}
+
+/// RFC 9110 §10.1.1's two verdicts, projected from the ONE derivation of the
+/// value the oracle admits.
+///
+/// **The extent question asked of the reader that hands out no offsets.**
+/// `Expectations` is a fold over eight bits with no lifetime parameter — it
+/// borrows no field line and keeps no slice — so nothing it says can be
+/// `place`d, and the offset grading `grade_extents` applies to the walk and to
+/// `media::accept` cannot be asked of it at any surface short of turning it
+/// into a borrowing walk. What it DOES state is whether some member parsed
+/// whole as the bare `100-continue`, which is a fact about where that member
+/// ended, and this is the derivation to hold it to.
+///
+/// This is the shape `projected_verdict` already is, for the reason its doc
+/// gives: a reader that hands out a verdict and no member list, and an oracle
+/// that hands out members and no verdict, can otherwise only be compared on
+/// whether the value parsed — which is blind to a member boundary in the wrong
+/// place, the defect the comparison exists to catch.
+///
+/// ```text
+/// Expect      = #expectation
+/// expectation = token [ "=" ( token / quoted-string ) parameters ]
+/// ```
+///
+/// The optional group holds everything behind the `token`, so a member whose
+/// derivation ends AT its head is the bare token and one whose derivation runs
+/// past it took the group. `100-continue` is matched case-insensitively,
+/// because §10.1.1 names it as an RFC 5234 §2.3 literal and the reader compares
+/// it that way.
+///
+/// Both verdicts are derived from a value that DERIVES, exactly as the reader
+/// derives both from a value that parsed: a member's boundary is a fact about a
+/// value that has one.
+fn projected_expectation(reading: &Reading, value: &[u8]) -> (bool, bool) {
+  if !reading.derives {
+    // `has_other` counts a value that did not parse: §10.1.1 makes an
+    // unrecognised expectation a 417 rather than a framing fault.
+    return (false, true);
+  }
+  let mut expects_continue = false;
+  let mut has_other = false;
+  for (&at, head) in &reading.member_heads {
+    let named = value
+      .get(at..head.end)
+      .is_some_and(|name| name.eq_ignore_ascii_case(b"100-continue"));
+    if head.bare && named {
+      expects_continue = true;
+    } else {
+      has_other = true;
+    }
+  }
+  (expects_continue, has_other)
+}
+
+/// Whether a `100-continue` member's EXTENT is what decides this value's
+/// [`projected_expectation`].
+///
+/// The number that says the comparison can fail. A record where the value
+/// derives and names a `100-continue` member is one where ending that member at
+/// its head, or running past it, moves `expects_continue` — so a reader whose
+/// member extent is wrong parts from the projection HERE and nowhere else.
+/// Without it the pair would be an equality between two constants.
+fn expectation_extent_is_decisive(reading: &Reading, value: &[u8]) -> bool {
+  reading.derives
+    && reading.member_heads.iter().any(|(&at, head)| {
+      value
+        .get(at..head.end)
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"100-continue"))
+    })
 }
 
 /// Everything one `media::accept` walk said about one `Accept` value.
@@ -1140,6 +1309,14 @@ struct Grade {
   /// a parameter name at, one missing where every derivation reads one, or a
   /// member that stopped at an offset the list admits no end at.
   ///
+  /// **Two readers reach it through offsets and one through a projection.**
+  /// The walk and `media::accept` hand over borrowed parameter names, so their
+  /// extents are graded offset by offset. RFC 9110 §10.1.1's `Expectations`
+  /// hands over nothing borrowed at all — it is a fold over eight bits with no
+  /// lifetime parameter — so what is graded there is the one thing it says
+  /// about where a member ends: whether some member parsed WHOLE as the bare
+  /// `100-continue`. See [`projected_expectation`].
+  ///
   /// **The extent axis, and a zero-target.** It is what issue #79 records the
   /// absence of: every other axis here is a question about where a member
   /// BEGINS, so a walk that ended its LAST member one well-formed parameter
@@ -1147,8 +1324,7 @@ struct Grade {
   /// graded EXACTLY, against the one derivation of the element that reaches a
   /// list boundary, because a bound cannot tell that walk from a correct one:
   /// a truncated member reads a strict prefix of the parameters the grammar
-  /// admits, and "no parameter the grammar does not admit" is a rule a strict
-  /// prefix passes.
+  /// admits, and a rule admitting any such prefix is one a truncation passes.
   member_extent: bool,
   /// The walk under `ParamSyntax::Parameter` accepted a value RFC 9110 §5.6.6
   /// does not derive, and the only thing it accepted past that production is a
@@ -1350,6 +1526,41 @@ fn grade_extents(
   out
 }
 
+/// What grading RFC 9110 §10.1.1's reader against the derivation found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ExpectExtent {
+  /// The reader's two verdicts are not the derivation's —
+  /// [`Grade::member_extent`], reached through a projection rather than through
+  /// offsets.
+  wrong: bool,
+  /// The comparison was made.
+  graded: bool,
+  /// A `100-continue` member's extent is what decided it. See
+  /// [`expectation_extent_is_decisive`].
+  decisive: bool,
+}
+
+/// Grades `Expectations`'s two extent-bearing verdicts against the one
+/// derivation the oracle admits.
+///
+/// Asked only where the reader and the oracle already AGREE about whether the
+/// value parsed. Where they do not, the difference is `over-accept` or
+/// `over-refuse` and is graded there; reporting it again here would put one
+/// defect under two names, and one of them a zero-target for something else.
+/// That is the same rule [`grade_extents`] applies to a member the oracle
+/// licenses no element start at.
+fn grade_expectation(value: &[u8], read: &Expect, reading: &Reading) -> ExpectExtent {
+  if read.parsed != reading.derives {
+    return ExpectExtent::default();
+  }
+  let (expects_continue, has_other) = projected_expectation(reading, value);
+  ExpectExtent {
+    wrong: read.expects_continue != expects_continue || read.has_other != has_other,
+    graded: true,
+    decisive: expectation_extent_is_decisive(reading, value),
+  }
+}
+
 /// Whether a parameter name the oracle read is RFC 9110 §12.4.2's, which names
 /// it "q" (case-insensitive).
 fn is_weight_name(value: &[u8], name: &oracle::ParamName) -> bool {
@@ -1480,7 +1691,7 @@ struct PairCount {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Tally {
   /// Records written, per corpus.
-  per_corpus: [usize; 6],
+  per_corpus: [usize; 7],
   /// Records written.
   records: usize,
   /// Records where two readers of one production parted.
@@ -1517,6 +1728,15 @@ struct Tally {
   /// Graded extents where `media::accept` dropped a `q` the grammar derives as
   /// a parameter, per RFC 9110 §12.5.1.
   media_q_dropped: usize,
+  /// Records where RFC 9110 §10.1.1's two extent-bearing verdicts were compared
+  /// with the derivation's.
+  expect_extent_graded: usize,
+  /// Of those, the records a `100-continue` member's EXTENT decided.
+  ///
+  /// The number that says the §10.1.1 comparison can fail. Everywhere else it
+  /// is an equality between two verdicts no extent decision moves, and a gate
+  /// that cannot fail is what this corpus exists not to ship.
+  expect_extent_decisive: usize,
   /// Records in the bare-name residue.
   residue_valueless: usize,
   /// Records where a walk yielded a member whose name lay in none of the lines.
@@ -1611,7 +1831,7 @@ struct Sink<'a, W: Write> {
   /// dump. It is the same hash `xtask` publishes with, reached by path rather
   /// than copied, so the two cannot disagree while both stay green.
   #[cfg(test)]
-  answers: [sha256::Sha256; 7],
+  answers: [sha256::Sha256; 8],
 }
 
 impl<'a, W: Write> Sink<'a, W> {
@@ -1633,6 +1853,7 @@ impl<'a, W: Write> Sink<'a, W> {
     self.corpus_d()?;
     self.corpus_e()?;
     self.corpus_f()?;
+    self.corpus_g()?;
     self.out.flush()
   }
 
@@ -1835,6 +2056,32 @@ impl<'a, W: Write> Sink<'a, W> {
     Ok(())
   }
 
+  /// RFC 9110 §10.1.1's `Expect`, written so that the reader's one statement
+  /// about where a member ENDS is a statement about something.
+  ///
+  /// The §5.6.6 comparison already hands `Expectations` a value on every
+  /// record, and its extent-bearing verdicts are graded there too — but that
+  /// generator writes the head `x=1` in front of every element, so no member is
+  /// ever named `100-continue` and both verdicts are constants no extent
+  /// decision moves. A comparison between two constants cannot fail, which is
+  /// the shape this corpus exists not to ship. This family writes the names.
+  ///
+  /// Each value once as one field line, and each member once cut across RFC
+  /// 9110 §5.2's join, so the projection is asked of a value the reader never
+  /// saw whole.
+  fn corpus_g(&mut self) -> std::io::Result<()> {
+    for value in expectation_lists() {
+      self.expect_field("G", &[&value], "expect-list")?;
+    }
+    for member in EXPECTATIONS {
+      let cut = member.len().checked_div(2).unwrap_or_default();
+      let head = member.get(..cut).unwrap_or_default();
+      let tail = member.get(cut..).unwrap_or_default();
+      self.expect_field("G", &[head, tail], "expect-split")?;
+    }
+    Ok(())
+  }
+
   /// Writes one record and counts it.
   fn record(
     &mut self,
@@ -1850,7 +2097,8 @@ impl<'a, W: Write> Sink<'a, W> {
       "C" => 2,
       "D" => 3,
       "E" => 4,
-      _ => 5,
+      "F" => 5,
+      _ => 6,
     };
     if let Some(slot) = self.tally.per_corpus.get_mut(index) {
       *slot = slot.saturating_add(1);
@@ -1879,7 +2127,7 @@ impl<'a, W: Write> Sink<'a, W> {
       .residue_valueless
       .saturating_add(usize::from(grade.residue_valueless));
     #[cfg(test)]
-    for slot in [index, 6] {
+    for slot in [index, 7] {
       if let Some(digest) = self.answers.get_mut(slot) {
         digest.update(answer.as_bytes());
         digest.update(b"\n");
@@ -2044,6 +2292,51 @@ impl<'a, W: Write> Sink<'a, W> {
     }
 
     let answer = format!("tc={}", empty_as_dash(&walked.rendered));
+    self.record(corpus, lines, spelling, grade, &answer)
+  }
+
+  /// One RFC 9110 §10.1.1 `Expect` value: `Expectations`, graded against
+  /// `expectation`.
+  ///
+  /// **One reader and no pair, and here that is a fact about the workspace
+  /// rather than a choice.** There is no second reader of `Expect`, and the
+  /// §5.6.6 walk cannot become one: `expectation` puts an argument between the
+  /// `token` and the `parameters`, and `parameterised_list` reads `token
+  /// parameters` with nothing between them, so it refuses `x=1` where §10.1.1
+  /// derives it. That is why the §5.6.6 comparison writes a different head per
+  /// reader instead of one shared value, and why this record is a reader
+  /// against an oracle.
+  fn expect_field(&mut self, corpus: &str, lines: &[&[u8]], spelling: &str) -> std::io::Result<()> {
+    let joined = join(lines);
+    let read = expectations(lines);
+    let reading = oracle::read(&joined, Production::Expectation);
+    let mut grade = Grade::default();
+    if read.parsed && !reading.derives {
+      grade.over_accept = true;
+    }
+    if !read.parsed && reading.derives {
+      grade.over_refuse = true;
+    }
+    let extent = grade_expectation(&joined, &read, &reading);
+    grade.member_extent |= extent.wrong;
+    self.count_expect_extent(&extent);
+
+    self.tally.state(if read.parsed {
+      "expect-parsed"
+    } else {
+      "expect-refused"
+    });
+    if read.empty_element {
+      self.tally.state("expect-empty-element");
+    }
+    if read.expects_continue {
+      self.tally.state("expect-continue");
+    }
+    if read.has_other {
+      self.tally.state("expect-other");
+    }
+
+    let answer = format!("exp={}", read.rendered);
     self.record(corpus, lines, spelling, grade, &answer)
   }
 
@@ -2238,7 +2531,9 @@ impl<'a, W: Write> Sink<'a, W> {
       ranged.parsed,
       true,
     );
-    grade.member_extent |= walk_extents.wrong || media_extents.wrong;
+    let expect_extent = grade_expectation(&expect_value, &read, &expect_reading);
+    grade.member_extent |= walk_extents.wrong || media_extents.wrong || expect_extent.wrong;
+    self.count_expect_extent(&expect_extent);
     self.count_extents(&walk_extents);
     self.count_extents(&media_extents);
     if media_extents.q_dropped > 0 {
@@ -2422,6 +2717,18 @@ impl<'a, W: Write> Sink<'a, W> {
     }
     if extents.unasked > 0 {
       self.tally.state("extent-unasked");
+    }
+  }
+
+  /// Counts one grading of RFC 9110 §10.1.1's extent-bearing verdicts.
+  fn count_expect_extent(&mut self, graded: &ExpectExtent) {
+    if graded.graded {
+      self.tally.state("expect-extent-graded");
+      self.tally.expect_extent_graded = self.tally.expect_extent_graded.saturating_add(1);
+    }
+    if graded.decisive {
+      self.tally.state("expect-extent-decisive");
+      self.tally.expect_extent_decisive = self.tally.expect_extent_decisive.saturating_add(1);
     }
   }
 
