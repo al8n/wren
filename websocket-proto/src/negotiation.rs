@@ -591,6 +591,18 @@ fn scan_to(value: &[u8], at: usize, delim: u8) -> Option<usize> {
   }
 }
 
+// gate-exempt: qdtext = <any TEXT except <">> — RFC 2616 §2.2's own production,
+// quoted where this crate imports that spec's quoted-string; RFC 2616 is
+// deliberately absent from `FETCHED` as obsolete, so no loaded spec carries the
+// rule to grade it against. Its sibling `quoted-pair` needs no marker: RFC 822
+// §3.3 spells that one identically and IS loaded.
+//
+// Its own block, and the blank line above is load-bearing: the span this marker
+// names carries a lone DQUOTE, and `quote-check` pairs those across a whole
+// comment block. Written inside the doc comment below it would shift every
+// quotation pairing in that block by one and manufacture an untriaged span out
+// of prose.
+
 /// The index just past the closing DQUOTE of the quoted-string opening at
 /// `open`; `None` when it never closes.
 ///

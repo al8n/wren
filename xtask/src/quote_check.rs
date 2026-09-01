@@ -181,6 +181,60 @@
 //!   from any other indented paragraph. Counting it would mean counting
 //!   every blockquote in the workspace, which measures nothing.
 //!
+//! ## What a production must BE before it is compared
+//!
+//! The comparison is a substring test, so a production with its tail cut off
+//! still matches: `transfer-coding = token *( OWS ";" OWS transfer-parameter`
+//! is a substring of RFC 9110 §10.1.4's own text, and the run that graded it
+//! printed `verbatim` and meant it. That is not a hypothetical. A transcription
+//! that carried §10.1.4's inner `transfer-parameter` rule and left out the
+//! CONTAINER it sits in passed this gate — and the container is the second
+//! place the two grammars differ, §5.6.6 bracketing the slot where §10.1.4
+//! does not. It was verbatim. It was also half a grammar, and nothing that
+//! runs found it — only reading the ABNF by hand did.
+//!
+//! So a candidate is now asked to BE a rule before it is asked whether it is
+//! the spec's: a name, a definition operator, and a right-hand side that
+//! balances ([`rule_fault`]). `(` and `[` must close, in that nesting order;
+//! `"` and `<` open a `char-val` and a `prose-val`, which nothing is read
+//! inside of; `;` outside both begins an ABNF comment and ends the rule; and
+//! something must be left. It is deliberately NOT part of [`is_production`],
+//! because keying admission on the right-hand side would make a broken
+//! production stop looking like a production — the gate's own defect would
+//! then delete the item it should be reporting. Admitted by the name and the
+//! operator, FAILED on the right-hand side.
+//!
+//! Two boundaries come with it, and both are the rule's, not the tree's:
+//!
+//! - **ABNF wraps, and a wrapped line is not a truncation.** The RFCs set
+//!   `media-range` over four lines, and this workspace transcribes them that
+//!   way, so a fenced rule's first line ends inside a group it does not close.
+//!   [`read_fenced_line`] joins the continuation lines onto what the shape
+//!   test reads while leaving what the COMPARISON reads a single line. A rule
+//!   wrapped inside a BACKTICKED span wraps for the other reason — the comment
+//!   ran out of line — and used to escape the check entirely rather than be
+//!   misjudged by it: pairing backticks within a line found no closer and
+//!   extracted no span at all, so the rule was never graded and never counted.
+//!   [`abnf_spans`] now reads a PARAGRAPH, which is the unit a Markdown code
+//!   span is allowed to wrap across, and pairs backtick RUNS the way rustdoc
+//!   does.
+//! - **A truncation on a boundary this cannot see still passes.** A rule with
+//!   no brackets — `media-type = type "/" subtype parameters` — can lose its
+//!   last name and still balance, still be a substring, and still be called
+//!   verbatim. So can one cut at a `/` between two complete alternatives. What
+//!   this rejects is a production truncated INSIDE a group, which is the shape
+//!   the measured defect had and the shape most truncations of an HTTP
+//!   production have, because HTTP's productions are mostly groups. It does
+//!   not decide that a transcription is the WHOLE of its rule, and nothing
+//!   that reads only the comment can: the rule's own name is the only thing
+//!   that says how much of it there should be.
+//!
+//! [`MIN_PRODUCTION_WORDS`] is the floor under BOTH verdicts, and it is the
+//! same floor as before: a span below it is neither malformed nor verbatim but
+//! none of this check's business, so `q=` and `realm=` stay unreported exactly
+//! as they were. That constant carries what widening past it was measured to
+//! cost.
+//!
 //! # What is normalised away on BOTH sides, and why
 //!
 //! Only differences a Rust comment cannot avoid, or the RFC's own typesetting:
@@ -265,9 +319,35 @@ use std::{
 
 type Error = Box<dyn std::error::Error>;
 
-/// A candidate ABNF production found in one file, paired with the source
-/// line its opening backtick is on.
-type Spans = Vec<(usize, String)>;
+/// The candidate ABNF productions found in one file.
+type Spans = Vec<Candidate>;
+
+/// One ABNF production candidate: the span as extracted, and the whole rule
+/// that span is part of.
+///
+/// The two hold the same text for a BACKTICKED candidate. Such a span may
+/// wrap across the lines of its paragraph and [`abnf_spans`] joins it back
+/// together while extracting it, so what comes out is already the whole of
+/// what its author wrote — there is nothing left for `rule` to add. They
+/// differ for a FENCED one, where a rule too long for a line is continued on
+/// the next, indented, exactly as the RFCs themselves set it: `span` is then
+/// the one line, and `rule` is that line with its continuations joined on.
+///
+/// Both are kept because they answer different questions and neither answers
+/// the other's. [`grade_production`] compares `span`, because the spec's own
+/// text is what a transcribed line must match and the joining is this
+/// extractor's doing rather than the author's. [`rule_fault`] reads `rule`,
+/// because "is this a complete rule" is a question about the RULE — a first
+/// line ending mid-group is not a truncation, it is a line.
+struct Candidate {
+  /// The source line the span's opening backtick, or its fenced line, is on.
+  line: usize,
+  /// The span as extracted: one backticked span, or one line of a fence.
+  span: String,
+  /// The whole rule `span` belongs to — `span` itself, or `span` with the
+  /// fenced continuation lines behind it joined on.
+  rule: String,
+}
 
 /// A quotation found in one file, paired with the source line its opening
 /// mark is on and every RFC its block named ([`cited_rfcs`]).
@@ -328,6 +408,16 @@ pub const DEFAULT_DIR: &str = ".rfc-cache";
 /// local-green/CI-red trap this list has already sprung once, over RFC 2046.
 /// RFC 2045 was added here for that reason before anything quoted it.
 ///
+/// RFC 6454 was added when the extractor first reached a production of it.
+/// `websocket-proto` reads `Origin` as one SP-separated list because RFC 6454
+/// §7.1 says so, and the rule saying so sat in a comment that WRAPPED it across
+/// two lines — so until [`abnf_spans`] read a paragraph rather than a line,
+/// there was no span to grade and no reason to notice the spec was missing. It
+/// is live law for a field this workspace parses, which is the same footing RFC
+/// 822 stands on below, and adding it moved nothing else: the untriaged
+/// backlog, both citation counts and the graded total were identical either
+/// side of it.
+///
 /// RFC 822 is here despite being obsolete, and it is not the exception the
 /// paragraph above forbids. RFC 2045 §1 makes it LIVE law for a MIME body
 /// part's header fields — "All of the header fields defined in this document
@@ -337,7 +427,7 @@ pub const DEFAULT_DIR: &str = ".rfc-cache";
 /// 822's own text. That is the opposite of quoting a dead spec a live one now
 /// governs: the live spec is what sends a reader here.
 const FETCHED: &[u32] = &[
-  822, 2045, 2046, 3986, 5322, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220,
+  822, 2045, 2046, 3986, 5322, 6454, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220,
 ];
 
 /// The untriaged backlog, per file, as it stands — and the whole of what makes
@@ -533,6 +623,10 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   let mut fallback = 0usize;
   let mut abnf_checked = 0usize;
   let mut abnf_failures = 0usize;
+  // Productions that never reached the comparison because they are not whole
+  // rules — counted apart from `abnf_failures`, whose denominator is
+  // `abnf_checked`, the number of productions the comparison DID read.
+  let mut abnf_malformed = 0usize;
   let mut abnf_skipped = 0usize;
   let mut abnf_exempt = 0usize;
   // The fenced half of the ABNF path, both sides of it: what the info-string
@@ -628,19 +722,51 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     if unattributable > untriaged_before {
       untriaged_by_file.insert(shown.clone(), unattributable - untriaged_before);
     }
-    for (line, production) in productions {
-      if exempt.contains(&production) {
+    for candidate in productions {
+      if exempt.contains(&candidate.span) {
         abnf_exempt += 1;
+        continue;
+      }
+      // Is this a whole RULE, before anything asks whether it is the spec's.
+      // Read from `rule` rather than `span`, so a fenced rule wrapped across
+      // lines is judged whole — see `read_fenced_line`. Held to the same
+      // floor the comparison is held to, so one admission test decides what
+      // this check is looking at at all.
+      if is_checkable_production(&candidate.rule)
+        && let Some(fault) = rule_fault(&candidate.rule)
+      {
+        abnf_malformed += 1;
+        println!(
+          "{shown}:{}: ABNF production is not a whole rule",
+          candidate.line
+        );
+        println!("  comment: `{}`", candidate.rule);
+        println!("  {}", fault.reason());
         continue;
       }
       // A deliberately elided production promises only that what remains is
       // verbatim — the same reading `run` already gives a quotation span.
-      for segment in production.split(['…']).flat_map(|part| part.split("...")) {
-        let Some(spec) = grade_production(segment, &specs, &mut abnf_checked) else {
+      for segment in candidate
+        .span
+        .split(['…'])
+        .flat_map(|part| part.split("..."))
+      {
+        if grade_production(segment, &specs, &mut abnf_checked).is_none() {
           continue;
-        };
+        }
         abnf_failures += 1;
-        println!("{shown}:{line}: ABNF production is not {}'s", spec.name);
+        // Which spec is NOT named, and the omission is the message: every
+        // loaded spec was searched, so the fact reported is that none of them
+        // carries these characters. Naming one would have to name it
+        // arbitrarily — `grade_production` searches them all and nothing here
+        // says which one a production meant to be quoting — and an arbitrary
+        // name reads as an attribution, sending the reader to compare against
+        // a spec that never had the rule.
+        println!(
+          "{shown}:{}: ABNF production is in none of the {} loaded specs",
+          candidate.line,
+          specs.len()
+        );
         println!("  comment: `{segment}`");
       }
     }
@@ -656,14 +782,15 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     );
   }
   // Also printed regardless: a span this uncited or exempted is not a
-  // failure, but it is not silence either — a fenced-off count is how
-  // `negotiation.rs:592`'s `quoted-pair` (a real, correctly-quoted RFC 2616
-  // production whose citation sits outside its own block) stays VISIBLE as
+  // failure, but it is not silence either — a fenced-off count is how a real,
+  // correctly-transcribed production nothing here can grade stays VISIBLE as
   // unchecked instead of vanishing the way it did before this line existed.
-  // `gate-exempt` now marks a QUOTATION the same way (Ruling 9): a deliberate
-  // historical citation of an obsolete spec whose successor does not carry
-  // the same words, so there is no loaded spec left to grade it against —
-  // `negotiation.rs`'s RFC 2616 "implied *LWS rule" quote is the first one.
+  // `gate-exempt` marks the same thing where a citation cannot (Ruling 9): a
+  // deliberate reference to an obsolete spec whose successor does not carry
+  // the same words, so there is no loaded spec left to grade it against.
+  // `negotiation.rs` holds one of each — its RFC 2616 "implied *LWS rule"
+  // QUOTATION was the first, and its RFC 2616 §2.2 `qdtext` rule joined it
+  // when the paragraph-wide extractor first reached that rule at all.
   //
   // The parenthesis is the whole reason now, and it was not before. This
   // number used to hold two different things under one label: a block citing
@@ -728,7 +855,7 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     println!("{line}");
   }
 
-  if failures == 0 && abnf_failures == 0 && backlog.is_empty() {
+  if failures == 0 && abnf_failures == 0 && abnf_malformed == 0 && backlog.is_empty() {
     println!(
       "quote-check: {checked} quotations verbatim, {abnf_checked} ABNF productions verbatim"
     );
@@ -743,6 +870,11 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   if abnf_failures > 0 {
     reasons.push(format!(
       "{abnf_failures} of {abnf_checked} ABNF productions are not the spec's own characters"
+    ));
+  }
+  if abnf_malformed > 0 {
+    reasons.push(format!(
+      "{abnf_malformed} ABNF productions are not whole rules"
     ));
   }
   if !backlog.is_empty() {
@@ -773,7 +905,7 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
 /// `recorded` is a parameter rather than [`UNTRIAGED`] read directly, for the
 /// reason `doc-check`'s `unclaimed_snapshots` takes its crate list as one: a
 /// unit test needs a table of its own, and a rule that can only be exercised
-/// against this workspace's own 97 spans is a rule nothing checks.
+/// against this workspace's own 91 spans is a rule nothing checks.
 fn untriaged_drift(
   counts: &BTreeMap<String, usize>,
   recorded: &[(&str, usize)],
@@ -1098,6 +1230,36 @@ fn excerpt(text: &str, from: usize, len: usize) -> String {
   text.get(start..end).unwrap_or_default().to_string()
 }
 
+/// The shortest production this check governs, in words.
+///
+/// Below it a span is not a checkable claim: `q = 1` and `realm=` are
+/// production-SHAPED, and grading either against a spec's grammar would
+/// report a field value as a mis-transcribed rule. It is the floor for BOTH
+/// verdicts a candidate can draw — [`rule_fault`]'s and
+/// [`grade_production`]'s — so that one admission test decides what this
+/// check is looking at, and a span it declines is neither malformed nor
+/// verbatim but simply none of its business.
+///
+/// Widening [`rule_fault`] past this floor was measured and rejected. Dropping
+/// the floor from the shape test alone — deleting the
+/// `is_checkable_production(&candidate.rule) &&` from [`run`]'s guard and
+/// leaving everything else as it is — and re-running
+/// `cargo run -p xtask -- quote-check` reports **23 candidates as malformed,
+/// 17 for an empty right-hand side and 6 for a quotation mark that never
+/// closes**. Not one of the 23 is a production: they are field values written
+/// with the value left off, values the sentence around them cuts in half, and
+/// this file's own metasyntax for the shape. Re-measure with that edit before
+/// leaning on the number, the way `doc-check`'s table census says of its own —
+/// it read `21 … 15 … 6` of the workspace it was written against, and the
+/// paragraph-wide extractor found two more empty right-hand sides.
+const MIN_PRODUCTION_WORDS: usize = 3;
+
+/// Whether a production candidate says enough to be graded at all — see
+/// [`MIN_PRODUCTION_WORDS`].
+fn is_checkable_production(text: &str) -> bool {
+  normalise_production(text).split_whitespace().count() >= MIN_PRODUCTION_WORDS
+}
+
 /// Grades one production segment. `None` when it is too short to be a
 /// checkable claim, or when SOME loaded spec contains it verbatim.
 ///
@@ -1117,9 +1279,14 @@ fn excerpt(text: &str, from: usize, len: usize) -> String {
 /// the more accurate a comment's citations became; see `cited_rfcs`'s doc
 /// comment for what it cost, measured.
 ///
-/// On failure the first spec is named, same as [`grade`] falls back to when a
-/// quotation's anchor does not narrow it — arbitrarily, since nothing here
-/// says which loaded spec a production was meant to be quoting.
+/// On failure the first spec comes back, same as [`grade`] falls back to when
+/// a quotation's anchor does not narrow it — arbitrarily, since nothing here
+/// says which loaded spec a production was meant to be quoting. [`run`] does
+/// NOT print that name for exactly that reason: an arbitrary name reads as an
+/// attribution, and "is not rfc2045's" over an RFC 9110 rule sends the reader
+/// to compare against a spec that never carried it. What is printed is the
+/// fact this actually establishes — that none of the loaded specs holds these
+/// characters.
 ///
 /// Both sides are [`normalise_production`]d, NOT [`normalise`]d, and the
 /// difference is the whole of what "verbatim" means here. `[ … ]` is RFC
@@ -1133,10 +1300,10 @@ fn excerpt(text: &str, from: usize, len: usize) -> String {
 /// `extension-param`) were stubbed down to their own name and the single word
 /// `token` — three words, the floor, with the whole right-hand side gone.
 fn grade_production<'a>(segment: &str, specs: &'a [Spec], checked: &mut usize) -> Option<&'a Spec> {
-  let wanted = normalise_production(segment);
-  if wanted.split_whitespace().count() < 3 {
+  if !is_checkable_production(segment) {
     return None;
   }
+  let wanted = normalise_production(segment);
   *checked += 1;
   if specs.iter().any(|spec| spec.grammar.contains(&wanted)) {
     return None;
@@ -1167,7 +1334,7 @@ fn grade_production<'a>(segment: &str, specs: &'a [Spec], checked: &mut usize) -
 fn exempted_spans(source: &str) -> HashSet<String> {
   let mut out = HashSet::new();
   for line in source.lines() {
-    let Some((body, _)) = comment_body(line) else {
+    let Some((body, _, _)) = comment_body(line) else {
       continue;
     };
     let Some(rest) = body.strip_prefix("gate-exempt:") else {
@@ -1260,12 +1427,14 @@ fn exempted_spans_for(path: &Path, source: &str) -> HashSet<String> {
 ///
 /// Consecutive comment lines are one block and are joined before the quotes are
 /// paired, so a quotation wrapped across lines is one span rather than several.
-/// A backticked production is found per raw line, before [`mask_code_spans`]
-/// runs on it — but which block it belongs to, and so whether [`cited_rfcs`]
-/// admits it as a candidate at all, is decided at the block's flush, once the
-/// whole block exists to be asked. Every quoted span pulled from the same block
-/// carries the same citations, for the same reason: the block, not the line, is
-/// what was cited. A FENCED production never joins a block at all — see
+/// A backticked production is found per PARAGRAPH — the same joining, over the
+/// smaller unit a Markdown code span may wrap across ([`abnf_spans`]) — and
+/// before [`mask_code_spans`] runs on the line. But which block it belongs to,
+/// and so whether [`cited_rfcs`] admits it as a candidate at all, is decided at
+/// the block's flush, once the whole block exists to be asked. Every quoted
+/// span pulled from the same block carries the same citations, for the same
+/// reason: the block, not the line, is what was cited. A FENCED production
+/// never joins a block at all — see
 /// [`fence_holds_grammar`] for why its admission is the fence's to answer.
 fn quotations(source: &str) -> Extracted {
   let mut out: QuotedSpans = Vec::new();
@@ -1277,7 +1446,7 @@ fn quotations(source: &str) -> Extracted {
   let mut marks: Vec<(usize, usize)> = Vec::new();
   // ABNF production candidates seen in the block under construction, admitted
   // or skipped only once the block's own citation is known.
-  let mut pending: Vec<(usize, String)> = Vec::new();
+  let mut pending: Spans = Vec::new();
   // Productions read from inside a fence. Kept apart from `pending` because
   // they are not the block's to admit, and apart from `productions` because
   // `flush` borrows that one for the whole of the loop below.
@@ -1287,41 +1456,59 @@ fn quotations(source: &str) -> Extracted {
   let mut fenced = false;
   // Only ever read while `fenced`: the info string of the fence now open.
   let mut grammar_fence = false;
+  // Whether the last production read from the fence now open is still taking
+  // continuation lines — see [`read_fenced_line`].
+  let mut continuing: Option<usize> = None;
+  // The comment lines of the paragraph under construction, which is the unit
+  // [`abnf_spans`] reads a backticked span over: a code span may be wrapped
+  // across the lines of one paragraph and may not cross a blank line, a fence
+  // or the end of the comment. Finer-grained than `block`, which keeps the
+  // blank comment lines a paragraph ends at, because a CITATION carries across
+  // them and a code span does not.
+  let mut paragraph: Vec<(usize, &str)> = Vec::new();
 
-  let mut flush =
-    |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Vec<(usize, String)>| {
-      // Computed once and reused for every span AND for the production gate
-      // below: both readings are "what did this block cite", so there is only
-      // one place that question is asked — see [`cited_rfcs`] for why the two
-      // readings of the answer still differ.
-      let cited = cited_rfcs(block);
-      for (at, span) in quoted_spans(block) {
-        let line = marks
-          .iter()
-          .take_while(|(offset, _)| *offset <= at)
-          .last()
-          .map_or(0, |(_, line)| *line);
-        out.push((line, span.to_string(), cited.clone()));
-      }
-      if cited.is_empty() {
-        skipped += pending.len();
-        pending.clear();
-      } else {
-        productions.append(pending);
-      }
-      block.clear();
-      marks.clear();
-    };
+  let mut flush = |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Spans| {
+    // Computed once and reused for every span AND for the production gate
+    // below: both readings are "what did this block cite", so there is only
+    // one place that question is asked — see [`cited_rfcs`] for why the two
+    // readings of the answer still differ.
+    let cited = cited_rfcs(block);
+    for (at, span) in quoted_spans(block) {
+      let line = marks
+        .iter()
+        .take_while(|(offset, _)| *offset <= at)
+        .last()
+        .map_or(0, |(_, line)| *line);
+      out.push((line, span.to_string(), cited.clone()));
+    }
+    if cited.is_empty() {
+      skipped += pending.len();
+      pending.clear();
+    } else {
+      productions.append(pending);
+    }
+    block.clear();
+    marks.clear();
+  };
 
   for (index, raw) in source.lines().enumerate() {
-    let Some((body, own_line)) = comment_body(raw) else {
+    let Some((body, own_line, indent)) = comment_body(raw) else {
       fenced = false;
+      // Drained before the flush, every time: `flush` is what decides whether
+      // this block's candidates are admitted or counted uncited, and a
+      // paragraph still held here when it ran would be admitted by the NEXT
+      // block's citations instead of its own.
+      take_paragraph(&mut paragraph, &mut pending);
       flush(&mut block, &mut marks, &mut pending);
       continue;
     };
     if own_line {
       if let Some(info) = body.strip_prefix("```") {
         fenced = !fenced;
+        // A fence never continues the one before it, open or close.
+        continuing = None;
+        // Nor does a code span reach across one, in either direction.
+        take_paragraph(&mut paragraph, &mut pending);
         if fenced {
           grammar_fence = fence_holds_grammar(info);
           if grammar_fence {
@@ -1337,12 +1524,10 @@ fn quotations(source: &str) -> Extracted {
         // does not — and named in the module doc either way, since a boundary
         // nobody is told about is the failure this whole command exists to
         // remove.
-        if is_production(body) {
-          if grammar_fence {
-            from_fences.push((index + 1, body.to_string()));
-          } else {
-            fenced_productions += 1;
-          }
+        if grammar_fence {
+          read_fenced_line(&mut from_fences, &mut continuing, index + 1, indent, body);
+        } else if is_production(body) {
+          fenced_productions += 1;
         }
         continue;
       }
@@ -1355,18 +1540,24 @@ fn quotations(source: &str) -> Extracted {
       block.push(' ');
     }
     marks.push((block.len(), index + 1));
-    for span in abnf_spans(body) {
-      pending.push((index + 1, span));
+    // A `///` with nothing after it is the blank line of the comment's own
+    // Markdown, and a code span may not hold one — so it ends the paragraph
+    // while leaving the block, and its citations, standing.
+    if body.is_empty() {
+      take_paragraph(&mut paragraph, &mut pending);
+    } else {
+      paragraph.push((index + 1, body));
     }
     block.push_str(&mask_code_spans(body));
   }
+  take_paragraph(&mut paragraph, &mut pending);
   flush(&mut block, &mut marks, &mut pending);
   // Merged here rather than in the loop: `flush`'s borrow of `productions`
   // ends at the call above. Re-sorted by line so one file's candidates stay
   // in the order a reader of that file would meet them.
   let fenced_read = from_fences.len();
   productions.append(&mut from_fences);
-  productions.sort_by_key(|(line, _)| *line);
+  productions.sort_by_key(|candidate| candidate.line);
   Extracted {
     quoted: out,
     productions,
@@ -1411,40 +1602,47 @@ fn markdown_quotations(source: &str) -> Extracted {
   // ABNF production candidates seen in the block under construction, admitted
   // or skipped only once the block's own citation is known — see
   // `quotations`'s `pending` for why this can't be decided per-line.
-  let mut pending: Vec<(usize, String)> = Vec::new();
+  let mut pending: Spans = Vec::new();
   // See `quotations`'s `from_fences` for why these three are kept apart.
   let mut from_fences: Spans = Vec::new();
   let mut fences_read = 0usize;
   let mut fences_skipped = 0usize;
   let mut fenced = false;
   let mut grammar_fence = false;
+  // See `quotations` for what these two track. A blank line ends a Markdown
+  // file's block AND its paragraph at once, so unlike `quotations` the two
+  // boundaries coincide here — the buffer is still its own, because the fence
+  // rule below breaks a paragraph without a blank line to do it.
+  let mut continuing: Option<usize> = None;
+  let mut paragraph: Vec<(usize, &str)> = Vec::new();
 
-  let mut flush =
-    |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Vec<(usize, String)>| {
-      // See `quotations`'s `flush` for why this is computed once and reused
-      // for both the spans below and the production gate.
-      let cited = cited_rfcs(block);
-      for (at, span) in quoted_spans(block) {
-        let line = marks
-          .iter()
-          .take_while(|(offset, _)| *offset <= at)
-          .last()
-          .map_or(0, |(_, line)| *line);
-        out.push((line, span.to_string(), cited.clone()));
-      }
-      if cited.is_empty() {
-        skipped += pending.len();
-        pending.clear();
-      } else {
-        productions.append(pending);
-      }
-      block.clear();
-      marks.clear();
-    };
+  let mut flush = |block: &mut String, marks: &mut Vec<(usize, usize)>, pending: &mut Spans| {
+    // See `quotations`'s `flush` for why this is computed once and reused
+    // for both the spans below and the production gate.
+    let cited = cited_rfcs(block);
+    for (at, span) in quoted_spans(block) {
+      let line = marks
+        .iter()
+        .take_while(|(offset, _)| *offset <= at)
+        .last()
+        .map_or(0, |(_, line)| *line);
+      out.push((line, span.to_string(), cited.clone()));
+    }
+    if cited.is_empty() {
+      skipped += pending.len();
+      pending.clear();
+    } else {
+      productions.append(pending);
+    }
+    block.clear();
+    marks.clear();
+  };
 
   for (index, raw) in source.lines().enumerate() {
     if let Some(info) = raw.trim_start().strip_prefix("```") {
       fenced = !fenced;
+      // See `quotations`: a fence never continues the one before it.
+      continuing = None;
       if fenced {
         grammar_fence = fence_holds_grammar(info);
         if grammar_fence {
@@ -1453,21 +1651,28 @@ fn markdown_quotations(source: &str) -> Extracted {
           fences_skipped += 1;
         }
       }
+      take_paragraph(&mut paragraph, &mut pending);
       flush(&mut block, &mut marks, &mut pending);
       continue;
     }
     if fenced {
-      // Same rule as `quotations` applies, for the same reason.
-      if is_production(raw.trim()) {
-        if grammar_fence {
-          from_fences.push((index + 1, raw.trim().to_string()));
-        } else {
-          fenced_productions += 1;
-        }
+      // Same rule as `quotations` applies, for the same reason — the
+      // continuation half included.
+      if grammar_fence {
+        read_fenced_line(
+          &mut from_fences,
+          &mut continuing,
+          index + 1,
+          raw.len().saturating_sub(raw.trim_start().len()),
+          raw.trim(),
+        );
+      } else if is_production(raw.trim()) {
+        fenced_productions += 1;
       }
       continue;
     }
     if raw.trim().is_empty() {
+      take_paragraph(&mut paragraph, &mut pending);
       flush(&mut block, &mut marks, &mut pending);
       continue;
     }
@@ -1475,16 +1680,19 @@ fn markdown_quotations(source: &str) -> Extracted {
       block.push(' ');
     }
     marks.push((block.len(), index + 1));
-    for span in abnf_spans(raw) {
-      pending.push((index + 1, span));
-    }
+    // Trimmed, where `mask_code_spans` below is handed the raw line: a
+    // paragraph's lines are about to be JOINED, and the indentation Markdown
+    // uses to lay a paragraph out would otherwise land inside a span that
+    // wraps across one of them.
+    paragraph.push((index + 1, raw.trim()));
     block.push_str(&mask_code_spans(raw));
   }
+  take_paragraph(&mut paragraph, &mut pending);
   flush(&mut block, &mut marks, &mut pending);
   // See `quotations` for why the merge waits until `flush` is done with.
   let fenced_read = from_fences.len();
   productions.append(&mut from_fences);
-  productions.sort_by_key(|(line, _)| *line);
+  productions.sort_by_key(|candidate| candidate.line);
   Extracted {
     quoted: out,
     productions,
@@ -1509,7 +1717,14 @@ fn markdown_quotations(source: &str) -> Extracted {
 ///
 /// The `own_line` half of the answer is for the fence rule, which is a property
 /// of doc comments and not of a comment beside code.
-fn comment_body(line: &str) -> Option<(&str, bool)> {
+///
+/// The third half is the body's own INDENT past the marker, counted before the
+/// trim that throws it away. It is what tells a wrapped ABNF rule's
+/// continuation from the prose that merely follows the rule
+/// ([`read_fenced_line`]), and it is returned from here rather than recovered
+/// by a second walk because this is the one function that knows where the
+/// marker ended.
+fn comment_body(line: &str) -> Option<(&str, bool, usize)> {
   let trimmed = line.trim_start();
   let own_line = trimmed.starts_with("//");
   let text = if own_line {
@@ -1521,7 +1736,8 @@ fn comment_body(line: &str) -> Option<(&str, bool)> {
     .strip_prefix("///")
     .or_else(|| text.strip_prefix("//!"))
     .or_else(|| text.strip_prefix("//"))?;
-  Some((body.trim(), own_line))
+  let indent = body.len().saturating_sub(body.trim_start().len());
+  Some((body.trim(), own_line, indent))
 }
 
 /// Where a comment begins on a line that starts with code, or `None` when the
@@ -1647,7 +1863,8 @@ fn quoted_spans(block: &str) -> Vec<(usize, &str)> {
   out
 }
 
-/// The backticked ABNF productions on one raw comment line.
+/// The backticked ABNF productions in one PARAGRAPH of comment, each paired
+/// with the source line its opening backtick run sits on.
 ///
 /// Runs BEFORE [`mask_code_spans`], which erases a backticked span holding a
 /// `"` — and a production's terminals are quoted, so by the time a block is
@@ -1657,21 +1874,235 @@ fn quoted_spans(block: &str) -> Vec<(usize, &str)> {
 /// A span counts when it opens with `name =` or RFC 2046's `name :=`, which is
 /// what separates a grammar rule from a backticked identifier. `=/`
 /// (incremental alternatives) counts too.
-fn abnf_spans(line: &str) -> Vec<String> {
+///
+/// # Why the unit is a paragraph and not a line
+///
+/// It was a line, and a line is where a production could leave this gate
+/// altogether. A rule too long for one comment line gets wrapped, its closing
+/// backtick lands on the next line, and pairing backticks within a line found
+/// no closer and gave up — so the rule had no span extracted from it, was
+/// never graded, never counted and never reported. That is the escape
+/// [`rule_fault`] closes one step later, arriving one step earlier: a
+/// truncated production at least reached the comparison and was called
+/// verbatim, while a wrapped one reached nothing.
+///
+/// A Markdown code span is a paragraph-level construct, and a paragraph is
+/// therefore the unit that reads what rustdoc renders: a line ending inside a
+/// span becomes a space, and a blank line ends the span rather than being
+/// swallowed by it. Where a paragraph ends is the caller's to say — see
+/// [`take_paragraph`] — because only the caller can tell a blank comment line
+/// from a fence from the end of the comment.
+///
+/// # Backtick RUNS, not backticks
+///
+/// A span opened by N backticks closes on the next run of exactly N. That is
+/// CommonMark's rule rather than a refinement of it, and joining lines is what
+/// makes it load-bearing here: a comment writes a literal backtick by wrapping
+/// it in two, and one such span in this very file — [`exempted_spans`]'s own
+/// doc comment — is wrapped across two lines. Pairing single backticks would
+/// take that span's head from one line and its tail from the next and offer the
+/// join as a grammar rule; `a_doubled_backtick_span_is_not_two_single_ones`
+/// quotes those two lines verbatim and holds it to reading one span, which
+/// holds backticks and is not production-shaped.
+///
+/// An opening run that finds no closer in the paragraph is literal text, and
+/// the walk resumes at the run after it: one stray backtick costs the spans
+/// behind it nothing. The line-at-a-time version abandoned the rest of its line
+/// at that point, which is why widening the unit had to widen the recovery with
+/// it — a paragraph is a great deal more to abandon than a line.
+fn abnf_spans(paragraph: &[(usize, &str)]) -> Vec<(usize, String)> {
   let mut out = Vec::new();
-  let mut rest = line;
-  while let Some(open) = rest.find('`') {
-    let after = &rest[open + 1..];
-    let Some(close) = after.find('`') else {
-      return out;
-    };
-    let span = &after[..close];
-    if is_production(span) {
-      out.push(span.to_string());
+  // The paragraph as one text, with the source line each joined line's first
+  // byte belongs to. Joined on `\n` rather than on a space so the join stays
+  // VISIBLE to the walk below: only a line ending INSIDE a span becomes a
+  // space, and a span has to be able to tell that space from one its author
+  // wrote.
+  let mut text = String::new();
+  let mut starts: Vec<(usize, usize)> = Vec::new();
+  for (line, body) in paragraph {
+    if !text.is_empty() {
+      text.push('\n');
     }
-    rest = &after[close + 1..];
+    starts.push((text.len(), *line));
+    text.push_str(body);
+  }
+  let runs = backtick_runs(&text);
+  let mut at = 0usize;
+  while let Some(&(open, len)) = runs.get(at) {
+    // The closer is the next run of the SAME length, and the runs between the
+    // two are content. A run with no such partner is literal text, so the walk
+    // resumes at the run after it rather than giving up on the paragraph.
+    let Some((index, &(close, _))) = runs
+      .iter()
+      .enumerate()
+      .skip(at.saturating_add(1))
+      .find(|(_, (_, other))| *other == len)
+    else {
+      at = at.saturating_add(1);
+      continue;
+    };
+    at = index.saturating_add(1);
+    let Some(content) = text.get(open.saturating_add(len)..close) else {
+      continue;
+    };
+    let span = code_span_text(content);
+    if is_production(&span) {
+      let line = starts
+        .iter()
+        .take_while(|(offset, _)| *offset <= open)
+        .last()
+        .map_or(0, |(_, line)| *line);
+      out.push((line, span));
+    }
   }
   out
+}
+
+/// Every run of backticks in `text`, as the byte offset it starts at and how
+/// many backticks long it is.
+fn backtick_runs(text: &str) -> Vec<(usize, usize)> {
+  let mut out = Vec::new();
+  let bytes = text.as_bytes();
+  let mut at = 0usize;
+  while at < bytes.len() {
+    if bytes.get(at) != Some(&b'`') {
+      at = at.saturating_add(1);
+      continue;
+    }
+    let start = at;
+    while bytes.get(at) == Some(&b'`') {
+      at = at.saturating_add(1);
+    }
+    out.push((start, at.saturating_sub(start)));
+  }
+  out
+}
+
+/// What a code span's delimiters actually enclose, once CommonMark is done
+/// with it: every line ending inside it becomes a space, and one space is
+/// dropped from each end when the span has one at BOTH ends and is not made of
+/// spaces alone.
+///
+/// The second half is the rule that lets a span hold a backtick of its own —
+/// the padding spaces belong to the delimiters rather than to the text — so
+/// reading it is what keeps a span's first character from being one its author
+/// never wrote.
+fn code_span_text(content: &str) -> String {
+  let joined: String = content
+    .chars()
+    .map(|ch| if ch == '\n' { ' ' } else { ch })
+    .collect();
+  if !joined.starts_with(' ') || !joined.ends_with(' ') || joined.trim().is_empty() {
+    return joined;
+  }
+  joined
+    .get(1..joined.len().saturating_sub(1))
+    .unwrap_or(&joined)
+    .to_string()
+}
+
+/// Reads the paragraph collected so far into `pending` as candidates, and
+/// empties it for the next one.
+///
+/// [`Candidate::rule`] is the span itself: a backticked production is whole
+/// where its author left it, so unlike a fenced one ([`read_fenced_line`])
+/// there is no continuation to join onto it — a span wrapped across lines was
+/// already joined by [`abnf_spans`] before it reached here.
+fn take_paragraph(paragraph: &mut Vec<(usize, &str)>, pending: &mut Spans) {
+  for (line, span) in abnf_spans(paragraph) {
+    pending.push(Candidate {
+      line,
+      rule: span.clone(),
+      span,
+    });
+  }
+  paragraph.clear();
+}
+
+/// Reads one line of an admitted `text` fence into `from_fences` — as a new
+/// candidate when it is production-shaped, and as the CONTINUATION of the one
+/// before it when it is not.
+///
+/// ABNF wraps, and this workspace transcribes it the way the RFCs print it.
+/// RFC 9110 §12.5.1 sets `media-range` over four lines and RFC 2046 §5.1 sets
+/// `tspecials` over three, so the first line of a wrapped rule ends inside a
+/// group it does not close. Reading that line as a whole rule would have
+/// [`rule_fault`] report seven correct transcriptions in this tree as
+/// truncated — and a check that invents failures gets switched off, which is
+/// the argument the module doc already makes about the tail anchor. Re-derived
+/// rather than inherited: replacing this function's join with nothing and
+/// re-running `cargo run -p xtask -- quote-check` reds at exactly 7, in
+/// `CHANGELOG.md`, `coding-corpus` twice, `media` twice and `range::multipart`
+/// twice.
+///
+/// So a continuation is joined onto [`Candidate::rule`], the only field
+/// `rule_fault` reads. [`Candidate::span`] keeps the single line, which is
+/// what [`grade_production`] compares: the join is this extractor's doing
+/// rather than the author's, and a spec's own text is what a transcribed line
+/// is held to.
+///
+/// A continuation is a line that is not itself production-shaped and is
+/// INDENTED PAST the rule it continues. That second half is the RFCs' own
+/// typesetting rather than a heuristic about content — a wrapped rule's later
+/// lines are set under its right-hand side, and all seven wrapped rules in this
+/// workspace are — and it is what tells a continuation from the prose that
+/// merely follows a rule. Without it the join reads whatever comes next, and a
+/// truncated rule followed immediately by text carrying the closer it dropped
+/// would BALANCE and pass: #75's own class, surviving inside the fix for #75.
+/// The indent comes from [`comment_body`], which counts it before the trim that
+/// throws it away.
+///
+/// Three things end a continuation, and all three are ends of the RULE: a blank
+/// line, a line production-shaped enough to start its own candidate, and a line
+/// back at or left of the rule's own indent. An ABNF `;` comment line indented
+/// under the rule joins and costs nothing: `rule_fault` stops at an unquoted
+/// `;`, so a comment can neither open nor close anything.
+///
+/// What remains open is narrow and stated: prose that is itself indented under
+/// the rule still joins. At that point the author has written something set as
+/// a continuation, and nothing here reads what a line MEANS.
+///
+/// A rule wrapped inside a BACKTICKED span is not this function's to join and
+/// never was: [`abnf_spans`] joins that one where it extracts it, because a
+/// code span's wrapping is Markdown's and is settled before anything asks what
+/// the text says. The two joins are separate for that reason, and the fenced
+/// one keeps [`Candidate::span`] on its single line where the backticked one
+/// has no line left to keep.
+fn read_fenced_line(
+  from_fences: &mut Spans,
+  continuing: &mut Option<usize>,
+  line: usize,
+  indent: usize,
+  body: &str,
+) {
+  if is_production(body) {
+    from_fences.push(Candidate {
+      line,
+      span: body.to_string(),
+      rule: body.to_string(),
+    });
+    *continuing = Some(indent);
+    return;
+  }
+  if body.trim().is_empty() {
+    *continuing = None;
+    return;
+  }
+  // Back at the rule's own indent, or left of it: the rule is over, whatever
+  // this line is. Clearing rather than merely declining is the half that
+  // bounds the damage — one un-indented line ends the join for the rest of the
+  // paragraph instead of letting a later indented one resume it.
+  let Some(opened) = *continuing else {
+    return;
+  };
+  if indent <= opened {
+    *continuing = None;
+    return;
+  }
+  if let Some(candidate) = from_fences.last_mut() {
+    candidate.rule.push(' ');
+    candidate.rule.push_str(body.trim());
+  }
 }
 
 // The two spans below name the SHAPE this function matches rather than any RFC's
@@ -1720,18 +2151,203 @@ fn abnf_spans(line: &str) -> Vec<String> {
 /// match arm offered to [`grade_production`] as a rule would be a failure
 /// invented out of a code sample.
 fn is_production(span: &str) -> bool {
+  right_hand_side(span).is_some()
+}
+
+/// Everything past the `=`, `=/` or `:=` that [`is_production`] recognises, or
+/// `None` when `span` carries no such operator.
+///
+/// The single derivation of where a rule's name ends and its definition
+/// begins. [`is_production`] is this function asked for a yes or a no, so a
+/// candidate's ADMISSION and the text [`rule_fault`] reads can never disagree
+/// about which character was the operator — the shape test would otherwise be
+/// judging a right-hand side the admission test never granted.
+///
+/// The `/` of `=/` belongs to the operator and is dropped with it: RFC 5234
+/// writes the two characters adjacent, so a `/` immediately behind the `=` is
+/// the incremental-alternative mark rather than the first alternation of an
+/// empty alternative. A `/` behind a SPACE is left alone, because that one is
+/// the rule's own.
+fn right_hand_side(span: &str) -> Option<&str> {
   let trimmed = span.trim_start();
   let name: String = trimmed
     .chars()
     .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
     .collect();
   if name.is_empty() || !name.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
-    return false;
+    return None;
   }
-  let after_name = trimmed[name.len()..].trim_start();
+  let after_name = trimmed.get(name.len()..)?.trim_start();
   let after_name = after_name.strip_prefix(':').unwrap_or(after_name);
-  let mut after_name = after_name.chars();
-  after_name.next() == Some('=') && !matches!(after_name.next(), Some('=' | '>'))
+  let rest = after_name.strip_prefix('=')?;
+  if rest.starts_with(['=', '>']) {
+    return None;
+  }
+  Some(rest.strip_prefix('/').unwrap_or(rest))
+}
+
+/// What stops a production-shaped span from being a whole ABNF rule.
+///
+/// Each variant names the CHARACTER the fault is about, because the repair is
+/// always a character: the one that was dropped, or the one that should not
+/// have been there.
+#[derive(Debug, PartialEq, Eq)]
+enum RuleFault {
+  /// A name and an operator with no grammar behind them — an empty
+  /// right-hand side, or a span with no operator at all.
+  Empty,
+  /// A `(`, `[`, `"` or `<` the rule opens and never closes. This is the
+  /// truncation case: a production whose tail was dropped mid-group.
+  Unclosed(char),
+  /// A `)` or `]` with nothing open for it to close — the truncation's
+  /// mirror, a production whose head was dropped.
+  Unopened(char),
+  /// A `)` or `]` closing the wrong opener; the closer first, then what was
+  /// actually open.
+  Mismatched(char, char),
+}
+
+impl RuleFault {
+  /// The line [`run`] prints under a malformed production.
+  fn reason(&self) -> String {
+    match *self {
+      Self::Empty => "nothing on the right of the definition operator".to_string(),
+      Self::Unclosed(ch) => format!("a `{ch}` this never closes"),
+      Self::Unopened(ch) => format!("a `{ch}` closing nothing"),
+      Self::Mismatched(close, open) => format!("a `{close}` closing a `{open}`"),
+    }
+  }
+}
+
+// The span below is the TRUNCATION this function rejects, quoted so the doc can
+// name it — RFC 9110 §10.1.4's rule with its closing ` )` dropped. This file is
+// inside the corpus it scans, and the marker is the mechanism it documents for
+// exactly that.
+// gate-exempt: transfer-coding = token *( OWS ";" OWS transfer-parameter — the measured truncation, quoted to name it, not a production of any RFC
+/// What stops `rule` from being a whole ABNF rule, or `None` when nothing
+/// does — the test a candidate passes before [`grade_production`] compares it
+/// with a spec at all.
+///
+/// # The hole this closes
+///
+/// The comparison is a SUBSTRING test, so a production with its tail cut off
+/// still matches: `transfer-coding = token *( OWS ";" OWS transfer-parameter`
+/// is a substring of RFC 9110 §10.1.4's own text, and the run that graded it
+/// said `verbatim` and meant it. That is not a hypothetical — a transcription
+/// that carried §10.1.4's inner `transfer-parameter` and omitted the
+/// CONTAINER it sits in passed this gate, and the container is the half where
+/// the two grammars differ: §5.6.6 brackets the slot, §10.1.4 does not. It was
+/// verbatim. It was also half a grammar.
+///
+/// # What "whole" means here, exactly
+///
+/// A rule is a name, an operator, and a right-hand side that BALANCES. This
+/// walks the right-hand side once and asks only that:
+///
+/// - `(` and `[` must be closed, by `)` and `]` respectively and in that
+///   nesting order. A `)` or `]` with nothing open is the same fault seen
+///   from the other end.
+/// - `"` opens an RFC 5234 `char-val` and `<` a `prose-val`; neither may hold
+///   its own closing character, so the first `"` or `>` after one closes it
+///   and nothing between them is read. That is what keeps §5.6.6's `";"` from
+///   being taken for a comment and RFC 2046's `<">` from being taken for an
+///   unbalanced quote.
+/// - `;` outside both begins an ABNF comment, which ends the rule. Everything
+///   behind it is prose about the grammar rather than grammar.
+/// - Something must remain: a name and an operator with nothing behind them
+///   is a rule that defines nothing.
+///
+/// # What it accepts that is not, in fact, a whole rule
+///
+/// Everything whose truncation falls on a boundary this cannot see. A rule
+/// with no brackets in it — `media-type = type "/" subtype parameters` — can
+/// lose its last name and still balance, still be a substring, and still pass
+/// here. So can one truncated at a `/` between two complete alternatives. The
+/// claim is bounded and worth stating in exactly these words: this rejects a
+/// production truncated INSIDE a group, which is the shape the measured
+/// defect had and the shape most truncations of an HTTP production have,
+/// because HTTP's productions are mostly groups. It does not decide that a
+/// transcription is the WHOLE of its rule, and nothing that reads only the
+/// comment can — the rule's own name is the only thing that says how much of
+/// it there should be, and matching on that is a larger design than this.
+///
+/// And a production carrying an ELISION mark, which is the one case this
+/// declines to answer at all rather than answering wrongly. `…` and `...` are
+/// this file's existing convention for an author cutting the middle out on
+/// purpose, read by [`run`] as it splits a span into the segments it grades; a
+/// rule that says it is not whole is not one for a wholeness test to fail.
+///
+/// This is also, deliberately, not part of [`is_production`]. Keying
+/// ADMISSION on the right-hand side would make a broken production stop
+/// looking like a production, so the gate's own defect would delete the item
+/// it should be reporting — [`exempted_spans`] carries that ruling, and this
+/// is the shape it demands: admitted by the name and the operator, FAILED on
+/// the right-hand side.
+fn rule_fault(rule: &str) -> Option<RuleFault> {
+  // An ELIDED production has already said of itself that it is not whole, and
+  // whole is the only thing this asks. `run` splits a span on the same two
+  // marks and grades the segments either side of them, precisely because the
+  // author declared the middle missing; asking the declared fragment to
+  // balance would report an author's own `…` back at them, and the repair —
+  // move the elision until the brackets pair — is arbitrary. The mark is as
+  // visible in the source as a `gate-exempt:` marker, and reading it the same
+  // way on both paths is what keeps this from being a second, quieter meaning
+  // for the same three characters.
+  if rule.contains('…') || rule.contains("...") {
+    return None;
+  }
+  // Every caller hands this a candidate `is_production` already admitted, so
+  // the operator is there. A span without one has no right-hand side at all,
+  // which is the extreme of the same fault rather than the absence of it.
+  let Some(rhs) = right_hand_side(rule) else {
+    return Some(RuleFault::Empty);
+  };
+  let mut open: Vec<char> = Vec::new();
+  // The `char-val` or `prose-val` now being passed over, if any.
+  let mut inside: Option<char> = None;
+  // Whether anything at all sits behind the operator.
+  let mut anything = false;
+  for ch in rhs.chars() {
+    if let Some(delimiter) = inside {
+      if (delimiter == '"' && ch == '"') || (delimiter == '<' && ch == '>') {
+        inside = None;
+      }
+      continue;
+    }
+    match ch {
+      ';' => break,
+      '"' | '<' => {
+        inside = Some(ch);
+        anything = true;
+      }
+      '(' | '[' => {
+        open.push(ch);
+        anything = true;
+      }
+      ')' | ']' => {
+        let Some(opener) = open.pop() else {
+          return Some(RuleFault::Unopened(ch));
+        };
+        if !matches!((opener, ch), ('(', ')') | ('[', ']')) {
+          return Some(RuleFault::Mismatched(ch, opener));
+        }
+        anything = true;
+      }
+      ch if ch.is_whitespace() => {}
+      _ => anything = true,
+    }
+  }
+  if let Some(delimiter) = inside {
+    return Some(RuleFault::Unclosed(delimiter));
+  }
+  // The innermost still-open group: the one whose closer is missing first.
+  if let Some(opener) = open.pop() {
+    return Some(RuleFault::Unclosed(opener));
+  }
+  if !anything {
+    return Some(RuleFault::Empty);
+  }
+  None
 }
 
 /// Whether a fence's `info` string says the block holds transcribed text
@@ -2260,6 +2876,24 @@ mod tests {
     assert!(both[0].contains("a.rs"));
   }
 
+  // One candidate flattened to the three things an extraction test is about.
+  // `span` and `rule` are shown separately on purpose: they are equal for
+  // every candidate that is not a fenced rule with continuation lines behind
+  // it, and a test that printed only one of them could not tell the two
+  // cases apart.
+  fn triples(productions: &[super::Candidate]) -> Vec<(usize, &str, &str)> {
+    productions
+      .iter()
+      .map(|candidate| {
+        (
+          candidate.line,
+          candidate.span.as_str(),
+          candidate.rule.as_str(),
+        )
+      })
+      .collect()
+  }
+
   fn spans(source: &str) -> Vec<String> {
     quotations(source)
       .quoted
@@ -2396,6 +3030,16 @@ mod tests {
     assert_eq!((rs.uncited, rs.fenced), (0, 0));
   }
 
+  // One paragraph's spans without their line numbers, for the tests below
+  // that are about the SHAPE a span has to have rather than about where it
+  // was written. The ones about wrapping keep the numbers.
+  fn one_line(line: &str) -> Vec<String> {
+    super::abnf_spans(&[(1, line)])
+      .into_iter()
+      .map(|(_, span)| span)
+      .collect()
+  }
+
   // An ABNF production reaches neither existing path: `mask_code_spans` erases
   // a backticked span holding a `"`, and `quoted_spans` only takes `"…"`. It
   // needs its own extractor, and this is the shape that finds one.
@@ -2403,7 +3047,7 @@ mod tests {
   fn a_backticked_production_is_extracted() {
     let line = "  /// RFC 9110 §8.3.1: `media-type = type \"/\" subtype parameters`";
     assert_eq!(
-      super::abnf_spans(line),
+      one_line(line),
       ["media-type = type \"/\" subtype parameters"]
     );
   }
@@ -2412,7 +3056,7 @@ mod tests {
   // rule from a name, and requiring it is what keeps this extractor quiet.
   #[test]
   fn a_backticked_name_is_not_a_production() {
-    assert!(super::abnf_spans("  /// see `open_request` and `Connection`").is_empty());
+    assert!(one_line("  /// see `open_request` and `Connection`").is_empty());
   }
 
   // `is_production` once saw only the FIRST character after `name`, so a Rust
@@ -2424,14 +3068,87 @@ mod tests {
   #[test]
   fn a_double_equals_is_not_a_production() {
     let line = "  // the EXACT fit, `need == out.len()`: the boundary between the two arms";
-    assert!(super::abnf_spans(line).is_empty());
+    assert!(one_line(line).is_empty());
     let arm = "  // `other => unreachable!()` is a match arm, not a rule";
-    assert!(super::abnf_spans(arm).is_empty());
+    assert!(one_line(arm).is_empty());
     let incremental = "  // `rule =/ extra-alternative` still opens one";
+    assert_eq!(one_line(incremental), ["rule =/ extra-alternative"]);
+  }
+
+  // The hole this closes, and it is one step earlier than the truncation one:
+  // a rule too long for a comment line is WRAPPED, so pairing backticks within
+  // a line found no closer, extracted nothing, and the rule was never graded
+  // at all. The span comes back joined, carrying the line its OPENING backtick
+  // is on, and the line ending inside it is a space — which is what CommonMark
+  // says a code span does with one.
+  #[test]
+  fn a_span_wrapped_across_two_lines_is_still_one_span() {
+    let paragraph = [
+      (7, "RFC 9110 §10.1.4: `transfer-coding = token"),
+      (8, "*( OWS \";\" OWS transfer-parameter )`"),
+    ];
     assert_eq!(
-      super::abnf_spans(incremental),
-      ["rule =/ extra-alternative"]
+      super::abnf_spans(&paragraph),
+      vec![(
+        7,
+        "transfer-coding = token *( OWS \";\" OWS transfer-parameter )".to_string()
+      )]
     );
+  }
+
+  // The reason the pairing counts backtick RUNS. A comment writes a literal
+  // backtick by wrapping it in two, and `exempted_spans`'s own doc comment
+  // wraps such a span across two lines — the two rows below are that comment,
+  // verbatim. Pairing single backticks would take the head from one line and
+  // the tail from the next and call the join a rule; the run rule reads one
+  // span, which holds backticks and is not production-shaped.
+  #[test]
+  fn a_doubled_backtick_span_is_not_two_single_ones() {
+    let paragraph = [
+      (
+        1,
+        "is none) as a deliberate non-production rather than a silent one: `` `q =",
+      ),
+      (
+        2,
+        "1` `` is production-SHAPED — [`is_production`] cannot tell a grammar rule",
+      ),
+    ];
+    assert_eq!(super::abnf_spans(&paragraph), vec![]);
+    assert_eq!(
+      super::code_span_text(" `q =\n1` "),
+      "`q = 1`",
+      "the line ending is a space, and one padding space goes from each end"
+    );
+  }
+
+  // An opening run with no partner of its own length is literal text, and the
+  // walk resumes at the run AFTER it rather than abandoning what is left. Over
+  // a paragraph that matters more than it did over a line, which is all the
+  // line-at-a-time version could give up on.
+  //
+  // The second half is the shape this does NOT rescue, stated because it is
+  // the one a reader will expect it to: a stray SINGLE backtick pairs with the
+  // next single one, so it takes the following span's opener as its closer and
+  // shifts every pairing behind it. That is what CommonMark says and what
+  // rustdoc renders, and reading it differently would mean grading text no
+  // reader of the docs ever sees as a code span.
+  #[test]
+  fn an_unpartnered_run_does_not_hide_the_spans_behind_it() {
+    let doubled = [
+      (3, "a stray `` opens nothing, and"),
+      (4, "`token = 1*tchar` is read all the same"),
+    ];
+    assert_eq!(
+      super::abnf_spans(&doubled),
+      vec![(4, "token = 1*tchar".to_string())]
+    );
+
+    let single = [
+      (3, "a stray ` opens a span, and"),
+      (4, "`token = 1*tchar` closes it instead of opening its own"),
+    ];
+    assert_eq!(super::abnf_spans(&single), vec![]);
   }
 
   // The fence this workspace transcribes its grammar in, read at last: a
@@ -2451,8 +3168,12 @@ mod tests {
       "  /// RFC 9112 §7:\n  /// ```text\n  /// transfer-parameter = token BWS\n  /// ```\n";
     let extracted = quotations(fenced);
     assert_eq!(
-      extracted.productions,
-      vec![(3, "transfer-parameter = token BWS".to_string())]
+      triples(&extracted.productions),
+      vec![(
+        3,
+        "transfer-parameter = token BWS",
+        "transfer-parameter = token BWS"
+      )]
     );
     assert_eq!((extracted.fences_read, extracted.fenced_read), (1, 1));
     assert_eq!((extracted.fences_skipped, extracted.fenced), (0, 0));
@@ -2525,8 +3246,12 @@ mod tests {
     let source = "See RFC 9112 §7:\n\n```text\ntransfer-parameter = token BWS\n```\n";
     let extracted = markdown_quotations(source);
     assert_eq!(
-      extracted.productions,
-      vec![(4, "transfer-parameter = token BWS".to_string())]
+      triples(&extracted.productions),
+      vec![(
+        4,
+        "transfer-parameter = token BWS",
+        "transfer-parameter = token BWS"
+      )]
     );
     assert_eq!((extracted.fenced_read, extracted.fenced), (1, 0));
 
@@ -2602,15 +3327,15 @@ mod tests {
   fn a_production_survives_in_any_citing_block() {
     let cited = quotations("  /// RFC 6455 §9.1's `extension-param = token`\n");
     assert_eq!(
-      cited.productions,
-      vec![(1, "extension-param = token".to_string())]
+      triples(&cited.productions),
+      vec![(1, "extension-param = token", "extension-param = token")]
     );
     assert_eq!(cited.uncited, 0);
 
     let several = quotations("  /// RFC 2616 and RFC 9110 both define `token = 1*tchar`\n");
     assert_eq!(
-      several.productions,
-      vec![(1, "token = 1*tchar".to_string())],
+      triples(&several.productions),
+      vec![(1, "token = 1*tchar", "token = 1*tchar")],
       "two citations are two attributions, not an absent one"
     );
     assert_eq!(several.uncited, 0);
@@ -2817,6 +3542,206 @@ mod tests {
     let mut checked = 0;
     assert!(super::grade_production("x=y", &specs, &mut checked).is_none());
     assert_eq!(checked, 0);
+  }
+
+  // The accept side, and it is the whole of what keeps this rule usable: every
+  // shape an RFC actually writes has to pass, or the gate reports the tree
+  // instead of the defect. Each line below is a real production, and each
+  // carries one character that a naive balance test gets wrong — the `;`
+  // inside a quoted terminal, the backslash a terminal can hold, RFC 2046's
+  // prose-val with parentheses in it, the prose-val holding a DQUOTE, and an
+  // ABNF comment carrying an unbalanced quote and paren both.
+  #[test]
+  fn a_whole_rule_is_accepted_in_every_shape_the_rfcs_write() {
+    for whole in [
+      "parameters = *( OWS \";\" OWS [ parameter ] )",
+      "transfer-coding = token *( OWS \";\" OWS transfer-parameter )",
+      "quoted-pair = \"\\\" ( HTAB / SP / VCHAR / obs-text )",
+      "media-range = ( \"*/*\" / ( type \"/\" \"*\" ) / ( type \"/\" subtype ) ) parameters",
+      "token := 1*<any (US-ASCII) CHAR except SPACE, CTLs, or tspecials>",
+      "tspecials :=  \"(\" / \")\" / \"<\" / \">\" / \"@\" / \",\" / \";\" / \":\" / \"\\\" / <\">",
+      "DQUOTE = %x22 ; \" (Double Quote)",
+      "Trailer =/ token",
+      "obs-text = %x80-FF",
+    ] {
+      assert_eq!(super::rule_fault(whole), None, "{whole}");
+    }
+  }
+
+  // The hole this closes, in the exact words the gate let through: RFC 9110
+  // §10.1.4's rule with its closing ` )` dropped IS a substring of the spec,
+  // so the comparison called it verbatim and meant it. Every other row is a
+  // truncation the same walk catches, at the other end and in the middle.
+  #[test]
+  fn a_production_truncated_inside_a_group_is_not_a_whole_rule() {
+    use super::RuleFault::{Empty, Mismatched, Unclosed, Unopened};
+
+    for (broken, fault) in [
+      (
+        "transfer-coding = token *( OWS \";\" OWS transfer-parameter",
+        Unclosed('('),
+      ),
+      (
+        "expectation = token [ \"=\" ( token / quoted-string )",
+        Unclosed('['),
+      ),
+      ("qdtext = <any TEXT", Unclosed('<')),
+      ("chunk-ext-val = \"unterminated", Unclosed('"')),
+      (
+        "expectation = token \"=\" ( token / quoted-string ) parameters ]",
+        Unopened(']'),
+      ),
+      (
+        "parameters = *( OWS \";\" OWS [ parameter )",
+        Mismatched(')', '['),
+      ),
+      ("parameters =", Empty),
+      ("parameters = ; and nothing but a comment", Empty),
+    ] {
+      assert_eq!(super::rule_fault(broken), Some(fault), "{broken}");
+    }
+  }
+
+  // An elision is the author saying the rule is not whole, and whole is the
+  // only question this asks. The `Via` rule below is the one elided production
+  // in this workspace; it balances, so it passes either way, and the second
+  // row is what the rule is actually for — an elision that lands inside a
+  // group, where refusing to answer is the difference between a gate and a
+  // gate that invents failures.
+  #[test]
+  fn an_elided_production_is_not_asked_whether_it_is_whole() {
+    assert_eq!(
+      super::rule_fault("Via = #( received-protocol RWS received-by …)"),
+      None
+    );
+    assert_eq!(super::rule_fault("Via = #( received-protocol …"), None);
+    assert_eq!(super::rule_fault("Via = #( received-protocol ..."), None);
+    assert_eq!(
+      super::rule_fault("Via = #( received-protocol"),
+      Some(super::RuleFault::Unclosed('(')),
+      "without the mark the same fragment is a truncation"
+    );
+  }
+
+  // The ruling this rule had to be shaped around: a broken production must
+  // still LOOK like one. Keying admission on the right-hand side would make
+  // the gate's own defect delete the item it should be reporting, so
+  // `is_production` still says yes to every row above and `rule_fault` is
+  // what says no.
+  #[test]
+  fn a_broken_production_is_still_admitted_as_a_candidate() {
+    let truncated = "transfer-coding = token *( OWS \";\" OWS transfer-parameter";
+    assert!(super::is_production(truncated));
+    assert!(super::rule_fault(truncated).is_some());
+  }
+
+  // ABNF wraps, and a rule set the way the RFCs print it ends its first line
+  // inside a group. The candidate keeps the LINE as its span, because that is
+  // what the spec's own text must contain, and carries the joined rule for the
+  // shape test — so a correct transcription of RFC 9110 §12.5.1 passes rather
+  // than being reported as truncated.
+  //
+  // The fixture is one source line with escaped newlines for the reason
+  // `a_text_fenced_production_is_read` gives: spelled across real lines it
+  // would be a live `text` fence in this file.
+  #[test]
+  fn a_fenced_rule_wrapped_across_lines_is_judged_whole() {
+    let wrapped = "  /// RFC 9110 §12.5.1:\n  /// ```text\n  /// media-range = ( \"*/*\"\n  ///                 / ( type \"/\" subtype )\n  ///               ) parameters\n  /// ```\n";
+    let extracted = quotations(wrapped);
+    assert_eq!(
+      triples(&extracted.productions),
+      vec![(
+        3,
+        "media-range = ( \"*/*\"",
+        "media-range = ( \"*/*\" / ( type \"/\" subtype ) ) parameters"
+      )]
+    );
+    assert_eq!(super::rule_fault(&extracted.productions[0].rule), None);
+    assert_eq!(
+      super::rule_fault(&extracted.productions[0].span),
+      Some(super::RuleFault::Unclosed('(')),
+      "the line alone is not a rule, which is why the join exists"
+    );
+  }
+
+  // What ends a continuation, both ways round. A blank line is what separates
+  // one rule from the next in every fence this workspace writes, and the next
+  // production-shaped line starts its own candidate rather than joining the
+  // one before it — without both, a rule would go on swallowing whatever
+  // follows the grammar.
+  #[test]
+  fn a_continuation_ends_at_a_blank_line_and_at_the_next_rule() {
+    let fence = "  /// ```text\n  /// mechanism := \"7bit\" /\n  ///              ietf-token\n  ///\n  /// prose about the two above\n  /// token := 1*<any CHAR>\n  ///             except tspecials>\n  /// ```\n";
+    let extracted = quotations(fence);
+    assert_eq!(
+      triples(&extracted.productions),
+      vec![
+        (
+          2,
+          "mechanism := \"7bit\" /",
+          "mechanism := \"7bit\" / ietf-token"
+        ),
+        (
+          6,
+          "token := 1*<any CHAR>",
+          "token := 1*<any CHAR> except tspecials>"
+        ),
+      ],
+      "the prose after the blank joined nothing"
+    );
+  }
+
+  // The #75 class surviving inside the fix for #75, and the indent that ends
+  // it. Both fixtures truncate RFC 9110 §12.5.1's `media-range` at its first
+  // line — a prefix that IS a substring of the spec, so only `rule_fault` can
+  // catch it — and then write the missing `)` on the next line. Set as a
+  // continuation, under the rule, it joins and the truncation is hidden; set as
+  // prose, back at the rule's own indent, it does not and the truncation is
+  // reported.
+  //
+  // One source line with escaped newlines, for the reason
+  // `a_text_fenced_production_is_read` gives.
+  #[test]
+  fn prose_after_a_truncated_fenced_rule_does_not_close_its_group() {
+    let prose = "  /// ```text\n  /// media-range = ( \"*/*\"\n  /// and the group closes somewhere down here )\n  /// ```\n";
+    let extracted = quotations(prose);
+    assert_eq!(
+      triples(&extracted.productions),
+      vec![(2, "media-range = ( \"*/*\"", "media-range = ( \"*/*\"")],
+      "prose at the rule's own indent joins nothing"
+    );
+    assert_eq!(
+      super::rule_fault(&extracted.productions[0].rule),
+      Some(super::RuleFault::Unclosed('(')),
+      "which is what leaves the truncation visible"
+    );
+
+    let continued = "  /// ```text\n  /// media-range = ( \"*/*\"\n  ///               and the group closes somewhere down here )\n  /// ```\n";
+    let extracted = quotations(continued);
+    assert_eq!(
+      extracted.productions[0].rule,
+      "media-range = ( \"*/*\" and the group closes somewhere down here )",
+      "indented under the rule it is a continuation, and this is what that costs"
+    );
+  }
+
+  // `=/` is RFC 5234's incremental-alternative operator, so its `/` is part of
+  // the operator; a `/` behind a space is the rule's own alternation. Getting
+  // that wrong would read the first row below as a right-hand side beginning
+  // with an alternation bar and nothing in front of it.
+  #[test]
+  fn the_incremental_alternative_slash_belongs_to_the_operator() {
+    assert_eq!(super::right_hand_side("Trailer =/ token"), Some(" token"));
+    assert_eq!(
+      super::right_hand_side("Trailer = / token"),
+      Some(" / token")
+    );
+    assert_eq!(
+      super::right_hand_side("boundary := 0*69<bchars>"),
+      Some(" 0*69<bchars>")
+    );
+    assert_eq!(super::right_hand_side("need == out.len()"), None);
+    assert_eq!(super::right_hand_side("other => panic!()"), None);
   }
 
   // The three answers `grade` used to collapse into one `None`. A green run
