@@ -38,15 +38,21 @@
 //! `auth-corpus`, so the way to find out is to run the binary at both
 //! revisions and `diff` the two outputs.
 //!
-//! A member's EXTENT is checked only through the offset the next member begins
-//! at and through the pair's verdict projection: nothing hands out where a
-//! member ends, so a walk that ended its LAST member early and yielded nothing
-//! behind it would satisfy every assertion here. The `Transfer-Encoding`
-//! verdict is what narrows that — a coding lost off the end of the list changes
-//! `final_is_chunked` — but only for that one pair, and the §5.6.6 pairs have
-//! no verdict at all. It is the largest thing a green run here does not say;
-//! the crate doc states it where a reader meets it first, and issue #79 carries
-//! what closing it would cost.
+//! **The digest is a baseline and never an oracle**, and until issue #79 it was
+//! the only thing watching a member's parameters at all. [`EXPECTED_DIGESTS`]
+//! carries that in full; `member_extent` is what gives that column a rule from
+//! RFC 9110 instead of a hash of itself, and
+//! [`the_extent_axis_reds_on_a_reader_that_truncates`] is the control that says
+//! the rule bites.
+//!
+//! A member's extent is graded only where a derivation of the whole value
+//! exists to settle it — [`EXTENTS_GRADED`] and [`EXTENTS_UNASKED`] are the two
+//! sides, and [`the_extent_question_is_declined_only_where_nothing_could_answer_it`]
+//! shows each reason it declines to be a reason rather than a filter. Where the
+//! reader is recovering past a fault, nothing here says where its members
+//! stop, and the `Transfer-Encoding` verdict projection remains the only thing
+//! that narrows it: a coding lost off the end of that list changes
+//! `final_is_chunked`, and the §5.6.6 pairs have no verdict at all.
 //!
 //! Of the member starts that ARE compared, the media reader contributes fewer
 //! than the walk does, on two counts that are measured here rather than argued:
@@ -133,8 +139,13 @@ fn nothing_this_corpus_grades_is_a_defect() {
     "a walk yielded a member built out of a parameter value's own data"
   );
   assert_eq!(
+    tally.member_extent, 0,
+    "a reader stated a member whose parameters are no derivation's"
+  );
+  assert_eq!(
     tally.unplaced, 0,
-    "a member's name was a slice of none of the lines it was read from"
+    "a member's name, or one of its parameters' names, was a slice of none of \
+     the lines it was read from"
   );
 }
 
@@ -285,6 +296,39 @@ fn the_media_readers_boundary_half_is_weaker_by_this_much() {
   );
 }
 
+/// How much of the corpus the extent grading was asked about, and what it found
+/// where RFC 9110 §10.1.4 leaves two answers.
+///
+/// The zero-target beside it is `member_extent`, and a zero nobody asked is
+/// worth nothing — issue #77's whole finding — so this is the denominator. It
+/// is counted in MEMBERS rather than records, because a member is what the
+/// grading consumes, and both directions are here: a change that made every
+/// extent unaskable would drive the zero-target to zero by asking nothing, and
+/// [`EXTENTS_GRADED`] is what reds on it.
+///
+#[test]
+#[cfg_attr(miri, ignore = "runs the whole corpus; see the zero-target test")]
+fn the_extent_grading_was_asked_this_much() {
+  let tally = &corpus().tally;
+  assert_eq!(tally.extents_graded, EXTENTS_GRADED);
+  assert_eq!(tally.extents_unasked, EXTENTS_UNASKED);
+  assert_eq!(tally.media_q_dropped, MEDIA_Q_DROPPED);
+  assert!(
+    tally.extents_graded > 0,
+    "no member's extent was graded, so the zero-target beside this is about nothing"
+  );
+}
+
+/// Member extents compared against the derivations the oracle admits, and the
+/// ones nothing could be asked about. See
+/// [`the_extent_grading_was_asked_this_much`].
+const EXTENTS_GRADED: usize = 37_466;
+/// See [`EXTENTS_GRADED`].
+const EXTENTS_UNASKED: usize = 225_768;
+/// Graded members where `media::accept` dropped a `q` the grammar derives as a
+/// parameter, per RFC 9110 §12.5.1. See [`EXTENTS_GRADED`].
+const MEDIA_Q_DROPPED: usize = 14;
+
 /// Every state worth counting, and how many records reach it.
 ///
 /// `axis-bws`, `axis-empty-slot` and `axis-bare-name` are three of the four
@@ -333,6 +377,15 @@ fn the_media_readers_boundary_half_is_weaker_by_this_much() {
 /// its failure names the row this table would then need. That asymmetry is what
 /// makes the media half the weaker one rather than merely the different one.
 ///
+/// `extent-graded` and `extent-unasked` are the extent grading's two
+/// directions, in RECORDS — the same measurement in members is
+/// [`EXTENTS_GRADED`] and the constants beside it. Both are here because the
+/// zero-target the grading carries is `member_extent`, and a change that made
+/// every extent unaskable would drive that to zero by asking nothing.
+/// `media-q-dropped` is where a `q` the grammar derives as a parameter is not
+/// one `media::accept` hands over, which is that reader's answer to RFC 9110
+/// §12.5.1 made countable.
+///
 /// No row here counts a pair. Those are [`EXPECTED_PAIRS`], keyed by kind,
 /// because a `parted` count read beside a state count is a count of two
 /// different things.
@@ -349,7 +402,10 @@ const EXPECTED_STATES: &[(&str, usize)] = &[
   ("expect-empty-element", 2751),
   ("expect-parsed", 6323),
   ("expect-refused", 80_034),
+  ("extent-graded", 25_623),
+  ("extent-unasked", 200_764),
   ("media-parsed", 3711),
+  ("media-q-dropped", 14),
   ("media-refused", 82_646),
   ("media-wildcard", 4),
   ("params-comparable", 80_434),
@@ -585,6 +641,25 @@ fn the_answer_column_reproduces_its_digest() {
 }
 
 /// The SHA-256 of the `answer` column: corpora `A`..`E`, then the whole run.
+///
+/// **This is a baseline and not an oracle, and the difference is the whole of
+/// what issue #79 measured.** The digest is taken OVER the column it grades, so
+/// it says only that the answers have not moved since somebody wrote these
+/// sixty-four characters down — never that they were right when they did. A
+/// reader that shipped ending its last member one well-formed parameter early
+/// would have had these digests computed FROM that behaviour, and the run would
+/// have been green for as long as the truncation was stable. Issue #79's
+/// measurement is exactly that: 6050 records rendered a different `answer` and
+/// every `grade` byte stayed identical, because nothing here graded what a
+/// member is made of past where it begins.
+///
+/// [`the_extent_grading_was_asked_this_much`] and the `member_extent`
+/// zero-target are what give that column an oracle: the parameter offsets a
+/// reader hands over are now compared with the ones RFC 9110's own grammar
+/// derives, so the same truncation reds on an assertion about the RFC rather
+/// than moving a hash of itself. What the digest still catches, and what
+/// nothing else here can, is an answer that moves INSIDE its grade — which is
+/// why it stays.
 const EXPECTED_DIGESTS: [&str; 6] = [
   "c332e6a3b291e0cb4058278f734d1f83b1ae6973bc03a7fd23743f37931e23ab",
   "423e2030881e41bb83c38138263b7f9b1082b0fe4e092202ff099899e25472ba",
@@ -1315,11 +1390,140 @@ fn raw_comma_split(value: &[u8]) -> crate::Walk {
     well_formed: true,
     starts,
     unplaced: 0,
+    extents: Vec::new(),
     names: Vec::new(),
     parameterised: Vec::new(),
     valueless: false,
     faults: Vec::new(),
   }
+}
+
+/// The extent axis BITES, proven against a reader that truncates.
+///
+/// `member_extent` is zero over the whole corpus, and issue #79 is the record
+/// of what an unasked zero was worth here before this axis existed: a walk
+/// patched to drop its last member's last well-formed parameter moved 6050
+/// records' `answer` and left every `grade` byte identical, because the only
+/// thing watching that column was a SHA-256 of itself. So the grader is run
+/// against that truncation, and against the three other ways a member's
+/// parameters can be no derivation's, and it has to fire on each.
+///
+/// The honest reading has to stay green in the same test, or the control would
+/// be proving that the grader fires on everything.
+#[test]
+fn the_extent_axis_reds_on_a_reader_that_truncates() {
+  // RFC 9110 §5.6.6 derives this value with exactly two parameters, whose names
+  // stand at 2 and 6. The element ending at `x;p=1` is a derivation of a
+  // PREFIX and not of a member: a `;` stands behind it, and §5.6.1.2 admits an
+  // element end only where a `,` or the value's end does.
+  let value: &[u8] = b"x;p=1;q=2";
+  let reading = oracle::read(value, Production::TokenParameters);
+  assert!(reading.derives);
+  assert_eq!(
+    reading
+      .member_params(0)
+      .iter()
+      .map(|admitted| admitted.iter().map(|name| name.at).collect::<Vec<_>>())
+      .collect::<Vec<_>>(),
+    vec![vec![2, 6]],
+    "one derivation of this member reaches the value's end, and it reads both"
+  );
+
+  let honest = extent(0, &[2, 6]);
+  assert!(
+    !crate::grade_extents(value, &[honest], &reading, true, false).wrong,
+    "the grader fired on the reading RFC 9110 derives"
+  );
+
+  // Issue #79's own mutation, as one member: the last parameter dropped. It is
+  // a strict PREFIX of what the grammar admits, which is why a bound would pass
+  // it and this does not.
+  for truncated in [extent(0, &[2]), extent(0, &[])] {
+    assert!(
+      crate::grade_extents(value, &[truncated], &reading, true, false).wrong,
+      "the axis did not fire on a member that ended early"
+    );
+  }
+  // A parameter at an offset no derivation reads a name at, and one manufactured
+  // behind the last.
+  for wrong in [extent(0, &[2, 5]), extent(0, &[2, 6, 8])] {
+    assert!(
+      crate::grade_extents(value, &[wrong], &reading, true, false).wrong,
+      "the axis did not fire on a member whose parameters are somewhere else"
+    );
+  }
+
+  // And the live walk, over the same value, reads what RFC 9110 derives.
+  let walked = walk(&[value], ParamSyntax::Parameter);
+  assert!(walked.well_formed);
+  assert_eq!(
+    walked.extents.first().map(|extent| extent.params.clone()),
+    Some(vec![2, 6])
+  );
+  assert!(!crate::grade_extents(value, &walked.extents, &reading, walked.well_formed, false).wrong);
+}
+
+/// One member's extent as a reader would report it.
+fn extent(at: usize, params: &[usize]) -> crate::Extent {
+  crate::Extent {
+    at,
+    params: params.to_vec(),
+    faulted: false,
+  }
+}
+
+/// The extent question is asked about the bytes BEHIND an offset, and the three
+/// cases it declines are declined because nothing could answer them.
+///
+/// Each of the three is a reason [`crate::grade_extents`] gives, shown to be
+/// the case it claims rather than a filter that quietly swallowed the corpus —
+/// which is what [`EXTENTS_GRADED`] beside [`EXTENTS_UNASKED`] measures at
+/// scale.
+#[test]
+fn the_extent_question_is_declined_only_where_nothing_could_answer_it() {
+  // A value no reading derives: the walk is recovering, and a recovering
+  // reader's members end where the fault left them.
+  let value: &[u8] = b"x;p=,a";
+  let reading = oracle::read(value, Production::TokenParameters);
+  assert!(!reading.derives);
+  let walked = walk(&[value], ParamSyntax::Parameter);
+  let graded = crate::grade_extents(value, &walked.extents, &reading, walked.well_formed, false);
+  assert_eq!(graded.graded, 0);
+  assert!(graded.unasked > 0);
+
+  // A member whose own parameter walk faulted. RFC 9110 §5.2 joins these into a
+  // value that derives, and the reader calls it well formed — the ONE fault
+  // that leaves it so — but the parameter it could not hand over is one the
+  // grammar reads, so the offsets it did hand over are not a whole derivation.
+  let lines: Vec<&[u8]> = vec![b"x;p=\"a", b"b\""];
+  let joined = join(&lines);
+  let walked = walk(&lines, ParamSyntax::Parameter);
+  assert!(walked.well_formed);
+  let reading = oracle::read(&joined, Production::TokenParameters);
+  assert!(reading.derives);
+  assert!(
+    walked.extents.first().is_some_and(|extent| extent.faulted),
+    "the parameter that crosses the join is reported as a fault"
+  );
+  let graded = crate::grade_extents(
+    &joined,
+    &walked.extents,
+    &reading,
+    walked.well_formed,
+    false,
+  );
+  assert_eq!(graded.graded, 0);
+  assert_eq!(graded.unasked, 1);
+
+  // A member beginning where no derivation begins an element: already graded by
+  // the start axes, and asking again would report one defect under two names.
+  let value: &[u8] = b"x;p=1";
+  let reading = oracle::read(value, Production::TokenParameters);
+  let stray = extent(3, &[]);
+  let graded = crate::grade_extents(value, &[stray], &reading, true, false);
+  assert!(!reading.licenses_member_at(3));
+  assert_eq!(graded.graded, 0);
+  assert!(!graded.wrong);
 }
 
 /// The bare parameter name is the one `ListError` the lenient arm cannot

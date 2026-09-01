@@ -47,6 +47,7 @@
 //! transfer-parameter = token BWS "=" BWS ( token / quoted-string )
 //! ```
 //!
+//!
 //! RFC 9110 §5.6.6, whose `parameters` has no head of its own and takes one
 //! from whatever rule concatenates it — §5.6.2's `token`, for the walk this
 //! grades:
@@ -117,6 +118,30 @@
 //!   prefix derivation admits. Also a question about the bytes in front, and
 //!   the one that tells a member invented out of a value's own data apart from
 //!   a member shown at an offset no reading reaches.
+//! - [`Reading::member_params`] — the parameter names read by each derivation
+//!   of an element at that offset which ENDS WHERE THE LIST ADMITS AN END.
+//!   The one question here about the bytes BEHIND an offset, and the only one
+//!   that can be: an extent is where a member stops, and nothing in front of a
+//!   member says where it stops.
+//!
+//! # Why the fourth question can be answered EXACTLY, and not as a bound
+//!
+//! `element_ends` reports a SET of ends because how many repetitions of the
+//! parameter rule an element took is genuinely ambiguous. Filtered to the ends
+//! the LIST admits, that set has at most one member, and the argument is one
+//! line of §5.6.1.2: every step this walk takes past an end requires a
+//! particular byte to stand at it — `;` for a repetition of the parameter rule,
+//! `=` for §10.1.1's argument — and [`boundary`] admits an end only where the
+//! next non-`OWS` byte is `,` or the value's end. An end the element continues
+//! past is therefore an end the list does not admit, and the other way round,
+//! so no two ends of one element are both boundaries.
+//!
+//! That is what makes an EXACT grading possible where a bound would be useless.
+//! A bound that admitted any parameter sequence the grammar reaches is
+//! satisfied by a walk that stopped one parameter early, which is the whole of
+//! issue #79's defect class; it cannot tell a member that ended where the list
+//! ends from one that ended in front of a `;` and threw the rest away.
+//!
 //!
 //! # Where the OWS at the value's two ends is admitted, and why
 //!
@@ -137,7 +162,7 @@
 //! grammar's, and an oracle carrying one would be grading a module against
 //! itself.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Which element production a value is read as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +198,28 @@ pub struct Reading {
   /// Offsets strictly inside a §5.6.4 `quoted-string` that opened at a
   /// `parameter-value` position some prefix derivation admits.
   pub string_data: BTreeSet<usize>,
+  /// For each offset an element both begins at and ends the list at: every
+  /// parameter-name sequence a derivation reaching that end reads, in order.
+  ///
+  /// The extent question, and the only one here asked about the bytes BEHIND an
+  /// offset. An offset with no row is one no derivation of an element there
+  /// carries all the way to a `,` or to the value's end.
+  ///
+  /// One sequence, because at most one end of an element is a list boundary —
+  /// the module doc carries that argument. It is a `Vec` of them anyway,
+  /// because a production whose alternatives derive one string at one end would
+  /// have several, and reporting one would be picking between them.
+  pub member_params: BTreeMap<usize, Vec<Vec<ParamName>>>,
+}
+
+/// One parameter name a derivation reads, as its offsets in the value RFC 9110
+/// §5.2 joins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamName {
+  /// Where the name's first byte is.
+  pub at: usize,
+  /// One past its last.
+  pub end: usize,
 }
 
 impl Reading {
@@ -193,12 +240,26 @@ impl Reading {
   pub fn is_string_data(&self, at: usize) -> bool {
     self.string_data.contains(&at)
   }
+
+  /// Every parameter-name sequence a derivation of the element at `at` that
+  /// reaches a list boundary reads.
+  ///
+  /// Empty where no derivation of an element beginning there ends where the
+  /// list admits an end — which is a different answer from "no element begins
+  /// there", and the one a member whose extent is wrong earns.
+  pub fn member_params(&self, at: usize) -> &[Vec<ParamName>] {
+    match self.member_params.get(&at) {
+      Some(readings) => readings,
+      None => &[],
+    }
+  }
 }
 
-/// Reads `value` under `production` and answers the three questions.
+/// Reads `value` under `production` and answers the four questions.
 pub fn read(value: &[u8], production: Production) -> Reading {
   let mut element_starts = BTreeSet::new();
   let mut string_data = BTreeSet::new();
+  let mut member_params: BTreeMap<usize, Vec<Vec<ParamName>>> = BTreeMap::new();
   let mut derives = false;
 
   // §5.5 removes the field value's leading whitespace, so the list begins past
@@ -210,14 +271,32 @@ pub fn read(value: &[u8], production: Production) -> Reading {
 
   while let Some(at) = queue.pop() {
     let mut ends = Vec::new();
-    element_ends(value, at, production, &mut ends, &mut string_data);
+    let mut chain = Vec::new();
+    element_ends(
+      value,
+      at,
+      production,
+      &mut ends,
+      &mut chain,
+      &mut string_data,
+    );
     if !ends.is_empty() {
       element_starts.insert(at);
+    }
+    // The fourth question. An end the list admits is one this element does not
+    // continue past, so at most one of them is here — the module doc carries
+    // that argument, and it is what makes the answer exact.
+    for &(end, taken) in &ends {
+      if boundary(value, end).is_none() {
+        continue;
+      }
+      let read = chain.get(..taken).unwrap_or_default().to_vec();
+      member_params.entry(at).or_default().push(read);
     }
     // The empty element §5.6.1.2 admits: `[ element ]` with nothing in it.
     // It contributes no element and ends nothing, so the boundary is asked at
     // the very offset the element would have started at.
-    for end in std::iter::once(at).chain(ends) {
+    for end in std::iter::once(at).chain(ends.iter().map(|&(end, _)| end)) {
       match boundary(value, end) {
         Some(Edge::Ends) => derives = true,
         Some(Edge::Next(next)) if seen.insert(next) => queue.push(next),
@@ -231,6 +310,7 @@ pub fn read(value: &[u8], production: Production) -> Reading {
     derives,
     element_starts,
     string_data,
+    member_params,
   }
 }
 
@@ -259,8 +339,10 @@ fn boundary(value: &[u8], end: usize) -> Option<Edge> {
   }
 }
 
-/// Every offset an element starting at `at` may end at, appended to `ends`,
-/// with every quoted-string interior it passed through recorded in `data`.
+/// Every offset an element starting at `at` may end at, appended to `ends`
+/// beside the number of parameter names the derivation reaching it read, with
+/// those names appended to `chain` and every quoted-string interior recorded in
+/// `data`.
 ///
 /// The alternatives inside an element are all decided by the next byte, so this
 /// is a walk rather than a search: a `quoted-string` ends at the first
@@ -269,11 +351,18 @@ fn boundary(value: &[u8], end: usize) -> Option<Edge> {
 /// `OWS`, `";"`, `","` or the end of the value. What is genuinely ambiguous is
 /// how MANY repetitions of the parameter rule the element took, which is why
 /// this reports a set of ends rather than one.
+///
+/// **`chain` is one sequence and not one per end, and that is a property of the
+/// walk rather than a compression.** Each step appends at most one parameter
+/// name and never revisits one, so the names an end was reached through are
+/// exactly `chain`'s first `taken` — which is what the `usize` beside each end
+/// carries.
 fn element_ends(
   value: &[u8],
   at: usize,
   production: Production,
-  ends: &mut Vec<usize>,
+  ends: &mut Vec<(usize, usize)>,
+  chain: &mut Vec<ParamName>,
   data: &mut BTreeSet<usize>,
 ) {
   let Some(head_end) = head_end(value, at, production) else {
@@ -287,19 +376,19 @@ fn element_ends(
     // bracket closes AFTER `parameters`, so a member with parameters and no
     // argument is not an expectation, and the bare token is the only other
     // reading.
-    ends.push(head_end);
+    ends.push((head_end, chain.len()));
     if value.get(head_end) != Some(&b'=') {
       return;
     }
     let Some(after) = argument_end(value, head_end.saturating_add(1), data) else {
       return;
     };
-    ends.push(after);
+    ends.push((after, chain.len()));
     cursor = after;
   } else {
     // §10.1.4 and §5.6.6 both put the repetition outside any bracket the head
     // is in, so the head alone is an element under either.
-    ends.push(head_end);
+    ends.push((head_end, chain.len()));
   }
 
   // The repetition: `*( OWS ";" OWS transfer-parameter )` for RFC 9110
@@ -318,7 +407,7 @@ fn element_ends(
         return;
       }
       cursor = semicolon.saturating_add(1);
-      ends.push(cursor);
+      ends.push((cursor, chain.len()));
       continue;
     };
     // The `=`, with the BWS §10.1.4 admits on both sides of it and §5.6.6
@@ -337,8 +426,12 @@ fn element_ends(
     let Some(after) = argument_end(value, start, data) else {
       return;
     };
+    chain.push(ParamName {
+      at: slot,
+      end: name_end,
+    });
     cursor = after;
-    ends.push(cursor);
+    ends.push((cursor, chain.len()));
   }
 }
 

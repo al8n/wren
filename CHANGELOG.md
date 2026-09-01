@@ -1,5 +1,83 @@
 # UNRELEASED
 
+## `coding-corpus` — a member's extent, graded exactly, and the column that was its own baseline
+
+Every axis this harness carried was a question about where a member BEGINS, so a
+reader that ended its LAST member one well-formed parameter early — and yielded
+nothing behind it — satisfied all of them. Issue #79 measured it: a walk patched
+to do exactly that moved 6 050 records' `answer` and left every `grade` byte
+identical over all 245 049. The only thing watching that column was a SHA-256
+taken OVER it, so a reader that shipped truncating would have had the baseline
+computed from the truncation. Closes #79.
+
+### Added
+
+- **The extent axis, `member-extent`, a zero-target.** For every member a reader
+  began where RFC 9110 licenses an element to begin, the offsets of the
+  parameter names it handed over must be the offsets of the parameter names of
+  the derivation of that element which reaches a list boundary. Graded on 37 466
+  members over 25 623 records.
+
+  **Exact, and not a bound.** A bound — no parameter the grammar does not
+  admit — is passed by a member that stopped a parameter early, because a
+  truncation reads a strict PREFIX of what the grammar admits. That prefix is
+  the whole of the defect class, so the comparison is equality.
+
+- **A fourth question in the oracle: `Reading::member_params`.** The first three
+  are about the bytes in FRONT of an offset, which is issue #77's finding; an
+  extent is about the bytes BEHIND one, and it can be answered exactly because
+  at most one end of an element is a list boundary. Every step the element walk
+  takes past an end needs a particular byte to stand at it — `;` for a
+  repetition, `=` for RFC 9110 §10.1.1's argument — and a boundary needs `,` or
+  the value's end, so an end the element continues past is one the list does not
+  admit.
+
+- **No new public item, and none was needed.** Issue #79 costed an accessor on
+  `ListMember` and `MediaRange` — a semver surface pinning where a member ends,
+  a widening of two `Copy` types on the no-panic path, a borrow promise across
+  RFC 9110 §5.2's join, and a `doc-check` snapshot move. None of it is required:
+  a parameter's NAME is already a borrowed subslice, which is what `ParamIter`
+  yields, and `place` already maps any such subslice to its offset in the
+  §5.2-joined value. The offsets come through the public API as it stands.
+
+- **The control that says the axis bites.**
+  `the_extent_axis_reds_on_a_reader_that_truncates` runs the grader against the
+  truncation issue #79 measured and against three shapes a truncation is not,
+  and requires the honest reading to stay green in the same test. Re-run over
+  the whole corpus, the mutation now reds `nothing_this_corpus_grades_is_a_defect`
+  at **2 564 records**; before this change it redded the digest and one control
+  and nothing else.
+
+- **What the grading is NOT asked, counted rather than argued.** 225 768 member
+  extents over 200 764 records are unasked: the reader refused the value, its
+  production does not derive it, the member began where the grammar begins no
+  element, or the member's own parameter walk faulted. Behind a fault a reader
+  is recovering and its members are a derivation of nothing, so the question has
+  no answer rather than an excused one.
+  `the_extent_question_is_declined_only_where_nothing_could_answer_it` shows
+  each reason to be the case it claims.
+
+- **`media-q-dropped` (14).** `MediaRange::params` hands over every parameter
+  except one named `q`, at any position, which is that reader's answer to RFC
+  9110 §12.5.1. The extent grading has to know it to grade `accept` at all, so
+  it is a licensed difference with a count rather than a silent subtraction.
+
+### Changed
+
+- `unplaced` now covers a parameter's name as well as a member's, and stays a
+  zero-target: a `token` cannot cross RFC 9110 §5.2's join, because the join
+  writes a comma and §5.6.2's `tchar` excludes it.
+- No record's `answer` moved, so every digest and every per-corpus count is
+  unchanged. The extent grading reads offsets the records never carried.
+
+### What this still does not say
+
+A member's extent is graded only where a derivation of the whole value exists to
+settle it, which is a fifth of the members this corpus sees; the rest are
+deliberately malformed. Where a reader recovers past a fault, the RFC 9112 §6.3
+item 4 verdict projection remains the only thing narrowing where its members
+stop, and the RFC 9110 §5.6.6 pairs have no verdict at all.
+
 ## `coding-corpus` — a pair is two walks or one walk twice, and the tally says which
 
 A differential that counts a same-engine pair beside a cross-implementation one

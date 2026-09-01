@@ -117,9 +117,12 @@
 //! **It compares whether a value parsed** — each reader against its own
 //! production's oracle, and each pair sharing a production against the other
 //! reader of it. **It compares where a member BEGINS**, against the offsets the
-//! oracle licenses an element to start at. **It compares the RFC 9112 §6.3 item
-//! 4 verdict** of the one pair that has one. And it hashes every reader's
-//! rendered answer, so an answer that moves inside its grade moves the digest.
+//! oracle licenses an element to start at. **It compares what a member is made
+//! of all the way to where it ENDS**, against the parameter names of the one
+//! derivation of that element which reaches a list boundary. **It compares the
+//! RFC 9112 §6.3 item 4 verdict** of the one pair that has one. And it hashes
+//! every reader's rendered answer, so an answer that moves inside its grade
+//! moves the digest.
 //!
 //! **The `accept` half of that BEGINS comparison is weaker than the walk's, and
 //! the tally says by how much.** `accept` stops at its first faulting member, so
@@ -135,27 +138,26 @@
 //! is zero, which is what makes this half the weaker one rather than the
 //! different one.
 //!
-//! **It does NOT compare where a member ENDS.** No reader in this workspace
-//! hands out a member's extent: `ListMember` yields a name and a parameter
-//! walk, `MediaRange` a type, a subtype, a weight and a parameter walk, and the
-//! `Transfer-Encoding` accumulator a verdict. So a walk that ended its LAST
-//! member early and yielded nothing behind it satisfies every assertion in
-//! `tests`. Two things narrow that, and neither closes it: the offset the NEXT
-//! member begins at constrains every member but the last, and the §6.3 item 4
-//! verdict moves when a coding is lost off the end of a `Transfer-Encoding`.
-//! The §5.6.6 pairs have no verdict, so on those the last member's extent is
-//! unobserved outright — and a truncated last member is the very class PR #78
-//! was about. Closing it needs a reader to EXPOSE extents, which is a public
-//! API decision rather than a change to this harness; issue #79 carries it,
-//! with the measurement.
+//! **The extent comparison needs no accessor, and it is asked of 37 772
+//! members.** Issue #79 costed a public one — a `Range<usize>` or a slice on
+//! `ListMember` and `MediaRange` — and none of it is required: a parameter's
+//! NAME is already a borrowed subslice of the line the member was read from,
+//! which is what `ParamIter` yields, and `place` already maps any such subslice
+//! to its offset in the RFC 9110 §5.2-joined value. So the offsets are had
+//! through the public API as it stands, and what they are graded against is
+//! `oracle`'s fourth question. The grading is EXACT — the walk's offsets are
+//! the derivation's, not a subset of them — because a bound cannot tell a
+//! member that ended where the list ends from one that ended a parameter early
+//! and threw the rest away, and the second is the whole of issue #79's class.
 //!
-//! **And it does NOT read a `TE`.** RFC 9110 §10.1.4's productions are `TE`'s
-//! as well as `Transfer-Encoding`'s — `TE = #t-codings` and
-//! `t-codings = "trailers" / ( transfer-coding [ weight ] )` — and every
-//! §10.1.4 value this corpus writes is a `Transfer-Encoding`, so the `weight`
-//! and the `"trailers"` alternative are bytes nothing here asserts anything
-//! about. Issue #80 carries it, and carries why a `TE` reader added later would
-//! be a fourth walk over this production with nothing comparing it.
+//! **It is asked of less than a fifth of the members it sees, and the two
+//! numbers are both in `tests`.** A member's extent is answerable only where
+//! the reader called the value well formed, the production derives it, the
+//! member began where the grammar begins an element, and the member's own
+//! parameter walk reported no fault; anywhere else the reader is recovering and
+//! its members are a derivation of nothing. 37 772 graded against 225 779
+//! unasked, and the second is not a licensed residue but the shape of a corpus
+//! four fifths of which is deliberately malformed.
 //!
 //! Two smaller ones, argued in `tests`'s own module doc: a digest that moves
 //! names the corpus and not the record, and only the manufactured subset of
@@ -581,6 +583,29 @@ fn spell_elements(head: &[u8], elements: &[&[u8]]) -> Spelt {
   }
 }
 
+/// Where one yielded member began, and where the parameter names inside it did.
+///
+/// The unit the extent grading consumes. A member start alone says where a
+/// member BEGINS, which is what the licensing check has always asked; the
+/// parameter offsets say what the member was made of all the way to its end,
+/// which is the question issue #79 records that nothing here could ask.
+struct Extent {
+  /// Where the member's name begins in the value RFC 9110 §5.2 joins.
+  at: usize,
+  /// Where each parameter name the member yielded begins, in order.
+  params: Vec<usize>,
+  /// The member's parameter walk reported a fault, so the parameters it yielded
+  /// are not all of the parameters it read.
+  ///
+  /// Where the reader also called the value well formed, this is
+  /// `ListError::ValueSpansFieldLines` and nothing else — every other fault
+  /// clears `well_formed` — so it names a parameter that is well formed and is
+  /// not one contiguous slice. The reader is right to report it and right to
+  /// stop, and the extent question about that member has no answer either way,
+  /// so it is counted as unasked rather than graded.
+  faulted: bool,
+}
+
 /// Everything one `parameterised_list` walk said about one value.
 struct Walk {
   /// Every read it yielded, rendered.
@@ -592,11 +617,20 @@ struct Walk {
   well_formed: bool,
   /// Where each yielded member's name begins in the value RFC 9110 §5.2 joins.
   starts: Vec<usize>,
-  /// A yielded member's name was a slice of none of the lines handed in, so its
-  /// offset could not be placed. `tests` holds this at zero; a non-zero count
-  /// would mean the licensing check graded fewer members than the walk yielded
-  /// and said nothing about the difference.
+  /// A yielded member's name — or one of its parameters' names — was a slice of
+  /// none of the lines handed in, so its offset could not be placed. `tests`
+  /// holds this at zero; a non-zero count would mean the licensing check graded
+  /// fewer members, or fewer parameters, than the walk yielded and said nothing
+  /// about the difference.
+  ///
+  /// A parameter name cannot span RFC 9110 §5.2's join — the join writes a
+  /// comma, and §5.6.2's `tchar` excludes it, so a `token` never crosses one —
+  /// which is why the extent grading can place every name it is handed and this
+  /// stays a zero-target rather than gaining a licensed residue.
   unplaced: usize,
+  /// Where each yielded member began and where its parameters' names began,
+  /// one row per member whose own name was placed.
+  extents: Vec<Extent>,
   /// The member names, in order.
   names: Vec<Vec<u8>>,
   /// Whether each member carried a `;` that introduced something.
@@ -617,6 +651,7 @@ fn walk(lines: &[&[u8]], syntax: ParamSyntax) -> Walk {
     well_formed: true,
     starts: Vec::new(),
     unplaced: 0,
+    extents: Vec::new(),
     names: Vec::new(),
     parameterised: Vec::new(),
     valueless: false,
@@ -635,7 +670,8 @@ fn walk(lines: &[&[u8]], syntax: ParamSyntax) -> Walk {
         continue;
       }
     };
-    match place(lines, &bases, member.name()) {
+    let member_at = place(lines, &bases, member.name());
+    match member_at {
       Some(at) => out.starts.push(at),
       None => out.unplaced = out.unplaced.saturating_add(1),
     }
@@ -643,11 +679,24 @@ fn walk(lines: &[&[u8]], syntax: ParamSyntax) -> Walk {
     out.rendered.push_str("Ok[");
     out.rendered.push_str(&escape(member.name()));
     let mut any_param = false;
+    let mut extent = Extent {
+      at: member_at.unwrap_or_default(),
+      params: Vec::new(),
+      faulted: false,
+    };
     for read in member.params() {
       any_param = true;
       out.rendered.push(';');
       match read {
         Ok((name, value)) => {
+          // The same `place` a member's name goes through, over the same
+          // pointer arithmetic: a parameter's name is a borrowed subslice of
+          // the line the member was read from, exactly as the member's own name
+          // is, and nothing new is needed to put it in the §5.2-joined value.
+          match place(lines, &bases, name) {
+            Some(at) => extent.params.push(at),
+            None => out.unplaced = out.unplaced.saturating_add(1),
+          }
           out.rendered.push_str(&escape(name));
           out.rendered.push('=');
           match value {
@@ -672,10 +721,14 @@ fn walk(lines: &[&[u8]], syntax: ParamSyntax) -> Walk {
           if fault != ListError::ValueSpansFieldLines {
             out.well_formed = false;
           }
+          extent.faulted = true;
           out.faults.push(fault);
           out.rendered.push_str(&format!("Err({fault:?})"));
         }
       }
+    }
+    if member_at.is_some() {
+      out.extents.push(extent);
     }
     out.parameterised.push(any_param);
     out.rendered.push(']');
@@ -760,12 +813,20 @@ struct Ranges {
   parsed: bool,
   /// Where each yielded range's `type` begins in the value RFC 9110 §5.2 joins.
   starts: Vec<usize>,
-  /// A yielded range's `type` was a slice of none of the lines handed in.
+  /// A yielded range's `type`, or one of its parameters' names, was a slice of
+  /// none of the lines handed in.
   ///
   /// Held at zero by `tests`, exactly as the walk's own count is. The one shape
   /// that would otherwise land here without being a defect is
   /// [`Self::wildcard`], which is counted apart for that reason.
   unplaced: usize,
+  /// Where each yielded range began and where its parameters' names began, one
+  /// row per range whose `type` was placed.
+  ///
+  /// A `"*/*"` range contributes none: it names no `type`, so there is no
+  /// offset to key its extent on either. That is the same cost
+  /// [`Self::wildcard`] already carries, one question further along.
+  extents: Vec<Extent>,
   /// Ranges whose `type` is RFC 9110 §12.5.1's `"*/*"` alternative, for which
   /// `MediaRange::ty` reports `None` and there is no slice to place.
   ///
@@ -793,6 +854,7 @@ fn ranges(lines: &[&[u8]]) -> Ranges {
     parsed: true,
     starts: Vec::new(),
     unplaced: 0,
+    extents: Vec::new(),
     wildcard: 0,
     fault: None,
   };
@@ -809,15 +871,24 @@ fn ranges(lines: &[&[u8]]) -> Ranges {
         continue;
       }
     };
+    let mut range_at = None;
     match range.ty() {
       // RFC 9110 §12.5.1's `"*/*"`: a range that names no type, so there is no
       // slice to place and this member's start is graded by nothing.
       None => out.wildcard = out.wildcard.saturating_add(1),
       Some(ty) => match place(lines, &bases, ty.as_bytes()) {
-        Some(at) => out.starts.push(at),
+        Some(at) => {
+          out.starts.push(at);
+          range_at = Some(at);
+        }
         None => out.unplaced = out.unplaced.saturating_add(1),
       },
     }
+    let mut extent = Extent {
+      at: range_at.unwrap_or_default(),
+      params: Vec::new(),
+      faulted: false,
+    };
     out.rendered.push_str("Ok[");
     out.rendered.push_str(range.ty().unwrap_or("*"));
     out.rendered.push('/');
@@ -829,6 +900,10 @@ fn ranges(lines: &[&[u8]]) -> Ranges {
       out.rendered.push(';');
       match read {
         Ok((name, value)) => {
+          match place(lines, &bases, name) {
+            Some(at) => extent.params.push(at),
+            None => out.unplaced = out.unplaced.saturating_add(1),
+          }
           out.rendered.push_str(&escape(name));
           out.rendered.push('=');
           match value {
@@ -848,8 +923,14 @@ fn ranges(lines: &[&[u8]]) -> Ranges {
         // Unreachable through `accept`, which reads every parameter itself
         // before it hands a range over; rendered rather than dropped, so a
         // change that made it reachable moves the digest instead of nothing.
-        Err(fault) => out.rendered.push_str(&format!("Err({fault:?})")),
+        Err(fault) => {
+          extent.faulted = true;
+          out.rendered.push_str(&format!("Err({fault:?})"));
+        }
       }
+    }
+    if range_at.is_some() {
+      out.extents.push(extent);
     }
     out.rendered.push(']');
   }
@@ -958,6 +1039,21 @@ struct Grade {
   /// `tests`'s negative control is what says the metric bites rather than never
   /// being asked.
   manufactured_member: bool,
+  /// A reader stated a member whose parameters are the parameters of no
+  /// derivation of the element it began — one at an offset no derivation reads
+  /// a parameter name at, one missing where every derivation reads one, or a
+  /// member that stopped at an offset the list admits no end at.
+  ///
+  /// **The extent axis, and a zero-target.** It is what issue #79 records the
+  /// absence of: every other axis here is a question about where a member
+  /// BEGINS, so a walk that ended its LAST member one well-formed parameter
+  /// early — and yielded nothing behind it — satisfied all of them. It is
+  /// graded EXACTLY, against the one derivation of the element that reaches a
+  /// list boundary, because a bound cannot tell that walk from a correct one:
+  /// a truncated member reads a strict prefix of the parameters the grammar
+  /// admits, and "no parameter the grammar does not admit" is a rule a strict
+  /// prefix passes.
+  member_extent: bool,
   /// The walk under `ParamSyntax::Parameter` accepted a value RFC 9110 §5.6.6
   /// does not derive, and the only thing it accepted past that production is a
   /// parameter with no value, handed over as `ParamValue::None`.
@@ -992,6 +1088,9 @@ impl Grade {
     }
     if self.manufactured_member {
       out.push("manufactured-member");
+    }
+    if self.member_extent {
+      out.push("member-extent");
     }
     if self.residue_valueless {
       out.push("residue-valueless");
@@ -1034,6 +1133,104 @@ fn grade_walk(walked: &Walk, reading: &Reading, valueless_ok: bool) -> Grade {
     }
   }
   grade
+}
+
+/// What grading one reader's member extents found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Extents {
+  /// Some member's parameters are no derivation's — [`Grade::member_extent`].
+  wrong: bool,
+  /// Members whose extent was compared against a derivation.
+  graded: usize,
+  /// Members whose extent nothing could be asked about: the reader refused the
+  /// value, the value derives under no reading, the member began where no
+  /// derivation begins an element, or its own parameter walk faulted.
+  unasked: usize,
+  /// Graded members where a `q` the grammar derives as a parameter was dropped
+  /// from what the reader handed over, because `weight_is_a_parameter_name` is
+  /// how that reader answers RFC 9110 §12.5.1.
+  q_dropped: usize,
+}
+
+/// Grades one reader's member extents against the derivations `reading` admits,
+/// EXACTLY.
+///
+/// For each member the reader began at an offset the oracle licenses: the
+/// offsets of the parameter names it handed over must be the offsets of the
+/// parameter names of some derivation of an element there that reaches a list
+/// boundary. Not a prefix of them — the whole of them, which is the difference
+/// between catching a member that ended one parameter early and not.
+///
+/// # What it does NOT ask, and why each is unaskable rather than excused
+///
+/// - **A value the reader refused, or that its production does not derive.**
+///   The reader is then recovering, and a recovering reader's members are not a
+///   derivation of anything: `oracle`'s own doc says an element start is
+///   licensed by the bytes in FRONT of it, and behind a fault there is no
+///   derivation of the whole list for a member's END to be settled by. The
+///   `recovered-member` axis is what watches those, and it is a counted state
+///   rather than a zero-target for the same reason.
+/// - **A member whose own parameter walk faulted.** See [`Extent::faulted`].
+/// - **A member the oracle licenses no element start at.** It is already graded
+///   `manufactured-member` or `recovered-member`, and asking a second question
+///   about an element the grammar does not begin there would report the same
+///   defect twice under a name that is a zero-target for something else.
+///
+/// `weight_is_a_parameter_name` is `false` for a reader that hands over every
+/// parameter the grammar derives, and `true` for one that reads a parameter
+/// named `q` as RFC 9110 §12.4.2's weight and so hands over the rest. Only
+/// `media::accept` is the second, and §12.5.1 is why: "Recipients SHOULD
+/// process any parameter named "q" as weight, regardless of parameter
+/// ordering." That is a rule about a parameter's NAME and not about where the
+/// parameter section stops, so the filter is applied at every position and not
+/// only the last — which is what that reader does.
+fn grade_extents(
+  value: &[u8],
+  extents: &[Extent],
+  reading: &Reading,
+  well_formed: bool,
+  weight_is_a_parameter_name: bool,
+) -> Extents {
+  let mut out = Extents::default();
+  for extent in extents {
+    if !well_formed || !reading.derives || extent.faulted || !reading.licenses_member_at(extent.at)
+    {
+      out.unasked = out.unasked.saturating_add(1);
+      continue;
+    }
+    out.graded = out.graded.saturating_add(1);
+    let readings = reading.member_params(extent.at);
+    let mut matched = None;
+    for admitted in readings {
+      let dropped =
+        weight_is_a_parameter_name && admitted.iter().any(|name| is_weight_name(value, name));
+      let wanted: Vec<usize> = admitted
+        .iter()
+        .filter(|name| !(weight_is_a_parameter_name && is_weight_name(value, name)))
+        .map(|name| name.at)
+        .collect();
+      if wanted == extent.params {
+        matched = Some(dropped);
+        break;
+      }
+    }
+    let Some(dropped) = matched else {
+      out.wrong = true;
+      continue;
+    };
+    if dropped {
+      out.q_dropped = out.q_dropped.saturating_add(1);
+    }
+  }
+  out
+}
+
+/// Whether a parameter name the oracle read is RFC 9110 §12.4.2's, which names
+/// it "q" (case-insensitive).
+fn is_weight_name(value: &[u8], name: &oracle::ParamName) -> bool {
+  value
+    .get(name.at..name.end)
+    .is_some_and(|spelt| spelt.eq_ignore_ascii_case(b"q"))
 }
 
 // ──────────────────────── the pairs, and what each proves ────────────────────
@@ -1172,6 +1369,20 @@ struct Tally {
   recovered_member: usize,
   /// Records with a member built out of a value's data.
   manufactured_member: usize,
+  /// Records with a member whose parameters are no derivation's.
+  member_extent: usize,
+  /// Member extents compared against the derivations the oracle admits.
+  ///
+  /// The extent grading's own denominator, and the number that says whether the
+  /// zero-target beside it was ever asked. A change that made every extent
+  /// unaskable would drive `member_extent` to zero and this with it.
+  extents_graded: usize,
+  /// Member extents nothing could be asked about. See [`grade_extents`] for the
+  /// four reasons, each of which is unaskable rather than excused.
+  extents_unasked: usize,
+  /// Graded extents where `media::accept` dropped a `q` the grammar derives as
+  /// a parameter, per RFC 9110 §12.5.1.
+  media_q_dropped: usize,
   /// Records in the bare-name residue.
   residue_valueless: usize,
   /// Records where a walk yielded a member whose name lay in none of the lines.
@@ -1231,6 +1442,12 @@ impl Tally {
   fn state(&mut self, name: &str) {
     let slot = self.states.entry(name.to_string()).or_default();
     *slot = slot.saturating_add(1);
+  }
+
+  /// Counts one reader's extent grading over one record.
+  fn extents(&mut self, extents: &Extents) {
+    self.extents_graded = self.extents_graded.saturating_add(extents.graded);
+    self.extents_unasked = self.extents_unasked.saturating_add(extents.unasked);
   }
 
   /// Counts one comparison of `pair`, and whether its two halves parted on it.
@@ -1488,6 +1705,9 @@ impl<'a, W: Write> Sink<'a, W> {
     tally.manufactured_member = tally
       .manufactured_member
       .saturating_add(usize::from(grade.manufactured_member));
+    tally.member_extent = tally
+      .member_extent
+      .saturating_add(usize::from(grade.member_extent));
     tally.residue_valueless = tally
       .residue_valueless
       .saturating_add(usize::from(grade.residue_valueless));
@@ -1548,6 +1768,26 @@ impl<'a, W: Write> Sink<'a, W> {
     let parted = strict.well_formed != list.parsed || projected_verdict(&strict) != list.verdict;
     self.tally.pair(Pair::TRANSFER_CODING, parted);
     grade.pair_disagree |= parted;
+
+    // The extents, each arm against its OWN production, for the reason the
+    // arms are graded apart everywhere else here.
+    let strict_extents = grade_extents(
+      &joined,
+      &strict.extents,
+      &coding_reading,
+      strict.well_formed,
+      false,
+    );
+    let lenient_extents = grade_extents(
+      &joined,
+      &lenient.extents,
+      &param_reading,
+      lenient.well_formed,
+      false,
+    );
+    grade.member_extent |= strict_extents.wrong || lenient_extents.wrong;
+    self.count_extents(&strict_extents);
+    self.count_extents(&lenient_extents);
 
     self.count_faults(&strict, "te");
     self.count_te_states(&strict, &lenient, &list, &coding_reading, &param_reading);
@@ -1740,6 +1980,41 @@ impl<'a, W: Write> Sink<'a, W> {
       }
     }
 
+    // The extents. `Expectations` contributes none — it is an accumulator that
+    // hands out a verdict and no member — so this is the walk and `accept`, the
+    // two readers here that yield members at all.
+    //
+    // `accept` is graded with §12.4.2's `q` taken as a parameter NAME rather
+    // than as a parameter, because that is what it does: `MediaRange::params`
+    // hands over every parameter except one named `q`, at any position, which
+    // is RFC 9110 §12.5.1's "Recipients SHOULD process any parameter named "q"
+    // as weight, regardless of parameter ordering". The walk carries no such
+    // rule and is graded against every parameter the grammar derives.
+    let walk_extents = grade_extents(
+      &walk_value,
+      &walked.extents,
+      &walk_reading,
+      walked.well_formed,
+      false,
+    );
+    let media_extents = grade_extents(
+      &media_value,
+      &ranged.extents,
+      &media_reading,
+      ranged.parsed,
+      true,
+    );
+    grade.member_extent |= walk_extents.wrong || media_extents.wrong;
+    self.count_extents(&walk_extents);
+    self.count_extents(&media_extents);
+    if media_extents.q_dropped > 0 {
+      self.tally.state("media-q-dropped");
+      self.tally.media_q_dropped = self
+        .tally
+        .media_q_dropped
+        .saturating_add(media_extents.q_dropped);
+    }
+
     let comparable = keeps_the_written_elements(&walk_reading, &walk_spelt.heads)
       && keeps_the_written_elements(&expect_reading, &expect_spelt.heads)
       && keeps_the_written_elements(&media_reading, &media_spelt.heads);
@@ -1898,6 +2173,22 @@ impl<'a, W: Write> Sink<'a, W> {
     }
     let answer = format!("cl={} / exp={}", list.rendered, read.rendered);
     self.record(corpus, lines, spelling, grade, &answer)
+  }
+
+  /// Counts one reader's extent grading, and the two states that say whether
+  /// the grading was asked at all.
+  ///
+  /// Both directions are states rather than one being left to be inferred: a
+  /// change that made every extent unaskable would drive the zero-target to
+  /// zero by asking nothing, and `extent-graded` is what reds on it.
+  fn count_extents(&mut self, extents: &Extents) {
+    self.tally.extents(extents);
+    if extents.graded > 0 {
+      self.tally.state("extent-graded");
+    }
+    if extents.unasked > 0 {
+      self.tally.state("extent-unasked");
+    }
   }
 
   /// Counts every fault a walk reported.
