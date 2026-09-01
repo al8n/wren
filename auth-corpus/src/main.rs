@@ -535,6 +535,9 @@ fn render_param(param: &http_semantics::auth::AuthParam<'_>) -> String {
 /// - `over-yield` — the reader showed it, some derivation puts it inside a
 ///   quoted-string, and none reads it as a challenge. The caller was handed a
 ///   challenge built out of bytes a sender wrote as that value's data.
+// gate-exempt: Basic =aaaaa, Digest realm=z — one malformed field value this
+// corpus feeds in, production-shaped only because a scheme name happens to be
+// followed by an `=`; not a production of any RFC.
 /// - `yields-underivable` — the reader showed it and NO derivation reads it
 ///   either way, because nothing derives the bytes in front of it. This is
 ///   RECOVERY, and the bulk of it is the axis working as intended: `Basic

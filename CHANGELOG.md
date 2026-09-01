@@ -1,5 +1,175 @@
 # UNRELEASED
 
+## `xtask` — a production that is not a rule, a rule no line could hold, and a `miri` budget that stops rather than reports
+
+Three ways something walked past a gate, and each one's failure was watched
+before it was written down. Closes #75 and #73.
+
+<!-- gate-exempt: transfer-coding = token *( OWS ";" OWS transfer-parameter — the measured truncation, quoted to name it, not a production of any RFC -->
+
+### Added
+
+- **`quote-check` asks whether a candidate IS a rule before asking whether it is
+  the spec's** (#75). The comparison is a substring test, so a production with
+  its tail cut off matched:
+  `transfer-coding = token *( OWS ";" OWS transfer-parameter` is a substring of
+  RFC 9110 §10.1.4's own text, and the run that graded it printed `verbatim` and
+  meant it. A candidate is now asked for a name, a definition operator and a
+  right-hand side that BALANCES before anything compares it — `(` and `[` closed
+  in nesting order, `"` and `<` opening a `char-val` and a `prose-val` nothing is
+  read inside of, `;` outside both ending the rule. It is deliberately not part
+  of the admission test: keying admission on the right-hand side would make a
+  broken production stop looking like a production, so the gate's own defect
+  would delete the item it should report. Admitted by the name and the operator,
+  failed on the right-hand side.
+
+  Demonstrated, not asserted. Dropping the trailing ` )` from
+  `coding-corpus/src/tests.rs:672` leaves `main` at **exit 0** with
+  `569 ABNF productions verbatim`, and this branch at **exit 1** with
+  `coding-corpus/src/tests.rs:672: ABNF production is not a whole rule` /
+  ``a `(` this never closes``.
+
+- **The extractor reads a PARAGRAPH, so a rule wrapped across two comment lines
+  is graded at all.** Backticks were paired within one line, so a rule too long
+  for a line — closing backtick on the next — had no span extracted from it: not
+  graded and passed, but never graded. That is the same escape as the truncation
+  above, one step earlier. Spans are now read over the paragraph a Markdown code
+  span may wrap across, pairing backtick RUNS the way rustdoc does, so a
+  doubled-backtick span holding a literal backtick is one span rather than two.
+
+  What the corpus gains, measured by swapping only `xtask/src/quote_check.rs` on
+  one tree and dumping every admitted candidate: **30 backticked spans that were
+  never extracted before**, and none lost. Twenty-nine of them clear the
+  three-word floor and were graded for the first time: **22 were already
+  verbatim and 7 were not.** Of those 7 — two real transcription defects (both
+  fixed below), one correct production of a spec that was not being loaded (RFC
+  6454, now fetched), three field values and Rust expressions that are
+  production-SHAPED and not productions, and one correct RFC 2616 rule whose
+  spec is deliberately absent from the cache; the last four carry
+  `gate-exempt:` markers naming why. Seven more spans were gained in blocks
+  citing no RFC, where there is nothing to grade them against. The run's own
+  last line moved from `574 ABNF productions verbatim` to `599`, and its
+  gate-exempt count from 17 to 21.
+
+- **`xtask miri-test`, a per-test budget under `miri` that STOPS the run**
+  (#73). Nothing failed when a test that is cheap natively and expensive
+  interpreted was added without a `#[cfg_attr(miri, ignore = "…")]`: one such
+  test — 1.1 s natively, over two hours interpreted — took
+  `cargo miri test -p http-semantics` from minutes to 3 h 10 m, 80 % of a
+  four-crate job limited to six hours, and the two crates queued behind it were
+  reported as neither passing nor failing. Interpreted cost does not track
+  native cost, so a reviewer has nothing to read.
+
+  It is a WATCHDOG rather than a report, because the harm is the job's budget
+  being spent and a run that named the offender at the end would have spent it
+  already. libtest on one thread flushes `test <name> ... ` before it runs the
+  test, so the unterminated tail of the stream names the test running NOW; when
+  the budget expires on it the whole process GROUP is killed — `cargo miri test`
+  is cargo over `cargo-miri runner` over `miri`, and killing the cargo at the top
+  leaves the interpreter under it running. The after-the-fact check over
+  finished tests is kept beside it as the floor.
+
+- **A second budget on the crate's TOTAL, because the first cannot see the harm
+  the job dies of.** A job has a wall-clock limit and dies of the SUM: five
+  hundred tests of forty seconds each is 20000 s with no single test within an
+  hour of its own ceiling, and the job dead anyway. The two rules catch disjoint
+  shapes — one test that ran away, and a crate that grew — and neither implies
+  the other. It is a watchdog too: the crate's clock runs against everything
+  finished plus the running test's elapsed, and whichever budget expires first
+  stops the run.
+
+  **4000 s per crate**, derived the way the per-test budget was derived from its
+  floor. The job's hard limit is 21600 s and it runs four crate steps, so four
+  crates sitting exactly on the ceiling spend 16000 s of test time — 74 % of the
+  limit, leaving 5600 s for `cargo miri setup`, four `cargo miri` builds
+  (roughly 150 s each) and the margin a red needs in order to be reported rather
+  than killed mid-print. Measured today, one crate at a time on one machine:
+  `http-semantics` 1597.6 s, `websocket-proto` 1551.8 s, `http1-proto` 784.3 s,
+  `http3-proto` 83.3 s — **4017 s in total, 18.6 % of the job's limit and 25.1 %
+  of what these four ceilings allow.** The slowest crate has 2.50 times its own
+  total to grow into, less headroom than the per-test budget's 3.50 and
+  necessarily so: a total is already the sum of everything a crate does. Two of
+  those figures are upper bounds and both are `websocket-proto`'s — its run was
+  the only one sharing the machine, and timing that crate on an aarch64 host at
+  all needed `sha1`'s soft backend — and both inflate rather than deflate.
+
+  The multiplication is asserted rather than left to a reader, and its other
+  factor is READ: `crates_the_job_names` counts the workflow's `miri-test` steps
+  and the command refuses to start when that count and the constant disagree, in
+  either direction. A fifth crate added to the job, or one quietly dropped from
+  it, reds until the arithmetic is re-derived.
+
+  Every run now prints its crate's total as a percentage of that ceiling, pass
+  or fail — the only thing that makes a crate on its way there visible before it
+  arrives.
+
+### Changed
+
+- The `miri` job's four `cargo miri test` steps are `cargo run -p xtask --
+  miri-test <crate>`. One command rather than a run and a log check, because the
+  second of two steps is the one that gets dropped. `PROPTEST_CASES` and
+  `MIRIFLAGS` moved off the workflow and into the wrapper, defaulted only when
+  the caller has not already chosen, so a developer measuring locally measures
+  what CI measures.
+
+- **RFC 6454 joins `FETCHED`.** `websocket-proto` reads `Origin` as one
+  SP-separated list because RFC 6454 §7.1 says
+  `origin-list = serialized-origin *( SP serialized-origin )`, and that rule sat
+  in a comment that wrapped it across two lines — so until the extractor read a
+  paragraph there was no span to grade and no reason to notice the spec was
+  missing. `load_specs` reads the whole cache directory, so a spec on disk and
+  absent from `FETCHED` grades locally and is missing in CI; that is the trap
+  this list already sprang once. Adding it moved nothing else: the untriaged
+  backlog, both citation counts and the graded total were identical either side.
+
+- **A production in none of the loaded specs no longer names one of them.**
+  `grade_production` searches every loaded spec and returns the first
+  arbitrarily; printing that name read as an attribution, and
+  `is not rfc2045's` over an RFC 9110 rule sends the reader to compare against a
+  spec that never carried it. The line now reports what the check established —
+  that none of the loaded specs holds those characters.
+
+- **A production carrying an elision mark is not asked whether it is whole.**
+  `…` and `...` are this file's existing convention for a deliberate cut, read
+  when a span is split into the segments that get graded; a rule that says it is
+  not whole is not one for a wholeness test to fail.
+
+- **A fenced rule's continuation must be INDENTED past the rule it continues.**
+  Reading every non-production line up to the next blank one as a continuation
+  left #75's own class alive inside the fix for #75: a rule truncated inside a
+  group, followed with no blank line by prose carrying the closer it dropped,
+  BALANCED and passed. The indent is the RFCs' own typesetting rather than a
+  heuristic about content — all seven wrapped rules in this workspace are set
+  that way — and it is counted by `comment_body` before the trim that throws it
+  away. Demonstrated: truncating RFC 9110 §12.5.1's `media-range` after its
+  first line in `coding-corpus/src/oracle.rs` and writing the missing `)` as
+  prose at the rule's own indent leaves the blind join at exit 0 with
+  `599 ABNF productions verbatim`, and this rule at exit 1 with
+  `ABNF production is not a whole rule`. Every count over the workspace is
+  unchanged either side, so it refuses nothing that was being read. What remains
+  is narrower and stated: prose that is itself indented under the rule still
+  joins.
+
+### Fixed
+
+- **`http1-proto/src/head/encode.rs` cited RFC 9112 §3 for RFC 7230's
+  `request-line`.** §3 is
+  `request-line = method SP request-target SP HTTP-version`; the comment ended it
+  with a `CRLF`, which is RFC 7230 §3.1.1's spelling and which RFC 9112 moved
+  into §2.1's `start-line CRLF`. The sibling comment four lines down transcribes
+  §4's `status-line` correctly, which is how invisible this was: same file, same
+  shape, same author, one wrong.
+
+- **`http1-proto/src/validate/tests.rs` cited RFC 9110 §10.1.1 for RFC 7231's
+  `expectation`.** §10.1.1 is
+  `expectation = token [ "=" ( token / quoted-string ) parameters ]`; the comment
+  spelled the container out as RFC 7231 §5.1.1 does, bracketing the slot
+  differently — which is the same class of difference, in the same place, as the
+  one that opened #75.
+
+Both were found by the paragraph extractor on its first run, and neither was
+reachable before it: each is written across two comment lines.
+
 ## `coding-corpus` — a pair is two walks or one walk twice, and the tally says which
 
 A differential that counts a same-engine pair beside a cross-implementation one

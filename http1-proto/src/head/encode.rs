@@ -498,8 +498,11 @@ pub(crate) fn encode_request_head<H: Headers + ?Sized>(
   out: &mut [u8],
 ) -> Result<usize, Error> {
   two_pass(out, expect, |sink| {
-    // RFC 9112 §3 `request-line = method SP request-target SP HTTP-version
-    // CRLF`, validated by the very functions that parse one.
+    // RFC 9112 §3 `request-line = method SP request-target SP
+    // HTTP-version`, validated by the very functions that parse one. The CRLF
+    // below is §2.1's `start-line CRLF` rather than part of that rule — RFC
+    // 7230 §3.1.1 ended the rule with one and RFC 9112 does not, which is the
+    // difference a transcription of the older spelling hides.
     parse_method(method.as_bytes())?;
     let target_text = check_target(target)?;
     sink.put(method.as_bytes());

@@ -1,6 +1,7 @@
 mod auth_diff;
 mod doc_check;
 mod handshake_diff;
+mod miri_test;
 mod qpack_data;
 mod quote_check;
 mod report;
@@ -114,6 +115,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       }
       shim_check::run()?;
     }
+    "miri-test" => {
+      let Some(crate_name) = args.next() else {
+        return Err("miri-test needs a crate name".into());
+      };
+      let filter = args.next();
+      if args.next().is_some() {
+        return Err("too many miri-test arguments".into());
+      }
+      miri_test::run(&crate_name, filter.as_deref())?;
+    }
     "-h" | "--help" | "help" => print_help(),
     other => return Err(format!("unknown command: {other}").into()),
   }
@@ -132,6 +143,7 @@ Usage:
   cargo run -p xtask -- quote-check [--fetch] [--include-ignored] [<spec-dir>]
   cargo run -p xtask -- doc-check [--require-all] [--bless]
   cargo run -p xtask -- shim-check
+  cargo run -p xtask -- miri-test <crate> [test-name-filter]
 
 `auth-diff` runs `auth-corpus` against two revisions of `http-semantics` and
 reports every answer that moved, grouped by what moved about it, plus a
@@ -190,6 +202,33 @@ spelled inside a raw string. CI's must-fail lie-check sees none of it:
 every real shim goes vacuous. This prints how many shims it examined, how many
 the linker instantiated and over how many symbols, so a green run is
 distinguishable from a run that never looked.
+
+`miri-test` is `cargo miri test -p <crate> --all-features` with two time
+budgets on it, and it is one command rather than two so they cannot be
+dropped without dropping the run. Nothing fails today when a test that is cheap
+natively and expensive interpreted is added without an exemption: one such test
+— 1.1 s natively, over two hours under `miri` — took its crate's step from
+minutes to 3 h 10 m, 80% of a four-crate job limited to six, and the crates
+queued behind it were reported as neither passing nor failing. Interpreted cost
+does not track native cost, so a reviewer has nothing to read: the same crate's
+`date` brute force is SLOWER natively and cheap under `miri`, because it is
+arithmetic rather than allocation. A test that means to be expensive says so
+with `#[cfg_attr(miri, ignore = \"…\")]`, which never runs and so is never
+timed; this makes the ABSENCE of one fail. It prints the run's total and its
+slowest few pass or fail, because all three exemptions in the tree today were
+added after somebody noticed a slow job rather than before.
+
+The second budget is the crate's TOTAL, because the first cannot see the harm:
+a job has a wall-clock limit and dies of the sum, so five hundred tests of forty
+seconds each kills it with no single test within an hour of its own ceiling. The
+per-crate ceiling times the number of crates the job runs is what bounds the
+job, and that crate count is read out of the workflow rather than trusted. Every
+run prints its crate's total as a percentage of that ceiling, pass or fail.
+
+`XTASK_MIRI_BUDGET=<seconds>` and `XTASK_MIRI_CRATE_BUDGET=<seconds>` tighten
+the two for one run and REFUSE any value looser than the ceiling they tighten,
+so either gate can be watched failing in seconds instead of in an hour. They are
+the only knobs, and the only direction they turn is stricter.
 ",
     quote_check::DEFAULT_DIR
   );

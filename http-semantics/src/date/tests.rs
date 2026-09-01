@@ -226,6 +226,11 @@ fn asctime_reads_both_spellings_of_a_single_digit_day() {
 
 // ── §5.6.7's fifty-year rule, and an oracle written from its sentence ────────
 //
+// gate-exempt: horizon = reference_year + 50 — the rejected model's own Rust
+// arithmetic, quoted below to say what it computed; not a production of any RFC.
+// gate-exempt: want = horizon - horizon % 100 + two_digits — the same model's
+// second line, quoted for the same reason.
+//
 // RFC 9110 §5.6.7: "Recipients of a timestamp value in rfc850-date format,
 // which uses a two-digit year, MUST interpret a timestamp that appears to be
 // more than 50 years in the future as representing the most recent year in the

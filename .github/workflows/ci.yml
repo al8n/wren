@@ -263,6 +263,21 @@ jobs:
 
   # Pure crates only: the driver crates do real socket IO, which miri cannot
   # interpret (and their unsafe surface is empty regardless).
+  #
+  # Every step here is `xtask miri-test` rather than a bare `cargo miri test`,
+  # and that is the gate: it runs the same command with `--report-time
+  # --test-threads=1` and fails any single test over a per-test budget. One test
+  # that is cheap natively and expensive interpreted — 1.1 s against over two
+  # hours — took the `http-semantics` step from minutes to 3 h 10 m, 80% of this
+  # job's six-hour limit, and the two crates queued behind it were reported as
+  # neither passing nor failing. Nothing failed. It is one command rather than a
+  # run and a log check because the second of two steps is the one that gets
+  # dropped.
+  #
+  # The wrapper also owns `PROPTEST_CASES` and `MIRIFLAGS`, which used to sit on
+  # each step here: `xtask/src/miri_test.rs` carries both, what they are for,
+  # and why a developer measuring locally has to be making the same choices this
+  # job makes.
   miri:
     runs-on: ubuntu-latest
     steps:
@@ -272,35 +287,14 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
       - run: cargo miri setup
-      - run: cargo miri test -p websocket-proto --all-features
-        env:
-          # proptest under miri is orders of magnitude slower; a handful of
-          # cases per property keeps the job in minutes while still running
-          # every test through the interpreter.
-          PROPTEST_CASES: 8
-          # proptest's failure persistence reads/writes regression files
-          # (committed in-tree), which needs `getcwd` + file IO — host
-          # syscalls miri's isolation rejects. Disabling isolation permits
-          # them; UB detection is unaffected.
-          MIRIFLAGS: -Zmiri-disable-isolation
+      - run: cargo run -p xtask -- miri-test websocket-proto
       # http-semantics holds `grammar` and `media` now, so this step runs their
       # unit suites through the interpreter — and, under `--all-features`, the
       # `test-no-panic` shims too, which in debug are plain functions (the link
-      # guard is release-only). The two env vars match its siblings' shape: both
-      # are inert while the crate has no proptest suite, and both are what that
-      # suite will need when it arrives.
-      - run: cargo miri test -p http-semantics --all-features
-        env:
-          PROPTEST_CASES: 8
-          MIRIFLAGS: -Zmiri-disable-isolation
-      - run: cargo miri test -p http1-proto --all-features
-        env:
-          PROPTEST_CASES: 8
-          MIRIFLAGS: -Zmiri-disable-isolation
-      - run: cargo miri test -p http3-proto --all-features
-        env:
-          PROPTEST_CASES: 8
-          MIRIFLAGS: -Zmiri-disable-isolation
+      # guard is release-only).
+      - run: cargo run -p xtask -- miri-test http-semantics
+      - run: cargo run -p xtask -- miri-test http1-proto
+      - run: cargo run -p xtask -- miri-test http3-proto
 
   # http1-proto is deliberately absent from this job: it ships no `fuzz/`
   # directory, so there is no `cargo fuzz list` to iterate and adding an empty

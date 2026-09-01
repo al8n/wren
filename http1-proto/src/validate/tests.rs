@@ -694,8 +694,11 @@ fn a_transfer_encoding_that_is_not_a_coding_list_frames_nothing() {
 }
 
 // RFC 9110 §10.1.1 `Expect` is parameterised too — `expectation = token
-// [ "=" ( token / quoted-string ) ] *( OWS ";" OWS [ expect-param ] )` — so the
-// same rule applies to it, and its own token is what identifies it.
+// [ "=" ( token / quoted-string ) parameters ]` — so the same rule applies to
+// it, and its own token is what identifies it. The parameters are §5.6.6's
+// `parameters`, not RFC 7231 §5.1.1's spelled-out `*( OWS ";" OWS
+// [ expect-param ] )`: the two bracket the slot differently, which is the
+// difference between an empty element being admitted and being refused.
 //
 // Read leniently rather than refused: §10.1.1 makes an unrecognised expectation
 // a 417 the semantic layer MAY send, not a framing fault. Nothing about a
