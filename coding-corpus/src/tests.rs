@@ -38,15 +38,30 @@
 //! `auth-corpus`, so the way to find out is to run the binary at both
 //! revisions and `diff` the two outputs.
 //!
-//! A member's EXTENT is checked only through the offset the next member begins
-//! at and through the pair's verdict projection: nothing hands out where a
-//! member ends, so a walk that ended its LAST member early and yielded nothing
-//! behind it would satisfy every assertion here. The `Transfer-Encoding`
-//! verdict is what narrows that — a coding lost off the end of the list changes
-//! `final_is_chunked` — but only for that one pair, and the §5.6.6 pairs have
-//! no verdict at all. It is the largest thing a green run here does not say;
-//! the crate doc states it where a reader meets it first, and issue #79 carries
-//! what closing it would cost.
+//! **The digest is a baseline and never an oracle**, and until issue #79 it was
+//! the only thing watching a member's parameters at all. [`EXPECTED_DIGESTS`]
+//! carries that in full; `member_extent` is what gives that column a rule from
+//! RFC 9110 instead of a hash of itself, and
+//! [`the_extent_axis_reds_on_a_reader_that_truncates`] is the control that says
+//! the rule bites.
+//!
+//! A member's extent is graded only where a derivation of the whole value
+//! exists to settle it — [`EXTENTS_GRADED`] and [`EXTENTS_UNASKED`] are the two
+//! sides, and [`the_extent_question_is_declined_only_where_nothing_could_answer_it`]
+//! shows each reason it declines to be a reason rather than a filter. Where the
+//! reader is recovering past a fault, nothing here says where its members
+//! stop, and the `Transfer-Encoding` verdict projection remains the only thing
+//! that narrows it: a coding lost off the end of that list changes
+//! `final_is_chunked`.
+//!
+//! **The third RFC 9110 §5.6.6 reader is graded at a coarser resolution than
+//! the other two, and [`EXPECT_EXTENT_DECISIVE`] is how much coarser.**
+//! `Expectations` borrows nothing — [`the_expectation_reader_borrows_nothing_to_place`]
+//! pins that as a compiler-checked fact — so the finest extent statement it
+//! makes is one bit per value, and 70 records of 86 477 are the ones that bit
+//! is actually decided by a member's extent on.
+//! [`the_expectation_extent_projection_reds_on_a_reader_that_truncates`] is the
+//! control that says those 70 can fail.
 //!
 //! Of the member starts that ARE compared, the media reader contributes fewer
 //! than the walk does, on two counts that are measured here rather than argued:
@@ -61,8 +76,8 @@ use std::{collections::BTreeSet, sync::OnceLock};
 use http_semantics::{grammar::ParamSyntax, media::MediaError};
 
 use crate::{
-  Grade, ParamValue, Tally, join, oracle, oracle::Production, parameterised_list, sha256::Sha256,
-  walk,
+  Expect, Grade, ParamValue, Tally, join, oracle, oracle::Production, parameterised_list,
+  sha256::Sha256, walk,
 };
 
 /// The whole corpus, run once for every test in this file.
@@ -73,7 +88,7 @@ struct Corpus {
   tally: Tally,
   /// The SHA-256 of the `answer` column, per corpus and then over the whole
   /// run.
-  digests: [String; 6],
+  digests: [String; 8],
 }
 
 /// Runs every generator into memory, once.
@@ -99,7 +114,7 @@ fn corpus() -> &'static Corpus {
 /// Asserted rather than narrated: a generator that stops generating shortens
 /// every count below it and would otherwise leave every one of them still
 /// green.
-const PER_CORPUS: [usize; 5] = [147_618, 86_103, 10_468, 344, 516];
+const PER_CORPUS: [usize; 7] = [147_618, 86_103, 10_468, 344, 516, 168, 120];
 
 /// Nothing this corpus grades is a defect.
 ///
@@ -111,7 +126,7 @@ const PER_CORPUS: [usize; 5] = [147_618, 86_103, 10_468, 344, 516];
 #[test]
 #[cfg_attr(
   miri,
-  ignore = "walks 245 049 records through four readers and an O(n^2) oracle; \
+  ignore = "walks 245 337 records through four readers and an O(n^2) oracle; \
             seconds natively, hours interpreted, and it exercises no unsafe code"
 )]
 fn nothing_this_corpus_grades_is_a_defect() {
@@ -133,8 +148,14 @@ fn nothing_this_corpus_grades_is_a_defect() {
     "a walk yielded a member built out of a parameter value's own data"
   );
   assert_eq!(
+    tally.member_extent, 0,
+    "a reader stated a member no derivation of the element ends where it did — \
+     the walk or `accept` at a parameter offset, or `Expectations` at the head"
+  );
+  assert_eq!(
     tally.unplaced, 0,
-    "a member's name was a slice of none of the lines it was read from"
+    "a member's name, or one of its parameters' names, was a slice of none of \
+     the lines it was read from"
   );
 }
 
@@ -285,6 +306,106 @@ fn the_media_readers_boundary_half_is_weaker_by_this_much() {
   );
 }
 
+/// How much of the corpus the extent grading was asked about, and what it found
+/// where RFC 9110 §10.1.4 leaves two answers.
+///
+/// The zero-target beside it is `member_extent`, and a zero nobody asked is
+/// worth nothing — issue #77's whole finding — so this is the denominator. It
+/// is counted in MEMBERS rather than records, because a member is what the
+/// grading consumes, and both directions are here: a change that made every
+/// extent unaskable would drive the zero-target to zero by asking nothing, and
+/// [`EXTENTS_GRADED`] is what reds on it.
+///
+/// The ambiguity rows are the other half. `EXTENTS_AMBIGUOUS` counts the
+/// members RFC 9110 admits two parameter readings of — a `q` that §12.4.2's
+/// `weight` derives, standing last in a `TE` member — and the two rows under it
+/// say which reading the walk took on each. `EXTENTS_Q_AS_WEIGHT` is zero and
+/// is asserted at zero rather than left as an absence: no reader in this
+/// workspace reads a `TE` `q` as weight today, and one that started would move
+/// this number rather than going quiet.
+#[test]
+#[cfg_attr(miri, ignore = "runs the whole corpus; see the zero-target test")]
+fn the_extent_grading_was_asked_this_much() {
+  let tally = &corpus().tally;
+  assert_eq!(tally.extents_graded, EXTENTS_GRADED);
+  assert_eq!(tally.extents_unasked, EXTENTS_UNASKED);
+  assert_eq!(tally.extents_ambiguous, EXTENTS_AMBIGUOUS);
+  assert_eq!(tally.extents_q_as_parameter, EXTENTS_Q_AS_PARAMETER);
+  assert_eq!(
+    tally.extents_q_as_weight, EXTENTS_Q_AS_WEIGHT,
+    "a reader read a `TE` member's `q` as RFC 9110 §12.4.2's weight, so \
+     `te-q-read-as-weight` is a row EXPECTED_STATES now needs"
+  );
+  assert_eq!(tally.media_q_dropped, MEDIA_Q_DROPPED);
+  assert_eq!(tally.expect_extent_graded, EXPECT_EXTENT_GRADED);
+  assert_eq!(tally.expect_extent_decisive, EXPECT_EXTENT_DECISIVE);
+  assert!(
+    tally.extents_graded > 0,
+    "no member's extent was graded, so the zero-target beside this is about nothing"
+  );
+  assert!(
+    tally.expect_extent_decisive > 0,
+    "no record's RFC 9110 §10.1.1 verdict was decided by a member's extent, so \
+     that comparison is an equality between two constants"
+  );
+  assert_eq!(
+    tally.extents_ambiguous,
+    tally
+      .extents_q_as_parameter
+      .saturating_add(tally.extents_q_as_weight),
+    "an ambiguous member was read neither way"
+  );
+}
+
+/// Member extents compared against the derivations the oracle admits, and the
+/// ones nothing could be asked about. See
+/// [`the_extent_grading_was_asked_this_much`].
+const EXTENTS_GRADED: usize = 37_772;
+/// See [`EXTENTS_GRADED`].
+const EXTENTS_UNASKED: usize = 225_779;
+/// Graded members RFC 9110 §10.1.4 admits two parameter readings of. See
+/// [`EXTENTS_GRADED`].
+const EXTENTS_AMBIGUOUS: usize = 125;
+/// Of those, the ones read with the `q` as a `transfer-parameter`. See
+/// [`EXTENTS_GRADED`].
+const EXTENTS_Q_AS_PARAMETER: usize = 125;
+/// Of those, the ones read with the `q` as RFC 9110 §12.4.2's weight — the
+/// reading nothing here takes, asserted at zero so that a reader which starts
+/// taking it says so. See [`EXTENTS_GRADED`].
+const EXTENTS_Q_AS_WEIGHT: usize = 0;
+/// Graded members where `media::accept` dropped a `q` the grammar derives as a
+/// parameter, per RFC 9110 §12.5.1. See [`EXTENTS_GRADED`].
+const MEDIA_Q_DROPPED: usize = 14;
+
+/// Records where RFC 9110 §10.1.1's two extent-bearing verdicts were compared
+/// with the derivation's, and the ones a `100-continue` member's EXTENT decided.
+///
+/// **These two are not in the same unit as the four above, and the difference
+/// is the hole this comparison leaves.** The walk and `media::accept` hand over
+/// borrowed parameter names, so their extents are graded offset by offset —
+/// 37 772 members, every parameter of every one of them. `Expectations` hands
+/// over nothing borrowed: it is a fold over eight bits with no lifetime
+/// parameter, so the finest thing it says about where a member ends is whether
+/// SOME member parsed whole as the bare `100-continue`, and the projection can
+/// grade that and no more. One bit per value, against a member-by-member,
+/// offset-by-offset answer for the other two.
+///
+/// So `EXPECT_EXTENT_GRADED` counts records the bit was compared on, and
+/// `EXPECT_EXTENT_DECISIVE` counts the ones where a member's extent DECIDED
+/// it — the only records on which the comparison can fail at all. 70 of 86 477
+/// is what this closure is worth, and it is written here rather than inferred,
+/// because a reader who took the first number for coverage would be reading a
+/// tautology: on every other record both sides answer the same way whatever the
+/// reader thinks a member's extent is.
+///
+/// Raising the second number means writing more `100-continue` members with
+/// something behind them. Making the comparison finer than one bit means
+/// `Expectations` handing out a member, which is a public API decision this
+/// branch declined to make on its own — see the crate doc.
+const EXPECT_EXTENT_GRADED: usize = 86_477;
+/// See [`EXPECT_EXTENT_GRADED`].
+const EXPECT_EXTENT_DECISIVE: usize = 70;
+
 /// Every state worth counting, and how many records reach it.
 ///
 /// `axis-bws`, `axis-empty-slot` and `axis-bare-name` are three of the four
@@ -333,6 +454,30 @@ fn the_media_readers_boundary_half_is_weaker_by_this_much() {
 /// its failure names the row this table would then need. That asymmetry is what
 /// makes the media half the weaker one rather than merely the different one.
 ///
+/// `extent-graded` and `extent-unasked` are the extent grading's two
+/// directions, in RECORDS — the same measurement in members is
+/// [`EXTENTS_GRADED`] and the constants beside it. Both are here because the
+/// zero-target the grading carries is `member_extent`, and a change that made
+/// every extent unaskable would drive that to zero by asking nothing.
+/// `media-q-dropped` is where a `q` the grammar derives as a parameter is not
+/// one `media::accept` hands over, which is that reader's answer to RFC 9110
+/// §12.5.1 made countable.
+///
+/// The four `te-` rows are corpus F's, and they are what issue #80 asked for.
+/// `te-trailers` is the literal `"trailers"` alternative, which no
+/// `Transfer-Encoding` value in this corpus can reach.
+/// `te-weight-ambiguous` is the member RFC 9110 leaves two readings of — a `q`
+/// standing last that §12.4.2's `weight` derives — and `te-q-read-as-parameter`
+/// beside it is which of the two the walk took on every one of them.
+/// `te-q-no-weight` is a `q` no `weight` reaches at all, which the vocabulary
+/// spells four ways; without it the ambiguity row could not be told from a
+/// corpus that writes a `q` and never varies it.
+///
+/// **`te-q-read-as-weight` has no row, and its absence is asserted rather than
+/// left to be noticed** — [`EXTENTS_Q_AS_WEIGHT`], at zero. It is the other
+/// reading of the same member, and a reader that started taking it would move
+/// that number and need a row here.
+///
 /// No row here counts a pair. Those are [`EXPECTED_PAIRS`], keyed by kind,
 /// because a `parted` count read beside a state count is a count of two
 /// different things.
@@ -346,10 +491,17 @@ const EXPECTED_STATES: &[(&str, usize)] = &[
   ("boundary-media-short", 15_904),
   ("empty-comparable", 10570),
   ("empty-comparable-empty", 8149),
-  ("expect-empty-element", 2751),
-  ("expect-parsed", 6323),
-  ("expect-refused", 80_034),
+  ("expect-continue", 34),
+  ("expect-empty-element", 2771),
+  ("expect-extent-decisive", 70),
+  ("expect-extent-graded", 86_477),
+  ("expect-other", 107),
+  ("expect-parsed", 6420),
+  ("expect-refused", 80_057),
+  ("extent-graded", 25_782),
+  ("extent-unasked", 200_773),
   ("media-parsed", 3711),
+  ("media-q-dropped", 14),
   ("media-refused", 82_646),
   ("media-wildcard", 4),
   ("params-comparable", 80_434),
@@ -358,6 +510,10 @@ const EXPECTED_STATES: &[(&str, usize)] = &[
   ("params-not-comparable", 5923),
   ("te-empty-element", 3565),
   ("te-multi-member", 12113),
+  ("te-q-no-weight", 84),
+  ("te-q-read-as-parameter", 100),
+  ("te-trailers", 24),
+  ("te-weight-ambiguous", 100),
 ];
 
 /// Every pair, keyed by what its agreement proves, with how many records it was
@@ -427,8 +583,14 @@ const WALK_STARTS_LOST: usize = 0;
 const MEDIA_WILDCARDS: usize = 4;
 
 /// Every fault the readers reported, keyed by the reader that reported it —
-/// `te` and `params` for the walk's two arms, `media` for `accept`, whose
-/// `MediaError` is its own type.
+/// `te` and `params` for the walk's two arms over `Transfer-Encoding` and
+/// §5.6.6, `te-codings` for the same walk over a `TE` value, and `media` for
+/// `accept`, whose `MediaError` is its own type.
+///
+/// `te-codings` is the same `ParamSyntax::TransferParameter` arm `te` is, over
+/// the same element, so its rows are not new variants but new WITNESSES: they
+/// are corpus F's, and they say the `TE` family reaches a malformed member and
+/// not only the well-formed ones its vocabulary spells.
 ///
 /// **`params:MissingParameterValue` is absent, and that is the one absence with
 /// a reason rather than a count.** `parameterised_list` refuses a bare
@@ -452,6 +614,8 @@ const EXPECTED_FAULTS: &[(&str, usize)] = &[
   ("params:NotAToken", 76_591),
   ("params:UnterminatedQuotedString", 948),
   ("params:ValueSpansFieldLines", 4),
+  ("te-codings:MissingParameterValue", 2),
+  ("te-codings:NotAToken", 7),
   ("te:InvalidQuotedByte", 2),
   ("te:MemberBoundaryUnknown", 187),
   ("te:MissingParameterValue", 1406),
@@ -501,7 +665,7 @@ const EXPECTED_VERDICTS: &[(&str, usize)] = &[
 /// the reason every other count here does: a walk that stopped recovering, or
 /// an entry point that stopped handing the bare name over, would otherwise
 /// lower a number nothing reads.
-const RECOVERED_MEMBERS: usize = 11_719;
+const RECOVERED_MEMBERS: usize = 11_721;
 /// See [`RECOVERED_MEMBERS`].
 const RESIDUE_RECORDS: usize = 3459;
 
@@ -584,14 +748,35 @@ fn the_answer_column_reproduces_its_digest() {
   assert_eq!(corpus().digests, EXPECTED_DIGESTS);
 }
 
-/// The SHA-256 of the `answer` column: corpora `A`..`E`, then the whole run.
-const EXPECTED_DIGESTS: [&str; 6] = [
+/// The SHA-256 of the `answer` column: corpora `A`..`G`, then the whole run.
+///
+/// **This is a baseline and not an oracle, and the difference is the whole of
+/// what issue #79 measured.** The digest is taken OVER the column it grades, so
+/// it says only that the answers have not moved since somebody wrote these
+/// sixty-four characters down — never that they were right when they did. A
+/// reader that shipped ending its last member one well-formed parameter early
+/// would have had these digests computed FROM that behaviour, and the run would
+/// have been green for as long as the truncation was stable. Issue #79's
+/// measurement is exactly that: 6050 records rendered a different `answer` and
+/// every `grade` byte stayed identical, because nothing here graded what a
+/// member is made of past where it begins.
+///
+/// [`the_extent_grading_was_asked_this_much`] and the `member_extent`
+/// zero-target are what give that column an oracle: the parameter offsets a
+/// reader hands over are now compared with the ones RFC 9110's own grammar
+/// derives, so the same truncation reds on an assertion about the RFC rather
+/// than moving a hash of itself. What the digest still catches, and what
+/// nothing else here can, is an answer that moves INSIDE its grade — which is
+/// why it stays.
+const EXPECTED_DIGESTS: [&str; 8] = [
   "c332e6a3b291e0cb4058278f734d1f83b1ae6973bc03a7fd23743f37931e23ab",
   "423e2030881e41bb83c38138263b7f9b1082b0fe4e092202ff099899e25472ba",
   "51f9d92b22ce3964c13440fe10bfa492bfe0276b72f4602944148aa6cfc038e5",
   "08645d53859eed3b531a1f3208edea6642bb7a337ed395c43973743e7f4e93dc",
   "79c07685f39633513470396ca6eb351ec495878c39a2d73b172cedb9c484f636",
-  "2c2c9168a06efc220946c868adc5d7b83d3728941ed45e0401132166572eb211",
+  "3a1f5f1a46d184513eabf7fe6ccdb1a30375b21d7a10ebd8e3a4c7c48c019efa",
+  "969b7ebc994c655417c0e1f00750d2dd86089f228f5833f6180150bce2b394c9",
+  "332e4eec5def31878db25e61d1b77b6930f272d4d35bf4d3a7b12b9a29c79070",
 ];
 
 // ─────────────────────── the demonstration against #78 ───────────────────────
@@ -1315,11 +1500,448 @@ fn raw_comma_split(value: &[u8]) -> crate::Walk {
     well_formed: true,
     starts,
     unplaced: 0,
+    extents: Vec::new(),
     names: Vec::new(),
     parameterised: Vec::new(),
     valueless: false,
     faults: Vec::new(),
   }
+}
+
+/// The extent axis BITES, proven against a reader that truncates.
+///
+/// `member_extent` is zero over the whole corpus, and issue #79 is the record
+/// of what an unasked zero was worth here before this axis existed: a walk
+/// patched to drop its last member's last well-formed parameter moved 6050
+/// records' `answer` and left every `grade` byte identical, because the only
+/// thing watching that column was a SHA-256 of itself. So the grader is run
+/// against that truncation, and against the three other ways a member's
+/// parameters can be no derivation's, and it has to fire on each.
+///
+/// The honest reading has to stay green in the same test, or the control would
+/// be proving that the grader fires on everything.
+#[test]
+fn the_extent_axis_reds_on_a_reader_that_truncates() {
+  // RFC 9110 §5.6.6 derives this value with exactly two parameters, whose names
+  // stand at 2 and 6. The element ending at `x;p=1` is a derivation of a
+  // PREFIX and not of a member: a `;` stands behind it, and §5.6.1.2 admits an
+  // element end only where a `,` or the value's end does.
+  let value: &[u8] = b"x;p=1;q=2";
+  let reading = oracle::read(value, Production::TokenParameters);
+  assert!(reading.derives);
+  assert_eq!(
+    reading
+      .member_params(0)
+      .iter()
+      .map(|admitted| admitted.iter().map(|name| name.at).collect::<Vec<_>>())
+      .collect::<Vec<_>>(),
+    vec![vec![2, 6]],
+    "one derivation of this member reaches the value's end, and it reads both"
+  );
+
+  let honest = extent(0, &[2, 6]);
+  assert!(
+    !crate::grade_extents(value, &[honest], &reading, true, false).wrong,
+    "the grader fired on the reading RFC 9110 derives"
+  );
+
+  // Issue #79's own mutation, as one member: the last parameter dropped. It is
+  // a strict PREFIX of what the grammar admits, which is why a bound would pass
+  // it and this does not.
+  for truncated in [extent(0, &[2]), extent(0, &[])] {
+    assert!(
+      crate::grade_extents(value, &[truncated], &reading, true, false).wrong,
+      "the axis did not fire on a member that ended early"
+    );
+  }
+  // A parameter at an offset no derivation reads a name at, and one manufactured
+  // behind the last.
+  for wrong in [extent(0, &[2, 5]), extent(0, &[2, 6, 8])] {
+    assert!(
+      crate::grade_extents(value, &[wrong], &reading, true, false).wrong,
+      "the axis did not fire on a member whose parameters are somewhere else"
+    );
+  }
+
+  // And the live walk, over the same value, reads what RFC 9110 derives.
+  let walked = walk(&[value], ParamSyntax::Parameter);
+  assert!(walked.well_formed);
+  assert_eq!(
+    walked.extents.first().map(|extent| extent.params.clone()),
+    Some(vec![2, 6])
+  );
+  assert!(!crate::grade_extents(value, &walked.extents, &reading, walked.well_formed, false).wrong);
+}
+
+/// One member's extent as a reader would report it.
+fn extent(at: usize, params: &[usize]) -> crate::Extent {
+  crate::Extent {
+    at,
+    params: params.to_vec(),
+    faulted: false,
+  }
+}
+
+/// The extent question is asked about the bytes BEHIND an offset, and the three
+/// cases it declines are declined because nothing could answer them.
+///
+/// Each of the three is a reason [`crate::grade_extents`] gives, shown to be
+/// the case it claims rather than a filter that quietly swallowed the corpus —
+/// which is what [`EXTENTS_GRADED`] beside [`EXTENTS_UNASKED`] measures at
+/// scale.
+#[test]
+fn the_extent_question_is_declined_only_where_nothing_could_answer_it() {
+  // A value no reading derives: the walk is recovering, and a recovering
+  // reader's members end where the fault left them.
+  let value: &[u8] = b"x;p=,a";
+  let reading = oracle::read(value, Production::TokenParameters);
+  assert!(!reading.derives);
+  let walked = walk(&[value], ParamSyntax::Parameter);
+  let graded = crate::grade_extents(value, &walked.extents, &reading, walked.well_formed, false);
+  assert_eq!(graded.graded, 0);
+  assert!(graded.unasked > 0);
+
+  // A member whose own parameter walk faulted. RFC 9110 §5.2 joins these into a
+  // value that derives, and the reader calls it well formed — the ONE fault
+  // that leaves it so — but the parameter it could not hand over is one the
+  // grammar reads, so the offsets it did hand over are not a whole derivation.
+  let lines: Vec<&[u8]> = vec![b"x;p=\"a", b"b\""];
+  let joined = join(&lines);
+  let walked = walk(&lines, ParamSyntax::Parameter);
+  assert!(walked.well_formed);
+  let reading = oracle::read(&joined, Production::TokenParameters);
+  assert!(reading.derives);
+  assert!(
+    walked.extents.first().is_some_and(|extent| extent.faulted),
+    "the parameter that crosses the join is reported as a fault"
+  );
+  let graded = crate::grade_extents(
+    &joined,
+    &walked.extents,
+    &reading,
+    walked.well_formed,
+    false,
+  );
+  assert_eq!(graded.graded, 0);
+  assert_eq!(graded.unasked, 1);
+
+  // A member beginning where no derivation begins an element: already graded by
+  // the start axes, and asking again would report one defect under two names.
+  let value: &[u8] = b"x;p=1";
+  let reading = oracle::read(value, Production::TokenParameters);
+  let stray = extent(3, &[]);
+  let graded = crate::grade_extents(value, &[stray], &reading, true, false);
+  assert!(!reading.licenses_member_at(3));
+  assert_eq!(graded.graded, 0);
+  assert!(!graded.wrong);
+}
+
+// ───────────── RFC 9110 §10.1.1, and the extent a fold can still state ───────
+
+/// `Expectations` borrows nothing, which is WHY its extent is graded through a
+/// projection instead of through offsets.
+///
+/// The obstacle stated as something the compiler checks rather than as a
+/// sentence in a doc. Issue #79's argument — that a reader already hands out
+/// the borrowed subslice `place` needs — does not transfer to this one, and the
+/// reason is structural: the type has no lifetime parameter, so it retains no
+/// part of any field line and there is nothing to place. If it ever gains one,
+/// this test stops compiling and whoever changed it can replace the projection
+/// with the offset grading the other two readers get.
+#[test]
+fn the_expectation_reader_borrows_nothing_to_place() {
+  const fn borrows_no_input<T: Copy + 'static>() {}
+  borrows_no_input::<http_semantics::grammar::Expectations>();
+}
+
+/// The RFC 9110 §10.1.1 projection REDS on a reader whose member ends at its
+/// name, and stays green on the one that does not.
+///
+/// The control the `member_extent` zero-target needs for its third reader.
+/// Before this comparison existed, the same truncation applied to
+/// `Expectations` itself left every one of this crate's tests green — measured,
+/// not assumed — because nothing here read `expects_continue` at all.
+///
+/// `100-continue=1` is the whole demonstration. RFC 9110 §10.1.1 writes
+/// `expectation = token [ "=" ( token / quoted-string ) parameters ]`, so the
+/// derivation of that member runs past its head and into the optional group:
+/// the member is not the bare token the field defines. A reader that stopped at
+/// the head would say it is.
+#[test]
+fn the_expectation_extent_projection_reds_on_a_reader_that_truncates() {
+  let value: &[u8] = b"100-continue=1";
+  let reading = oracle::read(value, Production::Expectation);
+  assert!(reading.derives);
+  let head = reading
+    .member_head(0)
+    .expect("the member reaches the list boundary");
+  assert_eq!(head.end, 12, "the head is the token");
+  assert!(
+    !head.bare,
+    "the derivation runs past it into the optional group"
+  );
+  assert_eq!(crate::projected_expectation(&reading, value), (false, true));
+
+  let read = crate::expectations(&[value]);
+  assert!(!read.expects_continue);
+  assert!(read.has_other);
+  let graded = crate::grade_expectation(value, &read, &reading);
+  assert!(!graded.wrong, "the live reader is not the truncating one");
+  assert!(graded.graded);
+  assert!(
+    graded.decisive,
+    "a member's extent decides this record, which is what makes the red possible"
+  );
+
+  // The same reader with its member ended at the name: this IS the bare token,
+  // and there is no other expectation in the value.
+  let truncating = Expect {
+    rendered: read.rendered.clone(),
+    parsed: read.parsed,
+    empty_element: read.empty_element,
+    expects_continue: true,
+    has_other: false,
+  };
+  assert!(
+    crate::grade_expectation(value, &truncating, &reading).wrong,
+    "the axis did not fire on a reader whose member ended at its name"
+  );
+
+  // And the bare token itself, where the two verdicts swap. Without this half
+  // the control would pass on a projection that always answers `(false, true)`.
+  let bare: &[u8] = b"100-continue";
+  let reading = oracle::read(bare, Production::Expectation);
+  assert!(
+    reading
+      .member_head(0)
+      .is_some_and(|head| head.bare && head.end == 12)
+  );
+  assert_eq!(crate::projected_expectation(&reading, bare), (true, false));
+  let read = crate::expectations(&[bare]);
+  assert!(read.expects_continue);
+  assert!(!read.has_other);
+  assert!(!crate::grade_expectation(bare, &read, &reading).wrong);
+
+  // RFC 5234 §2.3 makes a quoted ABNF literal case-insensitive, and §10.1.1
+  // names `100-continue` as one. Both sides have to agree about that too, or
+  // the projection would red on a value the reader reads correctly.
+  let shouted: &[u8] = b"100-CONTINUE";
+  let reading = oracle::read(shouted, Production::Expectation);
+  assert_eq!(
+    crate::projected_expectation(&reading, shouted),
+    (true, false)
+  );
+  assert!(!crate::grade_expectation(shouted, &crate::expectations(&[shouted]), &reading).wrong);
+}
+
+/// Every shape the `Expect` family exists to write arises from its GENERATOR.
+///
+/// The property beside the counts, for the reason
+/// [`every_verdict_arises_from_the_list_generator`] is one. `decisive` is the
+/// row that matters most: a vocabulary edit that stopped writing a
+/// `100-continue` with something behind it would leave every count in
+/// [`EXPECTED_STATES`] looking healthy and turn the §10.1.1 comparison into an
+/// equality between two constants.
+#[test]
+fn every_expectation_shape_arises_from_the_expect_generator() {
+  let mut seen = BTreeSet::new();
+  for value in crate::expectation_lists() {
+    let lines: Vec<&[u8]> = vec![&value];
+    let read = crate::expectations(&lines);
+    let reading = oracle::read(&value, Production::Expectation);
+    let graded = crate::grade_expectation(&value, &read, &reading);
+    assert!(!graded.wrong, "{}", String::from_utf8_lossy(&value));
+    if graded.graded {
+      seen.insert("graded");
+    }
+    if graded.decisive {
+      seen.insert("decisive");
+    }
+    if read.expects_continue {
+      seen.insert("continue");
+    }
+    if read.expects_continue && read.has_other {
+      seen.insert("continue-and-other");
+    }
+    if !read.parsed {
+      seen.insert("refused");
+    }
+    if read.empty_element {
+      seen.insert("empty-element");
+    }
+  }
+  assert_eq!(
+    seen,
+    BTreeSet::from([
+      "continue",
+      "continue-and-other",
+      "decisive",
+      "empty-element",
+      "graded",
+      "refused",
+    ]),
+    "the Expect generator does not reach the shapes the corpus counts"
+  );
+}
+
+// ──────────────────── `TE`, and the reading RFC 9110 leaves ──────────────────
+
+/// RFC 9110 §10.1.4's `t-codings` derives what its `transfer-coding` derives,
+/// and differs from it only in what a member's parameters ARE.
+///
+/// Both halves are facts about §5.6.2's `token`: `"trailers"` is one, and every
+/// §12.4.2 `qvalue` is one behind a `"q="` that is a `token` and an `=`. So a
+/// corpus that graded `TE` against `transfer-coding` would grade the two
+/// alternatives `t-codings` adds as though they were not there — which is what
+/// this corpus did until issue #80.
+#[test]
+fn the_te_element_derives_what_the_transfer_coding_does() {
+  for value in [
+    &b"trailers"[..],
+    b"gzip",
+    b"gzip;q=0.5",
+    b"gzip;q=1.5",
+    b"gzip;q = 0.5",
+    b"gzip;",
+    b"gzip;p",
+    b"trailers, gzip;q=0.5",
+    b"",
+    b",",
+  ] {
+    assert_eq!(
+      oracle::read(value, Production::TCodings).derives,
+      oracle::read(value, Production::TransferCoding).derives,
+      "§10.1.4 on {}",
+      String::from_utf8_lossy(value)
+    );
+  }
+}
+
+/// A `TE` member ending in a `q` RFC 9110 §12.4.2's `weight` derives has TWO
+/// parameter readings, and the walk takes the `transfer-parameter` one.
+///
+/// **The ambiguity issue #80 was filed over, and the decision this corpus
+/// records rather than makes.** `t-codings = "trailers" / ( transfer-coding
+/// [ weight ] )` puts an optional `weight` behind a rule that already repeats
+/// `transfer-parameter`, and `weight = OWS ";" OWS "q=" qvalue` derives no
+/// string that repetition does not — so `gzip;q=0.5` is a coding with one
+/// parameter and a coding with none and a weight, over the same bytes, ending
+/// at the same offset.
+///
+/// RFC 9110 settles it for `Accept` and for nothing else. §12.5.1 tells a
+/// recipient to "process any parameter named "q" as weight, regardless of
+/// parameter ordering", grounding it in a registry that governs media types;
+/// §12.4.2 calls the weight a "common parameter, named "q" (case-insensitive)"
+/// and says only what it means; §10.1.4 says nothing. So the oracle admits both
+/// and this pins which one the walk takes — a `TE` reader landing later is held
+/// to it, or moves this assertion on purpose.
+#[test]
+fn the_te_walk_reads_q_as_a_transfer_parameter() {
+  let value: &[u8] = b"gzip;q=0.5";
+  let reading = oracle::read(value, Production::TCodings);
+  assert_eq!(
+    reading
+      .member_params(0)
+      .iter()
+      .map(|admitted| admitted.iter().map(|name| name.at).collect::<Vec<_>>())
+      .collect::<Vec<_>>(),
+    vec![vec![], vec![5]],
+    "RFC 9110 leaves two readings of this member and the oracle names both"
+  );
+
+  let walked = walk(&[value], ParamSyntax::TransferParameter);
+  let graded = crate::grade_extents(value, &walked.extents, &reading, walked.well_formed, false);
+  assert_eq!(graded.ambiguous, 1);
+  assert_eq!(
+    graded.q_as_parameter, 1,
+    "the walk reads the `q` as a parameter"
+  );
+  assert_eq!(graded.q_as_weight, 0);
+
+  // Under §5.6.6 and RFC 9112 §7's container there is no `[ weight ]` at all,
+  // so the same bytes have ONE reading. The ambiguity is the field's, not the
+  // parameter rule's.
+  for production in [Production::TransferCoding, Production::TokenParameters] {
+    assert_eq!(
+      oracle::read(value, production).member_params(0).len(),
+      1,
+      "{production:?} admits one reading"
+    );
+  }
+
+  // And the four shapes no `weight` reaches, each for its own reason: a value
+  // that is no `qvalue`, a §5.6.4 `quoted-string` where `weight` has no
+  // alternative, §5.6.3's `BWS` where `weight` writes one literal, and a
+  // repetition standing behind the `q` where the bracket cannot reach.
+  for value in [
+    &b"gzip;q=1.5"[..],
+    b"gzip;q=\"0.5\"",
+    b"gzip;q = 0.5",
+    b"gzip;q=0.5;p=1",
+  ] {
+    let reading = oracle::read(value, Production::TCodings);
+    assert_eq!(
+      reading.member_params(0).len(),
+      1,
+      "{} has one reading",
+      String::from_utf8_lossy(value)
+    );
+    let walked = walk(&[value], ParamSyntax::TransferParameter);
+    let graded = crate::grade_extents(value, &walked.extents, &reading, walked.well_formed, false);
+    assert_eq!(graded.ambiguous, 0);
+    assert_eq!(graded.graded, 1);
+    assert!(!graded.wrong, "{}", String::from_utf8_lossy(value));
+  }
+}
+
+/// Every shape the `TE` family exists to write arises from its GENERATOR.
+///
+/// The property rather than the numbers, for the reason
+/// [`every_verdict_arises_from_the_list_generator`] is one: a count cannot say
+/// which generator earned it, and three of `Transfer-Encoding`'s verdicts used
+/// to be reached by hand-written cases alone. A vocabulary edit that stopped
+/// writing a `"trailers"` member, a `q` §12.4.2's weight derives, or a `q` it
+/// does not, reds HERE and names the shape.
+#[test]
+fn every_te_shape_arises_from_the_te_generator() {
+  let mut seen = BTreeSet::new();
+  for value in crate::t_codings_lists() {
+    let lines: Vec<&[u8]> = vec![&value];
+    let walked = walk(&lines, ParamSyntax::TransferParameter);
+    let reading = oracle::read(&value, Production::TCodings);
+    let graded = crate::grade_extents(&value, &walked.extents, &reading, walked.well_formed, false);
+    if walked
+      .names
+      .iter()
+      .any(|name| name.eq_ignore_ascii_case(b"trailers"))
+    {
+      seen.insert("trailers");
+    }
+    if graded.graded > 0 {
+      seen.insert("extent-graded");
+    }
+    if graded.ambiguous > 0 {
+      seen.insert("weight-ambiguous");
+    }
+    if graded.q_named > graded.ambiguous {
+      seen.insert("q-no-weight");
+    }
+    if graded.q_as_parameter > 0 {
+      seen.insert("q-read-as-parameter");
+    }
+    assert!(!graded.wrong, "{}", String::from_utf8_lossy(&value));
+  }
+  assert_eq!(
+    seen,
+    BTreeSet::from([
+      "extent-graded",
+      "q-no-weight",
+      "q-read-as-parameter",
+      "trailers",
+      "weight-ambiguous",
+    ]),
+    "the TE generator does not reach the shapes the corpus counts"
+  );
 }
 
 /// The bare parameter name is the one `ListError` the lenient arm cannot
