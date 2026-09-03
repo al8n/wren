@@ -2483,6 +2483,21 @@ const ELEMENT_START_REACH: [(&str, usize); 16] = [
 /// moved axis verdicts. It is pinned so the divergence cannot move quietly
 /// while somebody reconciles the two walks.
 ///
+///
+/// # It counts disagreements and not the harness's own output
+///
+/// The count is kept apart from the examples the failure message prints. It was
+/// not: the loop pushed a named example AND a marker for each of the first few
+/// disagreements and then measured the vector, so the instrument was counting
+/// its own emissions. Three figures were reported four too high before the
+/// re-count — **6 419 where it is 6 415, 327 where it is 323, and 172 where the
+/// variant measured beside it is 168** — four being exactly the number of
+/// examples the message had room for.
+///
+/// Anyone adding an example to that output must leave the counter alone. It is
+/// the same shape as a scanner that reads its own documentation, and this
+/// project has shipped a number wrong to that before.
+///
 /// # A known-wrong shape, awaiting the redesign
 ///
 /// It is not a cost with an argument behind it the way [`UNRESOLVED`] is. The
@@ -2710,6 +2725,12 @@ fn the_two_derivations_of_an_element_start_answer_alike() {
   );
 }
 
+/// Counted apart from the examples this differential's failure message prints,
+/// for the reason [`ELEMENT_START_DISAGREEMENTS`] carries: a count taken over
+/// the vector the examples are pushed into is a count of the harness's own
+/// output. This one is 0, so the bug could not show here — which is exactly why
+/// the rule belongs beside it rather than only beside the constant that caught
+/// it.
 const EXCUSED_DISAGREEMENTS: usize = 0;
 
 #[test]
