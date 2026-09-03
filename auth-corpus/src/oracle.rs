@@ -553,6 +553,18 @@ fn covers(
     if value.get(scheme_end) == Some(&b' ') {
       // The scheme and its `1*SP` derive whatever the body does, so a fault
       // inside the body is the BODY's element start and not this one.
+      //
+      // The bare-scheme reading is NOT dropped here, though this arm does not
+      // spell it. `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`
+      // leaves `Basic<SP>, Digest realm=z` deriving as two challenges, and the
+      // body's empty first element below reaches that same successor: §5.6.3's
+      // `OWS` is `*( SP / HTAB )` and §11.3's opener is `1*SP`, so `skip_sp`
+      // lands inside the run `skip_ows` crosses and `boundary(value, at)` at
+      // the body IS `boundary(value, scheme_end)`. What differs is the `list`
+      // the successor carries, and `readings`'s module doc carries the argument
+      // and the search that say the difference costs no opener. `readings`
+      // states the reading and this does not; that file's wording is the one
+      // this should be read as.
       derived = true;
       let body = skip_sp(value, scheme_end);
       // RFC 9110 §11.2's `token68` alternative, which is not a list. It is the
