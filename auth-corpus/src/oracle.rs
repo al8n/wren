@@ -678,9 +678,10 @@ fn covers(
       // are none of those. So `#auth-param` does not derive the body's first
       // element, this walk is not at an element start there under any reading,
       // and a position no reading is at cannot be the value's first fault.
-      // Reading it as one is what put `Bearer abc, Broken<HTAB>junk, x="open,
-      // Digest realm=z` behind a fault that is not there, and excused a
-      // `Digest` that no reading of the value holds inside a value.
+      // Reading it as one is what put
+      // `Bearer abc, Broken<HTAB>junk, x=<DQUOTE>open, Digest realm=z` behind a
+      // fault that is not there, and excused a `Digest` that no reading of the
+      // value holds inside a value.
       //
       // ABNF's `/` is unordered and nothing here orders it. What this says is
       // that ONE alternative derives these bytes and the other derives none of
@@ -691,8 +692,9 @@ fn covers(
       // `auth-scheme`, its `1*SP`, and a body that derives nothing at its first
       // element — is a non-derivation beside a derivation, and §11.6.1 leaves a
       // recipient no choice between those. Taking it anyway opens a list on a
-      // reading nobody has, which is how `Basic p1=1, …, p17=17, y = 1, Bearer,
-      // x="open, Digest realm=z` was excused: `y<SP>=<SP>1` is a whole
+      // reading nobody has, which is how
+      // `Basic p1=1, …, p17=17, y<SP>=<SP>1, Bearer, x=<DQUOTE>open, Digest
+      // realm=z` was excused: `y<SP>=<SP>1` is a whole
       // `auth-param` of the list `Basic` opened, and the probe behind `x` is
       // inside no value under any reading of the bytes.
       let derives_as_a_parameter = list
