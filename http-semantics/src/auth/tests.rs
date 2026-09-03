@@ -1246,23 +1246,23 @@ fn where_a_recovery_stands_says_whether_a_challenge_may_open_there() {
   // scan crossed put a comma in front of it and RFC 9110 §11.6.1's challenge
   // reading is not this scan's to admit.
   let scanned = scan_element(b"Basic a=1, b=2", 6, 6, || Ok(None)).unwrap();
-  assert_eq!(scanned.recovery.at, 6);
-  assert!(!scanned.recovery.after_comma);
+  assert_eq!(scanned.recovery.at(), 6);
+  assert!(!scanned.recovery.after_comma());
 
   // §5.2's join carried the element onto the line the walk now stands on, and
   // that line's first byte is behind the join's comma.
   let mut behind = [&b"Digest realm=\"evil\", x"[..]].into_iter();
   let scanned = scan_element(b"Basic a=\"x", 6, 6, || Ok(behind.next())).unwrap();
-  assert_eq!(scanned.recovery.at, 0);
-  assert_eq!(scanned.recovery.floor, 14);
-  assert!(scanned.recovery.after_comma);
+  assert_eq!(scanned.recovery.at(), 0);
+  assert_eq!(scanned.recovery.floor(), 14);
+  assert!(scanned.recovery.after_comma());
 
   // The value ran out inside the string, so the cursor is at the last line's
   // end, where no element of any list begins.
   let mut open = [&b"nothing closes it"[..]].into_iter();
   let scanned = scan_element(b"Basic a=\"x", 6, 6, || Ok(open.next())).unwrap();
-  assert_eq!(scanned.recovery.at, 17);
-  assert!(!scanned.recovery.after_comma);
+  assert_eq!(scanned.recovery.at(), 17);
+  assert!(!scanned.recovery.after_comma());
 }
 
 /// And the other half of `read_challenge`'s `recover_from`: an element the walk
@@ -1429,15 +1429,15 @@ fn a_body_s_first_element_recovers_at_the_element_the_outer_list_holds() {
 
   // Asked at the body's offset for both, which is what the walk used to do.
   let scanned = scan_element(value, 2, 2, || Ok(None)).unwrap();
-  assert_eq!(scanned.recovery.at, 2);
-  assert!(!scanned.recovery.strung);
+  assert_eq!(scanned.recovery.at(), 2);
+  assert!(!scanned.recovery.strung());
 
   // And asked with the outer element's, which is what it does.
   let scanned = scan_element(value, 2, 0, || Ok(None)).unwrap();
   assert_eq!(scanned.element.bytes, b"= \"c");
-  assert_eq!(scanned.recovery.at, 0);
-  assert_eq!(scanned.recovery.floor, 0);
-  assert!(scanned.recovery.strung);
+  assert_eq!(scanned.recovery.at(), 0);
+  assert_eq!(scanned.recovery.floor(), 0);
+  assert!(scanned.recovery.strung());
   // The comma is the same comma either way: only `auth-scheme 1*SP` stands
   // between the two offsets, and neither a `token` nor a run of SP holds one.
   assert_eq!(raw_comma_end(value, 0), raw_comma_end(value, 2));
