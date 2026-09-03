@@ -800,14 +800,28 @@ fn a_quote_where_no_string_may_open_hides_no_challenge() {
     );
   }
 
-  // And the shape this rule once cost, which the module doc's invariant took
-  // back. `Basic ",a=", Digest realm=z` hid `Digest`: an unadmitted DQUOTE
-  // stopped pairing with a later one, which left the next ADMITTED position —
-  // the value of `a=` — free to open a string RFC 9110 §5.6.4 ran to the end
-  // of the value. It cannot now, because the element in front of it is the one
-  // byte `"` that no production derives: the challenge is refused there, and
-  // everything behind that refusal is read to raw commas.
-  let [broken, digest, past] = walk::<3>([&b"Basic \",a=\", Digest realm=z"[..]]);
+  // And the shape this rule does NOT reach, which is the recovery's own.
+  // `Basic ",a=", Digest realm=z` refuses at the one byte `"` that no
+  // production derives — that much is this rule — and what stands behind that
+  // refusal is `a="`, whose DQUOTE is at RFC 9110 §11.2's value position and so
+  // is one a reading MAY open. That reading holds the comma in front of
+  // `Digest`, and every byte behind it, as `a`'s data. Yielding `Digest` was
+  // manufacturing a challenge out of a value's interior, which is what
+  // `refused_element_end` will not do.
+  let [broken, unknown, past] = walk::<3>([&b"Basic \",a=\", Digest realm=z"[..]]);
+  assert_eq!(broken.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+  // The pair that says the answer above is about the READING and not about the
+  // refusal standing in front of it: the same value with `a`'s string CLOSED
+  // before the comma. The reading that opens it stands outside it there,
+  // exactly as the reading that leaves it shut does, so no reading holds that
+  // comma — `Digest` is a challenge whose boundary this walk knows, and
+  // refusing to report it would hide a challenge for nothing.
+  let [broken, digest, past] = walk::<3>([&b"Basic \",a=\"\", Digest realm=z"[..]]);
   assert_eq!(broken.unwrap().unwrap_err(), AuthError::MalformedParameter);
   assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
@@ -847,43 +861,61 @@ fn the_control_is_that_the_trap_hides_a_challenge_on_its_own() {
   assert!(past.is_none(), "the trap hides `Digest` when it is sprung");
 }
 
+/// The tail whose boundary EVERY reading of it agrees on: the string opens
+/// where RFC 9110 §11.2 admits one and CLOSES in front of the comma, so the
+/// reading that opened it stands outside it there exactly as the reading that
+/// left it shut does. `Digest` is a challenge whose extent this walk knows,
+/// whatever refusal stands in front of it.
+const CERTAIN: &[u8] = b"safe=\"shut\", Digest realm=z";
+
+/// Every fault that refuses a challenge while the walk is still deciding where
+/// that challenge ends, and the head that carries it.
+///
+/// Driven twice — once behind [`CERTAIN`] and once behind [`TRAP`] — so that
+/// the two tests below differ in the TAIL and in nothing else. A trigger added
+/// to one is added to the other.
+const REFUSED_HEADS: [(&[u8], AuthError); 6] = [
+  // A value that closed with bytes behind that close.
+  (b"Basic a=\"x\"j", AuthError::MalformedParameter),
+  // An element that is no `auth-param` at all: two `=` where the production
+  // admits one value.
+  (b"Basic a=b=c", AuthError::MalformedParameter),
+  // A value that is neither of §11.2's alternatives taken whole.
+  (b"Basic a=x y", AuthError::MalformedParameter),
+  // A `token68` run where the body holds more than the run.
+  (b"Basic dGVzdA==", AuthError::MalformedParameter),
+  // §11.2's one-name-once MUST.
+  (b"Basic a=1, a=2", AuthError::DuplicateParameter),
+  // A byte §5.6.4 forbids INSIDE a string that legitimately opened. It stands
+  // in FRONT of the comma that ends this element, so no `quoted-string` derives
+  // over that comma in any reading and the recovery crosses it — the ruling
+  // `AuthError::InvalidQuotedString` records, and RFC 9110 §5.5 is why.
+  (b"Basic a=\"x\x00y\"", AuthError::InvalidQuotedString),
+];
+
+/// `head`, a comma, and `tail`.
+///
+/// The return type is an `impl` rather than the owned collection's own name,
+/// which is not in scope on the tier this crate builds with no features at all.
+fn behind(head: &[u8], tail: &[u8]) -> impl core::ops::Deref<Target = [u8]> {
+  let mut value = head.to_vec();
+  value.extend_from_slice(b", ");
+  value.extend_from_slice(tail);
+  value
+}
+
 #[test]
-fn every_way_a_challenge_is_refused_hides_no_challenge_behind_it() {
-  // The module doc's invariant, driven through every fault that refuses a
-  // challenge while the walk is still deciding where that challenge ends. Each
-  // value below is a challenge refused for a different reason, then `TRAP`,
-  // then `Digest`. RFC 9110 §11.4 has a user agent select "the challenge with
-  // what it considers to be the most secure auth-scheme that it understands",
-  // so every one of them must still reach `Digest`.
-  //
-  // `TRAP` is a well-formed opener in its own right — the control above proves
-  // it hides `Digest` when nothing precedes it — so what saves `Digest` here is
-  // that the refusal in front of it takes the rest of the challenge raw.
-  let trap = || {
-    let mut tail = b", ".to_vec();
-    tail.extend_from_slice(TRAP);
-    tail
-  };
-  for (head, fault) in [
-    // A value that closed across §5.2's join with bytes behind that close —
-    // the joined spelling of two field lines, the first ending inside the
-    // string and the second closing it and then running on.
-    (&b"Basic a=\"x,y\"junk"[..], AuthError::MalformedParameter),
-    // The same fault with the close and the junk on ONE line.
-    (b"Basic a=\"x\"j", AuthError::MalformedParameter),
-    // An element that is no `auth-param` at all: two `=` where the production
-    // admits one value.
-    (b"Basic a=b=c", AuthError::MalformedParameter),
-    // A value that is neither of §11.2's alternatives taken whole.
-    (b"Basic a=x y", AuthError::MalformedParameter),
-    // A `token68` run where the body holds more than the run.
-    (b"Basic dGVzdA==", AuthError::MalformedParameter),
-    // §11.2's one-name-once MUST.
-    (b"Basic a=1, a=2", AuthError::DuplicateParameter),
-  ] {
-    let mut value = head.to_vec();
-    value.extend_from_slice(&trap());
-    let [refused, digest, past] = walk::<3>([value.as_slice()]);
+fn every_way_a_challenge_is_refused_reaches_a_challenge_behind_a_certain_comma() {
+  // RFC 9110 §11.4 has a user agent select "the challenge with what it
+  // considers to be the most secure auth-scheme that it understands", so a
+  // challenge it cannot read must not take the readable ones behind it away.
+  // Each value below is a challenge refused for a different reason, then
+  // `CERTAIN`, then `Digest` — and every one of them reaches `Digest`, because
+  // the comma in front of it is one no reading of the bytes ahead of it holds
+  // inside a §5.6.4 quoted-string.
+  for (head, fault) in REFUSED_HEADS {
+    let value = behind(head, CERTAIN);
+    let [refused, digest, past] = walk::<3>([&*value]);
     assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
     assert_eq!(
       digest.unwrap().unwrap().scheme(),
@@ -893,11 +925,47 @@ fn every_way_a_challenge_is_refused_hides_no_challenge_behind_it() {
     assert!(past.is_none(), "{head:?}");
   }
 
-  // The same value as two field lines, opening on the first and closing on the
-  // second with `junk` behind the close. §5.2 joins them with a comma, so this
-  // is the same value as the one-line spelling above and answers the same way.
-  let mut tail = b"r\"junk, ".to_vec();
-  tail.extend_from_slice(TRAP);
+  // The OWS controls, which say the rule above is about WHERE the element
+  // begins and not about refusing whitespace. RFC 9110 §5.6.1.2 hangs `OWS` on
+  // its comma, so the element behind it is read exactly as one written with
+  // none — and each of these has an opener no reading holds the probe inside.
+  for continuation in [
+    // A quoted `realm` that CLOSES in front of the comma.
+    &b" Newauth realm=\"c\", Digest realm=z"[..],
+    b"\trealm=\"c\", Digest realm=z",
+    // A HTAB where `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`
+    // writes `1*SP`, so no challenge opens behind the whitespace either.
+    b" Newauth\trealm=\"c, Digest realm=z",
+    // A continuation with NO DQUOTE in it is not here and cannot be: the head's
+    // own value then closes nowhere, so §5.2's value ends inside a string, the
+    // walk answers `UnterminatedQuotedString` and there is no comma behind it
+    // for any reading to reach. That is the asymmetry
+    // `AuthError::ChallengeBoundaryUnknown` does not cover, recorded at
+    // `Refusal::Unbounded`; corpus I grades its row for it `hider-excused`.
+  ] {
+    let [refused, digest, past] = walk::<3>([&b"Basic a=\"x"[..], continuation]);
+    assert_eq!(
+      refused.unwrap().unwrap_err(),
+      AuthError::MalformedParameter,
+      "{continuation:?}"
+    );
+    assert_eq!(
+      digest.unwrap().unwrap().scheme(),
+      b"Digest",
+      "the challenge behind {continuation:?}"
+    );
+    assert!(past.is_none(), "{continuation:?}");
+  }
+
+  // A value that closed across §5.2's join with bytes behind that close. The
+  // element began on a line this walk no longer holds, so the recovery runs
+  // from the head of the line the value closed on — which is where the reading
+  // that ended the element at the join comma begins. `r"junk"` opens no string
+  // there: RFC 9110 §11.2 admits a value nowhere in it, since `r` is followed
+  // by a DQUOTE and not by an `=`. So both readings end the element at the same
+  // comma and `Digest` is reached.
+  let mut tail = b"r\"junk\", ".to_vec();
+  tail.extend_from_slice(CERTAIN);
   let [refused, digest, past] = walk::<3>([&b"Basic a=\"q"[..], tail.as_slice()]);
   assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
   assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
@@ -906,18 +974,18 @@ fn every_way_a_challenge_is_refused_hides_no_challenge_behind_it() {
   // One parameter past MAX_PARAMS_PER_CREDENTIAL, which is this reader's own
   // bound rather than a fault of the sender's — and refuses the challenge just
   // the same, so the same recovery has to follow it.
-  let mut value = SEVENTEEN_CHALLENGE.to_vec();
-  value.extend_from_slice(&trap());
-  let [refused, digest, past] = walk::<3>([value.as_slice()]);
+  let value = behind(SEVENTEEN_CHALLENGE, CERTAIN);
+  let [refused, digest, past] = walk::<3>([&*value]);
   assert_eq!(refused.unwrap().unwrap_err(), AuthError::TooManyParameters);
   assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
 
   // One field line past MAX_CHALLENGE_LINES, the other bound of this reader's,
-  // with the trap on the line behind the one that overran.
+  // met BETWEEN two elements — so the cursor stands where every reading is
+  // outside a string, and the tail on the line behind it is reached.
   let mut lines = [&b""[..]; 18];
   lines[..SEVENTEEN_LINES.len()].copy_from_slice(&SEVENTEEN_LINES);
-  lines[17] = TRAP;
+  lines[17] = CERTAIN;
   let [refused, digest, past] = walk::<3>(lines);
   assert_eq!(
     refused.unwrap().unwrap_err(),
@@ -926,43 +994,10 @@ fn every_way_a_challenge_is_refused_hides_no_challenge_behind_it() {
   assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
 
-  // The same bound, met at the crossing where the challenge's own value is
-  // still OPEN across §5.2's join. `TRAP` is not the trap for this one: the
-  // walk stands INSIDE a string that its DQUOTE would close, so it would spring
-  // a different case. What hides `Digest` here is the open string itself —
-  // every byte behind the bound is data of it, the comma in front of `Digest`
-  // included — so the line behind the bound is ordinary text and reaching
-  // `Digest` at all means the walk stopped where the challenge outgrew what it
-  // may hold.
-  let mut open_at_the_bound = [&b"j"[..]; 18];
-  open_at_the_bound[0] = b"Basic a=\"x";
-  open_at_the_bound[17] = b"p, Digest realm=z";
-  let [refused, digest, past] = walk::<3>(open_at_the_bound);
-  assert_eq!(
-    refused.unwrap().unwrap_err(),
-    AuthError::ChallengeSpansTooManyLines
-  );
-  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
-  assert!(past.is_none());
-
-  // And the fault that looks like an exception and is not: a byte RFC 9110
-  // §5.6.4 forbids INSIDE a string that legitimately opened. It is recovered
-  // from like every other refusal, and `TRAP` is the trap for it exactly as it
-  // is for the rows above — the DQUOTE in `trap="open` swallows the comma in
-  // front of `Digest` for any recovery that reads a refused run as a
-  // quoted-string, and this one does not read a refused run at all.
-  let mut value = b"Basic a=\"x\x00y\", ".to_vec();
-  value.extend_from_slice(TRAP);
-  let [refused, digest, past] = walk::<3>([value.as_slice()]);
-  assert_eq!(
-    refused.unwrap().unwrap_err(),
-    AuthError::InvalidQuotedString
-  );
-  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
-  assert!(past.is_none());
-
-  // The same byte met on the far side of §5.2's join, where the string opened
-  // on one field line and the forbidden byte stands first on the next.
+  // The forbidden byte met on the far side of §5.2's join, where the string
+  // opened on one field line and the byte stands first on the next. No
+  // `quoted-string` derives over those bytes either, so the comma behind the
+  // byte is a separator in every reading.
   let [refused, digest, past] = walk::<3>([&b"Basic a=\"x"[..], b"\x00, Digest realm=z"]);
   assert_eq!(
     refused.unwrap().unwrap_err(),
@@ -970,6 +1005,675 @@ fn every_way_a_challenge_is_refused_hides_no_challenge_behind_it() {
   );
   assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
+
+  // A whole challenge on the continuation line, whose own quoted parameter
+  // CLOSES in front of the comma. That is the reading §5.2's join admits beside
+  // the one that carried `a`'s value here, and its opener stands behind
+  // `auth-scheme 1*SP` — an offset no scan from the recovery cursor asks about
+  // unless it is looking for it. Here the two readings agree: `realm`'s string
+  // closes at `evil"`, so the comma behind it is RFC 9110 §5.6.1.2's separator
+  // whichever reading is the sender's, and `Newauth` is a challenge this walk
+  // knows the boundaries of. Refusing to report it would hide a challenge for
+  // nothing.
+  let [refused, newauth, past] = walk::<3>([
+    &b"Basic a=\"x"[..],
+    b"Digest realm=\"evil\", Newauth realm=z",
+  ]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  assert!(past.is_none());
+
+  // The same across TWO of §5.2's joins. The middle line carries no DQUOTE, so
+  // the reading that opened `a`'s value is still inside it at that line's end
+  // and the walk arrives at the last line with the same two readings it had at
+  // the first join — which is why one line's worth of state answers for a value
+  // spread over any number of them.
+  let [refused, newauth, past] = walk::<3>([
+    &b"Basic a=\"x"[..],
+    b"nothing here closes it",
+    b"Digest realm=\"evil\", Newauth realm=z",
+  ]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  assert!(past.is_none());
+
+  // And the element a challenge may NOT open at: the first of a challenge's own
+  // `#auth-param` list, which `challenge = auth-scheme [ 1*SP ( token68 /
+  // #auth-param ) ]` reaches past `1*SP` and not past a comma. RFC 9110
+  // §11.6.1's ambiguity is about the elements of the OUTER list, so
+  // `Digest realm="c` inside `Basic`'s body is an `auth-param` and nothing
+  // else — it has no `=` behind its leading token, so §11.2 admits a value
+  // nowhere in it, no reading opens a string at that DQUOTE, and the comma
+  // behind `"c` is a separator in all of them.
+  //
+  // No recovery decides this one, and that is worth saying because it is what
+  // keeps `Recovery::after_comma` false everywhere but a join:
+  // `BodyCheck::element` HOLDS the first element's verdict, and the loop breaks
+  // at `Newauth` because `opens_a_challenge` answers for it — so the fault is
+  // `BodyCheck::finish`'s and the walk never enters `seek` at all.
+  let [refused, newauth, past] = walk::<3>([&b"Basic Digest realm=\"c, Newauth realm=z"[..]]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  assert!(past.is_none());
+}
+
+#[test]
+fn the_two_positions_a_reading_may_open_a_string_at_are_an_element_s_and_a_challenge_s() {
+  // RFC 9110 §11.6.1 reads an element of the outer list two ways, and the
+  // openers they name are the whole of what `opener_at` answers.
+  //
+  // One more `auth-param` of the list already open: the element's OWN value
+  // position, which is where `trap="open`'s DQUOTE stands.
+  assert_eq!(
+    opener_at(b"trap=\"open, Digest realm=z", 0, true, false),
+    Some(5)
+  );
+  // Not admitted where the refused challenge opened no list — nothing in what
+  // is left of it is an `auth-param`, so nothing in it has a value position.
+  assert_eq!(
+    opener_at(b"trap=\"open, Digest realm=z", 0, false, false),
+    None
+  );
+
+  // A whole challenge: the value position of its FIRST parameter, behind
+  // `auth-scheme 1*SP`. Admitted only where a comma stands in front of the
+  // element, which is what §5.2's join puts at the head of a continuation line.
+  let joined = &b"Digest realm=\"evil, Newauth realm=z"[..];
+  assert_eq!(opener_at(joined, 0, true, true), Some(13));
+  assert_eq!(opener_at(joined, 0, true, false), None);
+  // §5.6.3's `BWS` is admitted around §11.2's `=` and moves the position.
+  assert_eq!(opener_at(b"Digest realm = \"evil", 0, true, true), Some(15));
+  // `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` writes `1*SP`,
+  // and §5.6.3's HTAB is not one — so no challenge opens here in any reading.
+  assert_eq!(opener_at(b"Digest\trealm=\"evil", 0, true, true), None);
+  // A value position holding a `token` opens nothing: §11.2's
+  // `( token / quoted-string )` is one alternative taken whole, and a scan
+  // started at a `tchar` would read the rest of the run as a string's interior.
+  assert_eq!(
+    opener_at(b"Digest realm=z, Newauth realm=q", 0, true, true),
+    None
+  );
+  assert_eq!(
+    opener_at(b"trap=open, Digest realm=z", 0, true, false),
+    None
+  );
+
+  // And never both at once, which is what keeps one scan an answer about every
+  // reading: §5.6.2's `tchar` holds no `=`, so a token followed by `BWS "="` is
+  // not a token followed by `1*SP` and another token. The two readings share
+  // one `token`, so they are read from ONE offset — the element's own start,
+  // which the OWS test below is about.
+  assert_eq!(opener_at(b"a = \"x", 0, true, true), Some(4));
+  assert_eq!(opener_at(b"a b=\"x", 0, true, true), Some(4));
+  assert_eq!(opener_at(b"a b=\"x", 0, true, false), None);
+}
+
+#[test]
+fn the_ows_a_list_hangs_on_its_comma_stands_in_front_of_both_openers() {
+  // RFC 9110 §5.6.1.2 expands its list as
+  // `#element => [ element ] *( OWS "," OWS [ element ] )`, so where a comma
+  // stands in front of the cursor the element begins behind whatever §5.6.3
+  // whitespace follows it — and BOTH of §11.6.1's readings are of the element,
+  // not of the comma's far side.
+  //
+  // Asked at the far side instead, neither shape is found at all: §5.6.2's
+  // `tchar` excludes SP and HTAB, so `token_end` answers `None` and the run
+  // reads as one holding no opener. Every offset below is one byte or two off
+  // the answer above it, and that is the whole of the defect.
+  assert_eq!(opener_at(b" realm=\"evil", 0, true, true), Some(7));
+  assert_eq!(opener_at(b"\trealm=\"evil", 0, true, true), Some(7));
+  assert_eq!(opener_at(b"  realm=\"evil", 0, true, true), Some(8));
+  assert_eq!(opener_at(b" \trealm=\"evil", 0, true, true), Some(8));
+  // The challenge reading, whose opener stands behind `auth-scheme 1*SP` as
+  // well as behind the list's `OWS`.
+  assert_eq!(opener_at(b" Newauth realm=\"evil", 0, true, true), Some(15));
+  assert_eq!(
+    opener_at(b"\tNewauth realm=\"evil", 0, true, true),
+    Some(15)
+  );
+  // The element reading alone, where the refused challenge opened no list: the
+  // whitespace moves the position it is not admitted AT, and it stays
+  // unadmitted.
+  assert_eq!(opener_at(b" realm=\"evil", 0, false, true), None);
+  assert_eq!(
+    opener_at(b" Newauth realm=\"evil", 0, false, true),
+    Some(15)
+  );
+
+  // And nothing is skipped where no comma stands in front of the cursor.
+  // `Challenges::open_element` has already put the cursor on an element's first
+  // byte there, so whitespace at it is the element's own and no production
+  // admits a value behind it.
+  assert_eq!(opener_at(b" realm=\"evil", 0, true, false), None);
+}
+
+#[test]
+fn where_a_recovery_stands_says_whether_a_challenge_may_open_there() {
+  // The element began and ended on the line the walk holds, so nothing this
+  // scan crossed put a comma in front of it and RFC 9110 §11.6.1's challenge
+  // reading is not this scan's to admit.
+  let scanned = scan_element(b"Basic a=1, b=2", 6, || Ok(None)).unwrap();
+  assert_eq!(scanned.recovery.at, 6);
+  assert!(!scanned.recovery.after_comma);
+
+  // §5.2's join carried the element onto the line the walk now stands on, and
+  // that line's first byte is behind the join's comma.
+  let mut behind = [&b"Digest realm=\"evil\", x"[..]].into_iter();
+  let scanned = scan_element(b"Basic a=\"x", 6, || Ok(behind.next())).unwrap();
+  assert_eq!(scanned.recovery.at, 0);
+  assert_eq!(scanned.recovery.floor, 14);
+  assert!(scanned.recovery.after_comma);
+
+  // The value ran out inside the string, so the cursor is at the last line's
+  // end, where no element of any list begins.
+  let mut open = [&b"nothing closes it"[..]].into_iter();
+  let scanned = scan_element(b"Basic a=\"x", 6, || Ok(open.next())).unwrap();
+  assert_eq!(scanned.recovery.at, 17);
+  assert!(!scanned.recovery.after_comma);
+}
+
+#[test]
+fn every_way_a_challenge_is_refused_invents_no_challenge_out_of_a_value() {
+  // The other half of the same rule, and the defect this walk carried. `TRAP`
+  // is a well-formed opener in its own right — the control above proves it
+  // hides `Digest` when nothing precedes it — so a recovery that crossed the
+  // comma inside `trap="open` would hand a caller a `Digest` challenge with a
+  // `realm` no sender wrote, chosen by whoever controls that parameter's value.
+  //
+  // Behind a fault nothing forces RFC 9110 §11.2's `( token / quoted-string )`
+  // on the bytes at `trap`'s value position, so the DQUOTE there is one a
+  // reading may open and a reading may leave shut, and the two disagree about
+  // that comma. The walk reports it: `AuthError::ChallengeBoundaryUnknown`, and
+  // no further item.
+  //
+  // Every trigger reaches the same recovery, which is why the table above is
+  // driven through both tails rather than one.
+  for (head, fault) in REFUSED_HEADS {
+    let value = behind(head, TRAP);
+    let [refused, unknown, past] = walk::<3>([&*value]);
+    assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
+    assert_eq!(
+      unknown.unwrap().unwrap_err(),
+      AuthError::ChallengeBoundaryUnknown,
+      "the boundary behind {head:?}"
+    );
+    assert!(past.is_none(), "{head:?}");
+  }
+
+  // The two-field-line spelling, where the readings part inside the ELEMENT
+  // rather than behind it. `Basic a="x` and `trap="open, Digest realm=z` are one
+  // value: the reading that opens `a`'s value closes it at the DQUOTE behind
+  // `trap=` and then runs to the comma behind `open`, and the reading that ends
+  // the element at §5.2's join comma opens a string at `trap`'s own value
+  // position instead and holds `Digest` inside it. So no tail is needed to
+  // spring this one — the head is the trap.
+  let [refused, unknown, past] = walk::<3>([&b"Basic a=\"x"[..], b"trap=\"open, Digest realm=z"]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+
+  // The same on ONE field line: `a="x,y"junk` closes its value and runs on, and
+  // the reading that leaves the DQUOTE shut ends the element at the comma
+  // INSIDE `"x,y"`. Two extents, and the tail behind them is not what decides
+  // it — this row answers the same with a comma no reading holds behind it.
+  for tail in [CERTAIN, TRAP] {
+    let value = behind(b"Basic a=\"x,y\"junk", tail);
+    let [refused, unknown, past] = walk::<3>([&*value]);
+    assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
+    assert_eq!(
+      unknown.unwrap().unwrap_err(),
+      AuthError::ChallengeBoundaryUnknown,
+      "{tail:?}"
+    );
+    assert!(past.is_none(), "{tail:?}");
+  }
+
+  // And a comma the reading that CARRIED the value across the join holds,
+  // which is the other half of what a recovery behind a joined element has to
+  // answer. `Basic a="x` and `p, q"junk, Digest realm=z` are one value: the
+  // reading that opens `a`'s value closes it at the DQUOTE behind `q` and runs
+  // on to the comma behind `junk`, and the reading that ends the element at
+  // §5.2's join comma begins at `p` — where the FIRST raw comma stands in
+  // front of that close, inside the bytes the first reading holds. So the
+  // earliest comma is one no boundary may be taken at, and a later one would
+  // hide the element the second reading found.
+  let [refused, unknown, past] = walk::<3>([&b"Basic a=\"x"[..], b"p, q\"junk, Digest realm=z"]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+
+  // The control that says that pair is about the RECOVERY and not about the
+  // shape: the same two lines with nothing behind the close, so the element
+  // derives, its value is the grammar's, and `Digest` is the second challenge.
+  let [basic, digest, past] = walk::<3>([&b"Basic a=\"x"[..], b"p, q\", Digest realm=z"]);
+  let basic = basic.unwrap().unwrap();
+  assert_eq!(basic.scheme(), b"Basic");
+  assert_eq!(names::<2>(&basic), [Some(&b"a"[..]), None]);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // The parameter bound, which is #77's own trigger: RFC 9110 §11.2 bounds
+  // `#auth-param` nowhere, so the input that meets it CONFORMS, and the
+  // challenge invented behind it was invented on conforming input.
+  let value = behind(SEVENTEEN_CHALLENGE, TRAP);
+  let [refused, unknown, past] = walk::<3>([&*value]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::TooManyParameters);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+
+  // The line bound met between elements, with the trap on the line behind the
+  // one that overran.
+  let mut lines = [&b""[..]; 18];
+  lines[..SEVENTEEN_LINES.len()].copy_from_slice(&SEVENTEEN_LINES);
+  lines[17] = TRAP;
+  let [refused, unknown, past] = walk::<3>(lines);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+
+  // The reading a join admits that no scan from the recovery cursor finds on
+  // its own: a whole challenge beginning on the continuation line, with a
+  // quoted parameter of ITS own. `Basic a="x` and
+  // `Digest realm="evil, Newauth realm=z, junk", Safe realm=s` are one value
+  // under RFC 9110 §5.2. One reading takes the DQUOTE behind `realm=` as the
+  // CLOSE of `a`'s value and ends the element behind `evil`; the other shuts
+  // `a` at the join comma and reads `Digest realm="evil, Newauth realm=z,
+  // junk"` as a challenge whose `realm` holds `Newauth realm=z` as data. The
+  // opener that decides it stands behind `auth-scheme 1*SP`, and a check asked
+  // only at the cursor never sees it — so the comma behind `evil` was crossed
+  // and `Newauth realm=z` was handed to a caller out of the middle of a realm.
+  //
+  // Nothing derivable is lost by refusing: the readings disagree about whether
+  // `Newauth` is a challenge at all, and `Safe realm=s` stands behind a comma
+  // only one of them agrees on.
+  let invented_across_a_join: [&[u8]; 2] = [
+    b"Basic a=\"x",
+    b"Digest realm=\"evil, Newauth realm=z, junk\", Safe realm=s",
+  ];
+  let [refused, unknown, past] = walk::<3>(invented_across_a_join);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none(), "a challenge out of `realm`'s own data");
+
+  // And across TWO joins, where the line the readings part on is not the line
+  // the element began on OR the one behind it.
+  let [refused, unknown, past] = walk::<3>([
+    &b"Basic a=\"x"[..],
+    b"nothing here closes it",
+    b"Digest realm=\"evil, Newauth realm=z, junk\", Safe realm=s",
+  ]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+
+  // The same reading with RFC 9110 §5.6.1.2's own `OWS` in front of it, which
+  // is what `#element => [ element ] *( OWS "," OWS [ element ] )` hangs on
+  // every comma — §5.2's join comma included. One space moves the element, and
+  // both of its openers, off the offset the join left the cursor on; a check
+  // asked at the cursor finds no `token` there at all, since §5.6.2's `tchar`
+  // excludes SP, and crosses the comma inside `realm`'s own value.
+  //
+  // Both of §11.6.1's readings are spelled, and both spellings of §5.6.3's
+  // `OWS`: the element's own value position (`realm="evil`) and a whole
+  // challenge's first parameter (`Newauth realm="evil`).
+  for continuation in [
+    &b" realm=\"evil, Digest realm=z"[..],
+    b"\trealm=\"evil, Digest realm=z",
+    b"  realm=\"evil, Digest realm=z",
+    b" Newauth realm=\"evil, Digest realm=z",
+    b"\tNewauth realm=\"evil, Digest realm=z",
+    b" \tNewauth realm=\"evil, Digest realm=z",
+  ] {
+    let [refused, unknown, past] = walk::<3>([&b"Basic a=\"x"[..], continuation]);
+    assert_eq!(
+      refused.unwrap().unwrap_err(),
+      AuthError::MalformedParameter,
+      "{continuation:?}"
+    );
+    assert_eq!(
+      unknown.unwrap().unwrap_err(),
+      AuthError::ChallengeBoundaryUnknown,
+      "a challenge out of a value behind the list's own OWS: {continuation:?}"
+    );
+    assert!(past.is_none(), "{continuation:?}");
+
+    // And across two joins, where one line's worth of state still answers.
+    let [refused, unknown, past] =
+      walk::<3>([&b"Basic a=\"x"[..], b"nothing here closes it", continuation]);
+    assert_eq!(
+      refused.unwrap().unwrap_err(),
+      AuthError::MalformedParameter,
+      "{continuation:?}"
+    );
+    assert_eq!(
+      unknown.unwrap().unwrap_err(),
+      AuthError::ChallengeBoundaryUnknown,
+      "{continuation:?}"
+    );
+    assert!(past.is_none(), "{continuation:?}");
+  }
+
+  // The same bound, met at the crossing where the challenge's own value is
+  // still OPEN across §5.2's join. `TRAP` is not the trap for this one, and no
+  // tail can be: the walk stands INSIDE a string RFC 9110 §11.2 admitted at a
+  // value position and §5.6.4 has closed nowhere, so every byte behind the
+  // bound — the comma in front of `Digest` included — is that value's data in
+  // the only reading there is. Yielding `Digest` here read a challenge out of
+  // the interior of `a`'s value.
+  let mut open_at_the_bound = [&b"j"[..]; 18];
+  open_at_the_bound[0] = b"Basic a=\"x";
+  open_at_the_bound[17] = b"p, Digest realm=z";
+  let [refused, unknown, past] = walk::<3>(open_at_the_bound);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+}
+
+/// The exact tail al8n/wren#77 measured: an element whose value is a
+/// well-formed RFC 9110 §5.6.4 quoted-string carrying a comma, a whole
+/// challenge, another comma, and more of the same value.
+///
+/// It is the shape the parameter bound made reachable on CONFORMING input, and
+/// the reason [`TRAP`] alone is not enough of a pin: the trap's string never
+/// closes, so a reader could be right about it for the wrong reason — by
+/// treating an unterminated run as special — and still cut this one in half.
+/// Here nothing at all is wrong with the value.
+const INVENTED: &[u8] = b"x=\"c, Digest realm=evil, junk\"";
+
+/// The scheme #77's recovery manufactured, and the one no answer may carry.
+fn yields_no_invented_scheme(lines: &[&[u8]], label: &[u8]) {
+  for credential in challenges(lines.iter().copied()).flatten() {
+    assert_ne!(
+      credential.scheme(),
+      b"Digest",
+      "{label:?}: a scheme built out of a parameter's own data"
+    );
+  }
+}
+
+#[test]
+fn a_value_the_grammar_admits_is_never_cut_into_a_challenge() {
+  // al8n/wren#77, pinned as the input it was measured on. RFC 9110 §11.2 bounds
+  // `#auth-param` nowhere, so
+  //
+  //     WWW-Authenticate: Basic p1=1, ..., p17=17, x="c, Digest realm=evil, junk"
+  //
+  // conforms: no repeated name, nothing malformed, no byte §5.5 forbids, one
+  // field line. What refuses it is `MAX_PARAMS_PER_CREDENTIAL`, which is this
+  // reader's own bound — and the recovery behind that refusal cut `x`'s value
+  // at the comma inside it and handed the caller
+  // `Ok(scheme="Digest", params=[realm="evil"])`. §11.4 has a user agent select
+  // "the challenge with what it considers to be the most secure auth-scheme
+  // that it understands", so the scheme and the realm it chooses were whoever
+  // wrote `x`'s value.
+  let mut exact = SEVENTEEN_CHALLENGE.to_vec();
+  exact.extend_from_slice(b", ");
+  exact.extend_from_slice(INVENTED);
+  let [refused, unknown, past] = walk::<3>([exact.as_slice()]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::TooManyParameters);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+  yields_no_invented_scheme(&[exact.as_slice()], SEVENTEEN_CHALLENGE);
+
+  // The control that says the tail is a value and not a trap: with nothing
+  // refused in front of it, those same bytes are ONE challenge carrying ONE
+  // parameter whose value holds the comma, the scheme and the realm as data.
+  // That is what the sender wrote, and it is what makes cutting it an
+  // invention rather than a recovery.
+  let credential = one([&b"Basic x=\"c, Digest realm=evil, junk\""[..]]);
+  assert_eq!(credential.scheme(), b"Basic");
+  assert_eq!(names::<2>(&credential), [Some(&b"x"[..]), None]);
+  assert!(
+    matches!(
+      credential.params().next().unwrap().value(),
+      Ok(ParamValue::Quoted(v)) if v == b"c, Digest realm=evil, junk"
+    ),
+    "the whole tail is one parameter's value"
+  );
+
+  // Every trigger reaches that recovery, so every trigger is driven through the
+  // same tail. The first six are the ones #77 enumerates; the two scheme faults
+  // reach it as well and are here for the same reason.
+  for (head, fault) in REFUSED_HEADS {
+    let value = behind(head, INVENTED);
+    let [refused, unknown, past] = walk::<3>([&*value]);
+    assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
+    assert_eq!(
+      unknown.unwrap().unwrap_err(),
+      AuthError::ChallengeBoundaryUnknown,
+      "{head:?}"
+    );
+    assert!(past.is_none(), "{head:?}");
+    yields_no_invented_scheme(&[&value], head);
+  }
+
+  // The line bound, which no one-line value can reach.
+  let mut lines = [&b""[..]; 18];
+  lines[..SEVENTEEN_LINES.len()].copy_from_slice(&SEVENTEEN_LINES);
+  lines[17] = INVENTED;
+  let [refused, unknown, past] = walk::<3>(lines);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+  yields_no_invented_scheme(&lines, INVENTED);
+
+  // And the scheme faults. They recover from where the scheme token ran out,
+  // and there is no reading that hides between the element's first byte and
+  // that cursor: `challenge` is entered only at an element no `auth-param` may
+  // begin at. What they DO have to answer for is what stands behind them —
+  // §11.6.1 lets a challenge already open take the refused element as a
+  // malformed parameter of its own, and under that reading its list is still
+  // open and the elements behind it may be parameters too. Both values below
+  // open a list in front of the refusal, so both reach the same recovery.
+  for (value, fault) in [
+    (
+      &b"Basic a=1, =x, x=\"c, Digest realm=evil, junk\""[..],
+      AuthError::MissingScheme,
+    ),
+    (
+      b"Basic a=1, Newauth\tq, x=\"c, Digest realm=evil, junk\"",
+      AuthError::MalformedScheme,
+    ),
+  ] {
+    let mut walk = challenges([value]).skip_while(|read| read.is_ok());
+    assert_eq!(
+      walk
+        .next()
+        .unwrap_or_else(|| panic!("{value:?}"))
+        .unwrap_err(),
+      fault,
+      "{value:?}"
+    );
+    assert_eq!(
+      walk
+        .next()
+        .unwrap_or_else(|| panic!("{value:?}"))
+        .unwrap_err(),
+      AuthError::ChallengeBoundaryUnknown,
+      "{value:?}"
+    );
+    assert!(walk.next().is_none(), "{value:?}");
+    yields_no_invented_scheme(&[value], value);
+  }
+}
+
+/// The refusals whose recovery asks whether a `#auth-param` list is open at
+/// all: the ones RFC 9110 §11.3's `challenge` takes at its `auth-scheme`, in
+/// front of the `1*SP` that is the body's only entrance.
+///
+/// Every other refusal is inside a body, where a list is open by construction
+/// and `Challenges::list_open` is not consulted.
+const SCHEME_REFUSALS: [(&[u8], AuthError); 3] = [
+  // `1*SP` is SP alone, so a HTAB reaching an element rather than §5.6.1.2's
+  // comma opens no body.
+  (b"Broken\tjunk", AuthError::MalformedScheme),
+  // No leading `token` at all.
+  (b"=x", AuthError::MissingScheme),
+  // A byte behind the token the production admits nothing after.
+  (b"Broken;junk", AuthError::MalformedScheme),
+];
+
+/// The tail those refusals are recovered past, whose DQUOTE stands at RFC 9110
+/// §11.2's value position and never closes.
+const OPEN_TRAP: &[u8] = b"x=\"open, Digest realm=z";
+
+#[test]
+fn a_list_lives_from_its_1_sp_to_the_scheme_that_stands_alone() {
+  // What a refusal at an `auth-scheme` inherits is the value's list state, not
+  // the refused challenge's: RFC 9110 §11.6.1 lets a challenge already open
+  // take the refused element as a malformed `auth-param` of its own, and under
+  // that reading the elements behind it may be parameters too. So the question
+  // is whether a `#auth-param` list is open HERE, and the two halves of it are
+  // pinned below in opposite directions.
+  //
+  // ```text
+  // challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+  // ```
+  //
+  // `1*SP` is the body's only entrance. A challenge that took it opened a list;
+  // a challenge that did not took no body at all, in any reading of its bytes.
+  for (prefix, reached) in [
+    // No list has opened anywhere in the value.
+    (&b""[..], true),
+    // One has, and nothing since has closed it.
+    (b"Basic a=1", false),
+    // A scheme standing alone closes it. Its own element DERIVES — §11.6.1's
+    // other reading of it needs `auth-param`'s `=`, and it has none — so the
+    // list-still-open reading is a non-derivation beside a derivation and not
+    // one of the two §11.6.1 leaves a recipient to choose between. This is the
+    // shape the walk hid a `Digest` behind.
+    (b"Basic a=1, Bearer", true),
+    // The other spelling of the same scheme, where §5.6.1.2's `OWS` stands
+    // between the token and its comma. One writer for both.
+    (b"Basic a=1, Bearer\t", true),
+    // And a list reopened behind that scheme is open again.
+    (b"Basic a=1, Bearer, Newauth b=2", false),
+    (b"Bearer, Basic a=1", false),
+    // A `token68` body closes NOTHING, and this is the row that says so.
+    // §11.3 writes `token68 / #auth-param` as an ABNF `/`, which orders
+    // nothing, so the same bytes read as `#auth-param` are a list whose first
+    // element derives nothing — and behind a fault this walk holds both
+    // readings. Under that one `open, Digest realm=z` is `x`'s own data, so
+    // crossing to it would hand a caller a challenge no sender wrote. A
+    // `token68` is exactly as much a fault, under the other alternative, as the
+    // scheme faults this flag is consulted for.
+    (b"Bearer abc", false),
+    (b"Bearer dGVzdA==", false),
+    (b"Basic a=1, Bearer abc", false),
+  ] {
+    for (refusal, fault) in SCHEME_REFUSALS {
+      let mut value = prefix.to_vec();
+      if !prefix.is_empty() {
+        value.extend_from_slice(b", ");
+      }
+      value.extend_from_slice(refusal);
+      value.extend_from_slice(b", ");
+      value.extend_from_slice(OPEN_TRAP);
+
+      let mut walk = challenges([value.as_slice()]).skip_while(|read| read.is_ok());
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_err(),
+        fault,
+        "{value:?}"
+      );
+      let last = walk.next().unwrap_or_else(|| panic!("{value:?}"));
+      if reached {
+        assert_eq!(
+          last.unwrap_or_else(|_| panic!("{value:?}")).scheme(),
+          b"Digest",
+          "a list every reading closed hid a challenge: {value:?}"
+        );
+      } else {
+        assert_eq!(
+          last.unwrap_err(),
+          AuthError::ChallengeBoundaryUnknown,
+          "a list some reading still has open was crossed: {value:?}"
+        );
+        yields_no_invented_scheme(&[&value], &value);
+      }
+      assert!(walk.next().is_none(), "{value:?}");
+    }
+  }
+
+  // The control that says the tail is a trap and the prefixes are what decides
+  // it: the same values with a DQUOTE that CLOSES in front of the comma reach
+  // `Digest` from every prefix, because every reading then stands outside the
+  // string there.
+  for prefix in [
+    &b""[..],
+    b"Basic a=1",
+    b"Basic a=1, Bearer",
+    b"Bearer abc",
+    b"Basic a=1, Bearer abc",
+  ] {
+    for (refusal, fault) in SCHEME_REFUSALS {
+      let mut value = prefix.to_vec();
+      if !prefix.is_empty() {
+        value.extend_from_slice(b", ");
+      }
+      value.extend_from_slice(refusal);
+      value.extend_from_slice(b", x=\"shut\", Digest realm=z");
+
+      let mut walk = challenges([value.as_slice()]).skip_while(|read| read.is_ok());
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_err(),
+        fault,
+        "{value:?}"
+      );
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_or_else(|_| panic!("{value:?}"))
+          .scheme(),
+        b"Digest",
+        "{value:?}"
+      );
+      assert!(walk.next().is_none(), "{value:?}");
+    }
+  }
 }
 
 #[test]
@@ -1032,27 +1736,37 @@ fn a_forbidden_byte_is_the_one_thing_a_high_byte_is_not() {
 
 #[test]
 fn where_a_forbidden_byte_is_recovered_from_is_where_the_scan_stood() {
-  // A KNOWN cost of recovering by raw commas from where the scan stands, kept
-  // visible rather than left to be found: RFC 9110 §5.2 makes these two field
-  // line lists ONE value, and they do not answer the same.
+  // A KNOWN cost of recovering from where the scan stands, kept visible rather
+  // than left to be found: RFC 9110 §5.2 makes these two field line lists ONE
+  // value, and they still do not answer the same. What they no longer do is
+  // disagree about a CHALLENGE — neither spelling yields `Digest realm=z` out
+  // of the middle of a realm — so what is left of the cost is which fault the
+  // walk ends on.
   //
   // On one line the scan never advanced past the element, so the cursor is on
-  // the element's first byte and the first raw comma from there is the one
-  // inside the realm — `Digest realm=z` stands behind it and is yielded.
+  // the element's first byte, the earliest comma from there is the one inside
+  // the realm, and the string RFC 9110 §11.2 admits at `realm`'s value position
+  // is still OPEN at it: the bytes between the DQUOTE and that comma are
+  // `qdtext`, whatever the %x00 later in the value does to the field as a
+  // whole. Some reading holds that comma, so there is no boundary to cross.
   let one_line = &b"Basic realm=\"ab, Digest realm=z, \x00c\""[..];
-  let [refused, digest, missing, past] = walk::<4>([one_line]);
+  let [refused, unknown, past] = walk::<3>([one_line]);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::InvalidQuotedString
   );
-  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
-  assert_eq!(missing.unwrap().unwrap_err(), AuthError::MissingScheme);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
   assert!(past.is_none());
 
   // Split at that same comma, the element's earlier bytes are on a field line
   // this walk no longer holds, so the cursor is on the first byte of the line
-  // the scan choked on — and `Digest realm=z` stands in FRONT of the first raw
-  // comma there, which puts it inside the refused run.
+  // the scan choked on. No string is admitted at THAT offset — ` Digest` opens
+  // with the list's own `OWS` and no `auth-param` value position stands there —
+  // so the comma behind `realm=z` is a separator in every reading and is
+  // crossed, and what stands behind it opens no challenge either.
   let split: [&[u8]; 2] = [b"Basic realm=\"ab", b" Digest realm=z, \x00c\""];
   let [refused, missing, past] = walk::<3>(split);
   assert_eq!(
@@ -1062,13 +1776,14 @@ fn where_a_forbidden_byte_is_recovered_from_is_where_the_scan_stood() {
   assert_eq!(missing.unwrap().unwrap_err(), AuthError::MissingScheme);
   assert!(past.is_none());
 
-  // What makes it a cost and not a defect: the challenge the split spelling
-  // does not show is one NO derivation of the value puts there either. The
-  // value carries a byte RFC 9110 §5.5 admits nowhere in one, so
-  // `Digest realm=z` is neither a challenge nor the data of a value. Both
-  // spellings show at least what they showed before this fault refused rather
-  // than ended the walk, which was nothing. Making them agree needs the OFFSET
-  // the scan choked at, which `QuotedScan::Invalid` does not carry.
+  // What makes the remainder a cost and not a defect: neither spelling shows a
+  // challenge at the probe's offset, and no derivation of the value puts one
+  // there either — the value carries a byte RFC 9110 §5.5 admits nowhere in
+  // one, so `Digest realm=z` is no challenge, and the reading that makes it a
+  // realm's data is the reading the one-line spelling stops on. What differs is
+  // the last fault: a boundary the walk could not derive against an element
+  // that derives nothing. Making them agree needs the OFFSET the scan choked
+  // at, which `QuotedScan::Invalid` does not carry.
   //
   // The control that says the two spellings are otherwise one value: with the
   // forbidden byte gone, both are one challenge with one realm.
@@ -2354,8 +3069,11 @@ fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
   // the challenge's own element is still OPEN: a quoted value RFC 9110 §5.2's
   // join carries onto the next line takes that line with it, so a line this
   // challenge may not hold is a line this reader may not read. The refusal is
-  // met at the crossing itself, and what is left of the challenge is found by
-  // raw commas like every other refusal.
+  // met at the crossing itself — and it is the one refusal in this module that
+  // leaves NO boundary behind it, because the cursor stands inside a §5.6.4
+  // quoted-string §11.2 admitted and nothing this walk may read can say where
+  // that string closes. Every comma behind it is the value's data in the only
+  // reading there is, so `AuthError::ChallengeBoundaryUnknown` follows.
   //
   // One value opens on the first line here and every continuation keeps it
   // open, so the SEVENTEENTH region is the one that does not fit — and the
@@ -2365,20 +3083,25 @@ fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
   let mut too_many = [&b"j"[..]; 18];
   too_many[0] = b"Basic a=\"x";
   too_many[17] = b"\x00, Digest realm=z";
-  let [refused, digest, past] = walk::<3>(too_many);
+  let [refused, unknown, past] = walk::<3>(too_many);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::ChallengeSpansTooManyLines
   );
-  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
   assert!(past.is_none());
 
   // ONE line fewer is sixteen regions, and there the byte IS read — the region
-  // it stands on is one this challenge holds. Both faults refuse and recover,
-  // so `Digest` survives either way and the FAULT is the whole of what tells
-  // the two rows apart: this pair says the refusal above is the bound being met
-  // FIRST rather than the byte being unreachable, and an edit that made the
-  // bound fire a line late would answer `InvalidQuotedString` here as well.
+  // it stands on is one this challenge holds. That fault leaves a boundary
+  // behind it, because a %x00 in front of the comma means no `quoted-string`
+  // derives over that comma in any reading, so `Digest` is reached — and the
+  // FAULT is what tells the two rows apart: this pair says the refusal above is
+  // the bound being met FIRST rather than the byte being unreachable, and an
+  // edit that made the bound fire a line late would answer
+  // `InvalidQuotedString` here as well.
   let mut within = [&b"j"[..]; 17];
   within[0] = b"Basic a=\"x";
   within[16] = b"\x00, Digest realm=z";
@@ -2390,18 +3113,21 @@ fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
   assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
   assert!(past.is_none());
 
-  // The cursor stands at the FIRST byte of the line the challenge could not
-  // hold, so what that line carries in front of its first raw comma is still
-  // the refused challenge's. A `Digest` with no comma in front of it on that
-  // line is inside the refused run and is not yielded — the cost of recovering
-  // raw, and the assertion an edit that moved the cursor elsewhere fails.
+  // And with no forbidden byte at all on the line the challenge could not
+  // hold: the same answer, for the same reason. `a`'s string is still open, so
+  // `Digest realm=z` is inside it whatever else that line carries, and the walk
+  // says so rather than reading it.
   let mut swallowed = [&b"j"[..]; 18];
   swallowed[0] = b"Basic a=\"x";
   swallowed[17] = b"Digest realm=z";
-  let [refused, past] = walk::<2>(swallowed);
+  let [refused, unknown, past] = walk::<3>(swallowed);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
   );
   assert!(past.is_none());
 
@@ -2427,12 +3153,32 @@ fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
   // join — and its value is a DQUOTE at the one position §11.2 admits one.
   // Reading it would open a string that swallows the comma in front of
   // `Digest`; `outgrown` answers for the missing body first, and refuses before
-  // that element's bytes are read.
+  // that element's bytes are read. The recovery behind that refusal is where
+  // the same DQUOTE is asked about again, and the answer is the same: some
+  // reading of `t="open` holds the comma in front of `Digest`, so the walk
+  // reports that it cannot say where the refused challenge ends.
   let mut refused_at_the_join = [&b"j"[..]; 18];
   refused_at_the_join[0] = b"Basic a=\"x";
   refused_at_the_join[16] = b"y\"";
   refused_at_the_join[17] = b"t=\"open, Digest realm=z";
-  let [refused, digest, past] = walk::<3>(refused_at_the_join);
+  let [refused, unknown, past] = walk::<3>(refused_at_the_join);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+
+  // The pair that says the answer above is the READING and not the crossing:
+  // the same shape with that element's string CLOSED in front of the comma. The
+  // bound is met at the same place and refuses the same challenge, and `Digest`
+  // is reached, because no reading of `t="shut"` holds that comma.
+  let mut certain_at_the_join = refused_at_the_join;
+  certain_at_the_join[17] = b"t=\"shut\", Digest realm=z";
+  let [refused, digest, past] = walk::<3>(certain_at_the_join);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::ChallengeSpansTooManyLines
@@ -2457,68 +3203,57 @@ fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
 }
 
 #[test]
-fn where_the_line_bound_recovers_from_is_where_the_scan_stood() {
-  // The pair `where_a_forbidden_byte_is_recovered_from_is_where_the_scan_stood`
-  // could not write for THIS crossing, and the reason it could not: the bound
-  // needs seventeen regions, so no one-line spelling of a value can meet it.
-  // Two spellings still exist. RFC 9110 §5.2 makes a field line list one value
-  // by separating each line value from the next with a comma, so folding a
-  // join comma into the line in front of it writes the SAME value over one
-  // line fewer — and the two do not answer alike.
+fn the_line_bound_met_inside_a_value_leaves_the_two_spellings_the_same_answer() {
+  // The asymmetry this test was written to record, and no longer has. The bound
+  // needs seventeen regions, so no one-line spelling of a value can meet it —
+  // but RFC 9110 §5.2 makes a field line list one value by separating each line
+  // value from the next with a comma, so folding a join comma into the line in
+  // front of it writes the SAME value over one line fewer. The two spellings
+  // used to answer with different numbers of challenges, because recovery ran
+  // by raw commas from where the scan STOOD and that offset moved with the
+  // sender's line breaks — which §5.2 says are no part of the value.
   //
-  // It is the same rule as the forbidden byte's, and the same cost. Recovery
-  // runs from where the scan STOOD, and for this fault that is the first byte
-  // of the line just fetched, since that is the line the challenge could not
-  // hold. Which line that is depends on where the sender broke its lines, and
-  // §5.2 says the line breaks are not part of the value.
-  //
-  // The two assertions move TOGETHER, and that is why this one exists. The
-  // other crossing has a fix in view — `QuotedScan`'s
-  // invalid arm carrying the offset the scan choked at, so the answer becomes
-  // a function of the joined value alone. A fix that answers only for the
-  // forbidden byte closes one entrance to one rule. This crossing carries no
-  // scan offset to hand over: its recovery point is the cursor
-  // `Challenges::skip_element` moves to the head of the fetched line, and it
-  // needs its own answer.
+  // They agree now, and what makes them agree is that neither has a boundary to
+  // find. The bound is met with the challenge's own value still open inside a
+  // §5.6.4 quoted-string, so every comma behind that DQUOTE is the value's data
+  // in the only reading there is: neither `Digest realm=z` nor `Newauth q=1` is
+  // a challenge under any reading of these bytes, and the walk says it cannot
+  // place the boundary rather than picking one of them.
 
   // Nineteen field lines, one value open from the first of them to the last.
-  // The seventeenth region is the one that does not fit, so the cursor stands
-  // at the head of the line carrying `Digest realm=z`. No raw comma stands in
-  // front of it there, so it is inside the refused run — and `Newauth q=1`,
-  // behind the next join, is what the walk yields.
   let mut folded_late = [&b"j"[..]; 19];
   folded_late[0] = b"Basic a=\"x";
   folded_late[17] = b"Digest realm=z";
   folded_late[18] = b"Newauth q=1";
-  let [refused, newauth, past] = walk::<3>(folded_late);
-  assert_eq!(
-    refused.unwrap().unwrap_err(),
-    AuthError::ChallengeSpansTooManyLines
-  );
-  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
-  assert!(past.is_none());
 
   // The same value, with the comma in front of `Digest` written INTO the line
-  // ahead of it instead of made by the join. One line fewer, so the region
-  // that does not fit is now the one `Newauth q=1` stands on — and `Newauth`
-  // is what the raw-comma recovery swallows instead. Same fault, one challenge
-  // fewer, same value.
+  // ahead of it instead of made by the join. One line fewer, so a different
+  // region is the one that does not fit.
   let mut folded_early = [&b"j"[..]; 18];
   folded_early[0] = b"Basic a=\"x";
   folded_early[16] = b"j,Digest realm=z";
   folded_early[17] = b"Newauth q=1";
-  let [refused, past] = walk::<2>(folded_early);
-  assert_eq!(
-    refused.unwrap().unwrap_err(),
-    AuthError::ChallengeSpansTooManyLines
-  );
-  assert!(past.is_none());
 
   // The claim the pair rests on, executed: the two lists are ONE value.
   assert!(
     joined_value(folded_late).eq(joined_value(folded_early)),
     "the two spellings must be one RFC 9110 §5.2 value"
   );
+
+  for lines in [&folded_late[..], &folded_early[..]] {
+    let [refused, unknown, past] = walk::<3>(lines.iter().copied());
+    assert_eq!(
+      refused.unwrap().unwrap_err(),
+      AuthError::ChallengeSpansTooManyLines,
+      "{lines:?}"
+    );
+    assert_eq!(
+      unknown.unwrap().unwrap_err(),
+      AuthError::ChallengeBoundaryUnknown,
+      "{lines:?}"
+    );
+    assert!(past.is_none(), "{lines:?}");
+  }
 
   // The control that says the FOLD is not what tells them apart: the same two
   // spellings with too few lines to meet the bound answer identically. What

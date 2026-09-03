@@ -1,5 +1,250 @@
 # UNRELEASED
 
+## `http-semantics` — the auth recovery invented a challenge out of a parameter's own data
+
+`challenges()` could hand a caller a challenge no origin server sent, built out
+of bytes the sender wrote as a parameter's **value** — and it did so on
+CONFORMING input, because the refusal that opened the door was this reader's own
+bound rather than a fault of the sender's. al8n/wren#77, measured at `9dd8708`:
+
+```text
+WWW-Authenticate: Basic p1=1, …, p17=17, x="c, Digest realm=evil, junk"
+```
+
+No repeated name, nothing malformed, no byte RFC 9110 §5.5 forbids, one field
+line. §11.2 bounds `#auth-param` nowhere, so this value conforms; what refuses
+it is `MAX_PARAMS_PER_CREDENTIAL`. The walk answered
+`[Err(TooManyParameters), Ok(scheme="Digest", params=[realm="evil"]), Err(MalformedScheme)]`,
+and §11.4 has a user agent answer a 401 by "selecting the challenge with what it
+considers to be the most secure auth-scheme that it understands" — so the scheme
+and the realm that choice turns on were whoever wrote `x`'s value. The same
+bytes with no fault in front of them are ONE `Basic` challenge whose `realm`
+holds that comma. The recovery is what invented the `Digest`.
+
+All six triggers reach that recovery — a trailing suffix behind a closed value,
+a malformed parameter, a duplicate name, the parameter bound, the line bound,
+and a byte §5.6.4 forbids — and the reasoning that hid it generalised a
+measurement taken for ONE of them to all six: it conflated the byte that
+TRIGGERS a refusal with the bytes the recovery then walks, which are ordinary
+data.
+
+### Fixed
+
+- **A comma is a boundary only where EVERY reading of the bytes in front of it
+  ends the element there.** Behind a fault nothing forces §11.2's
+  `( token / quoted-string )` on the bytes at a value position, so the DQUOTE
+  there is one a reading may open and a reading may leave shut. `seek` now
+  crosses only the commas the two agree on — `refused_element_end`, over
+  `some_reading_holds` — and where they part it reports
+  `AuthError::ChallengeBoundaryUnknown` and stops. Cutting there instead is the
+  defect; crossing to the string's close instead would hide every challenge an
+  unclosed value swallows, and inventing a challenge and hiding one are the same
+  harm.
+
+  There is exactly one place a reading may open a string in such a run, and that
+  is what makes one scan an answer about every reading rather than a sample of
+  two: a second opener needs a second element, a second element needs a comma,
+  and the run ends at the first comma by construction. The `grammar` walk asks
+  the same question of §5.6.6's `parameters`, where a member's own `;` puts many
+  openers in one run and a subset construction over their states is what answers;
+  an `auth-param` is one whole element with nothing repeating inside it, so the
+  construction collapses to a single `scan_quoted` bounded at the candidate
+  comma.
+
+  **Which place it is, §11.6.1 answers twice**, and `opener_at` reads both. An
+  element of the outer list is one more `auth-param` of the challenge already
+  open — its own value position — or the `auth-scheme` of the next one, whose
+  first parameter's value position stands behind `auth-scheme 1*SP`. The two
+  shapes exclude each other (§5.6.2's `tchar` holds no `=`, so a token followed
+  by `BWS "="` is not a token followed by `1*SP` and another token), so the run
+  still holds one opener or none and one scan still answers.
+
+- **A refused element's extent is one reading's, so the recovery goes back to
+  where the readings part.** An element whose extent `element_end` cut by
+  OPENING its own string, and which then derives nothing, has a reading that
+  leaves the DQUOTE shut and ends it at the first comma instead. Recovery now
+  runs from the element's own first byte, or — where §5.2's join carried it onto
+  a later line — from the head of the line the value closed on, with the close
+  as the offset in front of which no comma on that line is a boundary.
+  `Basic a="x` and `trap="open, Digest realm=z` are two field lines whose second
+  reading holds `Digest` inside `trap`'s value, and the walk yielded it.
+
+- **A join admits a whole CHALLENGE on the continuation line, and its
+  parameter's DQUOTE is not at the recovery cursor.** The reading that shut a
+  refused element's value at §5.2's join ends that element there, and what opens
+  at the continuation line's first byte is an element of the outer `#challenge`
+  list — which §11.6.1 lets be a scheme, its `1*SP` and its parameters. That
+  challenge's first parameter has its value position behind the scheme, at an
+  offset a check asked only at the cursor never looks at. `Basic a="x` and
+  `Digest realm="evil, Newauth realm=z, junk", Safe realm=s` are the two field
+  lines: one reading takes the DQUOTE behind `realm=` as the CLOSE of `a`'s
+  value, the other as the OPEN of a `realm` whose data runs
+  `evil, Newauth realm=z, junk` — and crossing the comma behind `evil` handed a
+  caller a `Newauth` challenge out of the middle of that realm. `Recovery`
+  carries whether a comma stands in front of the cursor, and `seek` takes it on
+  its first run only, since every later cursor is one `opens_a_challenge` has
+  already answered `false` for.
+
+- **The element behind a join comma does not begin at the join comma.** §5.6.1.2
+  expands its list as `#element => [ element ] *( OWS "," OWS [ element ] )`,
+  hanging whitespace on BOTH sides of the comma — so a sender that wrote one
+  space in front of a continuation line's element moved that element, and BOTH
+  of the openers above, off the offset §5.2's join left the cursor on. §5.6.2's
+  `tchar` excludes SP and HTAB, so a check asked at the offset instead of at the
+  element found no `token` at all and read the run as one holding no opener.
+
+  ```text
+  WWW-Authenticate: Basic a="x
+  WWW-Authenticate:  realm="evil, Digest realm=z
+  ```
+
+  One space, and the walk answered `Err(MalformedParameter), Ok(Digest realm=z)`
+  — a `Digest` read out of the middle of a `realm` the sender wrote whole. The
+  whole-challenge spelling (` Newauth realm=…`) and the two-join spelling failed
+  alike. `opener_at` now skips §5.6.3's `OWS` to the element's real start before
+  checking either shape, and the mutual-exclusion argument that keeps this ONE
+  scan is stated where it holds: the two readings share one `token`, so they are
+  read from one offset, and that offset is the element's. `Recovery::at` keeps
+  the unskipped offset, because `Recovery::floor` counts the commas this line
+  holds from the line's head.
+
+- **The `token68` verdict a body holds for its first element comes due where a
+  quoted-string decided that element's extent.** §11.2's `token68` alphabet
+  holds no DQUOTE, so an element carrying one is not one — and holding the
+  verdict to `BodyCheck::finish` reported it with the cursor already past a
+  boundary that element's own string had chosen.
+
+- **A challenge refused at its `auth-scheme` opened no parameter list**, so no
+  `auth-param` begins in what is left of it and no DQUOTE in it opens a string
+  in any reading — unless a list is open earlier in the value, where §11.6.1
+  lets the refused element be a malformed parameter of a challenge still open.
+  `Basic, type=1, x="a, Digest realm=z` reaches `Digest`; `Basic a=1, =x,
+  x="c, Digest realm=z"` does not.
+
+- **That list has a LIFETIME, and it used to have only a beginning.** The bit
+  recording it only ever turned on, so a refusal inherited the state of any
+  earlier body in the value — including one a completed challenge had since
+  closed. `1*SP` is the body's only entrance in
+  `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`, so a challenge
+  with nothing but §5.6.1.2's `OWS` and its comma behind its scheme took no body
+  under ANY reading and opened no list; and its own element DERIVES, so
+  §11.6.1's other reading of it — one more `auth-param` of the list in front of
+  it — is a non-derivation beside a derivation rather than one of the two
+  readings §11.6.1 leaves a recipient to choose between. Every reading therefore
+  has the earlier list closed at the comma in front of such a scheme, and
+  `Challenges::list_open` now says so. `Basic a=1, Bearer,
+  Broken<HTAB>junk, x="open, Digest realm=z` reaches `Digest`; it did not.
+
+  **A `token68` body closes nothing**, and the walk does not pretend otherwise.
+  §11.3 writes `token68 / #auth-param` as an ABNF `/`, which orders nothing, so
+  the same bytes read as `#auth-param` are a list whose FIRST element derives
+  nothing — and behind a fault this walk holds both readings, which is the whole
+  of what the boundary rule is. In `Bearer abc, Broken<HTAB>junk, x="open,
+  Digest realm=z` that reading makes `open, Digest realm=z` the data of `x`, so
+  the comma in front of `Digest` is one no boundary may be taken at and
+  `AuthError::ChallengeBoundaryUnknown` is the answer. Crossing it would
+  manufacture a challenge — the corpus grades that `over-yield`, and corpus J
+  pins both directions side by side.
+
+- **The line bound met with a value still OPEN across §5.2's join leaves no
+  boundary at all.** Every comma behind that DQUOTE is the value's data in the
+  only reading there is, and the line that would close the string is one
+  `MAX_CHALLENGE_LINES` forbids this reader to hold. The two spellings of such a
+  value — one field line apart, the join comma folded in or not — used to answer
+  with different numbers of challenges; they now answer alike, and
+  `the_line_bound_met_inside_a_value_leaves_the_two_spellings_the_same_answer`
+  is that agreement pinned where the disagreement used to be recorded.
+
+### Added
+
+- `AuthError::ChallengeBoundaryUnknown` — `challenges()`'s LAST item, and the
+  one fault it raises about itself rather than about a challenge. A caller that
+  receives it knows exactly what it holds: the challenges yielded in front of
+  it, and no claim at all about the rest of the value. `AuthError` is
+  `#[non_exhaustive]`.
+
+### `auth-corpus` — the harness was part of the defect
+
+The differential was GREEN over 36 records that each said the reader had handed
+a caller a challenge built out of a parameter's own data, because `over-yield`
+— the corpus's own name for exactly that — was pinned as a constant (16 for
+corpus D, 20 for E) rather than driven to zero. And `TooManyParameters`, the
+strongest trigger of the recovery, occurred **0 times in the whole corpus**:
+corpus E writes one parameter per field line, so the line bound always fired
+first and the parameter bound was unreachable by the harness built to find it.
+
+- **`over-yield` and `hider-unexcused` are zero-targets**, asserted by
+  `the_two_classes_this_module_is_driven_to_zero_on_are_zero` rather than
+  pinned. Both are 0 over all 935 692 records.
+
+- **Corpus H reaches the challenge a join opens**: 72 records over four heads
+  that leave a quoted-string open where their field line ends, nine
+  continuation lines, and one join or two. Every corpus in front of it puts its
+  tail at the recovery cursor itself, so a check asked only there was green over
+  all of them; corpus H answered `over-yield` **24** against the commit that
+  first drove that class to zero. A zero-target is only as strong as the shapes
+  the generators can write, which is corpus G's lesson repeated.
+
+- **Corpus I reaches the opener a list's own `OWS` moves**: corpus H's 4 heads
+  and 9 continuations again, times the 4 spellings of §5.6.3's `OWS` and one
+  join or two — 288 records. Corpus H starts every continuation at the element's
+  own first byte, so the openers a reader looks for at §5.2's join offset were
+  always AT that offset; corpus I answered `over-yield` **128** against the
+  commit that added H, and 0 here. Two families, and both defects
+  lived where the generator could not write.
+
+- **Corpus J reaches what an EARLIER challenge left open**: 8 prefixes of
+  challenges that COMPLETE, times 3 elements refused at their `auth-scheme`,
+  times 5 tails carrying the probe — 120 records. Every generator in front of it
+  refuses the value's FIRST challenge, so the list state a recovery reads was
+  written by the very challenge that failed and nothing measured what an
+  intervening one left behind. It answered `hider-unresolved` **6** against that
+  same commit and 0 here. It also pins the direction that must NOT move: the
+  `token68` prefixes stay `hider-excused`, and
+  `ows_after_the_join_comma_and_a_challenge_completed_in_front_are_shapes_these_generators_write`
+  asserts both halves per prefix, so a family that stopped writing its own shape
+  reds rather than going quiet.
+
+- **Corpus G reaches the parameter bound**: 180 records writing 2 to 21 distinct
+  parameters on ONE field line, behind nine tails — the eight corpora D and E
+  share plus one no other corpus can spell, a well-formed quoted value that
+  carries the probe, a comma and more of its own data and then CLOSES. Every
+  quoted tail in `TAILS` leaves its string open, so a reader could be right
+  about all of them for the wrong reason. `TooManyParameters` now occurs 46
+  times.
+
+- **The oracle asked the wrong question.** `Verdict::excused` asked whether the
+  WHOLE value derives and REACHES the position, so one malformed element made it
+  decide that no reading licensed a quoted-string §11.2 admits perfectly well —
+  and the axis therefore graded al8n/wren#77's own siblings `yields-underivable`
+  with `excused: false`, blind to the reader cutting those values in half. It is
+  now a recursive enumeration over readings: the grammar decides in front of the
+  first fault, where a `parameter-value` beginning with a DQUOTE derives only the
+  `quoted-string` alternative, and every admitted DQUOTE is a free choice behind
+  it. A `challenge` is read only at an element of the outer list, and an
+  `auth-param` only where a list is open.
+
+- **A third class, `hider-unresolved`**, for the 43 records where the reader
+  declined to place a boundary and SAID SO. A challenge nobody was shown and
+  nobody was told about is the harm this axis exists against; a challenge the
+  caller is told it has not been shown is a cost, and
+  `every_challenge_this_walk_declines_to_place_says_so_to_the_caller` asserts
+  that every record graded here carries the notice.
+
+- **The reproduction this table used to carry is gone, and says so.** `AXIS`
+  reproduced five per-corpus figures published before any harness was committed;
+  it cannot now, because the classifier those figures were computed with is the
+  one #77 found the defect in. What is kept is the part that can still be
+  checked — `RECOVERED` identifies the record set one earlier commit moved and
+  asserts its size — and the move itself is tabulated at `AXIS`.
+
+`cargo test -p http-semantics --all-features` reports 432 unit tests passing, 93
+of them this module's, beside the no-panic harness's fifteen and one doctest;
+`cargo test -p auth-corpus` reports 15. `xtask/snapshots/http-semantics-documented.txt`
+gains 65 lines and loses one — `Challenges.opened_a_list`, renamed `list_open`
+because it no longer only ever turns on: `grep -vc '^#'` counts 697 documented
+items on it at `9dd8708` and 762 here.
+
 ## `xtask` — a production that is not a rule, a rule no line could hold, and a `miri` budget that stops rather than reports
 
 Three ways something walked past a gate, and each one's failure was watched
@@ -169,6 +414,7 @@ before it was written down. Closes #75 and #73.
 
 Both were found by the paragraph extractor on its first run, and neither was
 reachable before it: each is written across two comment lines.
+
 ## `coding-corpus` — the third §5.6.6 reader's extent, graded through what a fold can still state
 
 The two commits below put the walk and `media::accept` into an extent

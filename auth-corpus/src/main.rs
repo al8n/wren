@@ -20,13 +20,13 @@
 //! corpus <TAB> case <TAB> spelling <TAB> axis <TAB> answer
 //! ```
 //!
-//! - `corpus` — which generator produced the input: `A`..`F`.
+//! - `corpus` — which generator produced the input: `A`..`J`.
 //! - `case` — the field lines, escaped, `|`-separated. `(corpus, case,
 //!   spelling)` is the record's key, and it is unique everywhere but the 32
 //!   inputs corpus D writes six times each — see
 //!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`,
-//!   which pins that exception and says what it costs. 935 032 records stand
-//!   for 934 872 distinct inputs. **Every corpus D figure quoted from this
+//!   which pins that exception and says what it costs. 935 692 records stand
+//!   for 935 532 distinct inputs. **Every corpus D figure quoted from this
 //!   crate is a count of RECORDS, not of distinct inputs**;
 //!   `corpus_d`'s own doc carries the arithmetic, and
 //!   `tests::what_corpus_d_says_about_distinct_inputs_is_not_what_its_records_say`
@@ -58,6 +58,8 @@
 //! derivation from RFC 9110's grammar; if it agreed with `http_semantics::auth`
 //! by construction it would grade nothing.
 
+// gate-exempt: trap="open, Digest realm=z — one field value shown in prose, a
+// tail this corpus names to contrast with its own; not a production of any RFC.
 mod oracle;
 /// FIPS 180-4's SHA-256, shared with `xtask` by path rather than copied.
 ///
@@ -128,16 +130,23 @@ fn main() {
 
 /// Writes every record, and the per-corpus counts to stderr.
 fn emit(out: &mut impl Write) -> std::io::Result<()> {
-  let mut counts = [0_usize; 6];
+  let mut counts = [0_usize; 10];
   corpus_a(out, &mut counts[0])?;
   corpus_b(out, &mut counts[1])?;
   corpus_c(out, &mut counts[2])?;
   corpus_d(out, &mut counts[3])?;
   corpus_e(out, &mut counts[4])?;
   corpus_f(out, &mut counts[5])?;
+  corpus_g(out, &mut counts[6])?;
+  corpus_h(out, &mut counts[7])?;
+  corpus_i(out, &mut counts[8])?;
+  corpus_j(out, &mut counts[9])?;
   out.flush()?;
   let total: usize = counts.iter().sum();
-  for (name, count) in ["A", "B", "C", "D", "E", "F"].iter().zip(counts) {
+  for (name, count) in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+    .iter()
+    .zip(counts)
+  {
     eprintln!("auth-corpus: {name} {count}");
   }
   eprintln!("auth-corpus: total {total}");
@@ -252,21 +261,19 @@ const TAILS: [&[u8]; 8] = [
 /// them surplus. 3648 records over 3488 distinct inputs.
 ///
 /// **So every figure quoted for corpus D counts records, and four of its five
-/// classes count some input more than once**: 25
-/// surplus `hider-excused`, 20 `no-probe`, 50 `yields`, 65
-/// `yields-underivable`, 0 `over-yield`. D's published row — 485 hiders, 90 of
-/// them unexcused, 16 over-yields — reads 455, 85 and 16 over distinct inputs.
+/// classes count some input more than once**: 30
+/// surplus `hider-excused`, 20 `no-probe`, 50 `yields`, 60
+/// `yields-underivable`, 0 `hider-unresolved`. The 90 records
+/// `evidence/auth-forbidden-byte-refuses` moved read 85 over distinct inputs.
 ///
-/// It is left in because the reproduction is the only validation this harness
-/// has: the figures it reproduces were computed over a corpus with this
-/// collapse in it, and a generator fixed here would move every one of them and
-/// take the agreement with it. What is done instead is to state both readings
-/// and pin both — `tests::the_axis_this_tree_answers_with_is_the_one_pinned`
-/// holds the record tally that reproduces them, and
+/// It is left in rather than deduplicated because fixing the generator would
+/// move every D figure and every D digest for a reason that is not a change in
+/// what the module answers. What is done instead is to state both readings and
+/// pin both — `tests::the_axis_this_tree_answers_with_is_the_one_pinned` holds
+/// the record tally, and
 /// `tests::what_corpus_d_says_about_distinct_inputs_is_not_what_its_records_say`
 /// holds the distinct-input tally a maintainer should quote from here on.
-/// Whoever re-derives D's figures should deduplicate and republish; until then,
-/// neither number is left for a reader to infer.
+/// Neither number is left for a reader to infer.
 ///
 /// # What no corpus varies, and why not here
 ///
@@ -281,11 +288,12 @@ const TAILS: [&[u8]; 8] = [
 /// carrying a bare comma and never a comma folded onto the end of an element.
 /// So the differential cannot see the pair at all.
 /// It is pinned by a unit test instead —
-/// `where_the_line_bound_recovers_from_is_where_the_scan_stood` in
-/// `http-semantics/src/auth/tests.rs`, beside the forbidden byte's. A row here
-/// would move the digests `tests` holds, so it belongs with the
-/// `QuotedScan::Invalid` offset fix, which has to re-derive them anyway; that
-/// test's fixtures are what to build it from.
+/// `the_line_bound_met_inside_a_value_leaves_the_two_spellings_the_same_answer`
+/// in `http-semantics/src/auth/tests.rs`, beside the forbidden byte's. That
+/// asymmetry is gone as of the commit that closed al8n/wren#77: the bound met
+/// with a value still open leaves no boundary either spelling can derive, so
+/// both answer `ChallengeSpansTooManyLines` and then
+/// `ChallengeBoundaryUnknown`. What the unit test now pins is the agreement.
 fn corpus_d(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
   let heads: [&[u8]; 4] = [b"Basic a=\"x", b"Basic a=x", b"Basic a=\"x\"", b"Basic"];
   let mids: [&[u8]; 6] = [b"j", b"b=2", b"", b" ", b",", b"\""];
@@ -415,6 +423,314 @@ fn corpus_f(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
   Ok(())
 }
 
+/// The tail corpus G adds to [`TAILS`]: a parameter whose value is a
+/// well-formed RFC 9110 §5.6.4 quoted-string carrying the probe, a comma, and
+/// more of its own data, CLOSING behind all of it.
+///
+/// The shape al8n/wren#77 was measured on, and the one no other corpus spells.
+/// Every quoted tail in [`TAILS`] leaves its string OPEN, so a reader could be
+/// right about all of them for the wrong reason — by treating an unterminated
+/// run as special — and still cut this one in half. Here nothing at all is
+/// wrong with the value: the string opens where §11.2 admits one, closes, and
+/// the commas between are `qdtext`.
+const CLOSED_OVER_THE_PROBE: &[u8] = b"x=\"c, Digest realm=z, junk\"";
+
+/// A challenge whose parameters are all DISTINCT and all on ONE field line, so
+/// that [`MAX_PARAMS_PER_CREDENTIAL`](http_semantics::auth::MAX_PARAMS_PER_CREDENTIAL)
+/// is the bound that fires.
+///
+/// # The witness no other corpus could reach
+///
+/// `TooManyParameters` occurred ZERO times in corpora A..F. Corpus E is the one
+/// that varies a parameter count, and it writes one parameter per FIELD LINE —
+/// so `MAX_CHALLENGE_LINES` always fired first and the parameter bound was never
+/// met. The strongest trigger of the recovery al8n/wren#77 is about was
+/// unreachable by the harness built to find it, and the differential was green
+/// over a defect it could not spell.
+///
+/// The bound is the one refusal here that RFC 9110 admits nothing about: §11.2
+/// bounds `#auth-param` nowhere, so every input this corpus writes CONFORMS, and
+/// what refuses it is this reader's own storage. That makes it the trigger a
+/// recovery may least afford to be wrong behind.
+fn corpus_g(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for params in 1..=20 {
+    for tail in TAILS.into_iter().chain([CLOSED_OVER_THE_PROBE]) {
+      let mut line = b"Basic p0=0".to_vec();
+      for index in 1..=params {
+        line.extend_from_slice(format!(", p{index}={index}").as_bytes());
+      }
+      line.extend_from_slice(b", ");
+      line.extend_from_slice(tail);
+      record(out, "G", &[&line], "challenges-params", count)?;
+    }
+  }
+  Ok(())
+}
+
+/// The continuation lines corpus H writes behind RFC 9110 §5.2's join.
+///
+/// Each is a whole field line, and the reading that left the head's value SHUT
+/// at the join opens an element of the outer `#challenge` list at its first
+/// byte — which §11.6.1 lets be a whole challenge, scheme and `1*SP` and
+/// parameters. The first two carry the probe INSIDE such a challenge's own
+/// quoted parameter, which is the shape that manufactures one; the rest are the
+/// neighbours that must not be refused with them.
+const CONTINUATIONS: [&[u8]; 9] = [
+  // A challenge whose quoted `realm` opens in front of the probe and never
+  // closes, so the probe is that realm's data under the reading that shut the
+  // head at the join.
+  b"Newauth realm=\"c, Digest realm=z",
+  // The same, CLOSED behind the probe — nothing at all wrong with that value,
+  // so a reader that is right about the unterminated one for the wrong reason
+  // (by treating an unterminated run as special) is still wrong here. The probe
+  // has bytes behind it that derive nothing, which is what a closing DQUOTE
+  // costs, so the axis grades this `no-probe` and the answer column is what
+  // pins it — the same trade [`CLOSED_OVER_THE_PROBE`] makes in corpus G.
+  b"Newauth realm=\"c, Digest realm=z, junk\"",
+  // Closed in FRONT of the probe, so both readings stand outside the string at
+  // the comma and the probe is a challenge whose boundary they agree on.
+  b"Newauth realm=\"c\", Digest realm=z",
+  // No quoted value anywhere in the challenge.
+  b"Newauth realm=c, Digest realm=z",
+  // A challenge whose first body element admits a value position nowhere.
+  b"Newauth p, Digest realm=z",
+  // An `auth-param` and not a challenge: no `1*SP` stands behind its token, so
+  // the opener is the element's OWN value position.
+  b"realm=\"c, Digest realm=z",
+  // The probe itself at the head of the line.
+  b"Digest realm=z",
+  // §11.2's `BWS` around the `=`, which §5.6.6's `parameter` does not have: the
+  // same opener, spelled with the whitespace.
+  b"Newauth realm = \"c, Digest realm=z",
+  // A HTAB where `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`
+  // writes `1*SP`, so no challenge opens here and the DQUOTE is at no value
+  // position of any reading.
+  b"Newauth\trealm=\"c, Digest realm=z",
+];
+
+/// The heads corpus H opens with: each leaves a RFC 9110 §5.6.4 quoted-string
+/// OPEN where its field line ends, so §5.2's join carries the element onto the
+/// continuation line and the readings of that element part AT the join.
+const OPEN_HEADS: [&[u8]; 4] = [
+  b"Basic a=\"x",
+  // A parameter already taken, so the list is open with a name in it.
+  b"Basic p=1, a=\"x",
+  // §11.2's one-name-once MUST, which refuses the element rather than the
+  // bytes behind it.
+  b"Basic a=1, a=\"x",
+  // A `quoted-pair` left half-written, whose escape §5.2's join comma spends.
+  b"Basic a=\"x\\",
+];
+
+/// The middle line corpus H's two-join spelling inserts.
+///
+/// It carries no DQUOTE, so the head's string is still open where this line
+/// ends — which is what keeps the reading that shut that string at the FIRST
+/// join from opening one of its own before the last line. RFC 9110 §5.6.4 ends
+/// a string only at a DQUOTE, and one this line held would either close the
+/// head's value here or stand behind a backslash, where §11.2 admits no value.
+const UNCLOSING: &[u8] = b"nothing here closes it";
+
+/// A challenge that begins on the continuation line RFC 9110 §5.2's join opens.
+///
+/// # The shape no other corpus spells
+///
+/// Corpora D and E put a tail behind a join, but every tail of theirs is read
+/// at the recovery cursor itself: `trap="open, Digest realm=z` is an
+/// `auth-param`, so the DQUOTE that hides the probe stands at the value
+/// position of the element the cursor is ON. RFC 9110 §11.6.1 admits a second
+/// reading of that element — it "might contain more than one challenge, and
+/// each challenge can contain a comma-separated list of authentication
+/// parameters" — under which the line opens a whole `challenge`, and THAT
+/// challenge's first parameter has its value position behind
+/// `auth-scheme 1*SP`, at an offset a check asked only at the cursor never
+/// looks at.
+///
+/// So a reader could answer every D and E record correctly and still hand a
+/// caller a challenge read out of the middle of a realm written on the
+/// continuation line. This corpus is that record, and its two-join spelling is
+/// the pin that one line's worth of state answers for a value spread over more.
+fn corpus_h(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for head in OPEN_HEADS {
+    for continuation in CONTINUATIONS {
+      for joins in [1_usize, 2] {
+        let mut lines: Vec<&[u8]> = Vec::with_capacity(3);
+        lines.push(head);
+        if joins == 2 {
+          lines.push(UNCLOSING);
+        }
+        lines.push(continuation);
+        let spelling = format!("challenges-join joins={joins}");
+        record(out, "H", &lines, &spelling, count)?;
+      }
+    }
+  }
+  Ok(())
+}
+
+/// The RFC 9110 §5.6.1.2 `OWS` corpus I writes between §5.2's join comma and
+/// the element behind it, each with the name it is recorded under.
+///
+/// `#element => [ element ] *( OWS "," OWS [ element ] )` hangs whitespace on
+/// BOTH sides of that comma, and §5.6.3's `OWS` is `*( SP / HTAB )`, so all
+/// four spell the same list and the element begins where the whitespace ends.
+const LIST_OWS: [(&str, &[u8]); 4] = [
+  ("sp", b" "),
+  ("htab", b"\t"),
+  ("sp-sp", b"  "),
+  ("sp-htab", b" \t"),
+];
+
+/// Corpus H's shapes with the list's own `OWS` in front of the continuation
+/// element.
+///
+/// # The shape corpus H holds fixed
+///
+/// Every line in [`CONTINUATIONS`] begins with the element's own first byte, so
+/// a reader that looked for either of RFC 9110 §11.6.1's two openers AT the
+/// offset §5.2's join left the cursor on found them both. §5.6.1.2 puts `OWS`
+/// behind its comma, and a sender that wrote one there moves the element — and
+/// both of its openers — off that offset. §5.6.2's `tchar` excludes SP and
+/// HTAB, so a check asked at the offset rather than at the element finds no
+/// `token` at all, reads the run as one holding no opener, and crosses the comma
+/// inside the continuation's own quoted value as if it were §5.6.1.2's
+/// separator.
+///
+/// `Basic a="x` and `<SP>realm="evil, Digest realm=z` are that value — the
+/// `<SP>` written visibly because one space is the whole of it — and the
+/// `Digest` handed back was read out of the middle of a `realm` the sender
+/// wrote whole. The `Newauth realm=...` continuations spell the same
+/// defect through §11.6.1's OTHER reading, where the opener stands behind
+/// `auth-scheme 1*SP` as well as behind the `OWS`.
+fn corpus_i(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for head in OPEN_HEADS {
+    for (name, ows) in LIST_OWS {
+      for continuation in CONTINUATIONS {
+        for joins in [1_usize, 2] {
+          let mut spaced = ows.to_vec();
+          spaced.extend_from_slice(continuation);
+          let mut lines: Vec<&[u8]> = Vec::with_capacity(3);
+          lines.push(head);
+          if joins == 2 {
+            lines.push(UNCLOSING);
+          }
+          lines.push(&spaced);
+          let spelling = format!("challenges-join-ows joins={joins} ows={name}");
+          record(out, "I", &lines, &spelling, count)?;
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+/// The challenges corpus J COMPLETES in front of the one it refuses, each
+/// leaving RFC 9110 §11.3's `#auth-param` list in a different state.
+///
+/// ```text
+/// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+const PREFIXES: [(&str, &[u8]); 8] = [
+  // Nothing at all: the refused element is the value's first, and no list has
+  // opened anywhere.
+  ("none", b""),
+  // A list, open behind it: `Basic` took the `1*SP`, so the element behind the
+  // comma may be one more parameter of it.
+  ("list", b"Basic a=1"),
+  // A `token68` body, which looks conclusive and is not. `token68 / #auth-param`
+  // is an unordered ABNF choice, so the same bytes read as `#auth-param` are a
+  // list whose first element derives nothing — and the list is open behind that
+  // fault.
+  ("token68", b"Bearer abc"),
+  // The padded spelling of the same run.
+  ("token68-pad", b"Bearer dGVzdA=="),
+  // A scheme with no body at all. `1*SP` is the body's only entrance, so no
+  // reading of these bytes opens a list.
+  ("bare", b"Bearer"),
+  // A list, and then the bare scheme that closes it in every reading.
+  ("list-bare", b"Basic a=1, Bearer"),
+  // A list, and then the `token68` that does NOT close it.
+  ("list-token68", b"Basic a=1, Bearer abc"),
+  // A bare scheme, and then the list that opens after it.
+  ("bare-list", b"Bearer, Basic a=1"),
+];
+
+/// The elements corpus J refuses at their `auth-scheme`, which is the refusal
+/// whose recovery asks whether a list is open at all.
+const SCHEME_FAULTS: [(&str, &[u8]); 3] = [
+  // `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` writes `1*SP`,
+  // and RFC 9110 §5.6.3's HTAB is not one — so a HTAB reaching an element
+  // rather than §5.6.1.2's comma opens no body.
+  ("htab", b"Broken\tjunk"),
+  // No leading `token` at all.
+  ("no-token", b"=x"),
+  // A byte behind the token the production admits nothing after.
+  ("punct", b"Broken;junk"),
+];
+
+/// The tails corpus J puts behind that refusal, carrying the probe.
+const TRAPS: [(&str, &[u8]); 5] = [
+  // A value position whose RFC 9110 §5.6.4 quoted-string opens over the probe
+  // and never closes.
+  ("open", b"x=\"open, Digest realm=z"),
+  // And one that CLOSES behind it, so nothing at all is wrong with the value.
+  ("closed-over", b"x=\"c, Digest realm=z, junk\""),
+  // Closed in FRONT of the probe: every reading stands outside the string at
+  // the comma, so the probe is a challenge whose boundary they agree on.
+  ("closed-front", b"x=\"c\", Digest realm=z"),
+  // No DQUOTE anywhere.
+  ("token", b"x=c, Digest realm=z"),
+  // The probe itself at the recovery cursor.
+  ("probe", b"Digest realm=z"),
+];
+
+/// A value whose refused challenge is NOT its first: challenges that complete
+/// stand in front of it, and what each of them leaves open is what decides
+/// whether a DQUOTE behind the refusal is at a value position at all.
+///
+/// # The shape no other corpus spells
+///
+/// Every generator in front of this one refuses the value's FIRST challenge, so
+/// the list state a recovery reads was written by the very challenge that
+/// failed. Nothing measures what an EARLIER challenge left behind. RFC 9110
+/// §11.6.1 is why that matters: an element this walk read as a scheme is one an
+/// earlier challenge's list could have taken as a malformed parameter of its
+/// own, so the list a refusal inherits is the value's rather than the
+/// challenge's — and a bit that only ever turns on cannot say that an
+/// intervening challenge closed it.
+///
+/// `Basic a=1, Bearer, Broken<HTAB>junk, x="open, Digest realm=z` is the value
+/// that needs the close: `Bearer` has no `1*SP`, so no reading of it opens a
+/// list, and every reading has `Basic`'s closed at the comma in front of it —
+/// yet `x` was read as a possible parameter and the `Digest` behind it hidden.
+///
+/// The rows this family exists to keep are the ones where the list is still
+/// open: `list`, `token68` and `list-token68`. A `token68` body is a fault
+/// under §11.3's other alternative, so the list stands open behind it and the
+/// probe really is inside a value under some reading — which makes crossing it
+/// an invention rather than a recovery. Those rows and the `bare` ones move in
+/// opposite directions, which is what makes this family a pin in both.
+fn corpus_j(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for (prefix_name, prefix) in PREFIXES {
+    for (fault_name, fault) in SCHEME_FAULTS {
+      for (trap_name, trap) in TRAPS {
+        let mut line = Vec::new();
+        if !prefix.is_empty() {
+          line.extend_from_slice(prefix);
+          line.extend_from_slice(b", ");
+        }
+        line.extend_from_slice(fault);
+        line.extend_from_slice(b", ");
+        line.extend_from_slice(trap);
+        let spelling =
+          format!("challenges-prefix prefix={prefix_name} fault={fault_name} trap={trap_name}");
+        record(out, "J", &[&line], &spelling, count)?;
+      }
+    }
+  }
+  Ok(())
+}
+
 // ──────────────────────────────── one record ─────────────────────────────────
 
 /// Writes the record for one case, choosing the entry point from `spelling`.
@@ -532,9 +848,11 @@ fn render_param(param: &http_semantics::auth::AuthParam<'_>) -> String {
 ///   is nothing there for any reader to show or hide.
 /// - `yields` — the reader showed it, and some derivation of the WHOLE value
 ///   reads it as a challenge. What the sender wrote is what the caller got.
-/// - `over-yield` — the reader showed it, some derivation puts it inside a
+/// - `over-yield` — the reader showed it, some reading puts it inside a
 ///   quoted-string, and none reads it as a challenge. The caller was handed a
-///   challenge built out of bytes a sender wrote as that value's data.
+///   challenge built out of bytes a sender wrote as that value's data. **This
+///   is the other number this module is driven to zero on**, and al8n/wren#77
+///   is what a non-zero one was.
 // gate-exempt: Basic =aaaaa, Digest realm=z — one malformed field value this
 // corpus feeds in, production-shaped only because a scheme name happens to be
 // followed by an `=`; not a production of any RFC.
@@ -550,11 +868,20 @@ fn render_param(param: &http_semantics::auth::AuthParam<'_>) -> String {
 ///   9110 §5.5 admits nowhere in a field value, there is no reading of those
 ///   bytes for the challenge to be the data of either. Corpus F is where that
 ///   subset lives; corpora A, B and C cannot spell it.
-/// - `hider-excused` — the reader did not show it, and some derivation puts it
+/// - `hider-excused` — the reader did not show it, and some reading puts it
 ///   inside a quoted-string. Not a defect: under that reading there is no
 ///   challenge there to show.
-/// - `hider-unexcused` — the same, with no such derivation. **This is the
-///   number this module is driven to zero on.**
+/// - `hider-unresolved` — the reader did not show it, no reading puts it inside
+///   a quoted-string, and the reader SAID SO: its answer carries
+///   `ChallengeBoundaryUnknown`, which is the walk telling the caller that the
+///   rest of the value is unread. A challenge nobody was shown and nobody was
+///   told about is the harm this axis exists against, and this is the other
+///   thing: RFC 9110 §11.4's user agent knows it has not seen the whole list
+///   and can act on that. It is a cost and not a defect, and `tests` pins its
+///   count with the three shapes it is made of.
+/// - `hider-unexcused` — the same, with no such reading and no such notice.
+///   **This is the number this module is driven to zero on**, beside
+///   `over-yield`.
 fn axis(lines: &[&[u8]]) -> String {
   let joined = join(lines);
   let Some(probe) = last_index_of(&joined, PROBE) else {
@@ -573,9 +900,22 @@ fn axis(lines: &[&[u8]]) -> String {
   }
   String::from(if verdict.excused {
     "hider-excused"
+  } else if says_the_rest_is_unread(lines) {
+    "hider-unresolved"
   } else {
     "hider-unexcused"
   })
+}
+
+/// Whether the `#challenge` walk told the caller that the rest of the value is
+/// unread.
+///
+/// `AuthError::ChallengeBoundaryUnknown` is that notice, and it is what
+/// separates a challenge silently hidden from one the caller is told it has not
+/// been shown.
+fn says_the_rest_is_unread(lines: &[&[u8]]) -> bool {
+  challenges(lines.iter().copied())
+    .any(|read| read.is_err_and(|fault| matches!(fault, AuthError::ChallengeBoundaryUnknown)))
 }
 
 /// Whether the `#challenge` walk yields the probe's scheme.
