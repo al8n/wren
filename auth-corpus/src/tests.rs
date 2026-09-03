@@ -61,7 +61,7 @@
 //!   them by is wider than the set, so the surplus is a third asserted column
 //!   rather than a caveat.
 //! - **The differential over the two derivations of `excused` cannot grade
-//!   what they share.** [`EXCUSED_DISAGREEMENTS`] is 0 over 1 839 285 offsets,
+//!   what they share.** [`EXCUSED_DISAGREEMENTS`] is 0 over 1 846 197 offsets,
 //!   and [`SHARED_JUDGEMENTS`] is what says which decisions that zero is not
 //!   about: 29 judgements the two take through one transcription, 17 of which
 //!   that gate answers nothing for. Eight now red a leaf property instead, and
@@ -326,7 +326,7 @@ fn a_high_byte_is_the_data_a_forbidden_one_is_not() {
 type Generator = fn(&mut Vec<u8>, &mut usize) -> std::io::Result<()>;
 
 /// The fourteen generators, in the order [`emit`] runs them.
-fn generators() -> [(&'static str, Generator); 15] {
+fn generators() -> [(&'static str, Generator); 16] {
   [
     ("A", corpus_a),
     ("B", corpus_b),
@@ -343,6 +343,7 @@ fn generators() -> [(&'static str, Generator); 15] {
     ("M", corpus_m),
     ("N", corpus_n),
     ("O", corpus_o),
+    ("P", corpus_p),
   ]
 }
 
@@ -471,7 +472,7 @@ fn the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart() {
     }
   }
   assert_eq!(
-    total, 948_544,
+    total, 949_696,
     "the corpus is the size every figure pinned here counts over"
   );
 
@@ -482,7 +483,7 @@ fn the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart() {
     .collect();
   shared.sort();
   assert_eq!(shared.len(), 32, "the groups that share a key: {shared:?}");
-  assert_eq!(counts.len(), 948_384, "distinct inputs behind the records");
+  assert_eq!(counts.len(), 949_536, "distinct inputs behind the records");
   for key in shared {
     assert_eq!(counts.get(key), Some(&6), "{key}");
     assert!(key.starts_with("D\t"), "outside corpus D: {key}");
@@ -593,7 +594,7 @@ type Pinned = (
 /// an answer moves a cell here, and the point is that it moves in the DIFF —
 /// where a reader can ask which cell and why — rather than in a figure nobody
 /// can recompute. Re-derive them from a failure's own message.
-const AXIS: [Pinned; 15] = [
+const AXIS: [Pinned; 16] = [
   (
     "A",
     262_136,
@@ -771,6 +772,25 @@ const AXIS: [Pinned; 15] = [
     4_854,
     5_103,
   ),
+  // A ZERO-TARGET standing at a non-zero number, pinned here and blessed
+  // nowhere: `the_three_classes_this_module_is_driven_to_zero_on_are_zero`
+  // REDS on this corpus. `hider-declined` is the walk declining a comma every
+  // reading of the value agrees about, and
+  // `the_cut_a_carried_value_covers_is_one_no_family_wrote` carries the
+  // witness and what it says.
+  (
+    "P",
+    1_152,
+    &[
+      ("hider-declined", 72),
+      ("hider-excused", 576),
+      ("hider-unresolved", 144),
+      ("yields", 144),
+      ("yields-underivable", 216),
+    ],
+    552,
+    1_608,
+  ),
 ];
 
 /// The three classes this module is driven to ZERO on, and the two it is not.
@@ -922,7 +942,7 @@ const ZERO_TARGETS: [&str; 3] = ["over-yield", "hider-unexcused", "hider-decline
 /// neither holds — is a zero-target rather than a cost. Corpus D's 18 and
 /// corpus E's 15 split 12/6 and 10/5 between the two once the line was drawn;
 /// the totals did not move and no record left the pair.
-const UNRESOLVED: [(&str, usize); 15] = [
+const UNRESOLVED: [(&str, usize); 16] = [
   ("A", 0),
   ("B", 0),
   ("C", 10),
@@ -972,6 +992,10 @@ const UNRESOLVED: [(&str, usize); 15] = [
   // disagree about, which is the cost this class counts and not a defect. What
   // this family found instead is in `over-yield` and in `hider-unexcused`.
   ("O", 72),
+  // Corpus P's 144 are the rows where the walk declined a comma the readings
+  // DO disagree about — the cost this class counts. The 72 it declined where
+  // they do not are `hider-declined` and are a finding.
+  ("P", 144),
 ];
 
 /// Corpus A read the three ways `challenges` is called on it.
@@ -1106,7 +1130,7 @@ const MOVED: &str = "an answer moved. `cargo run -p xtask -- auth-diff <base-rev
 /// carries no information about WHAT moved, so blessing one is a strictly
 /// blind act unless the `auth-diff` run that says what moved was actually made.
 /// [`MOVED`] is the failure message for that reason, and it names the command.
-const ANSWERS: [(&str, &str); 15] = [
+const ANSWERS: [(&str, &str); 16] = [
   (
     "A",
     "a7390db7460bf1c1405a1829405b4a32ae7729ccda5cfa640598e0328826c486",
@@ -1167,9 +1191,13 @@ const ANSWERS: [(&str, &str); 15] = [
     "O",
     "99b31741ea19915fd80464c1d4fe8cf93fdd748d83c1dfd4146dfb1fbc06e11c",
   ),
+  (
+    "P",
+    "4051295e29b5ac64cb6d30bdcb4a95c3f6d608fc0bb75f2e8c92f2bc6a2d61d3",
+  ),
 ];
 
-const WHOLE: &str = "c4943e11fcc9dc70954c449b5da8cdd49d37639c79b1ea58cf7d376c4f350fb6";
+const WHOLE: &str = "096ab2536a697f1e1209b44159a94aad04b30bf0c238838171c7ad89ea907fc1";
 
 /// Feeds `hash` what `auth-diff` digests: each record's `answer` column and the
 /// newline behind it, in record order.
@@ -1240,7 +1268,7 @@ fn the_answers_this_tree_gives_are_the_ones_the_differential_digested() {
 ///
 /// Its total per corpus is [`AXIS`]'s fault count, asserted below, so a parse
 /// that silently dropped a fault reds rather than lowering a row.
-const FAULTS: [(&str, &[(&str, usize)]); 15] = [
+const FAULTS: [(&str, &[(&str, usize)]); 16] = [
   (
     "A",
     &[
@@ -1390,6 +1418,15 @@ const FAULTS: [(&str, &[(&str, usize)]); 15] = [
       ("MalformedScheme", 2_427),
       ("TooManyParameters", 798),
       ("UnterminatedQuotedString", 684),
+    ],
+  ),
+  (
+    "P",
+    &[
+      ("ChallengeBoundaryUnknown", 648),
+      ("DuplicateParameter", 288),
+      ("MalformedParameter", 576),
+      ("UnterminatedQuotedString", 96),
     ],
   ),
 ];
@@ -2288,7 +2325,7 @@ const N_SPAN_DERIVES: [(&str, Option<bool>, bool); 15] = [
 ///
 /// # And the denominator is not the coverage
 ///
-/// 1 839 285 offsets and 0 disagreements is not *these two derivations agree
+/// 1 846 197 offsets and 0 disagreements is not *these two derivations agree
 /// about everything*. **A differential over two derivations grades the
 /// composition and never the transcriptions they share**, and
 /// [`SHARED_JUDGEMENTS`] is the enumeration of what that leaves out: 29
@@ -2299,7 +2336,7 @@ const N_SPAN_DERIVES: [(&str, Option<bool>, bool); 15] = [
 /// properties, and the differential itself still answers 0 for all 17 of them:
 /// what changed is that eight now red somewhere else. Whoever reads this number
 /// should read that table in the same breath.
-const EXCUSED_REACH: [(&str, usize); 15] = [
+const EXCUSED_REACH: [(&str, usize); 16] = [
   ("A", 330_347),
   ("B", 521_808),
   ("C", 720_896),
@@ -2315,6 +2352,7 @@ const EXCUSED_REACH: [(&str, usize); 15] = [
   ("M", 15_852),
   ("N", 164_864),
   ("O", 32_598),
+  ("P", 6_912),
 ];
 
 /// The number of offsets the two derivations of `excused` answer differently
@@ -2379,7 +2417,7 @@ const EXCUSED_REACH: [(&str, usize); 15] = [
 /// because the two walks consume `boundary`, `token_end` and `token68_end` at
 /// different places.
 ///
-/// So this 0 means: over 1 839 285 offsets, the two COMPOSITIONS agree. It does
+/// So this 0 means: over 1 846 197 offsets, the two COMPOSITIONS agree. It does
 /// not mean the readings they compose are right. Eight of the seventeen are now
 /// answered by a property instead — [`WRONGNESS_GATES`] is the whole set of
 /// things in this crate that make a wrongness claim — and nine are answered by
@@ -2388,6 +2426,172 @@ const EXCUSED_REACH: [(&str, usize); 15] = [
 /// `readings`'s module doc names the other thing the two are not independent
 /// about — where the free regime starts and stops — and says plainly that the
 /// two agreeing about it is not evidence either.
+/// How many offsets the two derivations of an ELEMENT START are held equal at,
+/// per corpus.
+///
+/// A REACH and not a target, for [`EXCUSED_REACH`]'s reason. The offsets are
+/// the ones `oracle::derives_as_a_challenge` is actually asked at — the probe —
+/// together with every RFC 9110 §5.6.1.2 comma in front of it and the far side
+/// of each of those commas, which is where that expansion puts the element a
+/// comma separates. The comma offsets themselves are in the set because an
+/// EMPTY element begins at one, which is a start both derivations must find.
+const ELEMENT_START_REACH: [(&str, usize); 16] = [
+  ("A", 402_767),
+  ("B", 668_888),
+  ("C", 848_336),
+  ("D", 59_280),
+  ("E", 6_880),
+  ("F", 384),
+  ("G", 3_940),
+  ("H", 464),
+  ("I", 1_856),
+  ("J", 888),
+  ("K", 1_856),
+  ("L", 960),
+  ("M", 29_184),
+  ("N", 313_984),
+  ("O", 55_140),
+  ("P", 11_520),
+];
+
+/// What the two derivations of an element start disagree about, over every
+/// offset [`ELEMENT_START_REACH`] counts.
+///
+/// **Not a zero and not a target.** `oracle::starts_an_element`'s doc carries
+/// what this measures, which way round it goes, and what its two attempted
+/// fixes cost — one of them 172 disagreements in the other direction and 313
+/// moved axis verdicts. It is pinned so the divergence cannot move quietly
+/// while somebody reconciles the two walks.
+const ELEMENT_START_DISAGREEMENTS: usize = 6_415;
+
+/// How many of those are offsets `oracle::derives_as_a_challenge` is actually
+/// asked at, which is the only kind an axis verdict can turn on.
+const ELEMENT_START_DISAGREEMENTS_AT_A_PROBE: usize = 323;
+
+/// What the two derivations of an element start SHARE, and what this
+/// differential therefore cannot see.
+///
+/// **A differential grades the composition and never the transcriptions the
+/// two run through**, which [`SHARED_JUDGEMENTS`] is the enumeration of for the
+/// `excused` pair. For this pair the shared surface is one item.
+/// `oracle::starts_an_element` imports exactly `skip_ows` from
+/// [`oracle`](crate::oracle) and writes its own comma scan inline;
+/// `readings::element_starts` runs through `skip_ows` too, in `boundary`,
+/// `value_position` and `cross`. Everything else `readings` shares with the
+/// oracle — `token_end`, `skip_sp`, `token68_end`, `scan_quoted`,
+/// `raw_comma_end`, `open_at`, `boundary`, `value_position` — is on one side of
+/// THIS question only, so a defect in it moves `readings` alone and this gate
+/// sees it.
+///
+/// Both halves measured against the pristine source, each injection applied
+/// alone:
+///
+/// | injection | axis verdicts moved | this differential |
+/// |---|---|---|
+/// | `skip_ows` skips SP and no longer HTAB — SHARED | 21 875 | 6 415 -> 6 387 |
+/// | `readings`'s own `cross` stops skipping the comma's `OWS` — not shared | — | 6 415 -> 456 815 |
+///
+/// So the gate is emphatically not vacuous, and it is nearly blind to the one
+/// thing the two run through: a `skip_ows` that lost §5.6.3's HTAB moves 21 875
+/// answers and moves this count by 28. What catches that injection is
+/// [`ZERO_TARGETS`] — `over-yield`, `hider-unexcused` and `hider-declined` all
+/// go non-zero under it — and not this differential, which is the same division
+/// of labour [`SHARED_JUDGEMENTS`]'s `caught_by` column records.
+///
+///     cargo run -q --release -p auth-corpus -- <out>      # the axis column
+///     cargo test -p auth-corpus the_two_derivations_of_an_element_start
+const ELEMENT_START_SHARED: &str = "skip_ows";
+
+/// The offsets an element-start question is asked at, for one record.
+fn element_start_questions(line: &str) -> (Vec<u8>, Vec<usize>) {
+  let [_, case, _, _, _] = columns(line);
+  let lines: Vec<Vec<u8>> = case.split('|').map(unescape).collect();
+  let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+  let joined = join(&refs);
+  let Some(probe) = last_index_of(&joined, PROBE) else {
+    return (joined, Vec::new());
+  };
+  let mut at: Vec<usize> = vec![probe];
+  for (comma, _) in joined
+    .iter()
+    .enumerate()
+    .take(probe)
+    .filter(|&(_, &byte)| byte == b',')
+  {
+    at.push(comma);
+    // The far side of that comma, with the `OWS` §5.6.1.2 hangs on it skipped —
+    // read with this file's own `past_ows` rather than `oracle`'s `skip_ows`,
+    // so that the QUESTIONS this differential asks do not move when the
+    // transcription the two ANSWERS share does.
+    at.push(past_ows(&joined, comma.saturating_add(1)));
+  }
+  at.sort_unstable();
+  at.dedup();
+  (joined, at)
+}
+
+#[test]
+fn the_two_derivations_of_an_element_start_answer_alike() {
+  // `oracle::starts_an_element` reads RFC 9110 §5.6.1.2 at ONE offset;
+  // `readings::element_starts` is the set of offsets the walk of every reading
+  // stands at. Two compositions, and this is the gate that holds them to each
+  // other — the shape al8n/wren#76 was filed over, asked about the rule this
+  // branch added.
+  let mut differ = 0usize;
+  let mut probes = 0usize;
+  let mut named: Vec<String> = Vec::new();
+  for ((name, generator), (pinned, reach)) in generators().into_iter().zip(ELEMENT_START_REACH) {
+    assert_eq!(name, pinned, "the two tables are in the same order");
+    let mut asked = 0usize;
+    for line in records(generator) {
+      let (joined, offsets) = element_start_questions(&line);
+      if offsets.is_empty() {
+        continue;
+      }
+      let probe = probe_at(&joined);
+      let walked = crate::readings::element_starts(&joined);
+      for at in offsets {
+        asked = asked.saturating_add(1);
+        let local = crate::oracle::starts_an_element(&joined, at);
+        if local == walked.contains(&at) {
+          continue;
+        }
+        differ = differ.saturating_add(1);
+        // The offsets `derives_as_a_challenge` is ACTUALLY asked at, counted
+        // apart from the rest: those are the ones an axis verdict turns on.
+        probes = probes.saturating_add(usize::from(at == probe));
+        if named.len() < 8 {
+          named.push(format!(
+            "corpus {name} at {at}: oracle::starts_an_element {local}, \
+             readings::element_starts {} — {}",
+            walked.contains(&at),
+            escape(&joined)
+          ));
+        }
+      }
+    }
+    assert_eq!(
+      asked, reach,
+      "corpus {name}: the offsets an element start is asked at"
+    );
+  }
+  assert!(
+    ELEMENT_START_SHARED.contains("skip_ows"),
+    "the one transcription this differential runs both derivations through"
+  );
+  // A PIN of a measured divergence, not a target and not a zero. The two
+  // derivations part, always the same way round, and `oracle::starts_an_element`
+  // carries what its own two attempted fixes cost.
+  assert_eq!(
+    differ, ELEMENT_START_DISAGREEMENTS,
+    "the two derivations of an element start part: {named:?}"
+  );
+  assert_eq!(
+    probes, ELEMENT_START_DISAGREEMENTS_AT_A_PROBE,
+    "and these many of them are offsets an axis verdict turns on"
+  );
+}
+
 const EXCUSED_DISAGREEMENTS: usize = 0;
 
 #[test]
@@ -3948,7 +4152,7 @@ fn the_notice_that_separates_the_two_classes_is_read_from_the_answer() {
 /// boundary is on a line this reader may not hold — and these eleven records
 /// are exactly the ones whose value CLOSES that string on a line past the
 /// bound. Corpora D and E are the only families that can write one.
-const CONFORMING: [(&str, usize); 15] = [
+const CONFORMING: [(&str, usize); 16] = [
   ("A", 0),
   ("B", 0),
   ("C", 0),
@@ -3964,6 +4168,7 @@ const CONFORMING: [(&str, usize); 15] = [
   ("M", 0),
   ("N", 0),
   ("O", 0),
+  ("P", 0),
 ];
 
 #[test]
@@ -5230,6 +5435,157 @@ fn one_value_spelled_over_three_line_counts_answers_two_ways() {
       "the `{spelling}` spelling's notice"
     );
   }
+}
+
+/// One value, over an element the SP that decides everything stands in.
+///
+/// Corpus P's `head=dup close=clean` rows refuse at RFC 9110 §11.2's
+/// one-name-once MUST — a bound of THIS reader's — over an element the grammar
+/// derives whole. `the_cut_a_carried_value_covers_is_one_no_family_wrote`
+/// carries what that costs.
+const SETTLED_COMMA_DECLINED: &[u8] = b"Basic a=1, a=\"x,p,q\",x=\"c\", Digest realm=z";
+
+#[test]
+fn the_cut_a_carried_value_covers_is_one_no_family_wrote() {
+  // Corpus P is the first family whose dimension is WHERE the field lines are
+  // cut over a run the carried value covers. Corpus O varies a cut too, but
+  // only inside a run of EMPTY elements in front of a continuation's first
+  // parameter; `Recovery::floor` is an offset into the run this one cuts.
+  let p = records(corpus_p);
+  assert_eq!(
+    p.len(),
+    1_152,
+    "two heads by four runs by two closes by two spacings by six traps, over \
+     every subset of the commas the carry covers"
+  );
+
+  // Every spelling of a cell is ONE value, asserted as byte identity before
+  // anything is asked about answers. RFC 9110 §5.2 contributes exactly the
+  // comma each cut took out.
+  let mut cells: HashMap<String, Vec<&String>> = HashMap::new();
+  for line in &p {
+    let [_, _, spelling, _, _] = columns(line);
+    let cell = spelling
+      .split(' ')
+      .filter(|field| !field.starts_with("cuts="))
+      .collect::<Vec<_>>()
+      .join(" ");
+    cells.entry(cell).or_default().push(line);
+  }
+  assert_eq!(cells.len(), 192, "the cells the cut axis is taken over");
+  let mut parted = 0usize;
+  let mut spellings = 0usize;
+  for (cell, rows) in &cells {
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    let mut answers: Vec<&str> = Vec::new();
+    for line in rows {
+      let [_, case, _, _, answer] = columns(line);
+      let lines: Vec<Vec<u8>> = case.split('|').map(unescape).collect();
+      let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+      values.push(join(&refs));
+      answers.push(answer);
+    }
+    for value in &values {
+      assert_eq!(
+        value, &values[0],
+        "corpus P: the cuts of {cell} are not one value"
+      );
+    }
+    spellings = spellings.saturating_add(rows.len());
+    if answers.iter().any(|answer| *answer != answers[0]) {
+      parted = parted.saturating_add(1);
+    }
+  }
+  assert_eq!(spellings, 1_152, "every spelling belongs to a cell");
+
+  // **The measurement.** `CUTS_THAT_PART` counts 36
+  // cells over corpus O's cut axis, and its doc calls that a lower bound
+  // because no family cut a value anywhere but inside a leading empty run.
+  // This is the run the carry covers, and the class is 104 of 192 cells —
+  // more than half of everything this family writes, against 36 of corpus O's
+  // 1 176.
+  assert_eq!(
+    parted, 104,
+    "corpus P: the cells whose cuts answer differently"
+  );
+
+  // And a THIRD finding, from a different cause than the cut. All 72 are
+  // `head=dup close=clean`: the element the carry ends in DERIVES as an
+  // `auth-param`, so the DQUOTE at its value position is FORCED and the comma
+  // inside that value is the value's data under EVERY reading — `settled` is
+  // what says so, and `hider-declined` is the class for declining a boundary
+  // no reading disagrees about.
+  //
+  // What the walk does instead is give up at that comma. `some_reading_holds`
+  // answers `true` for it, which is correct and is not a reason to stop: a
+  // comma every reading holds inside a value is one the element does not end
+  // at, so the walk should cross it as data and look for the offset where the
+  // element DOES end. `refused_element_end` answers `None` at the first raw
+  // comma instead, and the rest of the value goes unread.
+  //
+  // It is the same shape as [`CUTS_THAT_PART`]'s — a recovery that stops at
+  // the first comma rather than at the element's real end — reached from the
+  // other side, and it is left standing here for the same reason: closing it
+  // is a redesign of the single-opener argument rather than a patch.
+  let declined: Vec<&String> = p
+    .iter()
+    .filter(|line| columns(line)[3] == "hider-declined")
+    .collect();
+  assert_eq!(
+    declined.len(),
+    72,
+    "corpus P: the boundaries declined for nothing"
+  );
+  for line in &declined {
+    let [_, _, spelling, _, answer] = columns(line);
+    assert!(
+      spelling.contains(" head=dup ") && spelling.contains(" close=clean "),
+      "corpus P: a hider-declined outside the shape this test names: {line}"
+    );
+    assert!(
+      answer.contains("Err(DuplicateParameter)"),
+      "corpus P: a hider-declined refused by something other than a bound: {line}"
+    );
+    assert!(
+      answer.contains("Err(ChallengeBoundaryUnknown)"),
+      "corpus P: a hider-declined with no notice: {line}"
+    );
+  }
+
+  // The same fact over the one-line witness, with the ORACLE's own verdict
+  // beside it and no reader in the derivation.
+  let probe = probe_at(SETTLED_COMMA_DECLINED);
+  let verdict = oracle::read(SETTLED_COMMA_DECLINED, probe);
+  assert!(verdict.derives, "a challenge stands at the probe");
+  // `read`'s walk applies §11.2's one-name-once MUST, so the repeated `a` ends
+  // every derivation there and nothing reaches the probe. `covers` deliberately
+  // does NOT apply it — its own doc carries why — so the DQUOTE at `a`'s value
+  // position is still FORCED and the comma inside `"x,p,q"` is that value's
+  // data under every reading `covers` admits. Those two are not in conflict:
+  // the first is about a derivation of the WHOLE value and the second about
+  // what a run of bytes can be read as, which is the distinction this axis is
+  // built on.
+  assert!(
+    !verdict.reached,
+    "§11.2's MUST ends every derivation at the repeated name"
+  );
+  assert!(
+    !verdict.excused,
+    "no reading holds the probe inside a value"
+  );
+  assert!(
+    oracle::every_comma_in_front_is_settled(SETTLED_COMMA_DECLINED, probe),
+    "and every comma in front of it is one all readings agree about — \
+     the comma inside `\"x,p,q\"` is that value's data in EVERY one of them"
+  );
+  assert!(
+    !yields_the_probe(&[SETTLED_COMMA_DECLINED]),
+    "the challenge this walk declines to place"
+  );
+  assert!(
+    says_the_rest_is_unread(&[SETTLED_COMMA_DECLINED]),
+    "and it does say so, which is all that keeps it out of `hider-unexcused`"
+  );
 }
 
 /// Whether every cell whose cuts answer differently has the shape

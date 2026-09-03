@@ -168,8 +168,44 @@ pub fn covered(value: &[u8], probe: usize) -> bool {
 /// about an offset afterwards, so this cannot cut its own search short on one,
 /// and what it found can be printed.
 pub fn openable(value: &[u8]) -> BTreeSet<usize> {
+  walk(value).0
+}
+
+/// Every offset at which some reading of `value` begins an element of the OUTER
+/// RFC 9110 §5.6.1.2 `#challenge` list.
+///
+/// ```text
+/// #element  => [ element ] *( OWS "," OWS [ element ] )
+/// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+///
+/// The second derivation of the fact `oracle::starts_an_element` answers, and
+/// it is reached the other way round: that one reads §5.6.1.2 at ONE offset —
+/// the value's first byte, or the far side of a comma with the `OWS` that comma
+/// carries behind it — and this one is the set of offsets the walk of every
+/// reading actually stands at. A position no reading reaches is one no
+/// challenge can stand at, and a local rule cannot see that.
+///
+/// The body position §11.3's `1*SP` opens is NOT in the set, and that is the
+/// distinction both derivations exist for: [`element`] passes it to
+/// [`parameter`], [`token68_end`] and [`cross`] as an offset, and pushes only
+/// what stands BEHIND it as a state. `oracle::covers` carries the same fact as
+/// its `Start` and reaches it a third way.
+pub fn element_starts(value: &[u8]) -> BTreeSet<usize> {
+  walk(value).1
+}
+
+/// The one walk both answers are taken from: where a string may open, and where
+/// an element of the outer list may begin.
+///
+/// The two are one walk because they are one derivation asked two questions.
+/// What they are held against are `oracle::covers` and
+/// `oracle::starts_an_element`, which are two compositions of the OTHER
+/// derivation.
+fn walk(value: &[u8]) -> (BTreeSet<usize>, BTreeSet<usize>) {
   let mut opens = BTreeSet::new();
   let mut seen: BTreeSet<State> = BTreeSet::new();
+  let mut starts: BTreeSet<usize> = BTreeSet::new();
   // The head of the value: its first element, with no `#auth-param` list open
   // and nothing faulted in front of it.
   let mut work = vec![State {
@@ -181,9 +217,10 @@ pub fn openable(value: &[u8]) -> BTreeSet<usize> {
     if !seen.insert(state) {
       continue;
     }
+    starts.insert(state.at);
     element(value, state, &mut opens, &mut work);
   }
-  opens
+  (opens, starts)
 }
 
 /// One element start a reading of the value stands at.

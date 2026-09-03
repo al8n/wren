@@ -20,13 +20,13 @@
 //! corpus <TAB> case <TAB> spelling <TAB> axis <TAB> answer
 //! ```
 //!
-//! - `corpus` — which generator produced the input: `A`..`O`.
+//! - `corpus` — which generator produced the input: `A`..`P`.
 //! - `case` — the field lines, escaped, `|`-separated. `(corpus, case,
 //!   spelling)` is the record's key, and it is unique everywhere but the 32
 //!   inputs corpus D writes six times each — see
 //!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`,
-//!   which pins that exception and says what it costs. 948 544 records stand
-//!   for 948 384 distinct inputs — the two figures
+//!   which pins that exception and says what it costs. 949 696 records stand
+//!   for 949 536 distinct inputs — the two figures
 //!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`
 //!   asserts, and they are quoted from it rather than counted again here.
 //!   **Every corpus D figure quoted from this
@@ -136,7 +136,7 @@ fn main() {
 
 /// Writes every record, and the per-corpus counts to stderr.
 fn emit(out: &mut impl Write) -> std::io::Result<()> {
-  let mut counts = [0_usize; 15];
+  let mut counts = [0_usize; 16];
   corpus_a(out, &mut counts[0])?;
   corpus_b(out, &mut counts[1])?;
   corpus_c(out, &mut counts[2])?;
@@ -152,10 +152,11 @@ fn emit(out: &mut impl Write) -> std::io::Result<()> {
   corpus_m(out, &mut counts[12])?;
   corpus_n(out, &mut counts[13])?;
   corpus_o(out, &mut counts[14])?;
+  corpus_p(out, &mut counts[15])?;
   out.flush()?;
   let total: usize = counts.iter().sum();
   for (name, count) in [
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
   ]
   .iter()
   .zip(counts)
@@ -710,6 +711,33 @@ const TRAPS: [(&str, &[u8]); 6] = [
   // below spells the `=` tight, which is the spelling that reaches
   // `read_challenge`'s scheme fault and has recovered from the element's own
   // first byte since al8n/wren#77.
+  //
+  // # Which shapes of this ambiguity a FAMILY writes, and which only a witness
+  //
+  // They are all one class — an element §11.6.1 reads two ways, where the
+  // walk took one and recovered as if the other did not exist — so what is
+  // crossed and what is merely argued is worth naming in one place, and this
+  // is it.
+  //
+  // - `token BWS "=" BWS value` with a SP in the `BWS`, which is the shape
+  //   above: a FAMILY writes it, four times over — this row, `CONTINUATIONS`'s
+  //   `realm<SP>=<SP>"c`, `SPANS`'s `bws-sp`, and `O_BODIES`'s `bws`.
+  // - The same `BWS` spelled SP-then-HTAB, which the walk refuses at the body
+  //   POSITION rather than over the body's first element. **No family writes
+  //   it**; `tests::BWS_INVENTION_MIXED` is a one-line witness and nothing
+  //   else.
+  // - A challenge read at an element no `auth-param` begins at, with a list
+  //   open IN FRONT of it, whose body's first element is strung. **No family
+  //   writes it either** — `a_challenge_no_parameter_begins_at_recovers_at_its_body`
+  //   in `http-semantics` is the witness, and a mutation is what found that it
+  //   was needed.
+  // - A `token68` body that a `#auth-param` reading also derives, and a bare
+  //   `auth-scheme` that an `auth-param` reading also derives. **Neither has a
+  //   family and neither can**: the productions never derive one element
+  //   between them, which `http_semantics::auth`'s
+  //   `the_two_branches_are_never_both_derivable` runs over the alphabets and
+  //   `Challenges::list_open`'s doc argues for the scheme. Those two are prose,
+  //   and the prose is an argument rather than a gap.
   ("bws-open", b"x = \"open, Digest realm=z"),
   // And one that CLOSES behind it, so nothing at all is wrong with the value.
   ("closed-over", b"x=\"c, Digest realm=z, junk\""),
@@ -1638,6 +1666,145 @@ fn corpus_o(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
                 );
                 record(out, "O", &refs, &spelling, count)?;
               }
+            }
+          }
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+/// The heads corpus P opens with: each leaves an RFC 9110 §5.6.4 quoted-string
+/// OPEN where its own bytes end, so the value that string holds runs on through
+/// every element behind it until a DQUOTE closes it.
+const P_HEADS: [(&str, &[u8]); 2] = [
+  // A body's first element, with the list open and no name used yet, so the
+  // only fault the value can carry is the one [`P_CLOSES`] writes.
+  ("open", b"Basic a=\"x"),
+  // The same name used once already, so the element the carry ends in repeats
+  // it. §11.2's one-name-once MUST is a bound of THIS reader's rather than a
+  // fault of the grammar's, which is what makes the epoch DERIVABLE wherever
+  // the element itself parses — the other half of what a recovery behind a
+  // carried value has to answer.
+  ("dup", b"Basic a=1, a=\"x"),
+];
+
+/// The elements the carried value covers, which is corpus P's own axis.
+///
+/// ```text
+/// #element      => [ element ] *( OWS "," OWS [ element ] )
+/// quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+/// ```
+///
+/// None of them holds a DQUOTE, and that is a fact about what a carry IS rather
+/// than a choice this family makes: a §5.6.4 string closes at the first
+/// unescaped DQUOTE behind its opener, so an element carrying one would END the
+/// carry rather than stand inside it. `Recovery`'s own doc rests on the same
+/// fact — it is why every reading that shut the head's DQUOTE arrives at the
+/// line the walk holds OUTSIDE every string.
+///
+/// What varies is what each element is to the reading that DID shut it: `p` is
+/// a bare `auth-scheme`, so that reading has a whole challenge there;
+/// `y=1` is an `auth-param`, so it has none.
+const P_RUNS: [(&str, &[&[u8]]); 4] = [
+  ("bare", &[b"p"]),
+  ("bare-bare", &[b"p", b"r"]),
+  ("param", &[b"y=1"]),
+  ("bare-param", &[b"p", b"y=1"]),
+];
+
+/// The element the closing DQUOTE stands in, and what it leaves behind it.
+///
+/// `trails` puts bytes behind the close, and RFC 9110 §11.2's
+/// `( token / quoted-string )` is one alternative taken WHOLE — so the carried
+/// element derives nothing and the fault is the grammar's. `clean` leaves only
+/// the list's own `OWS` there, so the element derives and only [`P_HEADS`]'s
+/// repeated name can refuse it.
+const P_CLOSES: [(&str, &[u8]); 2] = [("trails", b"q\"junk"), ("clean", b"q\"")];
+
+/// A value whose refused element's quoted value is carried across RFC 9110
+/// §5.2's joins, with the join falling anywhere in the run that value covers.
+///
+/// # The axis corpora A..O hold fixed
+///
+/// **Where the field lines are cut, over a run the carried value covers.**
+/// §5.2 makes the lines one value — "concatenated in order, with each field
+/// line value separated by a comma" — so where a sender cut them changes no
+/// byte of it. Corpus O varies a cut too, but only inside a run of EMPTY
+/// elements in front of a continuation's first parameter; no family cuts a
+/// value inside a run the carry runs THROUGH, and that is the run
+/// `Recovery::floor` is an offset into.
+///
+/// `Basic a="x,p, q"junk, Digest realm=z` is the shape in one line. The head's
+/// DQUOTE opens a value that runs through `p` and closes at the DQUOTE behind
+/// `q`; `junk` stands behind that close, so §11.2 derives the element nowhere
+/// and the challenge is refused. Where the recovery then stands, and which of
+/// the value's commas stand ON the line it holds, is decided entirely by which
+/// of them the sender wrote as a join.
+///
+/// # What it crosses
+///
+/// - **Which commas are joins**, every subset of them — the family's own
+///   dimension. A run of `n` elements puts `n + 1` commas between the head and
+///   the close, and each subset is one spelling of the same value: the empty
+///   subset is the whole value on one field line, and the full one puts every
+///   element on its own.
+/// - **The run**, [`P_RUNS`], and with it what the reading that shut the head's
+///   DQUOTE finds there.
+/// - **What opened the carry and what it costs**, [`P_HEADS`].
+/// - **What closes it**, [`P_CLOSES`].
+/// - **How the commas are spelled**, `tight` against §5.6.3's `OWS` behind each
+///   of them, which §5.6.1.2 admits on both sides.
+/// - **The trap**, [`TRAPS`], which carries the probe.
+fn corpus_p(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for (head_name, head) in P_HEADS {
+    for (run_name, run) in P_RUNS {
+      for (close_name, close) in P_CLOSES {
+        for (spacing_name, ows) in [("tight", false), ("ows", true)] {
+          let separator: &[u8] = if ows { b", " } else { b"," };
+          for (trap_name, trap) in TRAPS {
+            // The value, and where every comma the carry covers stands in it.
+            // The comma in front of the trap is not among them: it stands
+            // BEHIND the close, so cutting there is corpus O's question and
+            // not this family's.
+            let mut value = head.to_vec();
+            let mut carried: Vec<usize> = Vec::new();
+            for element in run.iter().copied().chain([close]) {
+              carried.push(value.len());
+              value.extend_from_slice(separator);
+              value.extend_from_slice(element);
+            }
+            value.extend_from_slice(separator);
+            value.extend_from_slice(trap);
+            for mask in 0..(1_u32 << carried.len()) {
+              let mut lines: Vec<Vec<u8>> = Vec::new();
+              let mut from = 0_usize;
+              let mut cuts = String::new();
+              for (index, &at) in carried.iter().enumerate() {
+                if mask & (1_u32 << index) == 0 {
+                  continue;
+                }
+                if !cuts.is_empty() {
+                  cuts.push('.');
+                }
+                cuts.push_str(&index.saturating_add(1).to_string());
+                // §5.2 puts a comma between two field lines, so cutting the
+                // value AT one of its own commas and dropping that byte spells
+                // the same value over one more line.
+                lines.push(value.get(from..at).unwrap_or_default().to_vec());
+                from = at.saturating_add(1);
+              }
+              lines.push(value.get(from..).unwrap_or_default().to_vec());
+              if cuts.is_empty() {
+                cuts.push('-');
+              }
+              let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+              let spelling = format!(
+                "challenges-carried-cut head={head_name} run={run_name} \
+                 close={close_name} spacing={spacing_name} cuts={cuts} trap={trap_name}"
+              );
+              record(out, "P", &refs, &spelling, count)?;
             }
           }
         }

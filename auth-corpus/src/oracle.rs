@@ -242,7 +242,38 @@ fn challenge_readings(value: &[u8], at: usize) -> Vec<(usize, Context)> {
 /// [`covers`] carries the same distinction as [`Start`], reached by walking the
 /// value; this is the same sentence read off §5.6.1.2 at one offset. The two
 /// are separate compositions of `skip_ows` on purpose.
-fn starts_an_element(value: &[u8], at: usize) -> bool {
+///
+/// # And the differential says this rule is not that fact
+///
+/// `readings::element_starts` is the second derivation, and
+/// `the_two_derivations_of_an_element_start_answer_alike` holds the two to each
+/// other over every offset this crate asks about. They part at **6 415** of
+/// them, 323 of which are probes, and always the same way round: this rule
+/// admits a start the walk does not reach.
+/// `Basic a=",", Digest realm=z` is the shape — the comma stands inside a value
+/// the grammar FORCES, since `a=","` derives and no reading leaves that DQUOTE
+/// shut, so nothing begins on its far side under any reading at all.
+///
+/// **Two narrower rules were written here and both were refuted**, in opposite
+/// directions, which is what says the shape is wrong rather than the wording:
+///
+/// - `&& !(covered(value, comma) && settled(value, comma))` closes the 6 415
+///   and opens 168 of its own. `Basic<SP>,a=",", Digest realm=z` has a reading
+///   in which `Basic<SP>` is a BARE scheme — §11.3's optional group absent and
+///   the SP read as §5.6.1.2's own `OWS` — so no list is open at `a=","`, that
+///   element derives nothing, and the free regime crosses the comma inside it.
+///   [`forced`] answers about the readings that DO open the string and cannot
+///   see the one that never opened a list to hold it.
+/// - Asking [`covers`]'s own walk instead, through the [`Start`] it already
+///   carries, parts from `readings` at 23 361 offsets: that walk is shaped by
+///   the question it was built for and is not an enumeration of element starts.
+///
+/// Whether an element begins somewhere is a fact about which readings REACH
+/// there, and a rule at one offset cannot have it. Reconciling the two walks is
+/// oracle work with its own blast radius — the second rule alone moved 313 axis
+/// verdicts — so the differential is pinned at what it measures and the fact is
+/// left standing.
+pub(crate) fn starts_an_element(value: &[u8], at: usize) -> bool {
   let Some(comma) = value
     .get(..at)
     .and_then(|front| front.iter().rposition(|&byte| byte == b','))
