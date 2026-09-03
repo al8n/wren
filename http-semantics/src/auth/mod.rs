@@ -846,6 +846,12 @@ struct Recovery {
   /// there, which is where the reading that ended the element at that comma
   /// begins.
   ///
+  /// The element is the OUTER `#challenge` list's, which is not always the one
+  /// [`scan_element`] read: `auth-scheme 1*SP` is no §5.6.1.2 separator, so the
+  /// first element of a body §11.3's `1*SP` opened is a SUFFIX of an element
+  /// that began at the scheme. `scan_element`'s `element_at` is where that
+  /// element begins and this is taken from it.
+  ///
   /// The far side of a comma is not an element's first byte. §5.6.1.2 expands
   /// its list as `#element => [ element ] *( OWS "," OWS [ element ] )`, so a
   /// sender may write §5.6.3 whitespace between the two, and [`opener_at`] is
@@ -880,10 +886,24 @@ struct Recovery {
   /// answered `false` or as the first element of a body, and the end of a value
   /// that ran out inside a string, which begins no element at all.
   after_comma: bool,
-  /// Whether a §5.6.4 quoted-string decided this element's extent at all.
+  /// Whether a §5.6.4 quoted-string decided the extent of the element
+  /// [`at`](Self::at) begins at — which is the OUTER list's element and not
+  /// always the one [`scan_element`] read.
   ///
-  /// Where it did not, the element ran to the first comma read raw and every
+  /// Where it did not, that element ran to the first comma read raw and every
   /// reading of it ends there, so a refusal over it needs none of the above.
+  /// Asked at [`at`](Self::at) for exactly that reason: the run holds ONE value
+  /// position however it is read — [`opener_at`]'s exclusion argument — and
+  /// where the two offsets part it is the outer element's, so a scan from the
+  /// body's own would answer `false` over a string the sender opened.
+  /// `Basic a=1, Broken;junk, Bearer, x ="open, Digest realm=z` is the value
+  /// that says what that costs, and one SP is the whole of the difference from
+  /// `x="open`: §11.2's `BWS` lets the SP §11.3's `1*SP` needs stand in front
+  /// of the `=` too, so the walk enters a body at the `=`, no value position
+  /// stands THERE, and the held verdict came due at
+  /// [`BodyCheck::finish`](BodyCheck::finish) with the comma inside `x`'s own
+  /// value already crossed.
+  ///
   /// Where it did, RFC 9110 §11.2's `token68` alternative is dead — its
   /// alphabet holds no DQUOTE — which is what lets [`BodyCheck`]'s held verdict
   /// on a FIRST element come due here rather than at
@@ -906,6 +926,30 @@ struct Recovery {
 /// them would drop a parameter from a challenge that parsed and report
 /// nothing. There is nothing for them to disagree about while this is where
 /// both of them get the answer.
+///
+/// # `at` is where the element is READ from, `element_at` where a recovery
+/// behind it begins
+///
+/// ```text
+/// #element   => [ element ] *( OWS "," OWS [ element ] )
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// The two are one offset everywhere but the FIRST element of a body RFC 9110
+/// §11.3's `1*SP` opened. `auth-scheme 1*SP` is no §5.6.1.2 separator, so the
+/// element the OUTER `#challenge` list holds began at the scheme and this
+/// scan's element is a SUFFIX of it — and [`Recovery`] is about the outer
+/// list's element, because a recovery gets past an element of the outer list.
+/// [`Challenges::read_challenge`] is the one caller that ever parts them, and
+/// its `recover_from` carries when and why.
+///
+/// So the ELEMENT is read from `at`, which is the body's question and
+/// [`BodyCheck`]'s; the RECOVERY is taken from `element_at`, which is
+/// §11.6.1's. `element_at <= at`, and only `auth-scheme 1*SP` ever stands
+/// between them — a token and a run of SP, neither of which holds a comma, so
+/// [`raw_comma_end`] answers alike from either and only
+/// [`some_reading_holds`]'s question moves.
 ///
 /// `next` hands over the field line behind the join, `Ok(None)` where the value
 /// runs out, or the fault that crossing this one costs more than the caller may
@@ -940,7 +984,12 @@ struct Recovery {
 /// boundary a walk has not yet found must not be decided by bytes behind a
 /// fault — and a walk cannot be handed a verdict before it has the element the
 /// verdict is about.
-fn scan_element<'a, N>(head: &'a [u8], at: usize, mut next: N) -> Result<Scanned<'a>, AuthError>
+fn scan_element<'a, N>(
+  head: &'a [u8],
+  at: usize,
+  element_at: usize,
+  mut next: N,
+) -> Result<Scanned<'a>, AuthError>
 where
   N: FnMut() -> Result<Option<&'a [u8]>, AuthError>,
 {
@@ -955,19 +1004,23 @@ where
     Delim::Invalid => return Err(AuthError::InvalidQuotedString),
   };
   let mut cursor = head_end;
-  // Until a join is crossed the element is all on the line it began on, so a
-  // recovery behind it begins at its own first byte and no reading of it holds
-  // a comma the raw scan from there would find. Whether a string decided the
-  // extent at all is `param_value_at` answered over the same bytes `element_end`
-  // just asked it about, which is the one question either of them asks.
+  // Until a join is crossed the element the OUTER list holds is all on the line
+  // it began on, so a recovery behind it begins at `element_at` and no reading
+  // of it holds a comma the raw scan from there would find. Whether a string
+  // decided the extent at all is `param_value_at` answered at that same offset:
+  // the run holds ONE value position however it is read, and where the two
+  // offsets differ it is `element_at`'s, which is what `opener_at`'s exclusion
+  // argument says.
   let mut recovery = Recovery {
-    at,
-    floor: at,
-    // No join has been crossed, so what stands in front of this element is
-    // whatever the caller reached it past, and `Recovery::after_comma` says why
-    // no reading opens a challenge at it either way.
+    at: element_at,
+    floor: element_at,
+    // No join has been crossed, so what stands in front of the outer list's
+    // element is whatever the caller reached it past, and
+    // `Recovery::after_comma` says why no reading opens a challenge at it
+    // either way.
     after_comma: false,
-    strung: param_value_at(head, at).is_some_and(|value_at| head.get(value_at) == Some(&b'"')),
+    strung: param_value_at(head, element_at)
+      .is_some_and(|value_at| head.get(value_at) == Some(&b'"')),
   };
 
   // A quoted-string still open where a field line ends does NOT end the
@@ -2169,7 +2222,7 @@ impl<'a> ParamWalk<'a> {
     let start = self.at;
     let scanned = {
       let walk = &mut *self;
-      scan_element(head, start, || {
+      scan_element(head, start, start, || {
         let next = walk.line.saturating_add(1);
         if next >= walk.body.len {
           return Ok(None);
@@ -2378,6 +2431,65 @@ fn param_value_at(value: &[u8], at: usize) -> Option<usize> {
 /// reached its `=` on the line it began on never will.
 fn opens_a_challenge(value: &[u8], at: usize) -> bool {
   param_value_at(value, at).is_none()
+}
+
+/// Whether RFC 9110 §11.6.1's OTHER reading of `element` — a whole `challenge`
+/// rather than one more `auth-param` — leaves a `#auth-param` list OPEN behind
+/// it.
+///
+/// ```text
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// token68    = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+/// ```
+///
+/// `element` is one §5.6.1.2 element with the list's own `OWS` off both ends,
+/// which is what an [`Element`] carries. The question is §11.3's and is asked
+/// of it whole: an `auth-scheme`, the `1*SP` that is the body's only entrance,
+/// and a body the `token68` alternative does not take. `Complete::opens_a_list`
+/// asks the same question of a challenge this walk READ; this asks it of one it
+/// did not.
+///
+/// # A list opens at the `1*SP`, whatever the body derives
+///
+/// `[ 1*SP ( token68 / #auth-param ) ]` puts the list's first element at the
+/// first byte behind the SP run, so the list is open from there — and where
+/// nothing derives AT that element the readings are free from it, inside the
+/// list it stands in. That is the same sentence [`Epoch`] carries about a fault
+/// met inside a body, one element up: `Basic<SP><HTAB>a, a=", Digest realm=z`
+/// is a body whose first element derives nothing and whose list is open all the
+/// same.
+///
+/// So the `token68` alternative is the only thing that closes it. §11.2's
+/// alphabet holds no DQUOTE and no `=` but the trailing pad, and [`token68`]
+/// answers `Some` only where the run IS the whole body — which is what makes
+/// `Bearer abc` a challenge that opens nothing.
+///
+/// # Why the two readings can BOTH be about the same element
+///
+/// [`opener_at`]'s exclusion is about where a §5.6.4 quoted-string may OPEN,
+/// and it holds: at most one of the two readings puts a value position in the
+/// run. This is a different question. `y<SP>=<SP>1` is one `auth-param` under
+/// the reading the walk takes, and under the other it is an `auth-scheme` whose
+/// body opens AT the `=` and derives nothing — a non-derivation, but one that
+/// has already opened a list, which is exactly the state freedom starts in.
+/// `Broken<HTAB>junk, y<SP>=<SP>1, Bearer, x="open, Digest realm=z` is the
+/// value that needs it: `Challenges::seek` crosses `y<SP>=<SP>1` because
+/// [`opens_a_challenge`] answers `false` for it, and the list that reading
+/// opened is the one `x`'s DQUOTE stands at a value position of.
+fn opens_a_parameter_list(element: &[u8]) -> bool {
+  let Some(scheme_end) = token_end(element, 0) else {
+    return false;
+  };
+  // `1*SP` is the body's only entrance, so a scheme with anything else behind
+  // it — §5.6.3's HTAB included — takes no body and opens no list.
+  if element.get(scheme_end) != Some(&b' ') {
+    return false;
+  }
+  let body = skip_sp(element, scheme_end);
+  // A body that is only the list's own `OWS` is no body at all: the optional
+  // group needs one of its two alternatives, and neither derives whitespace.
+  !ends_element(element, body) && token68(element, body).is_none()
 }
 
 /// Where a reading of the run at `at` may OPEN the RFC 9110 §5.6.4
@@ -3941,6 +4053,7 @@ where
   fn skip_element(
     &mut self,
     region: &mut Section<'a>,
+    element_at: usize,
   ) -> Result<(Element<'a>, Recovery), (Refusal, Origin<'a>)> {
     let head = self.line;
     let start = self.at;
@@ -3963,7 +4076,7 @@ where
       let walk = &mut *self;
       let section = &mut *region;
       let open = &mut crossed_a_join;
-      scan_element(head, start, || {
+      scan_element(head, start, element_at, || {
         let Some(next) = walk.next_line() else {
           return Ok(None);
         };
@@ -3995,7 +4108,15 @@ where
       Err(fault) if crossed_a_join => {
         return Err((Refusal::Unbounded(fault), Origin::Crossed));
       }
-      Err(fault) => return Err((Refusal::Bounded(fault), Origin::Unread)),
+      // Nothing crossed, so the element the OUTER list holds is on this line
+      // and the cursor goes to where it begins — the scan's own offset, except
+      // where `auth-scheme 1*SP` stands in front of it and `element_at` is the
+      // scheme's. The same offset [`Recovery::at`] would carry had the scan
+      // produced one, and for the same reason.
+      Err(fault) => {
+        self.at = element_at;
+        return Err((Refusal::Bounded(fault), Origin::Unread));
+      }
     };
     self.at = scanned.at;
     region.end = self.at;
@@ -4130,6 +4251,34 @@ where
     // position is `param_value_at` answered at THIS offset, and an origin
     // behind the scheme token has already lost it.
     let start = self.at;
+    // And where a refusal met INSIDE this challenge's body is recovered from,
+    // for the same reason one element up.
+    //
+    // ```text
+    // challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+    // auth-param = token BWS "=" BWS ( token / quoted-string )
+    // ```
+    //
+    // §11.2's `BWS` is §5.6.3's `OWS`, so the `1*SP` §11.3 needs in front of a
+    // body may be the SAME whitespace an `auth-param` writes in front of its
+    // `=`. Where it is, this element derives two ways and the walk is about to
+    // take one of them — and the value position the OTHER admits stands at the
+    // element's own first byte, behind everything the challenge reading
+    // crosses. `opens_a_challenge` is that question, asked of the element the
+    // walk is reading a challenge at rather than of the ones it skips: nothing
+    // asks it HERE, because at the top of a value or behind a completed
+    // challenge no list is open and there is no second reading to lose.
+    //
+    // So the two conditions are the two halves of "the other reading exists".
+    // Where they hold, every refusal met before the body's first element has
+    // ENDED is a refusal over the element that began at `start` — no §5.6.1.2
+    // comma has been crossed, so the outer list's element has not ended — and
+    // the recovery begins there, exactly as a scheme fault's does.
+    // `Basic a=1, Broken;junk, Bearer, x ="open, Digest realm=z` is the value:
+    // the body opens AT the `=`, no value position stands there, and a recovery
+    // from it certified the comma inside `x`'s own value and handed a caller a
+    // `Digest` with a `realm` under the sender's control.
+    let recover_from = (!opens_a_challenge(head, start) && self.inside_a_list()).then_some(start);
     let Some(scheme_end) = token_end(head, self.at) else {
       return Err(self.refuse(Refusal::Scheme(AuthError::MissingScheme), Origin::Unread));
     };
@@ -4159,9 +4308,21 @@ where
         // that never opened, and it is the whole of what the `1*SP` used to buy
         // by writing a flag that then outlived the challenge. The offset is the
         // body's own, so `opener_at` reads the first parameter's value position
-        // from where §5.6.1.2 puts it.
+        // from where §5.6.1.2 puts it — unless `recover_from` says the element
+        // this body opened in has a reading of its own, in which case that
+        // reading's value position is at the element's first byte and the body
+        // position has already lost it. `x<SP><HTAB>="open, Digest realm=z`
+        // behind a fault is the value, and it is the SP-and-HTAB spelling of
+        // the `BWS` `x<SP>="open` writes with one SP.
         if head.get(at) == Some(&b'\t') && !ends_element(head, at) {
-          return Err(self.refuse(Refusal::Bounded(AuthError::MalformedScheme), Origin::Body));
+          let fault = Refusal::Bounded(AuthError::MalformedScheme);
+          return Err(match recover_from {
+            Some(element_at) => {
+              self.at = element_at;
+              self.refuse(fault, Origin::Unread)
+            }
+            None => self.refuse(fault, Origin::Body),
+          });
         }
         at
       }
@@ -4225,12 +4386,19 @@ where
           if let Err(fault) = check.settle() {
             return Err(self.refuse(Refusal::Bounded(fault), Origin::Unread));
           }
+          // Where the element the OUTER `#challenge` list holds begins on this
+          // line. `after_comma` is false at the body's first element and there
+          // alone — every later turn of this loop reached its element past a
+          // §5.6.1.2 comma or §5.2's join, and both END the outer list's
+          // element — so this is the one turn at which the two can part, and
+          // `recover_from` is whether they do.
+          let element_at = recover_from.filter(|_| !after_comma).unwrap_or(self.at);
           // Both faults the scan can raise leave the cursor INSIDE the
           // challenge they refuse — on the line the bound was met at, or on
           // the element the forbidden byte stands in — so both are refused
           // here and neither ends the walk. Which of the two the boundary
           // survives is the scan's to say, and it says so in the `Refusal`.
-          let (element, recovery) = match self.skip_element(&mut section) {
+          let (element, recovery) = match self.skip_element(&mut section, element_at) {
             Ok(scanned) => scanned,
             Err((refusal, origin)) => return Err(self.refuse(refusal, origin)),
           };
@@ -4708,8 +4876,18 @@ where
       }
     });
     let derives = auth_param(element.bytes, element.tail).is_ok();
+    // RFC 9110 §11.6.1's OTHER reading of the same element, which [`auth_param`]
+    // cannot see. Where the element takes §11.3's `1*SP`, that reading has
+    // opened a `#auth-param` list and its body derives nothing — every element
+    // this loop crosses is one [`opens_a_challenge`] answered `false` for, so
+    // its body begins at an `=` or at the `BWS` in front of one and §11.2
+    // derives neither. So the reading exists, it stops deriving, and it stops
+    // INSIDE a list: the span's claim is refuted over it, and a list may be
+    // open behind it whatever was open in front.
+    let opens = opens_a_parameter_list(element.bytes);
     if let Some(epoch) = self.epoch.as_mut() {
-      epoch.derivable = epoch.derivable && derives;
+      epoch.derivable = epoch.derivable && derives && !opens;
+      epoch.inside_a_list = epoch.inside_a_list || opens;
     }
   }
 }
@@ -4946,7 +5124,7 @@ where
     let start = self.at;
     let scanned = {
       let walk = &mut *self;
-      scan_element(head, start, || {
+      scan_element(head, start, start, || {
         let Some(next) = walk.next_line() else {
           return Ok(None);
         };

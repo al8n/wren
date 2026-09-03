@@ -61,7 +61,7 @@
 //!   them by is wider than the set, so the surplus is a third asserted column
 //!   rather than a caveat.
 //! - **The differential over the two derivations of `excused` cannot grade
-//!   what they share.** [`EXCUSED_DISAGREEMENTS`] is 0 over 1 799 842 offsets,
+//!   what they share.** [`EXCUSED_DISAGREEMENTS`] is 0 over 1 839 285 offsets,
 //!   and [`SHARED_JUDGEMENTS`] is what says which decisions that zero is not
 //!   about: 29 judgements the two take through one transcription, 17 of which
 //!   that gate answers nothing for. Eight now red a leaf property instead, and
@@ -471,7 +471,7 @@ fn the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart() {
     }
   }
   assert_eq!(
-    total, 946_462,
+    total, 948_544,
     "the corpus is the size every figure pinned here counts over"
   );
 
@@ -482,7 +482,7 @@ fn the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart() {
     .collect();
   shared.sort();
   assert_eq!(shared.len(), 32, "the groups that share a key: {shared:?}");
-  assert_eq!(counts.len(), 946_302, "distinct inputs behind the records");
+  assert_eq!(counts.len(), 948_384, "distinct inputs behind the records");
   for key in shared {
     assert_eq!(counts.get(key), Some(&6), "{key}");
     assert!(key.starts_with("D\t"), "outside corpus D: {key}");
@@ -680,81 +680,91 @@ const AXIS: [Pinned; 15] = [
   ),
   (
     "H",
-    72,
-    &[("hider-excused", 56), ("yields-underivable", 16)],
+    80,
+    &[("hider-excused", 64), ("yields-underivable", 16)],
     16,
-    104,
+    120,
   ),
   (
     "I",
-    288,
-    &[("hider-excused", 224), ("yields-underivable", 64)],
+    320,
+    &[("hider-excused", 256), ("yields-underivable", 64)],
     64,
-    416,
+    480,
   ),
   (
     "J",
-    120,
-    &[("hider-excused", 12), ("yields-underivable", 108)],
-    258,
-    150,
+    144,
+    &[("hider-excused", 18), ("yields-underivable", 126)],
+    306,
+    180,
   ),
   (
     "K",
-    288,
-    &[("hider-excused", 224), ("yields-underivable", 64)],
+    320,
+    &[("hider-excused", 256), ("yields-underivable", 64)],
     64,
-    416,
+    480,
   ),
   (
     "L",
-    120,
-    &[("hider-excused", 30), ("yields-underivable", 90)],
-    264,
-    225,
+    144,
+    &[("hider-excused", 45), ("yields-underivable", 99)],
+    303,
+    282,
   ),
   (
     "M",
-    1_050,
+    1_260,
     &[
-      ("hider-excused", 288),
+      ("hider-excused", 432),
       ("yields", 54),
-      ("yields-underivable", 708),
+      ("yields-underivable", 774),
     ],
-    1847,
-    2594,
+    2_102,
+    3_214,
   ),
+  // `over-yield` stood at 135 and stands at 0: `sustain_the_epoch` asks a
+  // crossed element both of RFC 9110 §11.6.1's readings now, and the one that
+  // takes §11.3's `1*SP` opens a `#auth-param` list whose body derives nothing.
+  // The 135 are `hider-excused` — that list is what puts the probe inside a
+  // value.
   (
     "N",
-    6_120,
+    7_872,
     &[
-      ("hider-excused", 1_784),
+      ("hider-excused", 2_864),
       ("hider-unresolved", 76),
-      ("yields", 324),
-      ("yields-underivable", 3_936),
+      ("yields", 372),
+      ("yields-underivable", 4_560),
     ],
-    9_713,
-    14_605,
+    11_730,
+    19_482,
   ),
-  // Two of these cells are ZERO-TARGETS standing at a non-zero number, and
-  // they are pinned here rather than blessed anywhere: `the_three_classes_this_
-  // module_is_driven_to_zero_on_are_zero` REDS on this corpus, which is the
-  // finding this family was written to make and not a number to paste over.
+  // One of these cells is a ZERO-TARGET standing at a non-zero number, and it
+  // is pinned here rather than blessed anywhere: `the_three_classes_this_
+  // module_is_driven_to_zero_on_are_zero` still REDS on this corpus, which is
+  // the finding this family made and not a number to paste over.
   // `leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_writes` carries
   // both witnesses and what each says.
+  //
+  // `over-yield` stood at 54 and stands at 0. `Recovery` is now taken at the
+  // offset the element the OUTER `#challenge` list holds begins at, so the one
+  // value position that run carries is the one a recovery scans from; the 54
+  // are `hider-excused` now, because the reading that opens `x<SP>="…` holds
+  // the probe inside its string and showing it was the invention.
   (
     "O",
     3_192,
     &[
-      ("hider-excused", 1_296),
+      ("hider-excused", 1_350),
       ("hider-unexcused", 18),
       ("hider-unresolved", 72),
-      ("over-yield", 54),
       ("yields", 222),
       ("yields-underivable", 1_530),
     ],
-    4_908,
-    5_049,
+    4_854,
+    5_103,
   ),
 ];
 
@@ -1122,39 +1132,39 @@ const ANSWERS: [(&str, &str); 15] = [
   ),
   (
     "H",
-    "4b0137c051df1c5eefb3e0e7843d7cd3864308d96f14b36ffbfe8c1f396fae03",
+    "7438c7ab172900f849c516744f45c54c3c0a1536e6ee4ad12d75504c39292dd8",
   ),
   (
     "I",
-    "4631d9b0af79f76c1b9b7ed10858b6a48cef2354d19be7de59bd3ea9bb0051e8",
+    "a0f62be9c4e0214fc748d7989d4ab900e867a19418bbd397debaf29371aba081",
   ),
   (
     "J",
-    "94266079dfabb47ddedc4a8ead414f8bac5880815a470c017d3207d255097e64",
+    "2fe0208d2cde7889ef96e758296125fb10bb18361bdbe0168cb249ec26aeffbe",
   ),
   (
     "K",
-    "71e5644e40aa51229bf44d5e0062a60960e4d9c7a13223df15a7c40f09aec49b",
+    "51ffbd35165c416fd8daf17554e6b68728c114f909bc929cd4c7b525bff91acb",
   ),
   (
     "L",
-    "2580ee6c9e84993c76c45c670b211d987759c02d6780f1d6e74cbba75ac7c0a0",
+    "667dd61eead8026ea82e1a9ca1e39524ed910b7df917d3382a681e7ef5e553fb",
   ),
   (
     "M",
-    "12869f9ecaebf9f6b55c0a5b90d142e018c7ad55a25dbd5b0dc96f3c83760873",
+    "0b95a8bdee78c39fc371f4d70ab830c0fc31d9d3d286d4636861d335eeefd3f9",
   ),
   (
     "N",
-    "69f3d692a6d4429fb6c3eb89c29e38e2014fe39b7499837f282db9791e45e03f",
+    "4623a16a476c6b2000dd030f4cb35d88570b8b2ce3b1492abe984c13928fb535",
   ),
   (
     "O",
-    "bdc4304de9ca2ea747d024d4cf4e2af08df1da220f72a13604c30818af93c1ae",
+    "99b31741ea19915fd80464c1d4fe8cf93fdd748d83c1dfd4146dfb1fbc06e11c",
   ),
 ];
 
-const WHOLE: &str = "782ce07317aa1aa5e3f17bfcdba0f6690ab3ab8527da18adc97ac1ab4f30776c";
+const WHOLE: &str = "c4943e11fcc9dc70954c449b5da8cdd49d37639c79b1ea58cf7d376c4f350fb6";
 
 /// Feeds `hash` what `auth-diff` digests: each record's `answer` column and the
 /// newline behind it, in record order.
@@ -1302,74 +1312,75 @@ const FAULTS: [(&str, &[(&str, usize)]); 15] = [
   (
     "H",
     &[
-      ("ChallengeBoundaryUnknown", 32),
-      ("MalformedParameter", 48),
+      ("ChallengeBoundaryUnknown", 40),
+      ("MalformedParameter", 56),
       ("UnterminatedQuotedString", 24),
     ],
   ),
   (
     "I",
     &[
-      ("ChallengeBoundaryUnknown", 128),
-      ("MalformedParameter", 192),
+      ("ChallengeBoundaryUnknown", 160),
+      ("MalformedParameter", 224),
       ("UnterminatedQuotedString", 96),
     ],
   ),
   (
     "J",
     &[
-      ("ChallengeBoundaryUnknown", 12),
-      ("MalformedScheme", 98),
-      ("MissingScheme", 40),
+      ("ChallengeBoundaryUnknown", 18),
+      ("MalformedScheme", 114),
+      ("MissingScheme", 48),
     ],
   ),
   (
     "K",
     &[
-      ("ChallengeBoundaryUnknown", 128),
-      ("MalformedParameter", 192),
+      ("ChallengeBoundaryUnknown", 160),
+      ("MalformedParameter", 224),
       ("UnterminatedQuotedString", 96),
     ],
   ),
   (
     "L",
     &[
-      ("ChallengeBoundaryUnknown", 18),
-      ("MalformedScheme", 161),
-      ("MissingScheme", 40),
-      ("UnterminatedQuotedString", 6),
+      ("ChallengeBoundaryUnknown", 27),
+      ("MalformedParameter", 18),
+      ("MalformedScheme", 177),
+      ("MissingScheme", 48),
+      ("UnterminatedQuotedString", 12),
     ],
   ),
   (
     "M",
     &[
-      ("ChallengeBoundaryUnknown", 218),
-      ("ChallengeSpansTooManyLines", 150),
-      ("DuplicateParameter", 150),
-      ("MalformedParameter", 150),
-      ("MalformedScheme", 1381),
-      ("MissingScheme", 150),
-      ("TooManyParameters", 360),
-      ("UnterminatedQuotedString", 35),
+      ("ChallengeBoundaryUnknown", 327),
+      ("ChallengeSpansTooManyLines", 180),
+      ("DuplicateParameter", 180),
+      ("MalformedParameter", 285),
+      ("MalformedScheme", 1_560),
+      ("MissingScheme", 180),
+      ("TooManyParameters", 432),
+      ("UnterminatedQuotedString", 70),
     ],
   ),
   (
     "N",
     &[
-      ("ChallengeBoundaryUnknown", 1_286),
-      ("ChallengeSpansTooManyLines", 1_080),
-      ("DuplicateParameter", 1_120),
-      ("MalformedParameter", 1_120),
-      ("MalformedScheme", 4_972),
-      ("MissingScheme", 560),
-      ("TooManyParameters", 4_180),
-      ("UnterminatedQuotedString", 287),
+      ("ChallengeBoundaryUnknown", 2_013),
+      ("ChallengeSpansTooManyLines", 1_392),
+      ("DuplicateParameter", 1_440),
+      ("MalformedParameter", 2_367),
+      ("MalformedScheme", 5_556),
+      ("MissingScheme", 720),
+      ("TooManyParameters", 5_376),
+      ("UnterminatedQuotedString", 618),
     ],
   ),
   (
     "O",
     &[
-      ("ChallengeBoundaryUnknown", 513),
+      ("ChallengeBoundaryUnknown", 567),
       ("MalformedParameter", 627),
       ("MalformedScheme", 2_427),
       ("TooManyParameters", 798),
@@ -1768,15 +1779,16 @@ fn ows_after_the_join_comma_and_a_challenge_completed_in_front_are_shapes_these_
     );
   }
 
-  // The opener that whitespace moves off the cursor is REACHED: 128 of corpus
+  // The opener that whitespace moves off the cursor is REACHED: 160 of corpus
   // I's records carry one, and the walk declines the comma behind it rather
-  // than crossing into a value. Those 128 answered `over-yield` at the commit
-  // that added corpus H.
+  // than crossing into a value. 128 of them answered `over-yield` at the commit
+  // that added corpus H; the other 32 are the `realm = "c` continuation
+  // added here, which spells §11.2's `BWS` in front of the same `=`.
   assert_eq!(
     i.iter()
       .filter(|line| columns(line)[4].contains("Err(ChallengeBoundaryUnknown)"))
       .count(),
-    128,
+    160,
     "corpus I: the openers a check asked at the join offset cannot see"
   );
 
@@ -1888,8 +1900,8 @@ fn ows_before_the_join_comma_and_a_challenge_completed_behind_are_shapes_these_g
     completed += 1;
   }
   assert_eq!(
-    completed, 90,
-    "corpus L: three closers over two openers, three faults, five traps"
+    completed, 108,
+    "corpus L: three closers over two openers, three faults, six traps"
   );
 
   // And the two directions the family holds apart, over the trap that never
@@ -1959,8 +1971,8 @@ fn a_second_recovery_epoch_is_a_shape_this_generator_writes() {
   let m = records(corpus_m);
   assert_eq!(
     m.len(),
-    1_050,
-    "five openers, seven refusals, six separators, five traps"
+    1_260,
+    "five openers, seven refusals, six separators, six traps"
   );
 
   // Every row is refused, and every row whose separator is not empty yields a
@@ -1989,8 +2001,8 @@ fn a_second_recovery_epoch_is_a_shape_this_generator_writes() {
     completed += 1;
   }
   assert_eq!(
-    completed, 525,
-    "corpus M: three closing separators over five openers, seven refusals, five traps"
+    completed, 630,
+    "corpus M: three closing separators over five openers, seven refusals, six traps"
   );
 
   // And the direction the family exists for, over the trap that never closes
@@ -2116,11 +2128,7 @@ fn a_second_recovery_epoch_is_a_shape_this_generator_writes() {
   let prefixed = shown("fault");
   let list = shown("list");
   let list_fault = shown("list-fault");
-  assert_eq!(
-    bare.len(),
-    210,
-    "seven refusals, six separators, five traps"
-  );
+  assert_eq!(bare.len(), 252, "seven refusals, six separators, six traps");
   assert_eq!(
     differing(&bare, &prefixed),
     Vec::<String>::new(),
@@ -2129,14 +2137,14 @@ fn a_second_recovery_epoch_is_a_shape_this_generator_writes() {
 
   // And the control that says the pairing is about the LIST rather than about
   // the prefix's bytes: the SAME fault, met inside a list, moves exactly the
-  // rows an unclosable epoch is supposed to move — the eighteen where a bound
-  // of this reader's would otherwise have been closed by the challenge behind
-  // it. Nowhere else, and never in the direction of showing more.
+  // rows an unclosable epoch is supposed to move — the twenty-seven where a
+  // bound of this reader's would otherwise have been closed by the challenge
+  // behind it. Nowhere else, and never in the direction of showing more.
   let moved = differing(&list, &list_fault);
   assert_eq!(
     moved.len(),
-    18,
-    "three receiver bounds, three closing separators, two DQUOTE traps: {moved:?}"
+    27,
+    "three receiver bounds, three closing separators, three DQUOTE traps: {moved:?}"
   );
   for name in &moved {
     assert!(
@@ -2183,8 +2191,8 @@ fn a_second_recovery_epoch_is_a_shape_this_generator_writes() {
       rows += 1;
     }
     assert_eq!(
-      rows, 150,
-      "corpus M, {refusal}: six separators, five traps, five openers"
+      rows, 180,
+      "corpus M, {refusal}: six separators, six traps, five openers"
     );
   }
 }
@@ -2230,21 +2238,39 @@ fn a_second_recovery_epoch_is_a_shape_this_generator_writes() {
 /// the span rule is asked at all — which no reading of the grammar can say, and
 /// `the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes` is what
 /// asserts it.
-const N_SPAN_DERIVES: [(&str, Option<bool>); 14] = [
-  ("none", Some(true)),
-  ("param", Some(true)),
-  ("quoted", Some(true)),
-  ("bws", Some(true)),
-  ("duplicate", Some(true)),
-  ("over-bound", Some(true)),
-  ("two-params", Some(true)),
-  ("ows-tail", Some(true)),
-  ("no-value", Some(false)),
-  ("trailing-token", Some(false)),
-  ("trailing-quoted", Some(false)),
-  ("open-quoted", None),
-  ("param-then-fault", Some(false)),
-  ("fault-then-param", Some(false)),
+/// # And a second column, which is a different production's question
+///
+/// `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`. The `bool` is
+/// whether some element of the span OPENS a `#auth-param` list under RFC 9110
+/// §11.6.1's challenge reading of it — the reading `derives_a_parameter` knows
+/// nothing about, because it is not the one that derives. A span that opens one
+/// leaves a list open behind it whether or not §11.2 derives its elements, and
+/// the value has stopped deriving inside that list: the body opens at an `=` or
+/// at the `BWS` in front of one, and §11.2 derives neither.
+///
+/// It is cross-checked below out of `oracle`'s own transcriptions of
+/// `token_end`, `skip_sp` and `token68_end`, composed here. One transcription
+/// per production with the COMPOSITION written twice is this crate's rule, and
+/// this is the second composition.
+const N_SPAN_DERIVES: [(&str, Option<bool>, bool); 15] = [
+  ("none", Some(true), false),
+  ("param", Some(true), false),
+  ("quoted", Some(true), false),
+  ("bws", Some(true), false),
+  // The one span that does. §11.2's `BWS` is §5.6.3's `OWS`, so the SP in front
+  // of the `=` is also the `1*SP` §11.3's body needs — and the body it opens
+  // begins AT the `=`, which no `token68` takes and no `auth-param` derives.
+  ("bws-sp", Some(true), true),
+  ("duplicate", Some(true), false),
+  ("over-bound", Some(true), false),
+  ("two-params", Some(true), false),
+  ("ows-tail", Some(true), false),
+  ("no-value", Some(false), false),
+  ("trailing-token", Some(false), false),
+  ("trailing-quoted", Some(false), false),
+  ("open-quoted", None, false),
+  ("param-then-fault", Some(false), false),
+  ("fault-then-param", Some(false), false),
 ];
 
 /// How many offsets the two derivations of `excused` are held equal at, per
@@ -2257,7 +2283,7 @@ const N_SPAN_DERIVES: [(&str, Option<bool>); 14] = [
 ///
 /// # And the denominator is not the coverage
 ///
-/// 1 799 842 offsets and 0 disagreements is not *these two derivations agree
+/// 1 839 285 offsets and 0 disagreements is not *these two derivations agree
 /// about everything*. **A differential over two derivations grades the
 /// composition and never the transcriptions they share**, and
 /// [`SHARED_JUDGEMENTS`] is the enumeration of what that leaves out: 29
@@ -2276,13 +2302,13 @@ const EXCUSED_REACH: [(&str, usize); 15] = [
   ("E", 3_740),
   ("F", 384),
   ("G", 2_140),
-  ("H", 280),
-  ("I", 1_120),
-  ("J", 486),
-  ("K", 1_120),
-  ("L", 516),
-  ("M", 13_175),
-  ("N", 128_596),
+  ("H", 312),
+  ("I", 1_248),
+  ("J", 588),
+  ("K", 1_248),
+  ("L", 624),
+  ("M", 15_852),
+  ("N", 164_864),
   ("O", 32_598),
 ];
 
@@ -2348,7 +2374,7 @@ const EXCUSED_REACH: [(&str, usize); 15] = [
 /// because the two walks consume `boundary`, `token_end` and `token68_end` at
 /// different places.
 ///
-/// So this 0 means: over 1 799 842 offsets, the two COMPOSITIONS agree. It does
+/// So this 0 means: over 1 839 285 offsets, the two COMPOSITIONS agree. It does
 /// not mean the readings they compose are right. Eight of the seventeen are now
 /// answered by a property instead — [`WRONGNESS_GATES`] is the whole set of
 /// things in this crate that make a wrongness claim — and nine are answered by
@@ -3258,7 +3284,7 @@ fn the_spans_this_table_names_are_the_ones_11_2_derives() {
   // string holds and every element is asked. None of these spans holds a comma
   // inside a value, which `the_spans_hold_no_comma_a_string_could_swallow`
   // below is what says.
-  for ((name, span), (pinned, derives)) in SPANS.into_iter().zip(N_SPAN_DERIVES) {
+  for ((name, span), (pinned, derives, opens)) in SPANS.into_iter().zip(N_SPAN_DERIVES) {
     assert_eq!(name, pinned, "the two tables are in the same order");
     let whole = span.split(|&byte| byte == b',').all(|element| {
       let element = trimmed(element);
@@ -3268,6 +3294,28 @@ fn the_spans_this_table_names_are_the_ones_11_2_derives() {
       whole,
       derives == Some(true),
       "span {name}: RFC 9110 §11.2 and this table disagree"
+    );
+    // And §11.3's question over the same elements, composed here out of
+    // `oracle`'s productions: an `auth-scheme`, the `1*SP` that is the body's
+    // only entrance, and a body the `token68` alternative does not take whole.
+    // ANY element that opens one leaves it open, because nothing a recovery
+    // crosses closes a list — a challenge that would is one the walk stops at
+    // rather than crosses.
+    let any = span.split(|&byte| byte == b',').any(|element| {
+      let element = trimmed(element);
+      let Some(scheme_end) = crate::oracle::token_end(element, 0) else {
+        return false;
+      };
+      if element.get(scheme_end) != Some(&b' ') {
+        return false;
+      }
+      let body = crate::oracle::skip_sp(element, scheme_end);
+      body < element.len()
+        && crate::oracle::token68_end(element, body).is_none_or(|end| end != element.len())
+    });
+    assert_eq!(
+      any, opens,
+      "span {name}: RFC 9110 §11.3 and this table disagree"
     );
   }
 }
@@ -3352,12 +3400,15 @@ fn the_two_rows_that_pin_the_span_rule_s_shape_can_fail() {
   // asserts that their rows SHOW the probe. Either rule change hides it there,
   // so both rows red.
   for name in ["duplicate", "over-bound"] {
-    let derives = N_SPAN_DERIVES
+    let (derives, opens) = N_SPAN_DERIVES
       .iter()
-      .find(|(spelled, _)| *spelled == name)
-      .map(|(_, derives)| *derives)
+      .find(|(spelled, _, _)| *spelled == name)
+      .map(|(_, derives, opens)| (*derives, *opens))
       .unwrap_or_else(|| panic!("{name} is one of this family's spans"));
     assert_eq!(derives, Some(true), "span {name}: §11.2 derives it");
+    // And §11.3 opens no list at either, which is the other half of what makes
+    // their rows show the probe.
+    assert!(!opens, "span {name}: §11.3 opens no list at it");
   }
 }
 
@@ -3440,10 +3491,10 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
   let n = records(corpus_n);
   assert_eq!(
     n.len(),
-    6_120,
-    "two openers over seven refusals and fourteen spans, over one cursor row \
-     and the thirteen spans that are a position, and over three joined \
-     refusals and fourteen spans, by four closers and five traps"
+    7_872,
+    "two openers over seven refusals and fifteen spans, over one cursor row \
+     and the fourteen spans that are a position, and over three joined \
+     refusals and fifteen spans, by four closers and six traps"
   );
 
   // Every row is refused, and every row whose closer ENDS a list completes a
@@ -3478,9 +3529,9 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
     completed += 1;
   }
   assert_eq!(
-    completed, 4_260,
-    "two openers, seven refusals by thirteen spans, one cursor row by twelve \
-     and three joined refusals by thirteen, three closing closers, five traps"
+    completed, 5_508,
+    "two openers, seven refusals by fourteen spans, one cursor row by thirteen \
+     and three joined refusals by fourteen, three closing closers, six traps"
   );
 
   // And the direction the family exists for, over the trap that never closes
@@ -3494,7 +3545,7 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
   // `over-yield` for it.
   for (refusal, bound, its_own_list) in M_REFUSAL_IS_A_BOUND {
     for (opener, a_list_in_front) in [("none", false), ("bound", true)] {
-      for (span, derives) in N_SPAN_DERIVES {
+      for (span, derives, opens) in N_SPAN_DERIVES {
         let marker = format!(" refusal={refusal} ");
         let opener_marker = format!(" opener={opener} ");
         let span_marker = format!(" span={span} ");
@@ -3520,8 +3571,15 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
         // what says so. Everywhere else the epoch has a list, and the probe is shown
         // only where that epoch can be CLOSED: by a bound of this reader's
         // whose whole span derived.
-        let list_free = !(a_list_in_front || its_own_list);
-        let shown = list_free || (bound && derives == Some(true));
+        // A span that opens a `#auth-param` list of its own is a list in front
+        // of the trap wherever it stands, so a fault that opened none no longer
+        // leaves the value list-free; and the value has stopped deriving inside
+        // that list, so an epoch a bound opened cannot be closed behind it
+        // either. Both terms are one fact —
+        // `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` — read
+        // at the two places this rule asks about a list.
+        let list_free = !(a_list_in_front || its_own_list || opens);
+        let shown = list_free || (bound && derives == Some(true) && !opens);
         for line in rows {
           assert_eq!(
             columns(line)[4].contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
@@ -3549,7 +3607,7 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
     ("join-malformed", false),
   ] {
     for opener in ["none", "bound"] {
-      for (span, derives) in N_SPAN_DERIVES {
+      for (span, derives, opens) in N_SPAN_DERIVES {
         let marker = format!(" refusal={refusal} ");
         let opener_marker = format!(" opener={opener} ");
         let span_marker = format!(" span={span} ");
@@ -3574,7 +3632,7 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
         // list-free case of the family above cannot arise here. The probe is
         // shown exactly where the epoch can be closed: a bound of this
         // reader's, whose whole span derived.
-        let shown = bound && derives == Some(true);
+        let shown = bound && derives == Some(true) && !opens;
         for line in rows {
           assert_eq!(
             columns(line)[4].contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
@@ -3593,7 +3651,7 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
   // A span rule with a first-element exception was green over every row above
   // and invented a `Digest` here.
   for (opener, _) in [("none", ()), ("bound", ())] {
-    for (span, derives) in N_SPAN_DERIVES {
+    for (span, derives, opens) in N_SPAN_DERIVES {
       // `none` is not a position, so the cursor family does not write it: with
       // nothing at the head of that line the closer stands there, opens a
       // challenge, and the body ends in front of it within the bound.
@@ -3624,7 +3682,7 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
       for line in rows {
         assert_eq!(
           columns(line)[4].contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
-          derives == Some(true),
+          derives == Some(true) && !opens,
           "corpus N, line-bound-head, {opener}, {span}: {line}"
         );
       }
@@ -3670,14 +3728,141 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
     declined += 1;
   }
   assert_eq!(
-    crossed, 45,
-    "corpus N: three list-free faults, three closing closers, five traps"
+    crossed, 54,
+    "corpus N: three list-free faults, three closing closers, six traps"
   );
   assert_eq!(
-    declined, 285,
+    declined, 342,
     "corpus N: the rows a list is open at, over three closing closers — the \
      joined refusals included, each of which is met inside a body and so has a \
      list of its own"
+  );
+}
+
+/// One value in which an element the recovery CROSSES opens a `#auth-param`
+/// list of its own, and the same value with that element's whitespace spelled
+/// so that it cannot.
+///
+/// ```text
+/// #element   => [ element ] *( OWS "," OWS [ element ] )
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// `y<SP>=<SP>1` reads as one `auth-param` — which is what the walk takes, and
+/// why `opens_a_challenge` answers `false` and `Challenges::seek` crosses it
+/// without stopping. It ALSO reads as an `auth-scheme` `y` taking §11.3's
+/// `1*SP`, whose `#auth-param` body opens at the `=` and derives nothing there.
+/// Under that reading the value has stopped deriving INSIDE a list `y` opened,
+/// so every element behind it is garbage that list still holds — and `x`'s
+/// DQUOTE stands at a value position with the probe inside its data.
+///
+/// The recovery records neither half: `Epoch::inside_a_list` is written once at
+/// the refusal and `Challenges::sustain_the_epoch` asks the crossed element
+/// only what RFC 9110 §11.2 makes of it, which is the reading that derives. So
+/// `Bearer` closes a list nothing opened, `x="open` is refused with no list in
+/// front of it, `opener_at` admits no reading, and the comma inside `x`'s value
+/// is crossed.
+const SPAN_OPENS_A_LIST: &[u8] = b"Broken\tjunk, y = 1, Bearer, x=\"open, Digest realm=z";
+
+/// The control: the same span with §11.2's `BWS` spelled the way [`SPANS`]
+/// already wrote it. §11.3's opener is `1*SP` and §5.6.3's HTAB is not one, so
+/// `y<HTAB>=<HTAB>1` takes no body, opens no list, and there is no second
+/// reading of the value to lose. One SP is the whole of the difference.
+const SPAN_OPENS_NO_LIST: &[u8] = b"Broken\tjunk, y\t=\t1, Bearer, x=\"open, Digest realm=z";
+
+#[test]
+fn the_span_that_opens_a_list_is_one_the_recovery_crosses() {
+  // The second finding, and the shape it is now held at. It was
+  // 135 `over-yield` records at `7c25761` — the commit that added the span this
+  // family could not write — and 0 here.
+  let n = records(corpus_n);
+  assert_eq!(
+    of(&tally(&n, |_| true), "over-yield"),
+    0,
+    "corpus N: the invented challenges"
+  );
+
+  // Identified by SHAPE and not by the verdict they used to carry: the span
+  // opens a `#auth-param` list under RFC 9110 §11.6.1's challenge reading, a
+  // closer that ENDS a list stands behind it, and the trap carries a DQUOTE at
+  // a value position of the list the span opened. Every one of them hides the
+  // probe, and every one says so — 135 of the 198 answered the other way at
+  // `7c25761`, and the rest were already excused by an epoch that could not
+  // close.
+  let mut shaped = 0usize;
+  for line in &n {
+    let [_, _, spelling, axis, answer] = columns(line);
+    let trap = spelling
+      .rsplit_once(" trap=")
+      .map(|(_, name)| name)
+      .expect("every corpus N spelling names its trap");
+    if !spelling.contains(" span=bws-sp ")
+      || spelling.contains(" closer=list ")
+      || !matches!(trap, "open" | "bws-open" | "closed-over")
+    {
+      continue;
+    }
+    assert_eq!(
+      axis, "hider-excused",
+      "corpus N: a span that opens a list graded elsewhere: {line}"
+    );
+    assert!(
+      !answer.contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
+      "corpus N: a span that opens a list still yields the probe: {line}"
+    );
+    assert!(
+      answer.contains("Err(ChallengeBoundaryUnknown)"),
+      "corpus N: a span that opens a list hides in silence: {line}"
+    );
+    shaped += 1;
+  }
+  assert_eq!(
+    shaped, 198,
+    "corpus N: two openers by nine refusals, three closing closers, three \
+     DQUOTE traps"
+  );
+
+  // And the one-line witness, graded by the ORACLE alone. No reader is in this
+  // derivation and nothing here is about what any revision of this workspace
+  // answers.
+  let verdict = oracle::read(SPAN_OPENS_A_LIST, probe_at(SPAN_OPENS_A_LIST));
+  assert!(verdict.derives, "the probe's own bytes derive");
+  assert!(
+    !verdict.reached,
+    "no derivation of the whole value reaches the probe"
+  );
+  assert!(
+    verdict.excused,
+    "a reading holds the probe inside the value of `x`, through the list the \
+     span opened"
+  );
+  // So a walk that yields it has invented one. This tree does not, and it tells
+  // the caller the rest is unread.
+  assert!(
+    !yields_the_probe(&[SPAN_OPENS_A_LIST]),
+    "the second invention, now closed"
+  );
+  assert!(
+    says_the_rest_is_unread(&[SPAN_OPENS_A_LIST]),
+    "and the caller is told the rest is unread"
+  );
+
+  // The control is the same value with the span's whitespace spelled so that
+  // §11.3's `1*SP` cannot be a prefix of it. No list opens there, no reading
+  // holds the probe, and the walk SHOWS it — which is recovery rather than
+  // invention, and is what says the fix turns on the list and not on the
+  // bytes of the trap.
+  let control = oracle::read(SPAN_OPENS_NO_LIST, probe_at(SPAN_OPENS_NO_LIST));
+  assert!(control.derives, "the probe's own bytes derive");
+  assert!(!control.reached, "and no derivation reaches it");
+  assert!(
+    !control.excused,
+    "with no `1*SP` the span opens no list and no reading holds the probe"
+  );
+  assert!(
+    yields_the_probe(&[SPAN_OPENS_NO_LIST]),
+    "the control is shown, and showing it is recovery rather than invention"
   );
 }
 
@@ -3694,7 +3879,7 @@ fn whitespace_at_the_head_of_the_value_is_the_one_edge_that_cannot_matter() {
   // with one anyway is skip it — `Challenges::open_element` takes §5.6.3's
   // `OWS` at every cursor including the value's first — so the answer for
   // `<OWS>value` is the answer for `value`, byte for byte, and a family
-  // spelling it would write 288 records that move together with corpus H's.
+  // spelling it would write 320 records that move together with corpus H's.
   //
   // Trailing whitespace on the LAST line is the same fact from the other end:
   // no join comma stands behind it, so it is the `OWS` §5.6.1.2 hangs on
@@ -3724,7 +3909,7 @@ fn whitespace_at_the_head_of_the_value_is_the_one_edge_that_cannot_matter() {
       }
     }
   }
-  assert_eq!(compared, 288, "the comparisons this control makes");
+  assert_eq!(compared, 320, "the comparisons this control makes");
 }
 
 #[test]
@@ -4491,11 +4676,12 @@ fn leading_empty_elements(value: &[u8], at: usize) -> usize {
   empties
 }
 
-/// One value in which RFC 9110 §11.2's `BWS` in FRONT of the `=` is what
-/// decides whether a challenge is invented, and the same value with that
-/// whitespace off it.
+/// One value in which RFC 9110 §11.2's `BWS` in FRONT of the `=` decided
+/// whether a challenge was invented, and the four spellings of the same
+/// whitespace that did not.
 ///
 /// ```text
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
 /// auth-param = token BWS "=" BWS ( token / quoted-string )
 /// ```
 ///
@@ -4503,12 +4689,83 @@ fn leading_empty_elements(value: &[u8], at: usize) -> usize {
 /// this, and the shape is corpus L's own cross — a list, a fault of the
 /// grammar, a challenge that completes behind it, and a trap — with a trap
 /// spelling the `BWS` that [`TRAPS`] does not.
+///
+/// **What one SP buys.** §11.2's `BWS` is §5.6.3's `OWS`, so the whitespace an
+/// `auth-param` may write in front of its `=` includes the `1*SP` §11.3 needs
+/// in front of a body. Where the sender writes at least one SP there, `x` reads
+/// as an `auth-scheme` too, the walk enters a body at the `=`, and the value
+/// position the `auth-param` reading admits is the one no scan from the body's
+/// offset can reach.
 const BWS_INVENTION: &[u8] = b"Basic a=1, Broken;junk, Bearer, x = \"c, Digest realm=z";
 
-/// The control: the same value with no `BWS` in front of the `=`, which is
-/// `corpus_l`'s `opener=list fault=punct closer=bare trap=open` row and answers
-/// the other way.
-const BWS_INVENTION_CONTROL: &[u8] = b"Basic a=1, Broken;junk, Bearer, x=\"c, Digest realm=z";
+/// The second spelling that invented, and the one no generator writes: §11.3's
+/// `1*SP` taken by the SP and a HTAB of the same `BWS` behind it, which the
+/// walk refuses at the body POSITION rather than over the body's first element.
+/// A different entrance and the same origin.
+const BWS_INVENTION_MIXED: &[u8] = b"Basic a=1, Broken;junk, Bearer, x \t=\"c, Digest realm=z";
+
+/// The spellings of the same value that never invented and must not start.
+///
+/// The `BWS` in front of the `=` is what §11.3's `1*SP` can be a prefix of, and
+/// each of these writes it so that it cannot be: none, one HTAB, and whitespace
+/// behind the `=` alone. Every one of them reaches
+/// `Challenges::read_challenge`'s scheme fault, which has recovered from the
+/// element's own first byte since al8n/wren#77 — so a fix that moved one of
+/// these would be a fix that lost the recovery those already had.
+///
+/// The first is `corpus_l`'s `opener=list fault=punct closer=bare trap=open`
+/// row. The other two are written nowhere else.
+const BWS_SAFE: [(&str, &[u8]); 3] = [
+  (
+    "no BWS at all",
+    b"Basic a=1, Broken;junk, Bearer, x=\"c, Digest realm=z",
+  ),
+  (
+    "BWS behind the `=` only",
+    b"Basic a=1, Broken;junk, Bearer, x= \"c, Digest realm=z",
+  ),
+  (
+    "a HTAB on each side",
+    b"Basic a=1, Broken;junk, Bearer, x\t=\t\"c, Digest realm=z",
+  ),
+];
+
+/// Corpus O's `scheme` axis, written as the one-line values the family's own
+/// rows are the general case of.
+///
+/// All 54 rows that invented carry `scheme=htab`, because `Newauth<HTAB>` takes
+/// no body and leaves the trap an element of the OUTER `#challenge` list, where
+/// the walk reads a challenge at it. `Newauth<SP>` takes §11.3's `1*SP`, so the
+/// same trap is one more `auth-param` of that challenge's own body — an element
+/// `opens_a_challenge` answers `false` for, which the body
+/// loop keeps rather than reading as a challenge of its own.
+///
+/// The family writes both: 228 `scheme=sp body=bws` records against 228
+/// `scheme=htab`, and the SP half graded `hider-excused` at `2dc787c` exactly
+/// as it does here. So the SP spelling was written and was always safe, and
+/// the HTAB scheme is not a control doing a witness's job — it is the axis
+/// value that puts the trap where a challenge is read.
+///
+/// The `bool` is whether the walk DECLINES the trap's boundary, which is the
+/// half of these two values that is observable from the answer: the HTAB scheme
+/// reads a challenge at the trap and refuses it, so the caller is told the rest
+/// is unread; the SP scheme reads one more `auth-param`, whose quoted-string
+/// never closes, and `AuthError::UnterminatedQuotedString` is the whole of it.
+/// Which of the two INVENTED at `2dc787c` is the HTAB one, and that is asserted
+/// separately: a notice and a yielded challenge are two facts and one bool
+/// cannot carry both.
+const BWS_BY_SCHEME: [(&str, &[u8], bool); 2] = [
+  (
+    "htab",
+    b"Basic a=1, Broken;junk, Newauth\t, realm = \"c, Digest realm=z",
+    true,
+  ),
+  (
+    "sp",
+    b"Basic a=1, Broken;junk, Newauth , realm = \"c, Digest realm=z",
+    false,
+  ),
+];
 
 /// One value whose probe stands at the first element of a challenge's BODY,
 /// with no RFC 9110 §5.6.1.2 comma between the two.
@@ -4628,31 +4885,51 @@ fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_w
 
   // ── and what the family ANSWERS, which is not what it was written expecting.
 
-  // `over-yield` is a zero-target of this module and corpus O answers 54.
-  // Every one of them is the same shape, and it is not this family's own: a
-  // list open where a grammar fault is met, a challenge completing behind it
-  // that ends that list in the reading the walk takes, and then an element RFC
-  // 9110 §11.2 derives as an `auth-param` whose `BWS` holds a SP — so the same
-  // bytes ALSO read as `auth-scheme 1*SP` with a body that derives nothing.
-  // The walk takes the challenge reading, refuses at the body, recovers from
-  // the BODY's offset, and never sees the value position the `auth-param`
-  // reading puts in front of that cursor.
-  let over_yields: Vec<&String> = o
+  // `over-yield` is a zero-target of this module. Corpus O answered 54 at
+  // `2dc787c` and answers 0 here: the rows are `hider-excused` now, which is
+  // the reading that holds the probe inside the trap's own value saying so.
+  //
+  // The 54 are identified by SHAPE and not by their old verdict, because a
+  // family that stopped writing the shape would go quiet rather than red. It is
+  // not this family's own dimension: a list open where a grammar fault is met,
+  // a challenge completing behind it that ends that list in the reading the
+  // walk takes, and then an element RFC 9110 §11.2 derives as an `auth-param`
+  // whose `BWS` holds a SP — so the same bytes ALSO read as `auth-scheme 1*SP`
+  // with a body that derives nothing. The walk takes the challenge reading and
+  // refuses at the body; what it did next was recover from the BODY's offset,
+  // where the value position the `auth-param` reading admits is one no scan can
+  // reach. `Recovery` is taken at the element the OUTER list holds now, and the
+  // three rows of the same shape with an EMPTY run of length zero are the ones
+  // whose trap stands behind no comma at all.
+  assert_eq!(
+    of(&tally(&o, |_| true), "over-yield"),
+    0,
+    "corpus O: the invented challenges"
+  );
+  let invented: Vec<&String> = o
     .iter()
-    .filter(|line| columns(line)[3] == "over-yield")
-    .collect();
-  assert_eq!(over_yields.len(), 54, "corpus O: the invented challenges");
-  for line in &over_yields {
-    let [_, _, spelling, _, answer] = columns(line);
-    assert!(
+    .filter(|line| {
+      let [_, _, spelling, _, _] = columns(line);
       spelling.contains(" head=list-fault ")
         && spelling.contains(" scheme=htab ")
-        && spelling.ends_with("body=bws"),
-      "corpus O: an over-yield outside the shape this test names: {line}"
+        && spelling.ends_with("body=bws")
+        && !spelling.contains(" empties=0 ")
+    })
+    .collect();
+  assert_eq!(invented.len(), 54, "corpus O: the rows that invented");
+  for line in &invented {
+    let [_, _, _, axis, answer] = columns(line);
+    assert_eq!(
+      axis, "hider-excused",
+      "corpus O: a row that invented is graded elsewhere now: {line}"
     );
     assert!(
-      answer.contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
-      "corpus O: an over-yield that yielded nothing: {line}"
+      !answer.contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
+      "corpus O: a row that invented still yields the probe: {line}"
+    );
+    assert!(
+      answer.contains("Err(ChallengeBoundaryUnknown)"),
+      "corpus O: a row that invented now hides in silence: {line}"
     );
   }
 
@@ -4672,21 +4949,51 @@ fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_w
     verdict.excused,
     "a reading holds the probe inside the value of `x`"
   );
-  // So a walk that yields it has invented one, and this tree does.
-  assert!(
-    yields_the_probe(&[BWS_INVENTION]),
-    "the invention this family found"
-  );
-  // And the control says what decides it: the same value with §11.2's `BWS`
-  // off the front of the `=`, which is a row `corpus_l` already writes.
-  assert!(
-    !yields_the_probe(&[BWS_INVENTION_CONTROL]),
-    "with no `BWS` the walk crosses nothing"
-  );
-  assert!(
-    says_the_rest_is_unread(&[BWS_INVENTION_CONTROL]),
-    "and tells the caller the rest is unread"
-  );
+  // So a walk that yields it has invented one. This tree does not, and it says
+  // so to the caller — the two halves of not hiding a challenge in silence.
+  for value in [BWS_INVENTION, BWS_INVENTION_MIXED] {
+    assert!(
+      !yields_the_probe(&[value]),
+      "the invention this family found: {}",
+      escape(value)
+    );
+    assert!(
+      says_the_rest_is_unread(&[value]),
+      "and the caller is told the rest is unread: {}",
+      escape(value)
+    );
+  }
+  // And the spellings of the same `BWS` that never invented, which say what
+  // decides it: a HTAB where §11.3's `1*SP` needs a SP, or no whitespace in
+  // front of the `=` at all, and the element is refused at its `auth-scheme`
+  // rather than inside a body. None of them may start.
+  for (spelling, value) in BWS_SAFE {
+    assert!(
+      !yields_the_probe(&[value]),
+      "the `{spelling}` spelling crosses nothing"
+    );
+    assert!(
+      says_the_rest_is_unread(&[value]),
+      "and the `{spelling}` spelling tells the caller the rest is unread"
+    );
+  }
+  // And the family's own `scheme` axis, as one-line values: the HTAB scheme is
+  // what leaves the trap an element of the OUTER list, where a challenge is
+  // read at it; the SP scheme keeps it inside the continuation's own body, an
+  // element `opens_a_challenge` answers `false` for. Only the first ever
+  // invented, and the SP half is written by the family rather than missing
+  // from it.
+  for (scheme, value, declines) in BWS_BY_SCHEME {
+    assert!(
+      !yields_the_probe(&[value]),
+      "the `{scheme}` scheme yields the probe"
+    );
+    assert_eq!(
+      says_the_rest_is_unread(&[value]),
+      declines,
+      "the `{scheme}` scheme's notice"
+    );
+  }
 
   // `hider-unexcused` is the other zero-target and corpus O answers 18. These
   // are NOT a defect of the reader, and saying so is the point of pinning them
