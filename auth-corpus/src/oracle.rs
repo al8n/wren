@@ -34,10 +34,21 @@
 //! - **Derives.** A whole challenge derives from the probe's offset to the end
 //!   of the value, asked of those bytes alone. Nothing is hidden where nothing
 //!   stands.
-//! - **Excused.** Some derivation reaches a §11.2 value position whose DQUOTE
-//!   opens a §5.6.4 quoted-string that covers the probe. The bytes are that
-//!   value's data under that reading, so a reader that showed no challenge
-//!   among them is not hiding one.
+//! - **Excused.** A §11.2 value position stands somewhere in front of the
+//!   probe, holds a DQUOTE, and the bytes between that DQUOTE and the probe are
+//!   ones §5.6.4 admits inside a quoted-string with none of them closing it. The
+//!   bytes are that value's data under the reading that opens it, so a reader
+//!   that showed no challenge among them is not hiding one.
+//!
+//!   **Asked of the POSITION and not of a derivation that reaches it**, which is
+//!   the correction al8n/wren#77 forced. Asking whether the whole value derives
+//!   let a malformed FIRST element decide that no reading licensed a
+//!   quoted-string standing later in the value that §11.2 admits perfectly well
+//!   — so inputs whose probe is plainly a parameter's data graded
+//!   `yields-underivable`, and the axis could not see the reader manufacturing a
+//!   challenge out of them. A reader in recovery is past the point where any
+//!   derivation of the whole value exists; what it must not do is cut a value
+//!   the grammar admits at that position, and that is what this now asks.
 //! - **Reached.** Some derivation has an element start exactly at the probe's
 //!   offset, reads it as an `auth-scheme`, and derives the rest of the value
 //!   from there. This is the whole value deriving, where **Derives** is the
@@ -49,8 +60,11 @@ use std::collections::HashSet;
 /// stands at in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verdict {
-  /// Some derivation puts the offset inside a §5.6.4 quoted-string, whether or
+  /// Some reading puts the offset inside a §5.6.4 quoted-string, whether or
   /// not that string closes.
+  ///
+  /// [`covered`] is the whole of it, and the module doc says why it is a
+  /// question about a POSITION rather than about a derivation that reaches one.
   pub excused: bool,
   /// Some derivation reads the offset as the `auth-scheme` of a challenge and
   /// derives the rest of the value from there.
@@ -90,7 +104,7 @@ enum Edge {
 /// admits, and reports the three facts the offset `probe` is graded by.
 pub fn read(value: &[u8], probe: usize) -> Verdict {
   let mut verdict = Verdict {
-    excused: false,
+    excused: covered(value, probe),
     reached: false,
     derives: derives_as_a_challenge(value, probe),
   };
@@ -104,7 +118,7 @@ pub fn read(value: &[u8], probe: usize) -> Verdict {
     if at == probe && verdict.derives {
       verdict.reached = true;
     }
-    for next in step(value, at, context.as_ref(), probe, &mut verdict) {
+    for next in step(value, at, context.as_ref()) {
       if seen.insert(next.clone()) {
         queue.push(next);
       }
@@ -120,13 +134,7 @@ pub fn read(value: &[u8], probe: usize) -> Verdict {
 /// `#element => [ element ] *( OWS "," OWS [ element ] )`, which hangs every
 /// `OWS` it has on a comma and none in front of the first element — so nothing
 /// here skips whitespace before an element no comma was crossed to reach.
-fn step(
-  value: &[u8],
-  at: usize,
-  context: Option<&Vec<Vec<u8>>>,
-  probe: usize,
-  verdict: &mut Verdict,
-) -> Vec<State> {
+fn step(value: &[u8], at: usize, context: Option<&Vec<Vec<u8>>>) -> Vec<State> {
   let mut out = Vec::new();
 
   // The empty element RFC 9110 §5.6.1.2 admits, which ends no challenge: its
@@ -134,7 +142,7 @@ fn step(
   // elements present."
   push(&mut out, value, boundary(value, at), context.cloned());
 
-  for (end, opened) in challenge_readings(value, at, probe, verdict) {
+  for (end, opened) in challenge_readings(value, at) {
     push(&mut out, value, boundary(value, end), opened);
   }
 
@@ -146,29 +154,17 @@ fn step(
     // RFC 9110 §11.2: "each parameter name MUST only occur once per
     // challenge". A reading that repeats one is not a reading — so the name is
     // answered BEFORE anything about this parameter's value is believed.
-    if !names.contains(&name) {
-      excuse(verdict, param.quoted, probe);
-      if let Some(end) = param.end {
-        let mut names = names.clone();
-        names.push(name);
-        names.sort();
-        push(&mut out, value, boundary(value, end), Some(names));
-      }
+    if !names.contains(&name)
+      && let Some(end) = param.end
+    {
+      let mut names = names.clone();
+      names.push(name);
+      names.sort();
+      push(&mut out, value, boundary(value, end), Some(names));
     }
   }
 
   out
-}
-
-/// Records the excuse a §5.6.4 quoted-string covering `probe` gives for showing
-/// no challenge there: under this reading those bytes are that value's data.
-fn excuse(verdict: &mut Verdict, quoted: Option<(usize, usize)>, probe: usize) {
-  if let Some((from, to)) = quoted
-    && from < probe
-    && probe < to
-  {
-    verdict.excused = true;
-  }
 }
 
 /// Every way the element at `at` reads as a whole `challenge`: where it ends,
@@ -177,12 +173,7 @@ fn excuse(verdict: &mut Verdict, quoted: Option<(usize, usize)>, probe: usize) {
 /// ```text
 /// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
 /// ```
-fn challenge_readings(
-  value: &[u8],
-  at: usize,
-  probe: usize,
-  verdict: &mut Verdict,
-) -> Vec<(usize, Context)> {
+fn challenge_readings(value: &[u8], at: usize) -> Vec<(usize, Context)> {
   let mut out = Vec::new();
   let Some(scheme_end) = token_end(value, at) else {
     return out;
@@ -205,11 +196,10 @@ fn challenge_readings(
   out.push((body, Some(Vec::new())));
   // And with a parameter in that first element. No name stands in front of it,
   // so §11.2's MUST has nothing to refuse here.
-  if let Some(param) = auth_param(value, body) {
-    excuse(verdict, param.quoted, probe);
-    if let Some(end) = param.end {
-      out.push((end, Some(vec![folded(value, param.name)])));
-    }
+  if let Some(param) = auth_param(value, body)
+    && let Some(end) = param.end
+  {
+    out.push((end, Some(vec![folded(value, param.name)])));
   }
   out
 }
@@ -223,12 +213,7 @@ fn challenge_readings(
 /// `at` cannot answer either, which is why [`Verdict::reached`] is the separate
 /// fact that a derivation gets here at all.
 fn derives_as_a_challenge(value: &[u8], at: usize) -> bool {
-  let mut ignored = Verdict {
-    excused: false,
-    reached: false,
-    derives: false,
-  };
-  challenge_readings(value, at, usize::MAX, &mut ignored)
+  challenge_readings(value, at)
     .into_iter()
     .any(|(end, _)| boundary(value, end).is_some())
 }
@@ -242,54 +227,49 @@ fn push(out: &mut Vec<State>, value: &[u8], edge: Option<Edge>, context: Context
   }
 }
 
-/// One `auth-param` the walk read: where its name is, where it ends when this
-/// reading has it end at all, and what a §5.6.4 quoted-string at its value
-/// position covers.
+/// One `auth-param` the walk read: where its name is, and where it ends when
+/// this reading has it end at all.
 struct Param {
   name: (usize, usize),
   /// One past the parameter's last byte, or `None` where the value is a string
   /// nothing closes and there is no parameter to hand back.
   end: Option<usize>,
-  /// `(the DQUOTE's offset, one past the string's last byte)` when a string
-  /// opened at the value position, `None` for a token value. The end of the
-  /// field value is the second half where nothing closes it.
-  quoted: Option<(usize, usize)>,
 }
 
-/// Reads RFC 9110 §11.2's `auth-param` at `at`.
+/// Where RFC 9110 §11.2's `auth-param` admits the VALUE of an element beginning
+/// at `at`, or `None` for an element that is no `auth-param`.
 ///
 /// ```text
 /// auth-param = token BWS "=" BWS ( token / quoted-string )
 /// ```
 ///
-/// The value position is where a §5.6.4 quoted-string may open and the only
-/// place it may, which is the fact the excuse is decided on. What that string
-/// covers is reported rather than acted on here, because whether this reading
-/// exists at all is the CALLER's question: §11.2's one-name-once MUST can
-/// refuse the name in front of a value nothing else refuses.
-fn auth_param(value: &[u8], at: usize) -> Option<Param> {
+/// Three terminals stand in front of that value and all three are read here:
+/// the name `token`, the `=`, and the `BWS` §5.6.3 defines as `OWS`'s own bytes
+/// on either side of it. This is the one position a §5.6.4 quoted-string may
+/// open at behind an `auth-scheme` — §5.6.2's `tchar` and §11.2's `token68`
+/// alphabet both exclude DQUOTE — which is the fact [`covered`] is decided on.
+fn value_position(value: &[u8], at: usize) -> Option<usize> {
   let name_end = token_end(value, at)?;
   let eq = skip_ows(value, name_end);
   if value.get(eq) != Some(&b'=') {
     return None;
   }
-  let start = skip_ows(value, eq.saturating_add(1));
-  let name = (at, name_end);
+  Some(skip_ows(value, eq.saturating_add(1)))
+}
+
+/// Reads RFC 9110 §11.2's `auth-param` at `at`.
+fn auth_param(value: &[u8], at: usize) -> Option<Param> {
+  let start = value_position(value, at)?;
+  let name = (at, token_end(value, at)?);
 
   if value.get(start) == Some(&b'"') {
     return match scan_quoted(value, start.saturating_add(1)) {
       Quoted::Closed(end) => Some(Param {
         name,
         end: Some(end),
-        quoted: Some((start, end)),
       }),
-      // Nothing closes it, so this reading has no parameter to hand back — and
-      // every byte from here to the end of the field value is inside it.
-      Quoted::Open => Some(Param {
-        name,
-        end: None,
-        quoted: Some((start, value.len())),
-      }),
+      // Nothing closes it, so this reading has no parameter to hand back.
+      Quoted::Open => Some(Param { name, end: None }),
       Quoted::Invalid => None,
     };
   }
@@ -297,8 +277,252 @@ fn auth_param(value: &[u8], at: usize) -> Option<Param> {
   Some(Param {
     name,
     end: Some(end),
-    quoted: None,
   })
+}
+
+/// Whether some reading of `value` puts `probe` inside an RFC 9110 §5.6.4
+/// quoted-string.
+///
+/// # What a reading is
+///
+/// ```text
+/// #element   => [ element ] *( OWS "," OWS [ element ] )
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// A left-to-right walk over element starts, and [`covers`] enumerates every
+/// one of them. Two regimes, and which regime an element is in is the whole of
+/// what this gets right that asking after the WHOLE value's derivation got
+/// wrong:
+///
+/// - **In front of the first fault the grammar decides.** A `parameter-value`
+///   beginning with a DQUOTE derives only the `quoted-string` alternative —
+///   §5.6.2's `tchar` excludes DQUOTE — so that string is not a choice, and
+///   where it closes is where the element ends.
+/// - **Behind the first fault nothing derives, so every DQUOTE §11.2 admits a
+///   value at is a choice**: a reading may open the string there, and a reading
+///   may leave it shut and take the element to the next comma read raw. The
+///   readings BETWEEN the two extremes are the ones a comparison of the raw
+///   reading with the greedy one never asks, and they are where a manufactured
+///   challenge comes from.
+///
+/// A fault is an element start no reading of the grammar leaves. That is the
+/// correction al8n/wren#77 forced: the old question was whether a derivation of
+/// the whole value REACHED the position, so one malformed element decided that
+/// no reading licensed a quoted-string standing perfectly well behind it, and
+/// the axis could not see the reader cutting that value in half.
+fn covered(value: &[u8], probe: usize) -> bool {
+  covers(
+    value,
+    0,
+    Start::Element,
+    false,
+    false,
+    probe,
+    &mut HashSet::new(),
+  )
+}
+
+/// Which list an element start belongs to.
+///
+/// A `challenge` stands at an element of the OUTER `#challenge` list and
+/// nowhere else. The first element of a challenge's own `#auth-param` list
+/// begins at the body position `1*SP` admits — inside the outer element — and
+/// `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` puts no second
+/// challenge there. Reading one anyway is how `Basic a a=", Digest realm=z`
+/// acquired a reading in which `a` is a scheme and the DQUOTE behind it opens a
+/// value: the `#auth-param` list has one element, `a a=`, and no production
+/// admits a string in it at all.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+enum Start {
+  /// An element of the outer `#challenge` list, where a challenge may open.
+  Element,
+  /// The first element of a challenge's `#auth-param` list, where none may.
+  Body,
+}
+
+/// One position of that walk.
+///
+/// - `at` — an element start, and an offset every reading in hand stands
+///   OUTSIDE a quoted-string at.
+/// - `list` — whether a challenge's `#auth-param` list is open here. At the head
+///   of the value none is, which is why `Basic ="x, Digest realm=z` has no
+///   reading in which `Basic` names a parameter whose value swallows the comma.
+/// - `faulted` — whether an element start in front of this one is one no reading
+///   of the grammar leaves.
+fn covers(
+  value: &[u8],
+  at: usize,
+  start: Start,
+  list: bool,
+  faulted: bool,
+  probe: usize,
+  seen: &mut HashSet<(usize, Start, bool, bool)>,
+) -> bool {
+  if at > probe || !seen.insert((at, start, list, faulted)) {
+    return false;
+  }
+  // Whether ANY reading of the grammar leaves this element start. Where none
+  // does, this start is the fault, and every reading behind it is free.
+  let mut derived = false;
+  let mut hit = false;
+
+  // The empty element §5.6.1.2 admits: "A recipient MUST parse and ignore a
+  // reasonable number of empty list elements".
+  match boundary(value, at) {
+    None => {}
+    Some(Edge::Ends) => derived = true,
+    Some(Edge::Next(next)) => {
+      derived = true;
+      hit |= covers(value, next, Start::Element, list, faulted, probe, seen);
+    }
+  }
+
+  // The element read as a whole `challenge`, which only an element of the outer
+  // list may be.
+  if start == Start::Element
+    && let Some(scheme_end) = token_end(value, at)
+  {
+    if value.get(scheme_end) == Some(&b' ') {
+      // The scheme and its `1*SP` derive whatever the body does, so a fault
+      // inside the body is the BODY's element start and not this one.
+      derived = true;
+      let body = skip_sp(value, scheme_end);
+      // §11.2's `token68` alternative, which is not a list.
+      if let Some(end) = token68_end(value, body)
+        && let Some(Edge::Next(next)) = boundary(value, end)
+      {
+        hit |= covers(value, next, Start::Element, false, faulted, probe, seen);
+      }
+      // And the `#auth-param` alternative, whose first element starts at the
+      // body position — an element start inside this outer element.
+      hit |= covers(value, body, Start::Body, true, faulted, probe, seen);
+    } else {
+      // No `1*SP`, so the scheme is a whole challenge that took no parameters.
+      match boundary(value, scheme_end) {
+        None => {}
+        Some(Edge::Ends) => derived = true,
+        Some(Edge::Next(next)) => {
+          derived = true;
+          hit |= covers(value, next, Start::Element, false, faulted, probe, seen);
+        }
+      }
+    }
+  }
+
+  // The element read as one more `auth-param` of a list already open. §11.2's
+  // one-name-once MUST is not applied here: a repeat refuses the reading, which
+  // makes this element a fault — and the regime behind a fault is the one this
+  // function is for, so the answer is the same either way and the name record
+  // is storage for nothing.
+  if list && let Some(start) = value_position(value, at) {
+    if value.get(start) == Some(&b'"') {
+      if open_at(value, start, probe) {
+        return true;
+      }
+      if let Quoted::Closed(end) = scan_quoted(value, start.saturating_add(1)) {
+        match boundary(value, end) {
+          None => {}
+          Some(Edge::Ends) => derived = true,
+          Some(Edge::Next(next)) => {
+            derived = true;
+            hit |= covers(value, next, Start::Element, list, faulted, probe, seen);
+          }
+        }
+      }
+    } else if let Some(end) = token_end(value, start) {
+      match boundary(value, end) {
+        None => {}
+        Some(Edge::Ends) => derived = true,
+        Some(Edge::Next(next)) => {
+          derived = true;
+          hit |= covers(value, next, Start::Element, list, faulted, probe, seen);
+        }
+      }
+    }
+  }
+
+  if !(faulted || !derived) {
+    return hit;
+  }
+
+  // Behind a fault. The DQUOTE §11.2 admits a value at is a choice: one reading
+  // opens the string there, and one leaves it shut and reads the element to the
+  // next comma raw.
+  if list
+    && let Some(start) = value_position(value, at)
+    && value.get(start) == Some(&b'"')
+  {
+    if open_at(value, start, probe) {
+      return true;
+    }
+    // The reading that opened it, past the close: what is left of the element
+    // holds no value position of its own, so it runs to the next raw comma.
+    if let Quoted::Closed(end) = scan_quoted(value, start.saturating_add(1)) {
+      hit |= resume(value, raw_comma_end(value, end), list, probe, seen);
+    }
+  }
+  // And the reading that opens nothing at all.
+  hit |= resume(value, raw_comma_end(value, at), list, probe, seen);
+  hit
+}
+
+/// The element start behind the comma at `end`, walked from there.
+///
+/// The end of `value` is no comma and opens no element, so a run that reaches
+/// it ends the reading.
+fn resume(
+  value: &[u8],
+  end: usize,
+  list: bool,
+  probe: usize,
+  seen: &mut HashSet<(usize, Start, bool, bool)>,
+) -> bool {
+  match value.get(end) {
+    Some(&b',') => covers(
+      value,
+      skip_ows(value, end.saturating_add(1)),
+      Start::Element,
+      list,
+      true,
+      probe,
+      seen,
+    ),
+    _ => false,
+  }
+}
+
+/// Whether the RFC 9110 §5.6.4 quoted-string opening at `quote` is still OPEN at
+/// `probe`.
+///
+/// The scan is taken over `value` cut at `probe`, so what it reports is the
+/// state the string is in THERE. A byte §5.6.4 forbids standing in FRONT of the
+/// probe means no quoted-string derives over it and there is no excuse to give —
+/// RFC 9110 §5.5 admits no CTL other than HTAB anywhere in a field value, so
+/// those bytes are no value's data. One standing BEHIND the probe is not in
+/// front of it: what the sender wrote between the DQUOTE and the probe is
+/// `qdtext` either way, and a reader that cut it in half read a challenge out of
+/// a value's interior.
+fn open_at(value: &[u8], quote: usize, probe: usize) -> bool {
+  quote < probe
+    && matches!(
+      scan_quoted(
+        value.get(..probe).unwrap_or_default(),
+        quote.saturating_add(1)
+      ),
+      Quoted::Open
+    )
+}
+
+/// Where the run at `at` ends when no quoted-string is opened in it: the first
+/// comma, read raw, or the end of `value`.
+fn raw_comma_end(value: &[u8], at: usize) -> usize {
+  let mut at = at;
+  while !matches!(value.get(at), None | Some(&b',')) {
+    at = at.saturating_add(1);
+  }
+  at
 }
 
 /// Where the element that ends at `end` leaves the list, or `None` when bytes
