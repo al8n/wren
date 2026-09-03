@@ -57,7 +57,31 @@
 //!   records that commit moved is still identifiable and its size is asserted,
 //!   but the tally it used to reconstruct is gone, because the commit that
 //!   closed al8n/wren#77 moved the reader and the oracle at once. That
-//!   constant records both halves of the move.
+//!   constant records both halves of the move — and the SHAPE it identifies
+//!   them by is wider than the set, so the surplus is a third asserted column
+//!   rather than a caveat.
+//! - **The differential over the two derivations of `excused` cannot grade
+//!   what they share.** [`EXCUSED_DISAGREEMENTS`] is 0 over 1 799 842 offsets,
+//!   and [`SHARED_JUDGEMENTS`] is what says which decisions that zero is not
+//!   about: 29 judgements the two take through one transcription, 17 of which
+//!   that gate answers nothing for. Eight now red a leaf property instead, and
+//!   **nine are answered by nothing at all** — each measured, one injection at
+//!   a time. [`PROSE_SHARED`] is the second class, the rules the two state
+//!   twice in WORDS, which no parse of a `use` declaration can find; those six
+//!   are caught, and by [`ZERO_TARGETS`] rather than by the differential.
+//!
+//! # Every number here is MEASURED or REASONED, and says which
+//!
+//! A number that was worked out and a number that was run look the same on the
+//! page, and this module has shipped one of each side by side: [`RECOVERED`]'s
+//! surplus was stated as 64 with the split the wrong way round, reasoned from a
+//! true fact about corpus F, beside per-corpus counts that had been run. So the
+//! convention from here: **a measured number carries the command that produced
+//! it**, in its own doc or in the constant it is asserted against, and a
+//! REASONED number says the word. Everything asserted in this file is measured
+//! by definition — a failure prints the number — and what needs the mark is the
+//! prose: the injection tables, the record counts quoted in doc comments, and
+//! anything a report will quote later.
 //! - **They cannot grade an input the corpus does not carry.** Corpus F is
 //!   hand-shaped and small; these numbers pin the answers over the inputs that
 //!   exist, which is not the same as over the inputs that matter. Measured:
@@ -302,7 +326,7 @@ fn a_high_byte_is_the_data_a_forbidden_one_is_not() {
 type Generator = fn(&mut Vec<u8>, &mut usize) -> std::io::Result<()>;
 
 /// The fourteen generators, in the order [`emit`] runs them.
-fn generators() -> [(&'static str, Generator); 14] {
+fn generators() -> [(&'static str, Generator); 15] {
   [
     ("A", corpus_a),
     ("B", corpus_b),
@@ -318,6 +342,7 @@ fn generators() -> [(&'static str, Generator); 14] {
     ("L", corpus_l),
     ("M", corpus_m),
     ("N", corpus_n),
+    ("O", corpus_o),
   ]
 }
 
@@ -446,7 +471,7 @@ fn the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart() {
     }
   }
   assert_eq!(
-    total, 943_270,
+    total, 946_462,
     "the corpus is the size every figure pinned here counts over"
   );
 
@@ -457,7 +482,7 @@ fn the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart() {
     .collect();
   shared.sort();
   assert_eq!(shared.len(), 32, "the groups that share a key: {shared:?}");
-  assert_eq!(counts.len(), 943_110, "distinct inputs behind the records");
+  assert_eq!(counts.len(), 946_302, "distinct inputs behind the records");
   for key in shared {
     assert_eq!(counts.get(key), Some(&6), "{key}");
     assert!(key.starts_with("D\t"), "outside corpus D: {key}");
@@ -557,9 +582,10 @@ type Pinned = (
 /// | E: 75 / 15 / 20 | 100 / 0 / 0, and 10 `hider-unresolved` and 5 `hider-conforming` |
 ///
 /// What is left of the reproduction is the part that can still be checked:
-/// [`RECOVERED`] identifies the record set one earlier commit moved and asserts
-/// its size, and `the_oracle_answers_the_readings_the_grammar_admits` derives
-/// the oracle's verdicts by hand from the RFC rather than from any tally.
+/// [`RECOVERED`] identifies the record set one earlier commit moved, asserts
+/// its size and asserts the surplus its identification carries, and
+/// `the_oracle_answers_the_readings_the_grammar_admits` derives the oracle's
+/// verdicts by hand from the RFC rather than from any tally.
 ///
 /// # These numbers are expected to move
 ///
@@ -567,7 +593,7 @@ type Pinned = (
 /// an answer moves a cell here, and the point is that it moves in the DIFF —
 /// where a reader can ask which cell and why — rather than in a figure nobody
 /// can recompute. Re-derive them from a failure's own message.
-const AXIS: [Pinned; 14] = [
+const AXIS: [Pinned; 15] = [
   (
     "A",
     262_136,
@@ -709,6 +735,26 @@ const AXIS: [Pinned; 14] = [
     ],
     9_713,
     14_605,
+  ),
+  // Two of these cells are ZERO-TARGETS standing at a non-zero number, and
+  // they are pinned here rather than blessed anywhere: `the_three_classes_this_
+  // module_is_driven_to_zero_on_are_zero` REDS on this corpus, which is the
+  // finding this family was written to make and not a number to paste over.
+  // `leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_writes` carries
+  // both witnesses and what each says.
+  (
+    "O",
+    3_192,
+    &[
+      ("hider-excused", 1_296),
+      ("hider-unexcused", 18),
+      ("hider-unresolved", 72),
+      ("over-yield", 54),
+      ("yields", 222),
+      ("yields-underivable", 1_530),
+    ],
+    4_908,
+    5_049,
   ),
 ];
 
@@ -861,7 +907,7 @@ const ZERO_TARGETS: [&str; 3] = ["over-yield", "hider-unexcused", "hider-decline
 /// neither holds — is a zero-target rather than a cost. Corpus D's 18 and
 /// corpus E's 15 split 12/6 and 10/5 between the two once the line was drawn;
 /// the totals did not move and no record left the pair.
-const UNRESOLVED: [(&str, usize); 14] = [
+const UNRESOLVED: [(&str, usize); 15] = [
   ("A", 0),
   ("B", 0),
   ("C", 10),
@@ -907,6 +953,10 @@ const UNRESOLVED: [(&str, usize); 14] = [
   // boundary in front of it, and they answered 44 before the span rule existed
   // too. Every other span of that family answers 0.
   ("N", 76),
+  // Corpus O's 72 are the rows where the walk declined a comma the readings
+  // disagree about, which is the cost this class counts and not a defect. What
+  // this family found instead is in `over-yield` and in `hider-unexcused`.
+  ("O", 72),
 ];
 
 /// Corpus A read the three ways `challenges` is called on it.
@@ -1041,7 +1091,7 @@ const MOVED: &str = "an answer moved. `cargo run -p xtask -- auth-diff <base-rev
 /// carries no information about WHAT moved, so blessing one is a strictly
 /// blind act unless the `auth-diff` run that says what moved was actually made.
 /// [`MOVED`] is the failure message for that reason, and it names the command.
-const ANSWERS: [(&str, &str); 14] = [
+const ANSWERS: [(&str, &str); 15] = [
   (
     "A",
     "a7390db7460bf1c1405a1829405b4a32ae7729ccda5cfa640598e0328826c486",
@@ -1098,9 +1148,13 @@ const ANSWERS: [(&str, &str); 14] = [
     "N",
     "69f3d692a6d4429fb6c3eb89c29e38e2014fe39b7499837f282db9791e45e03f",
   ),
+  (
+    "O",
+    "bdc4304de9ca2ea747d024d4cf4e2af08df1da220f72a13604c30818af93c1ae",
+  ),
 ];
 
-const WHOLE: &str = "1d600d6f1fc27a55008499fad4ebca456e7c9bc64f357f56c8bfa9d70c817cd1";
+const WHOLE: &str = "782ce07317aa1aa5e3f17bfcdba0f6690ab3ab8527da18adc97ac1ab4f30776c";
 
 /// Feeds `hash` what `auth-diff` digests: each record's `answer` column and the
 /// newline behind it, in record order.
@@ -1171,7 +1225,7 @@ fn the_answers_this_tree_gives_are_the_ones_the_differential_digested() {
 ///
 /// Its total per corpus is [`AXIS`]'s fault count, asserted below, so a parse
 /// that silently dropped a fault reds rather than lowering a row.
-const FAULTS: [(&str, &[(&str, usize)]); 14] = [
+const FAULTS: [(&str, &[(&str, usize)]); 15] = [
   (
     "A",
     &[
@@ -1312,6 +1366,16 @@ const FAULTS: [(&str, &[(&str, usize)]); 14] = [
       ("UnterminatedQuotedString", 287),
     ],
   ),
+  (
+    "O",
+    &[
+      ("ChallengeBoundaryUnknown", 513),
+      ("MalformedParameter", 627),
+      ("MalformedScheme", 2_427),
+      ("TooManyParameters", 798),
+      ("UnterminatedQuotedString", 684),
+    ],
+  ),
 ];
 
 /// `(fault, count)` over `lines`, sorted by name.
@@ -1354,8 +1418,8 @@ fn the_faults_each_corpus_answers_with_are_the_ones_it_answered_with() {
 // ─────────────── the records one earlier commit moved, identified ────────────
 
 /// How many records each corpus holds that `evidence/auth-forbidden-byte-refuses`
-/// moved out of `hider-unexcused`, identified by
-/// [`recovered_from_a_forbidden_byte`].
+/// moved out of `hider-unexcused`, and how many MORE the shape that identifies
+/// them selects: corpus, moved, surplus.
 ///
 /// # What this used to be, and why it is less
 ///
@@ -1391,13 +1455,55 @@ fn the_faults_each_corpus_answers_with_are_the_ones_it_answered_with() {
 /// holds every comma behind its DQUOTE, so those 137 records answer
 /// `ChallengeBoundaryUnknown` where they used to hand back a `Digest`.
 ///
-/// So the predicate below identifies the shape by the pair of faults it now
-/// answers with. **It is exact for corpora D and E and not for F**: F's 192
-/// rows put the octet BEHIND the probe as often as in front of it, and 64 of
-/// those already answered these two faults while showing no probe at all. D's
-/// 90 and E's 15 are the same records they always were; F's 96 are 32 of them
-/// and 64 that were never in the set.
-const RECOVERED: [(&str, usize); 3] = [("D", 90), ("E", 15), ("F", 96)];
+/// So [`recovered_from_a_forbidden_byte`] identifies the SHAPE by the pair of
+/// faults it now answers with, and the shape is wider than the set: two
+/// records can carry it and only one of them be a record that commit moved.
+/// The three columns are therefore corpus, the records it moved, and the
+/// records the shape also selects that it did not — and BOTH are asserted, so
+/// the surplus is a bounded quantity rather than a rounding a later reader
+/// quotes as if it were exact.
+///
+/// # The surplus, and two numbers that were wrong
+///
+/// An over-selection nobody has bounded easily gets quoted as exact, and
+/// this constant had already been quoted wrong. Its doc
+/// said F's 96 were "32 of them and 64 that were never in the set", by the
+/// argument that the surplus is where the octet stands BEHIND the probe. Both
+/// halves are wrong and the argument is too: the commit moved 64 of F's
+/// records, half of them with the octet behind the probe, and the surplus is
+/// 32.
+///
+/// The numbers above were reasoned about; these were run. This tree's own
+/// corpus source will not COMPILE against either revision — it names
+/// `ChallengeBoundaryUnknown`, which neither had — so the source AT
+/// `evidence/auth-forbidden-byte-refuses` was built against each of the two
+/// trees instead, and the axis columns compared record by record. That
+/// substitution is sound for exactly one reason and it was checked rather than
+/// assumed: `corpus_f`, [`OCTETS`] and [`PROBE`] are byte-identical between
+/// that tag and this tree, so the record keys line up.
+///
+/// ```text
+/// git archive <tag> | tar -x -C <dir>            # both tags
+/// cargo run --manifest-path <probe>/Cargo.toml -- <dump>   # one source, two http-semantics
+/// paste <(cut -f1,2,3,4 before.tsv) <(cut -f4 refuses.tsv) |
+///   awk -F'\t' '$4=="hider-unexcused" && $5!="hider-unexcused"'
+/// ```
+///
+/// `90 D · 15 E · 64 F`, 169 records. Intersected by key with what the
+/// predicate selects in this tree: every one of the 169 is selected, D and E
+/// hold nothing else, and F holds 32 more.
+///
+/// **The surplus is exactly F's `behind=true split=true` rows** — the octet
+/// behind the probe AND the value written across §5.2's join — all 8 forbidden
+/// octets by 2 closers by 2 trailings. They were `hider-unexcused` at BOTH
+/// tags, answering `InvalidQuotedString` alone at the first and
+/// `InvalidQuotedString` then `MissingScheme` at the second; they became
+/// `hider-excused` later on this branch, when the oracle stopped asking whether
+/// the WHOLE value derives. [`selected_but_never_moved`] is that
+/// identification, and it reads the spelling column because the answer column
+/// no longer separates them: F's `behind=true` rows answer the same two faults
+/// on one line as across a join, byte for byte.
+const RECOVERED: [(&str, usize, usize); 3] = [("D", 90, 0), ("E", 15, 0), ("F", 64, 32)];
 
 /// What a challenge cut out of a run a forbidden byte sealed would count, over
 /// every corpus.
@@ -1418,11 +1524,65 @@ const INVENTED_BEHIND_A_FORBIDDEN_BYTE: usize = 0;
 /// §5.6.4 forbids: its axis is `hider-excused` — some reading holds the probe
 /// among a value's own bytes — its answer carries `InvalidQuotedString`, and it
 /// carries `ChallengeBoundaryUnknown`.
+///
+/// A SHAPE and not a set. [`selected_but_never_moved`] is the other half:
+/// which records carrying the shape `evidence/auth-forbidden-byte-refuses` did
+/// not move.
 fn recovered_from_a_forbidden_byte(line: &str) -> bool {
   let [_, _, _, axis, answer] = columns(line);
   axis == "hider-excused"
     && answer.contains("Err(InvalidQuotedString)")
     && answer.contains("Err(ChallengeBoundaryUnknown)")
+}
+
+/// A byte no RFC 9110 field value admits: a CTL other than HTAB.
+///
+/// `OCTETS`'s doc carries the derivation and the §5.5 sentence it rests on;
+/// this is that rule as a predicate, and it is the one fact
+/// [`selected_but_never_moved`] needs about a byte.
+fn a_byte_no_field_value_admits(byte: u8) -> bool {
+  (byte < 0x20 && byte != b'\t') || byte == 0x7F
+}
+
+/// Whether this record carries [`recovered_from_a_forbidden_byte`]'s shape and
+/// is one that `evidence/auth-forbidden-byte-refuses` did NOT move: the value
+/// is written over more than one field line, and the byte that seals its string
+/// stands BEHIND the probe.
+///
+/// # Read from the record's own bytes, and why that took a second look
+///
+/// This set was first identified from the SPELLING column — the
+/// generator's own label for a case — on the ground that the answer column
+/// cannot separate the two, which is true and measured: F's `behind=true` rows
+/// answer `InvalidQuotedString` then `ChallengeBoundaryUnknown` on one line and
+/// across a join, byte for byte, with the same axis. But the answer column is
+/// not the only one that is not the label. The CASE column is the input, and
+/// the input is where the difference lives — necessarily, because RFC 9110
+/// §5.2 makes the two spellings ONE value, so what separates them is how it was
+/// written and nothing else.
+///
+/// So both facts are read from the case: `|` is what the record contract
+/// separates field lines with, and the sealing byte's offset is compared with
+/// the probe's in the value those lines join to. Measured against the label it
+/// replaces: the two agree on every one of the 201 records the shape selects,
+/// and `the_records_one_earlier_commit_moved_are_still_the_ones_it_moved`
+/// asserts that agreement rather than leaving it as a note, so a generator
+/// whose label drifts from its inputs reds.
+fn selected_but_never_moved(line: &str) -> bool {
+  let [_, case, _, _, _] = columns(line);
+  let lines: Vec<Vec<u8>> = case.split('|').map(unescape).collect();
+  if lines.len() < 2 {
+    return false;
+  }
+  let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+  let joined = join(&refs);
+  let Some(probe) = last_index_of(&joined, PROBE) else {
+    return false;
+  };
+  joined
+    .iter()
+    .position(|&byte| a_byte_no_field_value_admits(byte))
+    .is_some_and(|sealed| sealed > probe)
 }
 
 /// Whether this record shows the probe behind an `InvalidQuotedString` — a
@@ -1444,18 +1604,66 @@ fn of(counts: &[(String, usize)], axis: &str) -> usize {
 
 #[test]
 fn the_records_one_earlier_commit_moved_are_still_the_ones_it_moved() {
-  for (name, moved) in RECOVERED {
+  for (name, moved, surplus) in RECOVERED {
     let (_, generator) = generators()
       .into_iter()
       .find(|(known, _)| *known == name)
       .expect("every corpus [`RECOVERED`] names has a generator");
+    let selected: Vec<String> = records(generator)
+      .into_iter()
+      .filter(|line| recovered_from_a_forbidden_byte(line))
+      .collect();
+    let counted = selected
+      .iter()
+      .filter(|line| selected_but_never_moved(line))
+      .count();
+    // Both halves, so the shape's over-selection is a quantity this gate holds
+    // rather than a caveat in a doc comment. A record that leaves the surplus
+    // and a record that joins it move different numbers here.
+    assert_eq!(
+      counted, surplus,
+      "corpus {name}: records carrying the shape that commit never moved"
+    );
+    assert_eq!(
+      selected.len().saturating_sub(counted),
+      moved,
+      "corpus {name}: the records that commit moved"
+    );
+    // The label the generator writes says the same thing as the bytes, on
+    // every record the shape selects. [`selected_but_never_moved`] reads the
+    // bytes; this is what stops the two readings drifting apart unnoticed, and
+    // it is the whole of what the spelling column is still trusted for.
+    for line in &selected {
+      let [_, _, spelling, _, _] = columns(line);
+      assert_eq!(
+        selected_but_never_moved(line),
+        spelling.contains("behind=true") && spelling.contains("split=true"),
+        "corpus {name}: the case and the spelling disagree about this record"
+      );
+    }
+  }
+
+  // And the shape is written nowhere else. [`RECOVERED`] names three corpora
+  // and asserts nothing about the other eleven, so without this a shape
+  // appearing in one of them would be surplus nobody counted.
+  //
+  // A ZERO-target rather than a pin, and its non-vacuity is measured rather
+  // than assumed: the sweep reaches 942 302 records and finds none, so deleting
+  // it reds nothing on this tree. What it catches was shown by making one
+  // corpus match — the failure then names that corpus rather than one of the
+  // three, which is a different message from every other way this test can
+  // fail.
+  for (name, generator) in generators() {
+    if RECOVERED.iter().any(|(known, _, _)| *known == name) {
+      continue;
+    }
     assert_eq!(
       records(generator)
         .iter()
         .filter(|line| recovered_from_a_forbidden_byte(line))
         .count(),
-      moved,
-      "corpus {name}: the records answering behind a forbidden byte"
+      0,
+      "corpus {name}: the shape [`RECOVERED`] counts is written outside it"
     );
   }
 
@@ -2046,7 +2254,21 @@ const N_SPAN_DERIVES: [(&str, Option<bool>); 14] = [
 /// are: a differential that is driven to zero says nothing about the shapes it
 /// was never run over, and a corpus quietly narrowed would drive the
 /// disagreement count to zero by asking less. This is the denominator.
-const EXCUSED_REACH: [(&str, usize); 14] = [
+///
+/// # And the denominator is not the coverage
+///
+/// 1 799 842 offsets and 0 disagreements is not *these two derivations agree
+/// about everything*. **A differential over two derivations grades the
+/// composition and never the transcriptions they share**, and
+/// [`SHARED_JUDGEMENTS`] is the enumeration of what that leaves out: 29
+/// judgements the two take through one piece of code, of which **9 can still be
+/// broken without ANY gate of this crate reporting anything** — measured one
+/// injection at a time, each against a pristine 0, each moving answers of both
+/// derivations alike. It was 17 before this crate grew the eight leaf
+/// properties, and the differential itself still answers 0 for all 17 of them:
+/// what changed is that eight now red somewhere else. Whoever reads this number
+/// should read that table in the same breath.
+const EXCUSED_REACH: [(&str, usize); 15] = [
   ("A", 330_347),
   ("B", 521_808),
   ("C", 720_896),
@@ -2061,6 +2283,7 @@ const EXCUSED_REACH: [(&str, usize); 14] = [
   ("L", 516),
   ("M", 13_175),
   ("N", 128_596),
+  ("O", 32_598),
 ];
 
 /// The number of offsets the two derivations of `excused` answer differently
@@ -2088,7 +2311,7 @@ const EXCUSED_REACH: [(&str, usize); 14] = [
 /// first element dropped from `readings` reds it at 24. Each is one injection
 /// against a pristine 0, re-measured over this corpus.
 ///
-/// # What it cannot see, measured
+/// # What it cannot see, enumerated and measured
 ///
 /// A misunderstanding the two SHARE, and it surfaced after this gate was
 /// built.
@@ -2107,14 +2330,29 @@ const EXCUSED_REACH: [(&str, usize); 14] = [
 /// stronger form: `open_at`'s fix reverted while everything else stands reds
 /// this gate at **0** offsets, against a pristine 0 and beside five injections
 /// that red it at 36, 1 684, 156, 36 and 24. The gate is not blind here by
-/// accident — it is blind by construction, because the judgement lives in the
-/// one transcription the two derivations deliberately share.
+/// accident — it is blind by construction, because the judgement lives in a
+/// transcription the two derivations deliberately share.
 ///
-/// So the rule this gate rests on has a second half now: a differential over
-/// two derivations grades the COMPOSITION and never the transcriptions, and a
+/// So the rule this gate rests on has a second half: **a differential over two
+/// derivations grades the COMPOSITION and never the transcriptions**, and a
 /// judgement that lives in a shared transcription needs a reader outside this
-/// crate. `http_semantics::grammar::Readings::absorb` was that reader here, and
-/// it had answered the other way.
+/// crate. `http_semantics::grammar::Readings::absorb` was that reader for
+/// `open_at`, and it had answered the other way.
+///
+/// That rule was a sentence, and a sentence does not say WHICH judgements it
+/// covers. [`SHARED_JUDGEMENTS`] does: every decision the two take through one
+/// piece of code, with the disagreement count this gate reports when it is
+/// broken. **17 of the 29 are zeros for THIS gate**, and one of them is
+/// `open_at`'s, so the rule is not an inference from a single incident but the
+/// shape of the instrument; the four this gate does catch are caught only
+/// because the two walks consume `boundary`, `token_end` and `token68_end` at
+/// different places.
+///
+/// So this 0 means: over 1 799 842 offsets, the two COMPOSITIONS agree. It does
+/// not mean the readings they compose are right. Eight of the seventeen are now
+/// answered by a property instead — [`WRONGNESS_GATES`] is the whole set of
+/// things in this crate that make a wrongness claim — and nine are answered by
+/// nothing.
 ///
 /// `readings`'s module doc names the other thing the two are not independent
 /// about — where the free regime starts and stops — and says plainly that the
@@ -2123,6 +2361,17 @@ const EXCUSED_DISAGREEMENTS: usize = 0;
 
 #[test]
 fn the_two_derivations_of_excused_answer_alike() {
+  use std::io::Write;
+
+  // The instrument behind [`SHARED_JUDGEMENTS`]'s `moves` column. With
+  // `EXCUSED_DUMP` set, both derivations' answers are written as they are
+  // taken, so a defect injected into a transcription the two SHARE can be shown
+  // to move answers this gate then reports nothing about — which is the whole
+  // difference between a blind row and an unexercised one. Unset, which is
+  // every run but a measurement, nothing is opened and nothing is written.
+  let mut dump = std::env::var_os("EXCUSED_DUMP").map(|path| {
+    std::io::BufWriter::new(std::fs::File::create(path).expect("the dump path is writable"))
+  });
   let mut differ: Vec<String> = Vec::new();
   for ((name, generator), (pinned, reach)) in generators().into_iter().zip(EXCUSED_REACH) {
     assert_eq!(name, pinned, "the two tables are in the same order");
@@ -2132,6 +2381,9 @@ fn the_two_derivations_of_excused_answer_alike() {
         asked += 1;
         let walked = crate::oracle::covered(&joined, at);
         let enumerated = crate::readings::covered(&joined, at);
+        if let Some(out) = dump.as_mut() {
+          writeln!(out, "{name}\t{at}\t{walked}\t{enumerated}").expect("the dump is written");
+        }
         if walked != enumerated && differ.len() < 8 {
           differ.push(format!(
             "corpus {name} at {at}: oracle::covered {walked}, readings::covered \
@@ -2149,6 +2401,9 @@ fn the_two_derivations_of_excused_answer_alike() {
       "corpus {name}: the offsets `excused` is asked at"
     );
   }
+  if let Some(out) = dump.as_mut() {
+    out.flush().expect("the dump is written");
+  }
   let count = differ.iter().filter(|shown| shown.is_empty()).count();
   assert_eq!(
     count,
@@ -2159,6 +2414,837 @@ fn the_two_derivations_of_excused_answer_alike() {
       .filter(|shown| !shown.is_empty())
       .collect::<Vec<_>>()
   );
+}
+
+// ───────── what that zero grades, and the judgements it is not about ─────────
+
+/// One judgement the two derivations of `excused` take through a transcription
+/// they SHARE, and what [`EXCUSED_DISAGREEMENTS`] reports when it is wrong.
+///
+/// A row is a DECISION and not a function. `open_at` is one function and four
+/// decisions, and a defect can live in any one of them; listing the functions
+/// would say where the sharing is without saying what it costs. The sharing is
+/// right — two hand-written copies of one production is the shape al8n/wren#76
+/// was filed over and the shape `coding-corpus` exists to prevent — so what was
+/// missing was never the independence, it was a statement of which judgements
+/// fall outside the comparison the sharing buys.
+struct Shared {
+  /// The item `readings` imports from [`oracle`](crate::oracle) rather than
+  /// writing again.
+  of: &'static str,
+  /// The decision taken inside it — the branch a defect would live in.
+  judgement: &'static str,
+  /// The defect injected to measure the row, against the pristine source.
+  injection: &'static str,
+  /// How many of the offsets in [`EXCUSED_REACH`] change `oracle::covered`'s
+  /// answer under that injection, and how many change `readings::covered`'s.
+  ///
+  /// This is what tells a BLIND row from an unexercised one, and the reason
+  /// every row carries it: a zero disagreement count over an injection that
+  /// moves nothing is not a blind spot, it is a state the corpus cannot spell
+  /// at the offsets the question is asked at, and reporting the two alike would
+  /// overstate the gate's blindness as badly as omitting them understates it.
+  moves: (usize, usize),
+  /// What [`EXCUSED_DISAGREEMENTS`] counts under the injection.
+  differ: usize,
+  /// The gate that reds under the injection because the answer is WRONG, or
+  /// the empty string where none does.
+  ///
+  /// It must be one of [`WRONGNESS_GATES`], and the distinction is the whole
+  /// content of this column. Almost every injection below also reds [`AXIS`],
+  /// [`ANSWERS`] and [`WHOLE`] — but those are PINS, and [`AXIS`]'s own doc says
+  /// so in as many words: a cell that moved says one of the reader and the
+  /// oracle moved, and instructs a maintainer to go and look. A gate named here
+  /// says the judgement is wrong.
+  caught_by: &'static str,
+  /// The known-wrong spelling this crate keeps so that [`caught_by`](Self::caught_by)
+  /// is proven on every run rather than recorded, or the empty string where the
+  /// row has none.
+  ///
+  /// Only the property gates can carry one: a control is an implementation
+  /// passed to the property, and the differential's two derivations are whole
+  /// walks rather than a function it takes.
+  control: &'static str,
+}
+
+impl Shared {
+  /// Whether the injection moves an answer of either derivation at all.
+  const fn reached(&self) -> bool {
+    self.moves.0 > 0 || self.moves.1 > 0
+  }
+
+  /// Whether any gate of this crate answers a defect in this judgement.
+  const fn covered(&self) -> bool {
+    !self.caught_by.is_empty()
+  }
+
+  /// Whether the gate is silent about a defect it demonstrably could have
+  /// been asked about.
+  const fn blind(&self) -> bool {
+    self.reached() && !self.covered()
+  }
+}
+
+/// Every judgement the two derivations of `excused` take through ONE
+/// transcription, and the measured answer to *would this gate say so*.
+///
+/// # How each row was measured, and how to re-measure it
+///
+/// One injection at a time into `oracle`, applied to the pristine tree, with
+/// nothing else changed:
+///
+/// - `differ` is `cargo test -p auth-corpus --release
+///   the_two_derivations_of_excused_answer_alike`, read from the failure's own
+///   `left:` — 0 where it passes.
+/// - `moves` is a dump of `(oracle::covered, readings::covered)` over the same
+///   offsets, compared to the pristine dump line by line. Setting `EXCUSED_DUMP`
+///   makes the gate write that dump as it runs, so both numbers of a row come
+///   from one command.
+///
+/// # What the table says
+///
+/// **9 of the 29 rows are BLIND**: the injection moves as many as 30 826 of the
+/// differential's own answers — in BOTH derivations, identically — and nothing
+/// in this crate says so. That pair was measured over a corpus of 1 767 244
+/// offsets, which is [`EXCUSED_REACH`] BEFORE corpus O; the ratio is the claim
+/// and neither figure has been re-measured since, so neither is restated
+/// against the corpus as it now stands. It was 17, and the eight leaf properties
+/// are the difference; each of those rows names the property that catches it
+/// and the control that proves the property still does.
+///
+/// Twelve rows are covered, by two gates of very different kinds. Four are
+/// caught by the differential, and the reason is worth naming because it is not
+/// design: `boundary`, `token_end` and `token68_end` are asked at DIFFERENT
+/// places by the two walks, so a defect in them reaches one derivation before
+/// the other and the composition disagrees with itself — a shared transcription
+/// is graded by a differential only where the two happen to consume it
+/// asymmetrically. The other eight are caught by a property stated from the
+/// production, which does not care how the two walks consume anything.
+///
+/// Eight rows move neither derivation's answer at any of the offsets asked, so
+/// the gate's zero is not evidence about them either way. Two of those are the
+/// most interesting rows here, because they are not dead code: `B2` moves the
+/// axis of 491 628 records and `Q1` moves nothing at all. The gate asks one
+/// question — *does some reading hold this offset inside a quoted-string* — and
+/// a judgement the oracle needs for a DIFFERENT verdict is outside it however
+/// live it is elsewhere.
+///
+/// Blind by transcription, which is the shape a reader should take away:
+/// `value_position`, `skip_ows`, `skip_sp` and `raw_comma_end` were wholly
+/// blind and are now wholly covered; `token_end` was and is wholly covered;
+/// what is left blind is `open_at` two of four, `scan_quoted` three of seven,
+/// `boundary` two of four, and `token68_end` two of three. Every remaining
+/// blind row is a judgement about a §5.6.4 quoted-string or an element
+/// boundary, which is where this crate's question lives — so the properties
+/// took the leaves that were easiest to state from a production and left the
+/// ones that are the question itself.
+const SHARED_JUDGEMENTS: [Shared; 29] = [
+  Shared {
+    of: "open_at",
+    judgement: "a DQUOTE standing AT the probe opens no string that covers it",
+    injection: "`quote < probe` becomes `quote <= probe`",
+    moves: (0, 0),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "open_at",
+    judgement: "a scan that reached a closing DQUOTE does not cover the probe",
+    injection: "a scan still open at the probe stops covering it",
+    moves: (30_826, 30_826),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "open_at",
+    judgement: "a scan a forbidden byte SEALED does cover the probe",
+    injection: "an invalid scan stops covering it",
+    moves: (360, 360),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "open_at",
+    judgement: "the scan is cut at the probe, so a close BEHIND it shuts nothing",
+    injection: "the scan reads the whole value",
+    moves: (10_534, 10_534),
+    differ: 0,
+    caught_by: "open_at_reads_no_byte_at_or_behind_the_probe",
+    control: "open_at_reading_past_the_probe",
+  },
+  Shared {
+    of: "scan_quoted",
+    judgement: "input running out leaves the string open rather than invalid",
+    injection: "the end of input reports an invalid scan",
+    moves: (0, 0),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "scan_quoted",
+    judgement: "a close is reported one PAST the closing DQUOTE",
+    injection: "the close is reported at it",
+    moves: (876, 876),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "scan_quoted",
+    judgement: "a backslash opens RFC 9110 §5.6.4's `quoted-pair`",
+    injection: "the backslash is ordinary data",
+    moves: (118, 118),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "scan_quoted",
+    judgement: "a `quoted-pair` admits HTAB, SP, VCHAR and `obs-text` and nothing else",
+    injection: "the escaped byte is admitted whatever it is",
+    moves: (0, 0),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "scan_quoted",
+    judgement: "`obs-text` IS `qdtext`",
+    injection: "the high half of the octet range is refused",
+    moves: (0, 0),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "scan_quoted",
+    judgement: "a byte `qdtext` forbids makes the whole scan invalid",
+    injection: "the last arm admits the byte and reads on",
+    moves: (0, 0),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "scan_quoted",
+    judgement: "HTAB and SP are `qdtext`",
+    injection: "the two are refused inside a string",
+    moves: (764, 764),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "Quoted",
+    judgement: "a scan reports THREE outcomes and not two: a close, an end of input, and a byte the grammar forbids",
+    injection: "the invalid outcome is spelled as the open one at both of its returns",
+    moves: (0, 0),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "raw_comma_end",
+    judgement: "only a raw comma or the value's end stops the run, never a DQUOTE",
+    injection: "a DQUOTE stops it too",
+    moves: (1_518, 1_518),
+    differ: 0,
+    caught_by: "a_raw_run_ends_at_the_first_raw_comma",
+    control: "raw_comma_end_that_a_dquote_stops",
+  },
+  Shared {
+    of: "boundary",
+    judgement: "the `OWS` in front of the comma is the LIST's and not the element's",
+    injection: "the element is asked to hold it",
+    moves: (176, 176),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "boundary",
+    judgement: "the value ENDING is an element boundary",
+    injection: "it is no boundary",
+    moves: (0, 0),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "boundary",
+    judgement: "the `OWS` behind the comma is the list's too",
+    injection: "the next element starts on it",
+    moves: (2_876, 2_876),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "boundary",
+    judgement: "a byte that is neither `OWS` nor a comma ends NO element",
+    injection: "it ends the value",
+    moves: (29_112, 5_558),
+    differ: 23_554,
+    caught_by: "the_two_derivations_of_excused_answer_alike",
+    control: "",
+  },
+  Shared {
+    of: "Edge",
+    judgement: "the value ending is not the next element starting",
+    injection: "the end is reported as an element start at the value's length",
+    moves: (0, 0),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "skip_ows",
+    judgement: "RFC 9110 §5.6.3's `OWS` is SP and HTAB",
+    injection: "HTAB is not crossed",
+    moves: (2_386, 2_386),
+    differ: 0,
+    caught_by: "a_whitespace_run_is_crossed_whole",
+    control: "skip_ows_without_htab",
+  },
+  Shared {
+    of: "skip_sp",
+    judgement: "the `1*SP` a challenge's body opens behind is SP alone, never HTAB",
+    injection: "HTAB is crossed too",
+    moves: (898, 898),
+    differ: 0,
+    caught_by: "a_whitespace_run_is_crossed_whole",
+    control: "skip_sp_with_htab",
+  },
+  Shared {
+    of: "token_end",
+    judgement: "an empty run is no `token`",
+    injection: "the empty run is one",
+    moves: (34_847, 35_019),
+    differ: 172,
+    caught_by: "the_two_derivations_of_excused_answer_alike",
+    control: "",
+  },
+  Shared {
+    of: "token_end",
+    judgement: "the comma RFC 9110 §5.6.1 separates with is no `tchar`",
+    injection: "the alphabet admits it",
+    moves: (8_582, 10_484),
+    differ: 1_902,
+    caught_by: "the_two_derivations_of_excused_answer_alike",
+    control: "",
+  },
+  Shared {
+    of: "token68_end",
+    judgement: "an empty run is no `token68`",
+    injection: "the empty run is one",
+    moves: (2_290, 180),
+    differ: 2_110,
+    caught_by: "the_two_derivations_of_excused_answer_alike",
+    control: "",
+  },
+  Shared {
+    of: "token68_end",
+    judgement: "the padding is TRAILING and no part of the alphabet",
+    injection: "the trailing run stops being crossed",
+    moves: (656, 656),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "token68_end",
+    judgement: "`token68`'s alphabet excludes DQUOTE",
+    injection: "the alphabet admits it",
+    moves: (220, 220),
+    differ: 0,
+    caught_by: "",
+    control: "",
+  },
+  Shared {
+    of: "value_position",
+    judgement: "an `auth-param`'s name is a `token`",
+    injection: "an element with no name has a value position at its own first byte",
+    moves: (34_391, 34_391),
+    differ: 0,
+    caught_by: "a_value_position_stands_behind_a_name_and_an_eq",
+    control: "value_position_with_no_name",
+  },
+  Shared {
+    of: "value_position",
+    judgement: "RFC 9110 §5.6.3's `BWS` stands in front of the `=`",
+    injection: "the `=` is looked for on the byte behind the name",
+    moves: (2_132, 2_132),
+    differ: 0,
+    caught_by: "the_bws_in_front_of_the_eq_is_admitted",
+    control: "value_position_with_no_bws_in_front",
+  },
+  Shared {
+    of: "value_position",
+    judgement: "an element with no `=` has NO value position",
+    injection: "its value begins where the `=` was looked for",
+    moves: (84_029, 84_029),
+    differ: 0,
+    caught_by: "a_value_position_stands_behind_a_name_and_an_eq",
+    control: "value_position_with_no_eq_needed",
+  },
+  Shared {
+    of: "value_position",
+    judgement: "`BWS` stands behind the `=` too",
+    injection: "the value begins on the byte behind the `=`",
+    moves: (2_132, 2_132),
+    differ: 0,
+    caught_by: "a_value_position_stands_behind_a_name_and_an_eq",
+    control: "value_position_with_no_bws_behind",
+  },
+];
+
+/// How [`SHARED_JUDGEMENTS`] splits: blind, covered, and out of the gate's
+/// reach.
+///
+/// Pinned rather than printed, so that editing a row's measured numbers to make
+/// the gate look better moves a number here and reds. It is derived from the
+/// table and so is not independent evidence — what it buys is that the table
+/// cannot be quietly improved.
+///
+/// **It was `(17, 4, 8)`**, with the differential the only gate that made a
+/// wrongness claim about any of these judgements. The eight leaf properties
+/// moved eight rows — `open_at`'s O4, `raw_comma_end`'s, `skip_ows`'s,
+/// `skip_sp`'s and all four of `value_position`'s — from the first class to the
+/// second, and moved nothing else: the `moves` and `differ` columns re-measured
+/// identically, row for row, over the same 29 injections.
+const SHARED_SPLIT: (usize, usize, usize) = (9, 12, 8);
+
+/// The gates a row of [`SHARED_JUDGEMENTS`] may name, and the whole of what
+/// makes that column mean something.
+///
+/// Every one of these reds because an ANSWER IS WRONG. A pin — [`AXIS`],
+/// [`ANSWERS`], [`WHOLE`], [`FAULTS`] — reds under most of these injections too
+/// and is not coverage: it says a number moved, which is a thing to go and look
+/// at rather than a finding. Without this set a row could claim to be covered
+/// by a tally, and the blind count would fall to nearly zero while nothing had
+/// been learned.
+const WRONGNESS_GATES: [&str; 7] = [
+  "the_two_derivations_of_excused_answer_alike",
+  "the_three_classes_this_module_is_driven_to_zero_on_are_zero",
+  "a_value_position_stands_behind_a_name_and_an_eq",
+  "the_bws_in_front_of_the_eq_is_admitted",
+  "a_raw_run_ends_at_the_first_raw_comma",
+  "a_whitespace_run_is_crossed_whole",
+  "open_at_reads_no_byte_at_or_behind_the_probe",
+];
+
+/// This module's own source, read at compile time so that a name
+/// [`SHARED_JUDGEMENTS`] claims can be held against the item that carries it.
+///
+/// It is the same device `readings.rs` is read with, turned on this file: a
+/// table naming a test that no longer exists is the commonest way a record like
+/// this rots, and it is the one kind of rot that can be caught without running
+/// the sweep again.
+const THIS_FILE: &str = include_str!("tests.rs");
+
+/// Every item `readings` imports from [`oracle`](crate::oracle), read from that
+/// file rather than listed by hand.
+///
+/// The list is the whole of what the two derivations share, so a list written
+/// out here would go stale exactly when it mattered — at the commit that shares
+/// one more.
+fn shared_transcriptions() -> Vec<String> {
+  const SOURCE: &str = include_str!("readings.rs");
+  let code: String = SOURCE
+    .lines()
+    .filter(|line| !line.trim_start().starts_with("//"))
+    .collect::<Vec<_>>()
+    .join("\n");
+  // One reach into the oracle and one only. A second import written any other
+  // way would put a shared judgement outside this enumeration silently, which
+  // is the failure this parse exists to make loud.
+  assert_eq!(
+    code.matches("oracle").count(),
+    1,
+    "`readings` reaches the oracle in exactly one place"
+  );
+  let list = code
+    .split_once("use crate::oracle::{")
+    .and_then(|(_, rest)| rest.split_once("};"))
+    .expect("the one reach is the braced import")
+    .0;
+  list
+    .split(',')
+    .map(str::trim)
+    .filter(|name| !name.is_empty())
+    .map(str::to_owned)
+    .collect()
+}
+
+#[test]
+fn every_transcription_the_two_derivations_share_is_enumerated() {
+  let shared = shared_transcriptions();
+  for name in &shared {
+    assert!(
+      SHARED_JUDGEMENTS.iter().any(|row| row.of == name),
+      "`readings` shares `{name}` and [`SHARED_JUDGEMENTS`] enumerates no \
+       judgement taken inside it"
+    );
+  }
+  for row in &SHARED_JUDGEMENTS {
+    assert!(
+      shared.iter().any(|name| name == row.of),
+      "[`SHARED_JUDGEMENTS`] enumerates `{}` and `readings` does not share it",
+      row.of
+    );
+    // A row that restates its neighbour measures the same defect twice and
+    // makes the blind count look larger than the blindness is. Both columns,
+    // because two rows can state one judgement in two sentences or two
+    // judgements and then measure one of them.
+    assert_eq!(
+      SHARED_JUDGEMENTS
+        .iter()
+        .filter(|other| other.of == row.of && other.judgement == row.judgement)
+        .count(),
+      1,
+      "`{}` states one judgement twice: {}",
+      row.of,
+      row.judgement
+    );
+    assert_eq!(
+      SHARED_JUDGEMENTS
+        .iter()
+        .filter(|other| other.of == row.of && other.injection == row.injection)
+        .count(),
+      1,
+      "`{}` measures two judgements with one injection: {}",
+      row.of,
+      row.injection
+    );
+    assert!(
+      !row.injection.is_empty(),
+      "`{}` has numbers with no injection behind them: {}",
+      row.of,
+      row.judgement
+    );
+  }
+}
+
+#[test]
+fn every_guard_a_row_claims_is_one_this_crate_has() {
+  // What this can hold, and it is the part of the table that rots first: a row
+  // naming a gate that was renamed or deleted, or claiming coverage from a pin.
+  // What it CANNOT hold is the causal claim itself — that injecting THIS
+  // defect still reds THAT gate — because a gate cannot inject a defect into
+  // the tree it is running in. The eight property rows close most of that
+  // residue from the other side: each carries a control, and the property test
+  // asserts on every run that the control violates the clause the row is about.
+  // What is left is a reading: that the control spells the same defect the
+  // `injection` column names.
+  for row in &SHARED_JUDGEMENTS {
+    if row.caught_by.is_empty() {
+      assert!(
+        row.control.is_empty(),
+        "`{}` names a control and no gate to run it in: {}",
+        row.of,
+        row.judgement
+      );
+      assert_eq!(
+        row.differ, 0,
+        "`{}` is blind and the differential reports {} disagreements",
+        row.of, row.differ
+      );
+      continue;
+    }
+    assert!(
+      WRONGNESS_GATES.contains(&row.caught_by),
+      "`{}` claims coverage from `{}`, which is not one of the gates that says \
+       an answer is WRONG",
+      row.of,
+      row.caught_by
+    );
+    assert!(
+      THIS_FILE.contains(&format!("fn {}(", row.caught_by)),
+      "`{}` names the gate `{}` and this file defines no such item",
+      row.of,
+      row.caught_by
+    );
+    // The differential's column and the guard column say one thing between
+    // them: a row the differential catches has a non-zero count, and a row it
+    // does not has a zero and is caught by something else or by nothing.
+    assert_eq!(
+      row.differ > 0,
+      row.caught_by == "the_two_derivations_of_excused_answer_alike",
+      "`{}`: the disagreement count and the gate named disagree",
+      row.of
+    );
+    if !row.control.is_empty() {
+      assert!(
+        THIS_FILE.contains(&format!("fn {}(", row.control)),
+        "`{}` names the control `{}` and this file defines no such item",
+        row.of,
+        row.control
+      );
+    }
+  }
+
+  // And every gate in the set is claimed by some row. A gate nothing names is
+  // one whose deletion this table would not notice.
+  for gate in WRONGNESS_GATES {
+    assert!(
+      SHARED_JUDGEMENTS.iter().any(|row| row.caught_by == gate)
+        || PROSE_SHARED.iter().any(|row| row.caught_by == gate),
+      "`{gate}` is named as a wrongness gate and nothing claims it"
+    );
+    assert!(
+      THIS_FILE.contains(&format!("fn {gate}(")),
+      "`{gate}` is named as a wrongness gate and this file defines no such item"
+    );
+  }
+}
+// ─────────── the rules the two state twice in WORDS, and their guard ─────────
+
+/// One rule both derivations of `excused` obey and NEITHER shares a line of
+/// code for.
+///
+/// [`SHARED_JUDGEMENTS`] is held to `readings.rs`'s own `use` declaration, so
+/// it finds every judgement the two share AS CODE and, by construction, no rule
+/// they share as prose. That is a second blindness class and it is the one with
+/// nothing keeping the copies honest: a shared function has a compiler, a
+/// shared sentence has a reader.
+///
+/// The differential is blind to these the way it is blind to a transcription,
+/// and worse: changing ONE spelling reds it — `readings::cross` writing
+/// `free: true` reds it at 36 — so the gate looks like a guard right up until
+/// somebody changes both, which is what a maintainer who has understood the
+/// rule wrongly will do. Every row below is measured under a COORDINATED edit:
+/// both spellings changed together.
+struct Prose {
+  /// The rule, as both files state it.
+  rule: &'static str,
+  /// A verbatim run of `oracle`'s statement of it, held against that file.
+  in_oracle: &'static str,
+  /// A verbatim run of `readings`'s statement of it, held against that file.
+  in_readings: &'static str,
+  /// The edit that changes both spellings at once.
+  coordinated: &'static str,
+  /// The gate that reds under that edit — one of [`WRONGNESS_GATES`].
+  caught_by: &'static str,
+  /// What it reds with: the class, the corpus and the count.
+  reds: &'static str,
+}
+
+/// Every rule the two derivations state twice in words, and what catches the
+/// two copies drifting apart.
+///
+/// # The result, which is not the one the enumeration was built expecting
+///
+/// **All six are caught, and none of them by the differential.** The guard is
+/// [`ZERO_TARGETS`] — a class this module is driven to zero on going non-zero —
+/// and it catches them in BOTH directions, which is the part worth keeping:
+/// `over-yield` counts records where the reader yields a challenge the oracle
+/// EXCUSES, so an oracle that excuses too much raises it; `hider-unexcused`
+/// counts records where the reader hides one the oracle does not excuse, so an
+/// oracle that excuses too little raises that. A prose rule loosened and a
+/// prose rule tightened are therefore different failures with different gates,
+/// and the module doc's warning — that an edit making `Verdict::excused` fire
+/// more often lowers the number it is driven to zero on — names only the first.
+///
+/// Four of the six ALSO red the differential, and that is not evidence about
+/// the class: a coordinated edit written by hand is only approximately
+/// symmetric, and the residue is what the differential sees. PS1 and PS4 are
+/// the clean cases, and they red nothing but a zero-target.
+///
+/// # A seventh row of a different kind
+///
+/// The last row is stated ONCE and relied on twice. `oracle::covers` argues at
+/// length that §11.2's one-name-once MUST must not be applied where the
+/// question is where a string may open; `readings` never mentions it and tracks
+/// no names, so there is no second spelling to change and no coordinated edit
+/// to make. A rule like that can only be broken one side at a time, and its row
+/// records the one-sided break instead. It is the only row here that is not
+/// two copies of a sentence, and it is enumerated because *stated once, relied
+/// on twice* is the same blindness with one of the two copies missing.
+///
+/// # What this table cannot be held to
+///
+/// [`SHARED_JUDGEMENTS`] is complete against a `use` declaration a compiler
+/// maintains. **This one is complete against a reading of two files**, and
+/// nothing can make it otherwise: there is no declaration that says *this
+/// sentence is also written over there*. What IS held below is each row's
+/// citation — the verbatim run it quotes must still be in the file that is
+/// supposed to state it — so a rule deleted from one side reds even though a
+/// rule added to both would not.
+///
+/// # And the guard is the READER's, which is a coupling worth naming
+///
+/// Every row is caught by [`ZERO_TARGETS`], and a zero-target is 0 because of
+/// what the MODULE UNDER TEST answers: `over-yield` is empty because the reader
+/// yields no challenge the oracle excuses, `hider-unexcused` because it hides
+/// none the oracle does not. So a change to `http_semantics::auth` that made
+/// one of those classes non-zero for its own unrelated reasons would take the
+/// only guard these six rules have with it, and nothing here would say that had
+/// happened — the rows would still name a gate, and the gate would still exist
+/// and still be red for a different reason. The differential does not stand in:
+/// it is silent about a coordinated edit by construction, which is why this
+/// table exists.
+const PROSE_SHARED: [Prose; 7] = [
+  Prose {
+    rule: "the free regime reaches forward through the open `#auth-param` list \
+           and never further",
+    in_oracle: "So the fault propagates `list` rather than `true`.",
+    in_readings: "**`free` behind the crossing is `list` and never `true`**",
+    coordinated: "`resume` carries `faulted: true` and `cross` carries `free: true`",
+    caught_by: "the_three_classes_this_module_is_driven_to_zero_on_are_zero",
+    reds: "over-yield, corpus M, 18 records",
+  },
+  Prose {
+    rule: "the free regime starts at an element start no reading of the grammar \
+           leaves",
+    in_oracle: "Whether ANY reading of the grammar leaves this element start.",
+    in_readings: "Whether ANY reading of the grammar derives this element.",
+    coordinated: "both walks open the free regime only where one is already open",
+    caught_by: "the_three_classes_this_module_is_driven_to_zero_on_are_zero",
+    reds: "hider-declined, corpus A, 12 records",
+  },
+  Prose {
+    rule: "the DQUOTE at a value position is recorded whether or not the element \
+           it stands in goes on to derive",
+    in_oracle: "every DQUOTE §11.2 admits a value at whether or not the",
+    in_readings: "The DQUOTE standing at the value position is recorded whether or not the",
+    coordinated: "both walks count only a string that closes — the answer \
+                  al8n/wren#77 corrected",
+    caught_by: "the_three_classes_this_module_is_driven_to_zero_on_are_zero",
+    reds: "hider-unexcused, corpus A, 36 records",
+  },
+  Prose {
+    rule: "a challenge whose `1*SP` was taken has entered a list even where the \
+           body's first element is empty",
+    in_oracle: "The empty element §5.6.1.2 admits",
+    in_readings: "Including when that first element is EMPTY.",
+    coordinated: "neither walk reads the body's first element as an empty one",
+    caught_by: "the_three_classes_this_module_is_driven_to_zero_on_are_zero",
+    reds: "over-yield, corpus A, 4 records",
+  },
+  Prose {
+    rule: "where nothing derives the body's first element the walk stands INSIDE \
+           the list the `1*SP` opened",
+    in_oracle: "alternative, whose first element starts at the",
+    in_readings: "And where NOTHING derives the body's first element, the recipient that",
+    coordinated: "both walks cross that run with no list open",
+    caught_by: "the_three_classes_this_module_is_driven_to_zero_on_are_zero",
+    reds: "hider-declined, corpus A, 6 records",
+  },
+  Prose {
+    rule: "RFC 9110 §11.2's one-name-once MUST is not applied where the question \
+           is where a string may open",
+    in_oracle: "§11.2's one-name-once MUST is deliberately NOT applied here",
+    in_readings: "",
+    coordinated: "one-sided, because `readings` tracks no names: `covers` \
+                  un-derives an element whose folded name already stands in \
+                  front of it followed by an `=`",
+    caught_by: "the_three_classes_this_module_is_driven_to_zero_on_are_zero",
+    reds: "over-yield, corpus M, and the differential too",
+  },
+  Prose {
+    rule: "no challenge opens at a body head",
+    in_oracle: "The first element of a challenge's `#auth-param` list, where none may.",
+    in_readings: "where §11.6.1 puts no second challenge",
+    coordinated: "both walks read the body's first element as a whole challenge too",
+    caught_by: "the_three_classes_this_module_is_driven_to_zero_on_are_zero",
+    reds: "over-yield, corpus A, 4 records",
+  },
+];
+
+#[test]
+fn every_rule_the_two_derivations_state_twice_is_still_stated_twice() {
+  const ORACLE: &str = include_str!("oracle.rs");
+  const READINGS: &str = include_str!("readings.rs");
+  for row in &PROSE_SHARED {
+    assert!(
+      ORACLE.contains(row.in_oracle),
+      "`oracle` no longer states `{}` — the run cited is gone",
+      row.rule
+    );
+    // An empty `in_readings` is the seventh row's shape and only its shape: a
+    // rule stated once and relied on silently, whose break can only be
+    // one-sided. The doc says which; this refuses a row that leaves the
+    // citation out without saying so.
+    if row.in_readings.is_empty() {
+      assert!(
+        row.coordinated.starts_with("one-sided"),
+        "`{}` cites no statement in `readings` and does not say it is relied on \
+         silently",
+        row.rule
+      );
+    } else {
+      assert!(
+        READINGS.contains(row.in_readings),
+        "`readings` no longer states `{}` — the run cited is gone",
+        row.rule
+      );
+    }
+    assert!(
+      WRONGNESS_GATES.contains(&row.caught_by),
+      "`{}` claims coverage from `{}`, which is not a gate that says an answer \
+       is WRONG",
+      row.rule,
+      row.caught_by
+    );
+    assert!(
+      THIS_FILE.contains(&format!("fn {}(", row.caught_by)),
+      "`{}` names the gate `{}` and this file defines no such item",
+      row.rule,
+      row.caught_by
+    );
+    assert!(
+      !row.coordinated.is_empty() && !row.reds.is_empty(),
+      "`{}` is recorded with no coordinated edit or no result",
+      row.rule
+    );
+    // A rule stated twice in one sentence is one rule counted twice, and it
+    // would make the enumeration look wider than the reading behind it.
+    assert_eq!(
+      PROSE_SHARED
+        .iter()
+        .filter(|other| other.rule == row.rule)
+        .count(),
+      1,
+      "`{}` is enumerated twice",
+      row.rule
+    );
+  }
+}
+
+#[test]
+fn the_shared_judgements_are_blind_covered_or_out_of_the_gates_reach() {
+  let blind = SHARED_JUDGEMENTS.iter().filter(|row| row.blind()).count();
+  let covered = SHARED_JUDGEMENTS.iter().filter(|row| row.covered()).count();
+  let unreached = SHARED_JUDGEMENTS
+    .iter()
+    .filter(|row| !row.reached())
+    .count();
+  assert_eq!(
+    (blind, covered, unreached),
+    SHARED_SPLIT,
+    "the split [`SHARED_JUDGEMENTS`] measures"
+  );
+  assert_eq!(
+    blind + covered + unreached,
+    SHARED_JUDGEMENTS.len(),
+    "the three classes are exclusive and exhaustive"
+  );
+  // A covered row is one the two walks consume asymmetrically, so its two
+  // `moves` differ; a blind row moves both derivations by the same count, which
+  // is what makes the disagreement 0 rather than lucky.
+  for row in &SHARED_JUDGEMENTS {
+    if row.blind() {
+      assert_eq!(
+        row.moves.0, row.moves.1,
+        "`{}`: a row the gate cannot see moves both derivations alike",
+        row.of
+      );
+    }
+  }
 }
 
 #[test]
@@ -2672,7 +3758,7 @@ fn the_notice_that_separates_the_two_classes_is_read_from_the_answer() {
 /// boundary is on a line this reader may not hold — and these eleven records
 /// are exactly the ones whose value CLOSES that string on a line past the
 /// bound. Corpora D and E are the only families that can write one.
-const CONFORMING: [(&str, usize); 14] = [
+const CONFORMING: [(&str, usize); 15] = [
   ("A", 0),
   ("B", 0),
   ("C", 0),
@@ -2687,6 +3773,7 @@ const CONFORMING: [(&str, usize); 14] = [
   ("L", 0),
   ("M", 0),
   ("N", 0),
+  ("O", 0),
 ];
 
 #[test]
@@ -2915,5 +4002,843 @@ fn what_corpus_d_says_about_distinct_inputs_is_not_what_its_records_say() {
   assert_eq!(
     moved, unexcused,
     "distinct inputs behind the 90 records that commit moved"
+  );
+}
+
+// ───────────── the leaf productions, graded by property ──────────────────────
+
+/// Every byte string the property checks are run over: [`payloads`] of length
+/// 1..=5 over [`ALPHABET`], which is the eight bytes RFC 9110 §11.2's
+/// `auth-param` is made of — the two `tchar`s a name and a value need, the `=`
+/// that joins them, the DQUOTE and the backslash §5.6.4 gives meaning to,
+/// §5.6.1's comma, and the two bytes §5.6.3's `OWS` is made of.
+///
+/// 37 448 strings, and every offset of each is asked, which is why a property
+/// below can be stated over ALL inputs rather than over a hand-picked witness.
+fn leaf_inputs() -> Vec<Vec<u8>> {
+  (1..=5).flat_map(payloads).collect()
+}
+
+/// How many answers of `position` RFC 9110 §11.2 does not admit, by clause.
+///
+/// ```text
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// Three terminals stand in front of the value and each leaves a mark on the
+/// offset handed back, so each is a clause here — and they are counted apart
+/// rather than summed, because a control that breaks one must be shown to break
+/// THAT one:
+///
+/// - the `token` is `1*tchar` and the `=` is one byte, so the value stands at
+///   least two bytes past the element's start;
+/// - the `=` is between them;
+/// - and `BWS` is `OWS`, which is greedy, so the value position never stands ON
+///   one of its bytes.
+///
+/// **This is not a second reading of `auth-param`.** None of the three decides
+/// where a value position IS; each is a consequence a wrong one violates, which
+/// is the whole difference between a property and the transcription al8n/wren#76
+/// was filed over.
+fn value_positions_no_auth_param_admits(
+  position: impl Fn(&[u8], usize) -> Option<usize>,
+  inputs: &[Vec<u8>],
+) -> (usize, [usize; 3]) {
+  let mut asked = 0_usize;
+  let mut broken = [0_usize; 3];
+  for value in inputs {
+    for at in 0..=value.len() {
+      asked = asked.saturating_add(1);
+      let Some(place) = position(value, at) else {
+        continue;
+      };
+      if place < at.saturating_add(2) {
+        broken[0] = broken[0].saturating_add(1);
+      }
+      if !value.get(at..place).unwrap_or_default().contains(&b'=') {
+        broken[1] = broken[1].saturating_add(1);
+      }
+      if matches!(value.get(place), Some(&b' ') | Some(&b'\t')) {
+        broken[2] = broken[2].saturating_add(1);
+      }
+    }
+  }
+  (asked, broken)
+}
+
+/// How many values `position` stops admitting when one more SP is written in
+/// front of their `=`.
+///
+/// RFC 9110 §5.6.3's `BWS` is admitted there, so a respelling that adds one is
+/// the same `auth-param` with its value one byte further along. The `=` this
+/// inserts in front of is the first at or after `at`, which is the one any
+/// reading used: §5.6.2's `tchar` excludes `=`, so no `token` holds one, and
+/// `OWS` is SP and HTAB.
+///
+/// A METAMORPHIC clause and the only one of the four that has to be: `BWS` in
+/// front of the `=` is a rule about what a reading ACCEPTS, and a wrong one
+/// answers `None` where the right one answers `Some` — which no property over a
+/// returned offset can see.
+fn respellings_that_lose_their_value_position(
+  position: impl Fn(&[u8], usize) -> Option<usize>,
+  inputs: &[Vec<u8>],
+) -> (usize, usize) {
+  let mut asked = 0_usize;
+  let mut lost = 0_usize;
+  for value in inputs {
+    for at in 0..=value.len() {
+      let Some(place) = position(value, at) else {
+        continue;
+      };
+      let Some(eq) = value
+        .iter()
+        .enumerate()
+        .skip(at)
+        .find(|&(_, &byte)| byte == b'=')
+        .map(|(offset, _)| offset)
+      else {
+        continue;
+      };
+      asked = asked.saturating_add(1);
+      let mut respelt = value.clone();
+      respelt.insert(eq, b' ');
+      if position(&respelt, at) != Some(place.saturating_add(1)) {
+        lost = lost.saturating_add(1);
+      }
+    }
+  }
+  (asked, lost)
+}
+
+/// How many answers of `end_of` are not the first comma no string was opened
+/// in, or the value's end.
+///
+/// The run a reading crosses when it derives no part of what it is looking at
+/// ends at RFC 9110 §5.6.1's separator read RAW — so the offset handed back
+/// holds a comma or nothing at all, it does not go backwards, and no comma
+/// stands between it and where the run began.
+fn raw_runs_that_do_not_end_at_a_raw_comma(
+  end_of: impl Fn(&[u8], usize) -> usize,
+  inputs: &[Vec<u8>],
+) -> (usize, usize) {
+  let mut asked = 0_usize;
+  let mut broken = 0_usize;
+  for value in inputs {
+    for at in 0..=value.len() {
+      asked = asked.saturating_add(1);
+      let end = end_of(value, at);
+      let backwards = end < at || end > value.len();
+      let not_a_comma = !matches!(value.get(end), None | Some(&b','));
+      let comma_inside = value.get(at..end).unwrap_or_default().contains(&b',');
+      if backwards || not_a_comma || comma_inside {
+        broken = broken.saturating_add(1);
+      }
+    }
+  }
+  (asked, broken)
+}
+
+/// How many answers of `skip` leave a run of `admitted` half-crossed.
+///
+/// A whitespace run is crossed WHOLE: every byte between where the skip began
+/// and where it stopped is one the production admits, and the byte it stopped
+/// on is not. RFC 9110 §5.6.3's `OWS` is `*( SP / HTAB )` and §11.3's `1*SP` is
+/// SP alone, so the two differ only in `admitted` and the property is the same
+/// sentence for both — which is why the HTAB one transcription crosses and the
+/// other does not is a difference this can see rather than one it assumes.
+fn whitespace_runs_crossed_by_halves(
+  skip: impl Fn(&[u8], usize) -> usize,
+  admitted: impl Fn(u8) -> bool,
+  inputs: &[Vec<u8>],
+) -> (usize, usize) {
+  let mut asked = 0_usize;
+  let mut broken = 0_usize;
+  for value in inputs {
+    for at in 0..=value.len() {
+      asked = asked.saturating_add(1);
+      let stopped = skip(value, at);
+      let backwards = stopped < at || stopped > value.len();
+      let crossed_something_else = value
+        .get(at..stopped)
+        .unwrap_or_default()
+        .iter()
+        .any(|&byte| !admitted(byte));
+      let stopped_on_one = value.get(stopped).is_some_and(|&byte| admitted(byte));
+      if backwards || crossed_something_else || stopped_on_one {
+        broken = broken.saturating_add(1);
+      }
+    }
+  }
+  (asked, broken)
+}
+
+/// How many answers of `open` depend on a byte at or behind the probe.
+///
+/// Whether some reading holds an offset inside a string is a question about the
+/// bytes IN FRONT of that offset: the sender wrote them between an opening
+/// DQUOTE and this position, and what stands behind the position cannot unwrite
+/// them. So the answer over a value equals the answer over that value cut at the
+/// probe — the same question, asked with the later bytes gone.
+fn open_at_answers_that_read_past_the_probe(
+  open: impl Fn(&[u8], usize, usize) -> bool,
+  inputs: &[Vec<u8>],
+) -> (usize, usize) {
+  let mut asked = 0_usize;
+  let mut broken = 0_usize;
+  for value in inputs {
+    for quote in 0..value.len() {
+      for probe in quote.saturating_add(1)..=value.len() {
+        asked = asked.saturating_add(1);
+        let cut = value.get(..probe).unwrap_or_default();
+        if open(value, quote, probe) != open(cut, quote, probe) {
+          broken = broken.saturating_add(1);
+        }
+      }
+    }
+  }
+  (asked, broken)
+}
+
+// The controls. Each is a KNOWN-WRONG spelling of one transcription, and each
+// is asserted to violate the one clause it is wrong about — so a property that
+// stopped catching its own defect reds here rather than passing quietly. They
+// are not second transcriptions in al8n/wren#76's sense and cannot decay into
+// them: a control edited until it is right stops violating, and the test that
+// requires the violation is what says so.
+
+/// `value_position` with an element that has no name at all admitted.
+fn value_position_with_no_name(value: &[u8], at: usize) -> Option<usize> {
+  let name_end = crate::oracle::token_end(value, at).unwrap_or(at);
+  let eq = crate::oracle::skip_ows(value, name_end);
+  if value.get(eq) != Some(&b'=') {
+    return None;
+  }
+  Some(crate::oracle::skip_ows(value, eq.saturating_add(1)))
+}
+
+/// `value_position` with no `BWS` admitted in front of the `=`.
+fn value_position_with_no_bws_in_front(value: &[u8], at: usize) -> Option<usize> {
+  let name_end = crate::oracle::token_end(value, at)?;
+  if value.get(name_end) != Some(&b'=') {
+    return None;
+  }
+  Some(crate::oracle::skip_ows(value, name_end.saturating_add(1)))
+}
+
+/// `value_position` that hands back a position for an element with no `=`.
+fn value_position_with_no_eq_needed(value: &[u8], at: usize) -> Option<usize> {
+  let name_end = crate::oracle::token_end(value, at)?;
+  let eq = crate::oracle::skip_ows(value, name_end);
+  if value.get(eq) != Some(&b'=') {
+    return Some(eq);
+  }
+  Some(crate::oracle::skip_ows(value, eq.saturating_add(1)))
+}
+
+/// `value_position` with no `BWS` admitted behind the `=`.
+fn value_position_with_no_bws_behind(value: &[u8], at: usize) -> Option<usize> {
+  let name_end = crate::oracle::token_end(value, at)?;
+  let eq = crate::oracle::skip_ows(value, name_end);
+  if value.get(eq) != Some(&b'=') {
+    return None;
+  }
+  Some(eq.saturating_add(1))
+}
+
+/// `raw_comma_end` with a DQUOTE stopping the run too.
+fn raw_comma_end_that_a_dquote_stops(value: &[u8], at: usize) -> usize {
+  let mut at = at;
+  while !matches!(value.get(at), None | Some(&b',') | Some(&b'"')) {
+    at = at.saturating_add(1);
+  }
+  at
+}
+
+/// `skip_ows` with HTAB left uncrossed.
+fn skip_ows_without_htab(value: &[u8], at: usize) -> usize {
+  let mut at = at;
+  while value.get(at) == Some(&b' ') {
+    at = at.saturating_add(1);
+  }
+  at
+}
+
+/// `skip_sp` with HTAB crossed as though it were SP.
+fn skip_sp_with_htab(value: &[u8], at: usize) -> usize {
+  let mut at = at;
+  while matches!(value.get(at), Some(&b' ') | Some(&b'\t')) {
+    at = at.saturating_add(1);
+  }
+  at
+}
+
+/// `open_at` reading the whole value rather than the run in front of the probe.
+fn open_at_reading_past_the_probe(value: &[u8], quote: usize, probe: usize) -> bool {
+  quote < probe
+    && !matches!(
+      crate::oracle::scan_quoted(value, quote.saturating_add(1)),
+      crate::oracle::Quoted::Closed(_)
+    )
+}
+
+/// How many (value, offset) pairs the properties are asked over, per property.
+///
+/// A REACH, for [`EXCUSED_REACH`]'s reason: a property driven to zero says
+/// nothing about inputs it was never run over, and a generator quietly narrowed
+/// would drive every count below to zero by asking less.
+const LEAF_REACH: (usize, usize, usize, usize, usize) = (37_448, 219_344, 6_658, 219_344, 535_752);
+
+#[test]
+fn a_value_position_stands_behind_a_name_and_an_eq() {
+  let inputs = leaf_inputs();
+  assert_eq!(
+    inputs.len(),
+    LEAF_REACH.0,
+    "the strings every property is run over"
+  );
+  let (asked, broken) =
+    value_positions_no_auth_param_admits(crate::oracle::value_position, &inputs);
+  assert_eq!(asked, LEAF_REACH.1, "the offsets this property is asked at");
+  assert_eq!(broken, [0, 0, 0], "answers RFC 9110 §11.2 does not admit");
+
+  // Each clause against the control that breaks it, and only it. Without this
+  // the three zeros above could all be vacuous and nothing would say so.
+  let (_, name) = value_positions_no_auth_param_admits(value_position_with_no_name, &inputs);
+  assert!(
+    name[0] > 0,
+    "an element with no name is caught by the first clause"
+  );
+  let (_, no_eq) = value_positions_no_auth_param_admits(value_position_with_no_eq_needed, &inputs);
+  assert!(
+    no_eq[1] > 0,
+    "a position with no `=` in front of it is caught by the second"
+  );
+  let (_, bws) = value_positions_no_auth_param_admits(value_position_with_no_bws_behind, &inputs);
+  assert!(
+    bws[2] > 0,
+    "a position standing on `BWS` is caught by the third"
+  );
+}
+
+#[test]
+fn the_bws_in_front_of_the_eq_is_admitted() {
+  let inputs = leaf_inputs();
+  let (asked, lost) =
+    respellings_that_lose_their_value_position(crate::oracle::value_position, &inputs);
+  assert_eq!(
+    asked, LEAF_REACH.2,
+    "the respellings this property is asked over"
+  );
+  assert_eq!(lost, 0, "values whose value position one more SP took away");
+
+  let (_, control) =
+    respellings_that_lose_their_value_position(value_position_with_no_bws_in_front, &inputs);
+  assert!(
+    control > 0,
+    "a reading with no `BWS` in front of the `=` loses one"
+  );
+}
+
+#[test]
+fn a_raw_run_ends_at_the_first_raw_comma() {
+  let inputs = leaf_inputs();
+  let (asked, broken) =
+    raw_runs_that_do_not_end_at_a_raw_comma(crate::oracle::raw_comma_end, &inputs);
+  assert_eq!(asked, LEAF_REACH.3, "the offsets this property is asked at");
+  assert_eq!(broken, 0, "runs that end somewhere else");
+
+  let (_, control) =
+    raw_runs_that_do_not_end_at_a_raw_comma(raw_comma_end_that_a_dquote_stops, &inputs);
+  assert!(control > 0, "a run a DQUOTE stops does not end at a comma");
+}
+
+#[test]
+fn a_whitespace_run_is_crossed_whole() {
+  let inputs = leaf_inputs();
+  let ows = |byte: u8| matches!(byte, b' ' | b'\t');
+  let sp = |byte: u8| byte == b' ';
+
+  let (asked, broken) = whitespace_runs_crossed_by_halves(crate::oracle::skip_ows, ows, &inputs);
+  assert_eq!(asked, LEAF_REACH.3, "the offsets this property is asked at");
+  assert_eq!(broken, 0, "§5.6.3's `OWS` half-crossed");
+  let (_, control) = whitespace_runs_crossed_by_halves(skip_ows_without_htab, ows, &inputs);
+  assert!(
+    control > 0,
+    "a skip that leaves HTAB uncrossed stops on one"
+  );
+
+  let (_, broken) = whitespace_runs_crossed_by_halves(crate::oracle::skip_sp, sp, &inputs);
+  assert_eq!(broken, 0, "§11.3's `1*SP` half-crossed");
+  let (_, control) = whitespace_runs_crossed_by_halves(skip_sp_with_htab, sp, &inputs);
+  assert!(
+    control > 0,
+    "a skip that crosses HTAB crosses a byte `1*SP` does not"
+  );
+}
+
+#[test]
+fn open_at_reads_no_byte_at_or_behind_the_probe() {
+  let inputs = leaf_inputs();
+  let (asked, broken) = open_at_answers_that_read_past_the_probe(crate::oracle::open_at, &inputs);
+  assert_eq!(
+    asked, LEAF_REACH.4,
+    "the (quote, probe) pairs this property is asked at"
+  );
+  assert_eq!(broken, 0, "answers a byte behind the probe changed");
+
+  let (_, control) =
+    open_at_answers_that_read_past_the_probe(open_at_reading_past_the_probe, &inputs);
+  assert!(
+    control > 0,
+    "a scan that reads the whole value is changed by a close behind the probe"
+  );
+}
+
+// ────────── the one row of that table that is a divergence, pinned ──────────
+
+/// Values in which `readings::element` reads a bare `auth-scheme` where
+/// `oracle::covers` does not: a scheme token, a whitespace run RFC 9110 §5.6.3
+/// admits, and then the comma or the end of value that makes
+/// `boundary(value, scheme_end)` an edge.
+///
+/// The last three put a fault, an open list, and a `quoted-string` carrying a
+/// raw comma in front of the divergence, which is the one shape where a state
+/// differing only by `list` can cross where its twin derives.
+const BARE_SCHEME_WITNESSES: [&[u8]; 9] = [
+  b"Basic , Digest realm=z",
+  b"Basic ,Digest realm=z",
+  b"Basic \t, Digest realm=z",
+  b"Basic ",
+  b"Basic \t",
+  b"Basic , a=\", Digest realm=z",
+  b"\",a ,a a=\"x, Digest realm=z",
+  b"a=1,a ,a=\"x,y\", a b=\"c, Digest realm=z",
+  b"a=1,a=1,a ,a b=\"c, Digest realm=z",
+];
+
+#[test]
+fn a_bare_scheme_a_1_sp_stands_behind_is_a_reading_both_walks_reach() {
+  // `readings`'s module doc carries the argument and the search. This is the
+  // part of it that is a gate: the two derivations answer alike at every offset
+  // of every witness, and the module under test takes the same reading.
+  let mut asked = 0_usize;
+  for value in BARE_SCHEME_WITNESSES {
+    for probe in 0..=value.len() {
+      asked = asked.saturating_add(1);
+      assert_eq!(
+        crate::oracle::covered(value, probe),
+        crate::readings::covered(value, probe),
+        "{} at {probe}: the bare scheme is a reading one walk spells and the \
+         other reaches",
+        escape(value)
+      );
+    }
+  }
+  assert_eq!(asked, 213, "the offsets this pins");
+
+  // And the reading is the reader's. RFC 9110 §11.4 has a user agent SEARCH the
+  // list, so a `Basic` the walk declined to yield is a challenge withheld —
+  // this is the answer the divergence would have been about if it had been one.
+  let lines: [&[u8]; 1] = [b"Basic , Digest realm=z"];
+  let schemes: Vec<String> = challenges(lines.iter().copied())
+    .map(|item| match item {
+      Ok(challenge) => escape(challenge.scheme()),
+      Err(fault) => format!("Err({fault:?})"),
+    })
+    .collect();
+  assert_eq!(schemes, ["Basic", "Digest"], "the bare scheme is yielded");
+}
+
+// ──────── the strongest residual-pressure shape, and what it answers ────────
+
+/// The scheme corpus O writes its continuation challenge with, which stands in
+/// no other part of any case that family records.
+const O_SCHEME_TOKEN: &[u8] = b"Newauth";
+
+/// RFC 9110 §5.6.3's `OWS` skipped from `at`, written here rather than taken
+/// from [`oracle`](crate::oracle) so that the check below is independent of the
+/// derivation it grades.
+///
+/// ```text
+/// OWS = *( SP / HTAB )
+/// ```
+fn past_ows(value: &[u8], at: usize) -> usize {
+  let mut at = at;
+  while matches!(value.get(at), Some(b' ' | b'\t')) {
+    at = at.saturating_add(1);
+  }
+  at
+}
+
+/// How many EMPTY elements RFC 9110 §5.6.1.2 admits between `at` and the first
+/// element that is not one.
+///
+/// ```text
+/// #element => [ element ] *( OWS "," OWS [ element ] )
+/// ```
+///
+/// `[ element ]` is optional at every position, so a run of commas with nothing
+/// but the list's own whitespace between them is a run of empty elements — and
+/// this counts them by walking the bytes rather than by trusting the spelling
+/// column that names the number.
+fn leading_empty_elements(value: &[u8], at: usize) -> usize {
+  let mut at = past_ows(value, at);
+  let mut empties = 0_usize;
+  while value.get(at) == Some(&b',') {
+    empties = empties.saturating_add(1);
+    at = past_ows(value, at.saturating_add(1));
+  }
+  empties
+}
+
+/// One value in which RFC 9110 §11.2's `BWS` in FRONT of the `=` is what
+/// decides whether a challenge is invented, and the same value with that
+/// whitespace off it.
+///
+/// ```text
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// One field line, no §5.2 join, and no empty element anywhere: corpus O found
+/// this, and the shape is corpus L's own cross — a list, a fault of the
+/// grammar, a challenge that completes behind it, and a trap — with a trap
+/// spelling the `BWS` that [`TRAPS`] does not.
+const BWS_INVENTION: &[u8] = b"Basic a=1, Broken;junk, Bearer, x = \"c, Digest realm=z";
+
+/// The control: the same value with no `BWS` in front of the `=`, which is
+/// `corpus_l`'s `opener=list fault=punct closer=bare trap=open` row and answers
+/// the other way.
+const BWS_INVENTION_CONTROL: &[u8] = b"Basic a=1, Broken;junk, Bearer, x=\"c, Digest realm=z";
+
+/// One value whose probe stands at the first element of a challenge's BODY,
+/// with no RFC 9110 §5.6.1.2 comma between the two.
+///
+/// `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` puts no second
+/// challenge at a body's first element, so no reading of the outer `#challenge`
+/// list has an element start here and hiding these bytes is what a reader must
+/// do. [`Verdict::derives`] asks only whether the probe's own bytes derive as a
+/// challenge, so the axis grades the hide `hider-unexcused` all the same.
+const PROBE_INSIDE_A_BODY: &[u8] = b"Broken;junk,Newauth Digest realm=z";
+
+#[test]
+fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_writes() {
+  // Corpus O is the first family whose dimension is how far into the
+  // continuation challenge its first quoted parameter stands. Every row has to
+  // actually write the run, so the count comes first and the bytes are checked
+  // after it.
+  let o = records(corpus_o);
+  assert_eq!(
+    o.len(),
+    3_192,
+    "four heads over three join counts, two schemes and seven bodies, by the \
+     nineteen (empties, spacing, cut) spellings — one at zero empties and six, \
+     six and six at one, two and three"
+  );
+
+  // Every record writes the run its spelling names, counted off the JOINED
+  // value rather than off the line the generator happened to put it on.
+  let mut with_a_run = 0usize;
+  for line in &o {
+    let [_, case, spelling, _, _] = columns(line);
+    let lines: Vec<Vec<u8>> = case.split('|').map(unescape).collect();
+    let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+    let joined = join(&refs);
+    let scheme = last_index_of(&joined, O_SCHEME_TOKEN)
+      .expect("every corpus O case carries the continuation's scheme");
+    let empties = leading_empty_elements(&joined, scheme.saturating_add(O_SCHEME_TOKEN.len()));
+    let named = spelling
+      .split_once(" empties=")
+      .and_then(|(_, rest)| rest.split(' ').next())
+      .and_then(|digits| digits.parse::<usize>().ok())
+      .expect("every corpus O spelling names its own run");
+    assert_eq!(
+      empties, named,
+      "corpus O writes the empty run its spelling names: {line}"
+    );
+    with_a_run += usize::from(empties > 0);
+
+    // And the join count, which is the other half of the shape: one field line
+    // for the head, one per join past the first, one for the continuation —
+    // and one more wherever the cut puts §5.2's join INSIDE the run.
+    let joins = spelling
+      .split_once(" joins=")
+      .and_then(|(_, rest)| rest.split(' ').next())
+      .and_then(|digits| digits.parse::<usize>().ok())
+      .expect("every corpus O spelling names its join count");
+    let cut = spelling
+      .split_once(" cut=")
+      .and_then(|(_, rest)| rest.split(' ').next())
+      .and_then(|digits| digits.parse::<usize>().ok())
+      .expect("every corpus O spelling names where the join falls");
+    assert!(cut <= empties, "a cut past the run's end: {line}");
+    assert_eq!(
+      lines.len(),
+      joins.saturating_add(1).saturating_add(usize::from(cut > 0)),
+      "corpus O crosses the joins its spelling names: {line}"
+    );
+  }
+  assert_eq!(
+    with_a_run, 3_024,
+    "corpus O rows carrying at least one empty element: the 168 that carry \
+     none are the control"
+  );
+
+  // The cuts of one cell are ONE value spelled over different numbers of field
+  // lines, because RFC 9110 §5.2 contributes exactly the comma the cut took
+  // out. That identity is a fact about the generator and is asserted as one.
+  let mut cells: HashMap<String, Vec<&String>> = HashMap::new();
+  for line in &o {
+    let [_, _, spelling, _, _] = columns(line);
+    let cell = spelling
+      .split(' ')
+      .filter(|field| !field.starts_with("cut="))
+      .collect::<Vec<_>>()
+      .join(" ");
+    cells.entry(cell).or_default().push(line);
+  }
+  assert_eq!(cells.len(), 1_176, "the cells the cut axis is taken over");
+  let mut respelled = 0usize;
+  let mut parted: Vec<&String> = Vec::new();
+  for (cell, rows) in &cells {
+    let mut answers: Vec<&str> = Vec::new();
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    for line in rows {
+      let [_, case, _, _, answer] = columns(line);
+      let lines: Vec<Vec<u8>> = case.split('|').map(unescape).collect();
+      let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+      values.push(join(&refs));
+      answers.push(answer);
+    }
+    for value in &values {
+      assert_eq!(
+        value, &values[0],
+        "corpus O: the cuts of {cell} are not one value"
+      );
+    }
+    if answers.iter().any(|answer| *answer != answers[0]) {
+      parted.push(rows.first().copied().expect("a cell has rows"));
+    }
+    respelled = respelled.saturating_add(rows.len().saturating_sub(1));
+  }
+  assert_eq!(
+    respelled, 2_016,
+    "corpus O rows that respell a value another row of the same cell writes"
+  );
+  the_cells_whose_cuts_answer_differently(&cells, &parted);
+
+  // ── and what the family ANSWERS, which is not what it was written expecting.
+
+  // `over-yield` is a zero-target of this module and corpus O answers 54.
+  // Every one of them is the same shape, and it is not this family's own: a
+  // list open where a grammar fault is met, a challenge completing behind it
+  // that ends that list in the reading the walk takes, and then an element RFC
+  // 9110 §11.2 derives as an `auth-param` whose `BWS` holds a SP — so the same
+  // bytes ALSO read as `auth-scheme 1*SP` with a body that derives nothing.
+  // The walk takes the challenge reading, refuses at the body, recovers from
+  // the BODY's offset, and never sees the value position the `auth-param`
+  // reading puts in front of that cursor.
+  let over_yields: Vec<&String> = o
+    .iter()
+    .filter(|line| columns(line)[3] == "over-yield")
+    .collect();
+  assert_eq!(over_yields.len(), 54, "corpus O: the invented challenges");
+  for line in &over_yields {
+    let [_, _, spelling, _, answer] = columns(line);
+    assert!(
+      spelling.contains(" head=list-fault ")
+        && spelling.contains(" scheme=htab ")
+        && spelling.ends_with("body=bws"),
+      "corpus O: an over-yield outside the shape this test names: {line}"
+    );
+    assert!(
+      answer.contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
+      "corpus O: an over-yield that yielded nothing: {line}"
+    );
+  }
+
+  // Derived from the ORACLE alone, over the one-line value the 54 are the
+  // general case of — no reader, and nothing about what any revision of this
+  // workspace answers. `Basic`'s list is open where `Broken;junk` is met,
+  // nothing derives there, so the reading in which every element since is
+  // garbage that list still holds survives — and under it `x = "c, Digest
+  // realm=z` is one `auth-param` whose quoted-string never closes.
+  let verdict = oracle::read(BWS_INVENTION, probe_at(BWS_INVENTION));
+  assert!(verdict.derives, "the probe's own bytes derive");
+  assert!(
+    !verdict.reached,
+    "no derivation of the whole value reaches the probe"
+  );
+  assert!(
+    verdict.excused,
+    "a reading holds the probe inside the value of `x`"
+  );
+  // So a walk that yields it has invented one, and this tree does.
+  assert!(
+    yields_the_probe(&[BWS_INVENTION]),
+    "the invention this family found"
+  );
+  // And the control says what decides it: the same value with §11.2's `BWS`
+  // off the front of the `=`, which is a row `corpus_l` already writes.
+  assert!(
+    !yields_the_probe(&[BWS_INVENTION_CONTROL]),
+    "with no `BWS` the walk crosses nothing"
+  );
+  assert!(
+    says_the_rest_is_unread(&[BWS_INVENTION_CONTROL]),
+    "and tells the caller the rest is unread"
+  );
+
+  // `hider-unexcused` is the other zero-target and corpus O answers 18. These
+  // are NOT a defect of the reader, and saying so is the point of pinning them
+  // by shape: the probe stands at the first element of a challenge's body with
+  // no §5.6.1.2 comma in front of it, so no reading of the outer `#challenge`
+  // list has an element start there and showing it would be the invention.
+  // What grades them is [`Verdict::derives`], which asks whether the probe's
+  // own bytes derive as a challenge and not whether anything may begin at that
+  // offset — the distinction `oracle::covers` carries as `Start::Body` and this
+  // one does not.
+  let unexcused: Vec<&String> = o
+    .iter()
+    .filter(|line| columns(line)[3] == "hider-unexcused")
+    .collect();
+  assert_eq!(
+    unexcused.len(),
+    18,
+    "corpus O: the probes at a body position"
+  );
+  for line in &unexcused {
+    let [_, case, spelling, _, _] = columns(line);
+    assert!(
+      spelling.contains(" empties=0 ") && spelling.ends_with("body=probe"),
+      "corpus O: a hider-unexcused outside the shape this test names: {line}"
+    );
+    let lines: Vec<Vec<u8>> = case.split('|').map(unescape).collect();
+    let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+    let joined = join(&refs);
+    let probe = probe_at(&joined);
+    let element = last_index_of(joined.get(..probe).unwrap_or_default(), b",")
+      .map_or(0, |at| at.saturating_add(1));
+    assert!(
+      !joined
+        .get(element..probe)
+        .unwrap_or_default()
+        .contains(&b','),
+      "corpus O: a hider-unexcused whose probe IS an element start: {line}"
+    );
+  }
+  // The same fact over the one-line witness, with the oracle's own verdict
+  // beside it.
+  let inside = oracle::read(PROBE_INSIDE_A_BODY, probe_at(PROBE_INSIDE_A_BODY));
+  assert!(inside.derives, "the probe's own bytes derive");
+  assert!(
+    !inside.reached,
+    "no derivation of the whole value reaches it"
+  );
+  assert!(!inside.excused, "and no reading holds it inside a string");
+  assert!(
+    !yields_the_probe(&[PROBE_INSIDE_A_BODY]),
+    "the walk does not invent a challenge out of a body's first element"
+  );
+}
+
+/// How many of corpus O's cells answer differently depending on where §5.2's
+/// join was cut, and what shape every one of them has.
+///
+/// # A number that is not a target and is not a cost either
+///
+/// [`UNRESOLVED`] and [`CONFORMING`] are pinned because each is a cost this
+/// module has an argument for. This one has no argument yet, and it is pinned
+/// so that it cannot move quietly while somebody decides.
+///
+/// Every cut of a cell spells ONE value — RFC 9110 §5.2 contributes exactly the
+/// comma the cut took out, and the test above asserts the byte identity before
+/// it asks anything about answers. Over 1 140 of the 1 176 cells the answers
+/// agree. Over 36 they do not: the probe is SHOWN where the join is the LAST
+/// comma of the leading run — so the body's first non-empty element begins at
+/// the head of a field line — and DECLINED with
+/// `AuthError::ChallengeBoundaryUnknown` at every earlier cut of the same
+/// value.
+///
+/// All 36 are `head=open body=closed-front`, and the shape says why the two
+/// classes are the ones they are. `Basic a="x` opens a §5.6.4 quoted-string
+/// that §5.2's joins carry, `realm="c"` CLOSES in front of the probe, and the
+/// element the fault is met over ends at that close — so the walk recovers on
+/// the line that close is on. Where a comma stands in front of it ON THAT LINE
+/// the readings disagree about that comma and the walk declines; where the cut
+/// moved the close to the head of its own line there is no such comma to see,
+/// and the same value's probe is shown. `Recovery::floor` is the offset that
+/// question is asked at.
+///
+/// **Neither answer is a zero-target**: the declining rows grade
+/// `hider-unresolved` and the showing rows `yields-underivable`, and both are
+/// classes this module holds at a pinned number rather than at zero. So the
+/// whole divergence is invisible to [`ZERO_TARGETS`] by construction, and it is
+/// the second thing corpus O found that no gate in front of it could see.
+///
+/// What it is NOT is a `MAX_CHALLENGE_LINES` effect, which is the one place
+/// this module is entitled to answer by the spelling: corpus O writes at most
+/// five field lines and that bound is seventeen.
+const CUTS_THAT_PART: usize = 36;
+
+/// Whether every cell whose cuts answer differently has the shape
+/// [`CUTS_THAT_PART`] names, and the direction it names.
+fn the_cells_whose_cuts_answer_differently(
+  cells: &HashMap<String, Vec<&String>>,
+  parted: &[&String],
+) {
+  assert_eq!(
+    parted.len(),
+    CUTS_THAT_PART,
+    "corpus O: the cells whose cuts answer differently"
+  );
+  let mut shown = 0usize;
+  let mut declined = 0usize;
+  for line in parted {
+    let [_, _, spelling, _, _] = columns(line);
+    assert!(
+      spelling.contains(" head=open ") && spelling.ends_with("body=closed-front"),
+      "corpus O: a parted cell outside the shape this constant names: {line}"
+    );
+    let cell = spelling
+      .split(' ')
+      .filter(|field| !field.starts_with("cut="))
+      .collect::<Vec<_>>()
+      .join(" ");
+    let empties = spelling
+      .split_once(" empties=")
+      .and_then(|(_, rest)| rest.split(' ').next())
+      .and_then(|digits| digits.parse::<usize>().ok())
+      .expect("every corpus O spelling names its own run");
+    for row in cells.get(&cell).expect("the cell the row came from") {
+      let [_, _, its, _, answer] = columns(row);
+      let cut = its
+        .split_once(" cut=")
+        .and_then(|(_, rest)| rest.split(' ').next())
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .expect("every corpus O spelling names where the join falls");
+      let yields = answer.contains(&format!("Ok[{}", escape(PROBE_SCHEME)));
+      if cut == empties {
+        assert!(
+          yields,
+          "corpus O: the cut that puts the element at a line's head hides the \
+           probe: {row}"
+        );
+        shown = shown.saturating_add(1);
+      } else {
+        assert!(
+          !yields && answer.contains("Err(ChallengeBoundaryUnknown)"),
+          "corpus O: an earlier cut of a parted cell answers a third way: {row}"
+        );
+        declined = declined.saturating_add(1);
+      }
+    }
+  }
+  assert_eq!(
+    shown, 36,
+    "the cut of each parted cell that shows the probe"
+  );
+  assert_eq!(
+    declined, 72,
+    "the cuts of the same 36 values that decline it"
   );
 }

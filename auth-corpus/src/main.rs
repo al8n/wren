@@ -20,13 +20,13 @@
 //! corpus <TAB> case <TAB> spelling <TAB> axis <TAB> answer
 //! ```
 //!
-//! - `corpus` — which generator produced the input: `A`..`N`.
+//! - `corpus` — which generator produced the input: `A`..`O`.
 //! - `case` — the field lines, escaped, `|`-separated. `(corpus, case,
 //!   spelling)` is the record's key, and it is unique everywhere but the 32
 //!   inputs corpus D writes six times each — see
 //!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`,
-//!   which pins that exception and says what it costs. 943 270 records stand
-//!   for 943 110 distinct inputs — the two figures
+//!   which pins that exception and says what it costs. 946 462 records stand
+//!   for 946 302 distinct inputs — the two figures
 //!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`
 //!   asserts, and they are quoted from it rather than counted again here.
 //!   **Every corpus D figure quoted from this
@@ -136,7 +136,7 @@ fn main() {
 
 /// Writes every record, and the per-corpus counts to stderr.
 fn emit(out: &mut impl Write) -> std::io::Result<()> {
-  let mut counts = [0_usize; 14];
+  let mut counts = [0_usize; 15];
   corpus_a(out, &mut counts[0])?;
   corpus_b(out, &mut counts[1])?;
   corpus_c(out, &mut counts[2])?;
@@ -151,10 +151,11 @@ fn emit(out: &mut impl Write) -> std::io::Result<()> {
   corpus_l(out, &mut counts[11])?;
   corpus_m(out, &mut counts[12])?;
   corpus_n(out, &mut counts[13])?;
+  corpus_o(out, &mut counts[14])?;
   out.flush()?;
   let total: usize = counts.iter().sum();
   for (name, count) in [
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N",
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
   ]
   .iter()
   .zip(counts)
@@ -1391,6 +1392,220 @@ fn corpus_n_at_the_cursor(out: &mut impl Write, count: &mut usize) -> std::io::R
             "challenges-span opener={opener_name} refusal=line-bound-head span={span_name} closer={closer_name} trap={trap_name}"
           );
           record(out, "N", &refs, &spelling, count)?;
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+/// What corpus O brings its recovery to RFC 9110 §5.2's join with, and the
+/// list state each head leaves where that join is crossed.
+///
+/// Two ways a recovery reaches a join, and this crate already knows both:
+/// an element whose §5.6.4 quoted-string is still open where the field line
+/// ends, so the refusal is met with the cursor at the head of the continuation;
+/// and an element that ENDS at the line's end, so the recovery crosses the join
+/// looking for the next one. The list state is the axis crossed with them,
+/// because RFC 9110 §11.2 admits a value position only inside a `#auth-param`
+/// list — so a head with none open leaves the continuation's OWN body list as
+/// the only reading under which a DQUOTE behind the empty run stands at a value
+/// position at all.
+const O_HEADS: [(&str, &[u8]); 4] = [
+  // The string spans the join. `Basic`'s `1*SP` has a list open, and the
+  // reading that carries `a`'s value across the join covers everything behind
+  // it — corpus H's head, and the one whose refusal is met AT the join rather
+  // than in front of it.
+  ("open", b"Basic a=\"x"),
+  // A fault of RFC 9110's grammar at the line's end, with NO list open anywhere
+  // in the value: `Broken;junk` is refused at its `auth-scheme`, and §11.3's
+  // `1*SP` — the body's only entrance — was never taken.
+  ("fault", b"Broken;junk"),
+  // The same fault with a list open where it is met, which is the pair
+  // [`M_OPENERS`] holds apart: an earlier epoch reaches past its own challenge
+  // only through a list it stood in.
+  ("list-fault", b"Basic a=1, Broken;junk"),
+  // A bound of THIS recipient's, so the epoch standing in front of the
+  // continuation carries a list AND is closable.
+  ("bound", M_OPENERS[4].1),
+];
+
+/// The line corpus O repeats between its head and its continuation, once per
+/// join past the first.
+///
+/// It carries no DQUOTE, so a head whose §5.6.4 quoted-string is open where its
+/// line ends still has it open where this one does — [`UNCLOSING`]'s property,
+/// which is what keeps the `open` head's element spanning every join. And RFC
+/// 9110 §11.2 derives it whole, so a recovery crossing it absorbs an element
+/// that SUSTAINS the epoch's claim rather than one that refutes it: the joins
+/// this family counts are joins the recovery is still running at.
+const O_MIDDLE: &[u8] = b"y=1";
+
+/// The two spellings of RFC 9110 §11.3's body entrance corpus O writes, and the
+/// list the empty run behind each belongs to.
+///
+/// ```text
+/// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+const O_SCHEMES: [(&str, &[u8]); 2] = [
+  // `1*SP` taken, so the run behind it is the challenge's own `#auth-param`
+  // list and its empty elements are that list's. This is the reading §11.6.1
+  // admits at a join, and the one this family is about.
+  ("sp", b"Newauth "),
+  // The control. RFC 9110 §5.6.3's HTAB is `OWS` and is not `1*SP`, so no body
+  // opens here: the scheme is a whole challenge that took no parameters, the
+  // run behind it is the OUTER `#challenge` list's, and a DQUOTE past it stands
+  // at no value position any reading of these bytes admits.
+  ("htab", b"Newauth\t"),
+];
+
+/// What stands behind corpus O's leading empty elements: the first element of
+/// the continuation challenge's body that is not empty, carrying the probe.
+const O_BODIES: [(&str, &[u8]); 7] = [
+  // A RFC 9110 §5.6.4 quoted-string that opens in front of the probe and never
+  // closes, so the probe is that value's data under the reading the empty run
+  // leads to.
+  ("open", b"realm=\"c, Digest realm=z"),
+  // The same, CLOSED behind the probe — nothing at all wrong with the value, so
+  // a reader right about the unterminated one by treating an unterminated run
+  // as special is still wrong here.
+  ("closed-over", b"realm=\"c, Digest realm=z, junk\""),
+  // Closed in FRONT of the probe, so every reading stands outside the string at
+  // the comma and the probe is a challenge whose boundary they agree on.
+  ("closed-front", b"realm=\"c\", Digest realm=z"),
+  // No DQUOTE anywhere.
+  ("token", b"realm=c, Digest realm=z"),
+  // §11.2's `BWS` around the `=`, which moves the DQUOTE off the offset a check
+  // written from the printed examples would look at.
+  ("bws", b"realm = \"c, Digest realm=z"),
+  // An element that admits a value position nowhere, so the run behind the
+  // empties opens no string under any reading.
+  ("no-value", b"p, Digest realm=z"),
+  // The probe itself as the body's first non-empty element.
+  ("probe", b"Digest realm=z"),
+];
+
+/// Where the `cut`-th comma of a run stands in `value`, counting from one.
+fn nth_comma(value: &[u8], cut: usize) -> Option<usize> {
+  value
+    .iter()
+    .enumerate()
+    .filter(|&(_, &byte)| byte == b',')
+    .map(|(at, _)| at)
+    .nth(cut.checked_sub(1)?)
+}
+
+/// A continuation challenge whose body opens with EMPTY elements, and RFC 9110
+/// §5.2's join falling anywhere in that run.
+///
+/// # The axis corpora A..N hold fixed
+///
+/// **How far into the continuation challenge its first quoted parameter
+/// stands.** RFC 9110 §5.6.1.2's recipient expansion is what admits the
+/// distance:
+///
+/// ```text
+/// #element   => [ element ] *( OWS "," OWS [ element ] )
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// `[ element ]` is optional at every position, so a challenge's `#auth-param`
+/// body may open with any number of empty elements before the parameter that
+/// carries a quoted value. Every continuation corpora H, I and K write puts
+/// that parameter FIRST — `Newauth realm="c, Digest realm=z` — so the DQUOTE
+/// §11.6.1's challenge reading admits stands inside the very run §5.2's join
+/// left the cursor on, at `auth-scheme 1*SP` and a `token BWS "="` behind it.
+/// One comma in front of it moves the DQUOTE out of that run entirely: the run
+/// at the join ends at the first comma read raw, no reading opens a string in
+/// it, the boundary is CERTIFIED, and everything about the parameter is decided
+/// one or more elements later — by whatever the walk still carries about the
+/// challenge that opened back at the join.
+///
+/// That is the strongest residual-pressure case of this shape.
+///
+/// # What it crosses
+///
+/// - **How many empty elements stand in front of the parameter**, 0..=3, which
+///   is this family's own dimension. 0 is corpus H's own continuation and the
+///   control every other row is read against.
+/// - **How that run is spelled**, [`LIST_OWS`]'s question asked inside a body:
+///   `tight` writes bare commas and `ows` hangs §5.6.3 whitespace behind each
+///   of them, which §5.6.1.2 admits on both sides. At 0 empties there is no
+///   comma for the spacing to be about, so the `ows` spelling is skipped rather
+///   than recorded as a second name for one input.
+/// - **Where §5.2's join falls**, `cut`: `0` puts the whole challenge on the
+///   continuation line with the join comma in front of its scheme, and `i` puts
+///   the join AT the `i`-th comma of the run — so the scheme and `i-1` of the
+///   empties stand on the line in front of it. Every cut of one cell spells the
+///   SAME value, because a join contributes exactly the comma it replaces, and
+///   `leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_writes` asserts
+///   that identity and the agreement of the answers over it. With the `ows`
+///   spacing the cuts also walk corpus I's and corpus K's shapes — whitespace
+///   behind the join comma, and whitespace in front of it — INSIDE a challenge
+///   body, which is a position neither of those families can reach.
+/// - **How many joins the recovery has already crossed**, 1..=3. Corpora H, I
+///   and K stop at two; multiple earlier joins are what makes
+///   the case worst, and [`O_MIDDLE`] is the line that adds one without closing
+///   a string or refuting an epoch's claim.
+/// - **What brought the recovery to the join**, [`O_HEADS`], which is also the
+///   list state the continuation is read in.
+/// - **The scheme**, [`O_SCHEMES`]: `1*SP` taken, so the empty run is the
+///   challenge's own body list; and the HTAB control, where it is the outer
+///   list's and no body opened at all.
+/// - **What stands behind the run**, [`O_BODIES`].
+fn corpus_o(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for (head_name, head) in O_HEADS {
+    for joins in 1_usize..=3 {
+      for (scheme_name, scheme) in O_SCHEMES {
+        for (body_name, body) in O_BODIES {
+          for empties in 0_usize..=3 {
+            for (spacing_name, ows) in [("tight", false), ("ows", true)] {
+              // Nothing to space. The two spellings are one byte string with no
+              // comma in it, and recording it twice would count one input as
+              // two.
+              if empties == 0 && ows {
+                continue;
+              }
+              // RFC 9110 §5.6.1.2 hangs `OWS` on both sides of its comma, so
+              // an empty element written with one is the same element.
+              let separator: &[u8] = if ows { b", " } else { b"," };
+              let mut continuation = scheme.to_vec();
+              for _ in 0..empties {
+                continuation.extend_from_slice(separator);
+              }
+              continuation.extend_from_slice(body);
+              for cut in 0..=empties {
+                let mut lines: Vec<Vec<u8>> = Vec::with_capacity(joins.saturating_add(2));
+                lines.push(head.to_vec());
+                for _ in 1..joins {
+                  lines.push(O_MIDDLE.to_vec());
+                }
+                match nth_comma(&continuation, cut) {
+                  // RFC 9110 §5.2 puts a comma between two field lines, so
+                  // cutting the continuation AT one of its own commas and
+                  // dropping that byte spells the same value over one more
+                  // line.
+                  Some(at) => {
+                    lines.push(continuation.get(..at).unwrap_or_default().to_vec());
+                    lines.push(
+                      continuation
+                        .get(at.saturating_add(1)..)
+                        .unwrap_or_default()
+                        .to_vec(),
+                    );
+                  }
+                  None => lines.push(continuation.clone()),
+                }
+                let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+                let spelling = format!(
+                  "challenges-empty-run head={head_name} joins={joins} scheme={scheme_name} \
+                   empties={empties} spacing={spacing_name} cut={cut} body={body_name}"
+                );
+                record(out, "O", &refs, &spelling, count)?;
+              }
+            }
+          }
         }
       }
     }

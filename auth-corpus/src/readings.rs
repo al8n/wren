@@ -44,6 +44,51 @@
 //! | a `Start` tag telling a body's first element from the outer list's | the body's first element handled where it occurs |
 //! | a `Regime` selecting which readings count | one enumeration; `forced` is not this function's question |
 //! | memo key `(at, start, list, faulted)` | memo key `(at, list)` |
+//! | the bare scheme read only where NO `1*SP` stands behind it | read either way |
+//!
+//! # The last row of that table is a divergence, and it is equivalent
+//!
+//! `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`. The optional
+//! group needs a body, so a run of SP with nothing derivable behind it is
+//! §5.6.1.2's own `OWS` in front of the comma and the challenge is the bare
+//! scheme — `Basic<SP>, Digest realm=z` is two challenges, and the module under
+//! test yields exactly those two. **This file's wording is the right one**, and
+//! `element` reads the bare scheme whether or not a SP stands there;
+//! `oracle::covers` reads it only in its no-SP arm.
+//!
+//! The two answer alike anyway, and the reason is one fact about the two
+//! whitespace productions rather than an accident:
+//!
+//! 1. §5.6.3's `OWS` is `*( SP / HTAB )` and §11.3's opener is `1*SP`, so
+//!    `skip_sp(v, scheme_end)` lands INSIDE the run `skip_ows(v, scheme_end)`
+//!    crosses, and both end at the same offset. Hence
+//!    `boundary(v, scheme_end) == boundary(v, body)` — the bare scheme's edge
+//!    and the body's first element's edge are the SAME edge.
+//! 2. So the extra reading fires exactly when `step(boundary(value, body), …,
+//!    true, …)` fires, and pushes the same offset with `list` false where that
+//!    one pushed it true. It can never set `derived` where the body branch has
+//!    not already set it, so it suppresses no crossing either.
+//! 3. And a state that differs only by `list` being false contributes no
+//!    opener the `list`-true state does not. The one way it could is that a
+//!    `list`-false state crosses where a `list`-true state derives — but the
+//!    crossing then runs to a raw comma INSIDE a `quoted-string` that closes,
+//!    and no opener can be recorded there: `scan_quoted` reaching that close
+//!    means every DQUOTE between is a `quoted-pair`, preceded by a backslash,
+//!    while a value position is preceded by `=` or `BWS`. Every exit from
+//!    inside the string lands on the element boundary the derived reading
+//!    already reached.
+//!
+//! **Searched as well as argued**: `openable` compared against a build with the
+//! reading confined to the no-SP arm, over every string of length 1..=9 over
+//! this crate's own eight-byte alphabet — 153 391 688 values — and over six
+//! prefixes that force the divergence at the first element crossed with every
+//! suffix of length 1..=7, 14 380 464 values, comparing `oracle::covered` and
+//! `readings::covered` at every offset of each. Zero differences.
+//! `a_bare_scheme_a_1_sp_stands_behind_is_a_reading_both_walks_reach` keeps a
+//! handful of those values as a gate. What falls outside the search is any
+//! shape needing a byte the alphabet omits — a `token68`-only character such as
+//! `/` or `+`, or an `obs-text` byte — or more than nine bytes of structure
+//! outside the six prefixes; the argument above is what covers those.
 //!
 //! # The fault regime is one rule, and the differential is what proved it
 //!
