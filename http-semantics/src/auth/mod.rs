@@ -2730,9 +2730,51 @@ fn refused_element_end(
   at: usize,
   parameters: bool,
   after_comma: bool,
+  forced: bool,
+  floor: usize,
 ) -> Option<usize> {
+  // Asked FIRST, because a comma in front of the carried value's close is not
+  // a comma this element ends at under any reading and `some_reading_holds` is
+  // a question about the readings admitted AT THE CURSOR — which no longer
+  // include the one that carried that value here. The span still derives, so
+  // `( token / quoted-string )` is not a choice at its value position: the
+  // element ends at the close, and `floor` is that close, an offset ON this
+  // line because [`scan_element`] stops crossing joins the moment a string
+  // closes. A byte behind the close would have made this `ValueTail::Trails`,
+  // which [`auth_param`] refuses — so a span that reaches here with `forced`
+  // true has only §5.6.1.2's own `OWS` between the close and the comma.
+  if forced && floor > at {
+    return Some(raw_comma_end(value, floor));
+  }
   let end = raw_comma_end(value, at);
-  (!some_reading_holds(value, at, end, parameters, after_comma)).then_some(end)
+  if !some_reading_holds(value, at, end, parameters, after_comma) {
+    return Some(end);
+  }
+  if !forced {
+    return None;
+  }
+  // The span still DERIVES, so `( token / quoted-string )` is not a choice
+  // here: §5.6.2's `tchar` excludes DQUOTE, so a reading that leaves this one
+  // shut derives no value at all, and an element that derives nothing is no
+  // element of a `#challenge` any reading of the value has. The string is the
+  // only reading, `end` is inside it in ALL of them, and the element ends where
+  // the string closes.
+  let quote = opener_at(value, at, parameters, after_comma)?;
+  match scan_quoted(value, quote.saturating_add(1), false) {
+    // Behind the close, only §5.6.1.2's own `OWS` may stand: `( token /
+    // quoted-string )` is one alternative taken WHOLE, so a byte behind that
+    // DQUOTE leaves the element deriving nothing — and an element that derives
+    // nothing is where the freedom this span had claimed to be free of BEGINS.
+    // `ends_element` is that test, and it is what tells `a="x,p,q"` — whose
+    // string closes inside its own element — from `y="q, Bearer, x="`, whose
+    // does not: the close there is another element's opener, `open` stands
+    // behind it, and nothing derives.
+    QuotedScan::Closed(close) if ends_element(value, close) => Some(raw_comma_end(value, close)),
+    QuotedScan::Closed(_) => None,
+    // It closes nowhere on this line, so every byte behind the DQUOTE is that
+    // value's data and there is no boundary to find. The caller is told.
+    QuotedScan::Open { .. } | QuotedScan::Invalid => None,
+  }
 }
 
 /// Where the RFC 9110 §5.6.1.2 element starting at `at` ends — the comma that
@@ -3432,6 +3474,10 @@ enum Origin<'a> {
     element: Element<'a>,
     /// [`Recovery::after_comma`], which is also what says a join was crossed.
     after_comma: bool,
+    /// [`Recovery::floor`] — where the value RFC 9110 §5.2's join carried onto
+    /// this line CLOSES, which is an offset on the line the walk holds and
+    /// never one on a line it dropped.
+    floor: usize,
   },
   /// The head of the line RFC 9110 §5.2's join left, with a §5.6.4
   /// quoted-string a reading of the value opened still open around the cursor
@@ -3570,6 +3616,18 @@ struct Epoch<'a> {
   /// `false` for — so neither the challenge reading nor the `OWS` skip it
   /// carries has anything left to do there.
   after_comma: bool,
+  /// Where the value RFC 9110 §5.2's join carried onto this line CLOSES, or the
+  /// cursor where no join carried one.
+  ///
+  /// [`Recovery::floor`] is what it is and where it comes from. It is read by
+  /// [`Challenges::seek`] and only while [`derivable`](Self::derivable) holds:
+  /// a span that still derives has ONE reading of its value position, so the
+  /// element ends at that close and the commas in front of it are that value's
+  /// data in every reading rather than in some of them. Where the span does not
+  /// derive there are two readings and no offset either of them agrees to
+  /// resume at, which is what `AuthError::ChallengeBoundaryUnknown` tells the
+  /// caller.
+  floor: usize,
   /// The element this refusal was made OVER, where the walk had already scanned
   /// one — which is not always the run standing at the cursor.
   ///
@@ -4527,7 +4585,22 @@ where
     fault: AuthError,
   ) -> AuthError {
     self.at = recovery.at;
-    let bounded = raw_comma_end(self.line, recovery.at) >= recovery.floor;
+    // A comma in front of the carried value's close is one the reading that
+    // opened that value holds — so it is no boundary, and where the readings
+    // are FREE there is nothing behind it this walk may resume at either.
+    //
+    // Where the fault is a bound of this reader's the readings are not free:
+    // the value still derives, `( token / quoted-string )` is not a choice at
+    // its value position, and the element ends where the string closes. That
+    // close is [`Recovery::floor`] and it is on THIS line —
+    // [`scan_element`] stops crossing joins the moment the string closes, so a
+    // close is never left on a line the walk dropped. So there IS a boundary
+    // to find and [`Challenges::seek`] is where it is found.
+    // [`Challenges::refuse`] re-derives the whole claim, and a span this
+    // predicate calls derivable that its own test does not degrades to
+    // [`refused_element_end`]'s decline rather than to a crossing.
+    let bounded =
+      raw_comma_end(self.line, recovery.at) >= recovery.floor || fault.is_a_receiver_bound();
     self.refuse(
       if bounded {
         Refusal::Bounded(fault)
@@ -4537,6 +4610,7 @@ where
       Origin::Scanned {
         element,
         after_comma: recovery.after_comma,
+        floor: recovery.floor,
       },
     )
   }
@@ -4590,6 +4664,14 @@ where
           ..
         }
       ),
+      // Where the value a join carried onto this line closes, which is the one
+      // offset a recovery over a span that still DERIVES may resume at. Every
+      // other entrance stands where no value was carried here, and the cursor
+      // itself is that offset.
+      floor: match origin {
+        Origin::Scanned { floor, .. } => floor,
+        Origin::Unread | Origin::Body | Origin::Crossed => self.at,
+      },
       scanned: match origin {
         Origin::Scanned { element, .. } => Some(element),
         Origin::Unread | Origin::Body | Origin::Crossed => None,
@@ -4688,6 +4770,13 @@ where
   /// crosses is one no reading holds inside a string, and a §5.6.1.2 comma or
   /// the end of the value is all it ever stops at.
   fn seek(&mut self) {
+    // Where the value RFC 9110 §5.2's join carried onto the line the refusal was
+    // made on CLOSES. It is an offset on THAT line, so it means nothing once
+    // this loop has crossed a join of its own — `crossed` is what says so, and
+    // a stale one would have this walk resume at a byte of a line it is no
+    // longer reading.
+    let floor = self.epoch.map(|epoch| epoch.floor);
+    let mut crossed = false;
     loop {
       // Taken rather than read: RFC 9110 §11.6.1's challenge reading is
       // admitted at the offset a join left the cursor on and at no other, since
@@ -4706,7 +4795,15 @@ where
       // as a whole element cost.
       let scanned = self.epoch.as_mut().and_then(|epoch| epoch.scanned.take());
       let parameters = self.inside_a_list();
-      let Some(end) = refused_element_end(self.line, self.at, parameters, after_comma) else {
+      // Whether a derivation of the whole value still reaches the cursor, which
+      // is what says §11.2's `quoted-string` alternative is still FORCED at a
+      // value position rather than one of two readings. Read at every turn
+      // because `sustain_the_epoch` can refute it at any element this crosses.
+      let forced = self.epoch.is_some_and(|epoch| epoch.derivable);
+      let resume = floor.filter(|_| !crossed).unwrap_or(self.at);
+      let Some(end) =
+        refused_element_end(self.line, self.at, parameters, after_comma, forced, resume)
+      else {
         // No boundary. The cursor still moves to the end of the run — the walk
         // stands past the bytes it read rather than in front of them — and
         // then the one question left is whether anything is unread at all. A
@@ -4727,11 +4824,13 @@ where
       // inside a value, which is no element at all.
       self.sustain_the_epoch(end, scanned);
       self.at = end;
+      let held = self.line.len();
       match self.open_element(None) {
         Step::End => return,
         // A comma was crossed by construction: the element just skipped ended
         // on one, or at the line end RFC 9110 §5.2 puts one at.
         Step::Element { .. } => {
+          crossed = crossed || self.line.len() != held || self.at < floor.unwrap_or(0);
           // The epoch does NOT end here, and the element this stops on is why:
           // [`opens_a_challenge`] says no `auth-param` begins at it, which is
           // not the same as saying a list ended in front of it. An element that
