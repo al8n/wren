@@ -2405,8 +2405,8 @@ const EXCUSED_REACH: [(&str, usize); 16] = [
 /// A misunderstanding the two SHARE, and it surfaced after this gate was
 /// built.
 ///
-/// `oracle::open_at` collapsed `Quoted::Invalid` to "this string is not open
-/// here". It is the one line both derivations ask the question through:
+/// `oracle::open_at` collapsed `Quoted::Invalid` to `not open here`. It is the
+/// one line both derivations ask the question through:
 /// `readings::covered` calls it over every opener `openable` found, and
 /// `oracle::covers` calls it in both of its regimes. So a challenge cut out of
 /// a run a forbidden byte sealed was excused by NEITHER derivation, this

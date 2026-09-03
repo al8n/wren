@@ -645,6 +645,13 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   // checked against. The running total above stays as it was: one is the
   // number the report prints, the other is the number the gate holds.
   let mut untriaged_by_file: BTreeMap<String, usize> = BTreeMap::new();
+  // And the spans themselves, so a file that drifts can be ACTED on. The count
+  // alone told a reader which file to look in and nothing about where, and the
+  // cheap answer to that is to add the file to `UNTRIAGED` — which is a bless
+  // of exactly the shape this table exists to refuse. They are carried here
+  // because they are already in hand: `grade` is handed the normalised span and
+  // the line it sits on, and dropped both on the floor when it counted one.
+  let mut untriaged_spans: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = crate::report::site(source.strip_prefix(&root).unwrap_or(source));
@@ -668,6 +675,11 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
       }
       for segment in span.split(['…']).flat_map(|part| part.split("...")) {
         let quoted = normalise(segment);
+        // `grade` answers `None` for two different things: a span too short to
+        // be a quotation at all, and one it counted as untriaged. The counter
+        // is what tells them apart, so it is read on both sides of the call
+        // rather than inferred from the span.
+        let untriaged_before_span = unattributable;
         let Some(grade) = grade(
           &quoted,
           &cited,
@@ -677,6 +689,12 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
           &mut narrow,
           &mut fallback,
         ) else {
+          if unattributable > untriaged_before_span {
+            untriaged_spans
+              .entry(shown.clone())
+              .or_default()
+              .push((line, quoted));
+          }
           continue;
         };
         failures += 1;
@@ -851,8 +869,15 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   // bounded, and for what a run that could not fail a fabricated quotation
   // cost.
   let backlog = untriaged_drift(&untriaged_by_file, UNTRIAGED, include_ignored);
-  for line in &backlog {
+  for (file, line) in &backlog {
     println!("{line}");
+    // Each span with the line it sits on and its own words, the way the
+    // production-shape failure already names what it rejected. A count on its
+    // own is a failure nobody can act on, and the cheapest response to one is
+    // the bless this table exists to refuse.
+    for (at, span) in untriaged_spans.get(file).into_iter().flatten() {
+      println!("  {file}:{at}: \"{span}\"");
+    }
   }
 
   if failures == 0 && abnf_failures == 0 && abnf_malformed == 0 && backlog.is_empty() {
@@ -910,7 +935,7 @@ fn untriaged_drift(
   counts: &BTreeMap<String, usize>,
   recorded: &[(&str, usize)],
   include_ignored: bool,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
   let mut out = Vec::new();
   for (file, &found) in counts {
     let recorded = recorded
@@ -919,29 +944,38 @@ fn untriaged_drift(
       .map(|(_, count)| *count);
     match recorded {
       Some(recorded) if recorded == found => {}
-      Some(recorded) => out.push(format!(
-        "quote-check: {file}: {found} untriaged span(s), `UNTRIAGED` records {recorded} — \
+      Some(recorded) => out.push((
+        file.clone(),
+        format!(
+          "quote-check: {file}: {found} untriaged span(s), `UNTRIAGED` records {recorded} — \
          {}",
-        if found > recorded {
-          "a span this run could not attribute to any spec it names. Read it: repair the \
+          if found > recorded {
+            "a span this run could not attribute to any spec it names. Read it: repair the \
            quotation, mark it `gate-exempt`, or raise the number here once it is known to be \
            the author's own words"
-        } else {
-          "triage was done and the table was not told. Lower the number here"
-        }
+          } else {
+            "triage was done and the table was not told. Lower the number here"
+          }
+        ),
       )),
       None if include_ignored => {}
-      None => out.push(format!(
-        "quote-check: {file}: {found} untriaged span(s), and the file is not in `UNTRIAGED` — \
-         a file absent from that table must hold none"
+      None => out.push((
+        file.clone(),
+        format!(
+          "quote-check: {file}: {found} untriaged span(s), and the file is not in `UNTRIAGED` — \
+           a file absent from that table must hold none"
+        ),
       )),
     }
   }
   for (file, recorded) in recorded {
     if !counts.contains_key(*file) {
-      out.push(format!(
-        "quote-check: {file}: 0 untriaged span(s), `UNTRIAGED` records {recorded} — the whole \
-         entry is stale; remove it"
+      out.push((
+        (*file).to_owned(),
+        format!(
+          "quote-check: {file}: 0 untriaged span(s), `UNTRIAGED` records {recorded} — the whole \
+           entry is stale; remove it"
+        ),
       ));
     }
   }
@@ -2841,15 +2875,28 @@ mod tests {
 
     let grown = untriaged_drift(&counts(&[("a.rs", 3), ("b.rs", 1)]), table, false);
     assert_eq!(grown.len(), 1, "{grown:?}");
-    assert!(grown[0].contains("a.rs: 3 untriaged span(s), `UNTRIAGED` records 2"));
+    assert!(
+      grown[0]
+        .1
+        .contains("a.rs: 3 untriaged span(s), `UNTRIAGED` records 2")
+    );
 
     let shrunk = untriaged_drift(&counts(&[("a.rs", 1), ("b.rs", 1)]), table, false);
     assert_eq!(shrunk.len(), 1, "{shrunk:?}");
-    assert!(shrunk[0].contains("Lower the number here"));
+    assert!(shrunk[0].1.contains("Lower the number here"));
 
     let stale = untriaged_drift(&counts(&[("a.rs", 2)]), table, false);
     assert_eq!(stale.len(), 1, "{stale:?}");
-    assert!(stale[0].contains("the whole entry is stale"));
+    assert!(stale[0].1.contains("the whole entry is stale"));
+
+    // And the FILE beside each message, which is what lets `run` print the
+    // spans that drifted underneath it. A message alone names a count and a
+    // file to open; the pairing is what turns that into something a reader can
+    // act on, and the cheap answer to a failure nobody can act on is the bless
+    // `UNTRIAGED` exists to refuse.
+    assert_eq!(grown[0].0, "a.rs");
+    assert_eq!(shrunk[0].0, "a.rs");
+    assert_eq!(stale[0].0, "b.rs");
   }
 
   // The one relaxation, and its boundary. `docs/` is gitignored, so a file the
@@ -2864,8 +2911,8 @@ mod tests {
 
     let tracked = untriaged_drift(&found, table, false);
     assert_eq!(tracked.len(), 1, "{tracked:?}");
-    assert!(tracked[0].contains("docs/design.md"));
-    assert!(tracked[0].contains("not in `UNTRIAGED`"));
+    assert!(tracked[0].1.contains("docs/design.md"));
+    assert!(tracked[0].1.contains("not in `UNTRIAGED`"));
 
     assert!(untriaged_drift(&found, table, true).is_empty());
 
@@ -2873,7 +2920,7 @@ mod tests {
     let drifted = counts(&[("a.rs", 3), ("docs/design.md", 9)]);
     let both = untriaged_drift(&drifted, table, true);
     assert_eq!(both.len(), 1, "{both:?}");
-    assert!(both[0].contains("a.rs"));
+    assert!(both[0].1.contains("a.rs"));
   }
 
   // One candidate flattened to the three things an extraction test is about.
