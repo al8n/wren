@@ -1245,14 +1245,14 @@ fn where_a_recovery_stands_says_whether_a_challenge_may_open_there() {
   // The element began and ended on the line the walk holds, so nothing this
   // scan crossed put a comma in front of it and RFC 9110 §11.6.1's challenge
   // reading is not this scan's to admit.
-  let scanned = scan_element(b"Basic a=1, b=2", 6, || Ok(None)).unwrap();
+  let scanned = scan_element(b"Basic a=1, b=2", 6, 6, || Ok(None)).unwrap();
   assert_eq!(scanned.recovery.at, 6);
   assert!(!scanned.recovery.after_comma);
 
   // §5.2's join carried the element onto the line the walk now stands on, and
   // that line's first byte is behind the join's comma.
   let mut behind = [&b"Digest realm=\"evil\", x"[..]].into_iter();
-  let scanned = scan_element(b"Basic a=\"x", 6, || Ok(behind.next())).unwrap();
+  let scanned = scan_element(b"Basic a=\"x", 6, 6, || Ok(behind.next())).unwrap();
   assert_eq!(scanned.recovery.at, 0);
   assert_eq!(scanned.recovery.floor, 14);
   assert!(scanned.recovery.after_comma);
@@ -1260,9 +1260,130 @@ fn where_a_recovery_stands_says_whether_a_challenge_may_open_there() {
   // The value ran out inside the string, so the cursor is at the last line's
   // end, where no element of any list begins.
   let mut open = [&b"nothing closes it"[..]].into_iter();
-  let scanned = scan_element(b"Basic a=\"x", 6, || Ok(open.next())).unwrap();
+  let scanned = scan_element(b"Basic a=\"x", 6, 6, || Ok(open.next())).unwrap();
   assert_eq!(scanned.recovery.at, 17);
   assert!(!scanned.recovery.after_comma);
+}
+
+/// The recovery over a body's FIRST element is the OUTER list's element, and
+/// `element_at` is the whole of the difference.
+///
+/// ```text
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// `x = "c, Digest realm=z` derives two ways: an `auth-scheme` `x`, §11.3's
+/// `1*SP`, and a body opening at the `=` — which derives nothing, since `=` is
+/// no `tchar` — or one `auth-param` whose `BWS` is that same SP and whose
+/// quoted-string opens at offset 4 and never closes. The walk enters the body,
+/// so `scan_element` is asked at 2; the element the OUTER `#challenge` list
+/// holds begins at 0, and the value position is 4.
+///
+/// A scan that took the recovery at its own offset answers that no
+/// quoted-string decided anything — `param_value_at` needs a `token` and `=` is
+/// not one — so the held verdict came due behind a comma inside `x`'s value.
+/// `Basic a=1, Broken;junk, Bearer, x = "c, Digest realm=z` is the value that
+/// cost, and `auth-corpus`'s corpus O is where 54 of its shape were counted.
+/// The other reading of an element a recovery CROSSES, which `auth_param`
+/// cannot see.
+///
+/// ```text
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// `Challenges::seek` crosses an element `opens_a_challenge` answered `false`
+/// for — one an `auth-param` begins at — and `sustain_the_epoch` used to ask it
+/// only what §11.2 makes of it. Where §11.2's `BWS` in front of the `=` holds a
+/// SP, the same bytes are also an `auth-scheme` taking §11.3's `1*SP`, whose
+/// body opens AT the `=` and derives nothing. That reading has a `#auth-param`
+/// list open and has stopped deriving inside it, which is what
+/// `Broken<HTAB>junk, y<SP>=<SP>1, Bearer, x="open, Digest realm=z` needed and
+/// did not get.
+#[test]
+fn a_crossed_element_may_open_a_list_the_reading_that_derives_does_not() {
+  // The one SP, and every neighbouring spelling of the same production. Only
+  // `1*SP` is the body's entrance, and §5.6.3's HTAB is not one of its bytes.
+  assert!(opens_a_parameter_list(b"y = 1"));
+  assert!(opens_a_parameter_list(b"y  = 1"));
+  assert!(opens_a_parameter_list(b"y \t= 1"));
+  assert!(!opens_a_parameter_list(b"y=1"));
+  assert!(!opens_a_parameter_list(b"y\t=\t1"));
+  assert!(!opens_a_parameter_list(b"y= 1"));
+
+  // A challenge that takes the OTHER alternative closes no list of its own, and
+  // a scheme with no body opens none.
+  assert!(!opens_a_parameter_list(b"Bearer abc"));
+  assert!(!opens_a_parameter_list(b"Bearer dGVzdA=="));
+  assert!(!opens_a_parameter_list(b"Bearer"));
+  assert!(!opens_a_parameter_list(b""));
+  // And a body that is only the list's own whitespace is no body at all: the
+  // optional group needs one of its two alternatives and neither derives `OWS`.
+  assert!(!opens_a_parameter_list(b"Bearer "));
+  // A challenge with a parameter body opens one, which is the same sentence
+  // read over an element the walk would have stopped at rather than crossed.
+  assert!(opens_a_parameter_list(b"Basic a=1"));
+
+  // And the walk, over the value the two spellings part on. Both are shown at
+  // `7c25761`; only the second may be, because only the first has a reading
+  // that holds the probe inside `x`'s value.
+  let opens: &[u8] = b"Broken\tjunk, y = 1, Bearer, x=\"open, Digest realm=z";
+  let closes: &[u8] = b"Broken\tjunk, y\t=\t1, Bearer, x=\"open, Digest realm=z";
+  let [_, _, _, last] = walk::<4>([opens]);
+  assert_eq!(
+    last.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown,
+    "a span that opens a list is a list in front of the trap"
+  );
+  let [_, _, _, last] = walk::<4>([closes]);
+  assert_eq!(
+    last.unwrap().unwrap().scheme(),
+    b"Digest",
+    "and one that opens none leaves the boundary every reading agrees on"
+  );
+}
+
+#[test]
+fn a_body_s_first_element_recovers_at_the_element_the_outer_list_holds() {
+  let value = b"x = \"c, Digest realm=z";
+  // Where the walk enters the body: past `auth-scheme 1*SP`, at the `=`.
+  assert_eq!(skip_sp(value, token_end(value, 0).unwrap()), 2);
+  // The two readings, and the one value position the run holds. It is the
+  // outer element's, and no scan from the body's own offset finds it.
+  assert_eq!(param_value_at(value, 0), Some(4));
+  assert_eq!(param_value_at(value, 2), None);
+
+  // Asked at the body's offset for both, which is what the walk used to do.
+  let scanned = scan_element(value, 2, 2, || Ok(None)).unwrap();
+  assert_eq!(scanned.recovery.at, 2);
+  assert!(!scanned.recovery.strung);
+
+  // And asked with the outer element's, which is what it does.
+  let scanned = scan_element(value, 2, 0, || Ok(None)).unwrap();
+  assert_eq!(scanned.element.bytes, b"= \"c");
+  assert_eq!(scanned.recovery.at, 0);
+  assert_eq!(scanned.recovery.floor, 0);
+  assert!(scanned.recovery.strung);
+  // The comma is the same comma either way: only `auth-scheme 1*SP` stands
+  // between the two offsets, and neither a `token` nor a run of SP holds one.
+  assert_eq!(raw_comma_end(value, 0), raw_comma_end(value, 2));
+  // So all that moves is the question `some_reading_holds` asks, and it is the
+  // difference between crossing that comma and declining it.
+  assert!(some_reading_holds(
+    value,
+    0,
+    raw_comma_end(value, 0),
+    true,
+    false
+  ));
+  assert!(!some_reading_holds(
+    value,
+    2,
+    raw_comma_end(value, 2),
+    true,
+    false
+  ));
 }
 
 #[test]

@@ -25,8 +25,8 @@
 //!   spelling)` is the record's key, and it is unique everywhere but the 32
 //!   inputs corpus D writes six times each — see
 //!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`,
-//!   which pins that exception and says what it costs. 946 462 records stand
-//!   for 946 302 distinct inputs — the two figures
+//!   which pins that exception and says what it costs. 948 544 records stand
+//!   for 948 384 distinct inputs — the two figures
 //!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`
 //!   asserts, and they are quoted from it rather than counted again here.
 //!   **Every corpus D figure quoted from this
@@ -488,7 +488,7 @@ fn corpus_g(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
 /// parameters. The first two carry the probe INSIDE such a challenge's own
 /// quoted parameter, which is the shape that manufactures one; the rest are the
 /// neighbours that must not be refused with them.
-const CONTINUATIONS: [&[u8]; 9] = [
+const CONTINUATIONS: [&[u8]; 10] = [
   // A challenge whose quoted `realm` opens in front of the probe and never
   // closes, so the probe is that realm's data under the reading that shut the
   // head at the join.
@@ -510,6 +510,15 @@ const CONTINUATIONS: [&[u8]; 9] = [
   // An `auth-param` and not a challenge: no `1*SP` stands behind its token, so
   // the opener is the element's OWN value position.
   b"realm=\"c, Digest realm=z",
+  // The same element with RFC 9110 §11.2's `BWS` in FRONT of its `=`, which is
+  // whitespace §11.3's `1*SP` IS a prefix of — so `realm` reads as an
+  // `auth-scheme` too, with a body opening at the `=` that derives nothing. The
+  // row above is this element with that whitespace off it, and the pair is the
+  // one place this family parts §11.6.1's two readings behind the offset §5.2's
+  // join left rather than at it. The `Newauth realm = "c` row below writes the
+  // same `BWS` inside a challenge's BODY, where the element's own head is a
+  // scheme and there is no second reading of it to lose.
+  b"realm = \"c, Digest realm=z",
   // The probe itself at the head of the line.
   b"Digest realm=z",
   // §11.2's `BWS` around the `=`, which §5.6.6's `parameter` does not have: the
@@ -683,10 +692,25 @@ const SCHEME_FAULTS: [(&str, &[u8]); 3] = [
 ];
 
 /// The tails corpus J puts behind that refusal, carrying the probe.
-const TRAPS: [(&str, &[u8]); 5] = [
+const TRAPS: [(&str, &[u8]); 6] = [
   // A value position whose RFC 9110 §5.6.4 quoted-string opens over the probe
   // and never closes.
   ("open", b"x=\"open, Digest realm=z"),
+  // The same opener with §11.2's `BWS` in FRONT of the `=`, spelled with the SP
+  // that `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` needs.
+  //
+  // `auth-param = token BWS "=" BWS ( token / quoted-string )`, and §11.2's
+  // `BWS` is §5.6.3's `OWS` — so one SP there makes the SAME element an
+  // `auth-scheme` with a body opening AT the `=`, which derives nothing because
+  // `=` is no `tchar`. The walk reads a challenge at a trap by construction, so
+  // this is the one place in this family where §11.6.1's two readings of the
+  // element the recovery stops on part behind the cursor rather than at it.
+  //
+  // Written nowhere until corpus O crossed it by accident: every trap above and
+  // below spells the `=` tight, which is the spelling that reaches
+  // `read_challenge`'s scheme fault and has recovered from the element's own
+  // first byte since al8n/wren#77.
+  ("bws-open", b"x = \"open, Digest realm=z"),
   // And one that CLOSES behind it, so nothing at all is wrong with the value.
   ("closed-over", b"x=\"c, Digest realm=z, junk\""),
   // Closed in FRONT of the probe: every reading stands outside the string at
@@ -1116,7 +1140,7 @@ fn corpus_m(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
 /// The last two are the same two elements in both orders, because the claim is
 /// about EVERY element of the span and a rule that asked only the first would
 /// be green over one of them.
-const SPANS: [(&str, &[u8]); 14] = [
+const SPANS: [(&str, &[u8]); 15] = [
   // Nothing absorbed at all: corpus M's own shape, and the control every other
   // row here is read against.
   ("none", b""),
@@ -1124,6 +1148,16 @@ const SPANS: [(&str, &[u8]); 14] = [
   ("param", b"y=1"),
   ("quoted", b"y=\"q\""),
   ("bws", b"y\t=\t1"),
+  // The same `BWS` spelled with §5.6.3's other byte. The row above writes HTAB
+  // on both sides, which is the spelling
+  // `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` can never
+  // take; this one writes the SP that it can, so an absorbed element carries
+  // the whitespace that makes the other production a reading of the same bytes.
+  // What a span element is asked is `auth_param` and nothing else — the walk
+  // crosses these rather than reading a challenge at them — so the two are
+  // expected to answer alike, and this row is what says so rather than assumes
+  // it.
+  ("bws-sp", b"y = 1"),
   ("duplicate", b"a=1, a1=1, p1=1"),
   ("over-bound", b"q1=1, q2=1, q3=1, q4=1, q5=1, q6=1, q7=1, q8=1, q9=1, q10=1, q11=1, q12=1, q13=1, q14=1, q15=1, q16=1, q17=1, q18=1, q19=1"),
   ("two-params", b"y=1, z=2"),
