@@ -215,18 +215,73 @@ fn challenge_readings(value: &[u8], at: usize) -> Vec<(usize, Context)> {
   out
 }
 
-/// Whether a whole `challenge` derives from `at`, ending where RFC 9110
+/// Whether RFC 9110 §5.6.1.2 lets an element of the OUTER `#challenge` list
+/// begin at `at`.
+///
+/// ```text
+/// #element  => [ element ] *( OWS "," OWS [ element ] )
+/// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+///
+/// The expansion puts an element of the outer list at exactly two kinds of
+/// offset: the value's first byte, and the far side of a comma with the `OWS`
+/// that comma carries behind it. Nowhere else — and in particular NOT at the
+/// body position §11.3's `1*SP` opens, which stands inside an outer element
+/// and which the production puts no second `challenge` at.
+///
+/// # Why the comma may be read raw
+///
+/// Readings differ about whether a given comma SEPARATES or is some value's
+/// data; they do not differ about where the commas are. So where a raw comma
+/// stands in front of `at` with only §5.6.3 whitespace between, the reading
+/// that leaves that comma outside every string puts an element start here —
+/// and where none does, no reading can, because every element start behind the
+/// first is behind a comma. Whether that reading also holds the probe inside a
+/// string is [`covered`]'s question and is asked separately.
+///
+/// [`covers`] carries the same distinction as [`Start`], reached by walking the
+/// value; this is the same sentence read off §5.6.1.2 at one offset. The two
+/// are separate compositions of `skip_ows` on purpose.
+fn starts_an_element(value: &[u8], at: usize) -> bool {
+  let Some(comma) = value
+    .get(..at)
+    .and_then(|front| front.iter().rposition(|&byte| byte == b','))
+  else {
+    // No comma in front, so the only element that can begin here is the list's
+    // first — and §5.6.1.2 puts no `OWS` in front of that one.
+    return at == 0;
+  };
+  skip_ows(value, comma.saturating_add(1)) == at
+}
+
+/// Whether a whole `challenge` stands at `at`: an element of the outer
+/// `#challenge` list begins there, and one derives from it to where RFC 9110
 /// §5.6.1.2 lets a list element end.
 ///
 /// The probe's OWN bytes, asked in isolation. What stands behind the element it
 /// ends at is a different question — one about the rest of the list and not
-/// about whether a challenge is written here — and one the bytes in FRONT of
-/// `at` cannot answer either, which is why [`Verdict::reached`] is the separate
-/// fact that a derivation gets here at all.
+/// about whether a challenge is written here — which is why [`Verdict::reached`]
+/// is the separate fact that a derivation gets here at all.
+///
+/// # The bytes in front DO answer one thing, and leaving it out invented a
+/// challenge to hide
+///
+/// Where a challenge may STAND. `challenge = auth-scheme [ 1*SP ( token68 /
+/// #auth-param ) ]` puts no second challenge at a body's first element, so
+/// `Broken;junk,Newauth Digest realm=z` has the probe at an offset no reading
+/// of the outer `#challenge` list has an element start at — and hiding it is
+/// what a reader MUST do, since showing it would be manufacturing a challenge
+/// out of one challenge's body. Asked without [`starts_an_element`], this
+/// answered `true` there and the axis graded 18 records of corpus O
+/// `hider-unexcused`: a zero-target reporting the reader for doing the one
+/// thing the module exists to make it do. [`covers`] has carried the same
+/// distinction as [`Start`] since `Basic a a=", Digest realm=z`, and this is
+/// the axis's third input catching up with it.
 fn derives_as_a_challenge(value: &[u8], at: usize) -> bool {
-  challenge_readings(value, at)
-    .into_iter()
-    .any(|(end, _)| boundary(value, end).is_some())
+  starts_an_element(value, at)
+    && challenge_readings(value, at)
+      .into_iter()
+      .any(|(end, _)| boundary(value, end).is_some())
 }
 
 /// Records the state an [`Edge`] leads to, if it leads to one.

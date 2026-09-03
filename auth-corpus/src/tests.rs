@@ -741,25 +741,30 @@ const AXIS: [Pinned; 15] = [
     11_730,
     19_482,
   ),
-  // One of these cells is a ZERO-TARGET standing at a non-zero number, and it
-  // is pinned here rather than blessed anywhere: `the_three_classes_this_
-  // module_is_driven_to_zero_on_are_zero` still REDS on this corpus, which is
-  // the finding this family made and not a number to paste over.
+  // The family that found both inventions, and neither cell it
+  // found them in is a zero-target standing at a number any more.
   // `leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_writes` carries
   // both witnesses and what each says.
   //
   // `over-yield` stood at 54 and stands at 0. `Recovery` is now taken at the
   // offset the element the OUTER `#challenge` list holds begins at, so the one
   // value position that run carries is the one a recovery scans from; the 54
-  // are `hider-excused` now, because the reading that opens `x<SP>="…` holds
-  // the probe inside its string and showing it was the invention.
+  // are `hider-excused`, because the reading that opens `x<SP>="…` holds the
+  // probe inside its string and showing it was the invention.
+  //
+  // `hider-unexcused` stood at 18 and stands at 0, and `no-probe` is where they
+  // went — with six `hider-excused` rows of the same shape beside them. That
+  // move is the ORACLE's and not the module's: `derives_as_a_challenge` asks
+  // whether an element of the outer list may BEGIN at the probe now, which is
+  // what says nothing stands at a body's first element for a reader to hide.
+  // Every answer digest held across it, which is the split [`ANSWERS`] is for.
   (
     "O",
     3_192,
     &[
-      ("hider-excused", 1_350),
-      ("hider-unexcused", 18),
+      ("hider-excused", 1_344),
       ("hider-unresolved", 72),
+      ("no-probe", 24),
       ("yields", 222),
       ("yields-underivable", 1_530),
     ],
@@ -4773,9 +4778,16 @@ const BWS_BY_SCHEME: [(&str, &[u8], bool); 2] = [
 /// `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` puts no second
 /// challenge at a body's first element, so no reading of the outer `#challenge`
 /// list has an element start here and hiding these bytes is what a reader must
-/// do. [`Verdict::derives`] asks only whether the probe's own bytes derive as a
-/// challenge, so the axis grades the hide `hider-unexcused` all the same.
+/// do. `oracle::derives_as_a_challenge` asked only whether the probe's own
+/// bytes derive as a challenge, and the axis graded the hide `hider-unexcused`
+/// for it — a zero-target reporting the reader for the one thing this module
+/// exists to make it do.
 const PROBE_INSIDE_A_BODY: &[u8] = b"Broken;junk,Newauth Digest realm=z";
+
+/// The control, one comma apart: RFC 9110 §5.6.1.2's separator in front of the
+/// same bytes puts an element of the outer `#challenge` list at them, so a
+/// challenge stands there and the walk shows it.
+const PROBE_AT_AN_ELEMENT: &[u8] = b"Broken;junk,Newauth,Digest realm=z";
 
 #[test]
 fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_writes() {
@@ -4995,48 +5007,62 @@ fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_w
     );
   }
 
-  // `hider-unexcused` is the other zero-target and corpus O answers 18. These
-  // are NOT a defect of the reader, and saying so is the point of pinning them
-  // by shape: the probe stands at the first element of a challenge's body with
-  // no §5.6.1.2 comma in front of it, so no reading of the outer `#challenge`
-  // list has an element start there and showing it would be the invention.
-  // What grades them is [`Verdict::derives`], which asks whether the probe's
-  // own bytes derive as a challenge and not whether anything may begin at that
-  // offset — the distinction `oracle::covers` carries as `Start::Body` and this
-  // one does not.
-  let unexcused: Vec<&String> = o
-    .iter()
-    .filter(|line| columns(line)[3] == "hider-unexcused")
-    .collect();
+  // `hider-unexcused` was the other zero-target and corpus O answered 18. It
+  // answers 0, and the 18 are `no-probe`: the probe stands at the first element
+  // of a challenge's BODY with no §5.6.1.2 comma in front of it, so no reading
+  // of the outer `#challenge` list has an element start there and there is
+  // nothing for any reader to show or to hide. They were never a defect of the
+  // reader — `oracle::derives_as_a_challenge` asked whether the probe's own
+  // bytes derive as a challenge and not whether one may STAND at that offset,
+  // which is the distinction `oracle::covers` has carried as `Start::Body`
+  // since `Basic a a=", Digest realm=z`.
+  //
+  // Pinned by SHAPE, because a family that stopped writing the shape would go
+  // quiet rather than red. The other six are `head=open`: the same body
+  // position with a §5.2 join carrying an open string over it, which used to
+  // grade `hider-excused` for a reading that has no challenge to hold.
   assert_eq!(
-    unexcused.len(),
-    18,
+    of(&tally(&o, |_| true), "hider-unexcused"),
+    0,
     "corpus O: the probes at a body position"
   );
-  for line in &unexcused {
-    let [_, case, spelling, _, _] = columns(line);
-    assert!(
-      spelling.contains(" empties=0 ") && spelling.ends_with("body=probe"),
-      "corpus O: a hider-unexcused outside the shape this test names: {line}"
-    );
+  let mut bodied = 0usize;
+  for line in &o {
+    let [_, case, spelling, axis, _] = columns(line);
+    if !(spelling.contains(" empties=0 ") && spelling.ends_with("body=probe")) {
+      continue;
+    }
     let lines: Vec<Vec<u8>> = case.split('|').map(unescape).collect();
     let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
     let joined = join(&refs);
     let probe = probe_at(&joined);
+    // Where §5.6.1.2 would put the element start in front of the probe, read
+    // off the value here rather than taken from the oracle: the far side of the
+    // last comma, with the `OWS` that comma carries skipped. The probe stands
+    // PAST it, so no element of the outer list begins where the probe does.
     let element = last_index_of(joined.get(..probe).unwrap_or_default(), b",")
       .map_or(0, |at| at.saturating_add(1));
     assert!(
-      !joined
-        .get(element..probe)
-        .unwrap_or_default()
-        .contains(&b','),
-      "corpus O: a hider-unexcused whose probe IS an element start: {line}"
+      past_ows(&joined, element) < probe,
+      "corpus O: a body=probe row whose probe IS an element start: {line}"
     );
+    assert_eq!(
+      axis, "no-probe",
+      "corpus O: a probe at a body position graded as one that stands there: {line}"
+    );
+    bodied += 1;
   }
+  assert_eq!(
+    bodied, 24,
+    "corpus O: four heads by three join counts by two schemes"
+  );
   // The same fact over the one-line witness, with the oracle's own verdict
   // beside it.
   let inside = oracle::read(PROBE_INSIDE_A_BODY, probe_at(PROBE_INSIDE_A_BODY));
-  assert!(inside.derives, "the probe's own bytes derive");
+  assert!(
+    !inside.derives,
+    "no element of the outer `#challenge` list begins at a body's first element"
+  );
   assert!(
     !inside.reached,
     "no derivation of the whole value reaches it"
@@ -5046,16 +5072,30 @@ fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_w
     !yields_the_probe(&[PROBE_INSIDE_A_BODY]),
     "the walk does not invent a challenge out of a body's first element"
   );
+  // And the control, one comma apart: with §5.6.1.2's separator in front of it
+  // the same bytes ARE an element of the outer list, a challenge stands there,
+  // and the walk shows it.
+  let element = oracle::read(PROBE_AT_AN_ELEMENT, probe_at(PROBE_AT_AN_ELEMENT));
+  assert!(
+    element.derives,
+    "a comma puts an element start at the probe"
+  );
+  assert!(
+    yields_the_probe(&[PROBE_AT_AN_ELEMENT]),
+    "and the walk shows the challenge that stands there"
+  );
 }
 
 /// How many of corpus O's cells answer differently depending on where §5.2's
 /// join was cut, and what shape every one of them has.
 ///
-/// # A number that is not a target and is not a cost either
+/// # The argument this constant used to lack
 ///
 /// [`UNRESOLVED`] and [`CONFORMING`] are pinned because each is a cost this
-/// module has an argument for. This one has no argument yet, and it is pinned
-/// so that it cannot move quietly while somebody decides.
+/// module has an argument for. This one had none. It has one now, and the
+/// argument is not that the divergence is acceptable — it is that the obvious
+/// fix MOVES the class rather than closing it, which is a thing measured rather
+/// than supposed. [`ONE_VALUE_THREE_SPELLINGS`] is that measurement pinned.
 ///
 /// Every cut of a cell spells ONE value — RFC 9110 §5.2 contributes exactly the
 /// comma the cut took out, and the test above asserts the byte identity before
@@ -5085,7 +5125,112 @@ fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_w
 /// What it is NOT is a `MAX_CHALLENGE_LINES` effect, which is the one place
 /// this module is entitled to answer by the spelling: corpus O writes at most
 /// five field lines and that bound is seventeen.
+///
+/// # Why 36 and not 0, and what a fix would have to be
+///
+/// The reading that opened the refused element's value holds every comma in
+/// front of its close, so no boundary may be CERTIFIED there — that is the
+/// module's own invariant and `Recovery::floor` is where it is enforced. To
+/// answer the earlier cuts as the last one does, the recovery would have to
+/// reach the first comma BEHIND the close, which means getting past the commas
+/// in front of it without certifying any of them.
+///
+/// **The obvious way to do that was built and measured, and it relocates the
+/// class.** Making `floor` an offset the recovery may not STOP in front of —
+/// rather than a test of whether it may run at all — takes these 36 cells to
+/// zero, moves 72 corpus O records `hider-unresolved` -> `yields-underivable`,
+/// moves nothing anywhere else, and leaves all three of [`ZERO_TARGETS`] at
+/// zero. It also makes `Basic a="x,p, q"junk, Digest realm=z` answer
+/// `Ok[Digest]` over two field lines and `ChallengeBoundaryUnknown` over one.
+/// The same value, parted by its spelling, in the other direction.
+///
+/// The reason is the invariant: crossing the comma behind `p` is certifying a
+/// comma the reading that opened `a`'s value holds. What a recovery would need
+/// instead is the SHUT reading's elements across the whole run in front of the
+/// close — and each of them may open a §5.6.4 quoted-string of its own, so the
+/// question stops being the one-opener scan `opener_at` argues for and becomes
+/// the subset construction `crate::grammar`'s `Readings` makes for RFC 9110
+/// §5.6.6's `parameters`. Nor is the close itself a place to resume from: at
+/// `Basic a="x` and a continuation whose first element is `r` with a quoted
+/// value of `c`, the open reading's string closes at the DQUOTE the SHUT
+/// reading's `r` opens its value with — so the two stand on opposite sides of
+/// that one byte, and neither offset is one every reading is outside a string
+/// at.
+///
+/// # And 36 is a LOWER BOUND on the class
+///
+/// Corpus O's `cut` axis moves §5.2's join inside a leading run of EMPTY
+/// elements, which is the only place any generator here cuts a value. The class
+/// is about a cut falling anywhere the carried value runs, and
+/// [`ONE_VALUE_THREE_SPELLINGS`] is a value that parts at THIS commit over a
+/// cut no family writes: three field lines show the probe where one and two
+/// decline. So this number counts what corpus O can see and not what there is.
 const CUTS_THAT_PART: usize = 36;
+
+/// One value, spelled over one, two and three field lines, that this walk
+/// answers about in two ways.
+///
+/// RFC 9110 §5.2 makes the three one value — "concatenated in order, with each
+/// field line value separated by a comma" — so every byte of it is the same and
+/// only where the sender cut it differs. The two-line spelling puts a comma in
+/// front of the close of the value `a="x` opened; the three-line spelling puts
+/// that close on the head of its own line; and the one-line spelling has no
+/// join at all, so `Recovery::floor` is the element's own start and
+/// `some_reading_holds` is asked at the DQUOTE rather than at a line head.
+///
+/// The last field is what the walk answers: `true` where it SHOWS the probe.
+/// It is pinned rather than driven to one value because [`CUTS_THAT_PART`]
+/// carries why, and because a constant nobody can see move is how this
+/// divergence went unnoticed for so long.
+const ONE_VALUE_THREE_SPELLINGS: [(&str, &[&[u8]], bool); 3] = [
+  (
+    "one line",
+    &[b"Basic a=\"x,p, q\"junk, Digest realm=z"],
+    false,
+  ),
+  (
+    "two lines",
+    &[b"Basic a=\"x", b"p, q\"junk, Digest realm=z"],
+    false,
+  ),
+  (
+    "three lines",
+    &[b"Basic a=\"x", b"p", b" q\"junk, Digest realm=z"],
+    true,
+  ),
+];
+
+#[test]
+fn one_value_spelled_over_three_line_counts_answers_two_ways() {
+  // The bytes first, because the whole claim is that these are one value and
+  // the answers below are therefore about a spelling.
+  let joined: Vec<Vec<u8>> = ONE_VALUE_THREE_SPELLINGS
+    .iter()
+    .map(|(_, lines, _)| join(lines))
+    .collect();
+  for value in &joined {
+    assert_eq!(value, &joined[0], "the three spellings are not one value");
+  }
+  // And no reading holds the probe inside a value, so showing it is recovery
+  // and declining it is a cost — neither answer is a zero-target, which is why
+  // no gate of this crate can see the divergence.
+  let verdict = oracle::read(&joined[0], probe_at(&joined[0]));
+  assert!(verdict.derives, "a challenge stands at the probe");
+  assert!(
+    !verdict.reached,
+    "and no derivation of the value reaches it"
+  );
+  assert!(!verdict.excused, "and no reading holds it inside a string");
+
+  for (spelling, lines, shows) in ONE_VALUE_THREE_SPELLINGS {
+    assert_eq!(yields_the_probe(lines), shows, "the `{spelling}` spelling");
+    assert_eq!(
+      says_the_rest_is_unread(lines),
+      !shows,
+      "the `{spelling}` spelling's notice"
+    );
+  }
+}
 
 /// Whether every cell whose cuts answer differently has the shape
 /// [`CUTS_THAT_PART`] names, and the direction it names.
