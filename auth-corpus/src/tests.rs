@@ -824,60 +824,42 @@ const AXIS: [Pinned; 16] = [
 /// somebody decided to keep, and the only honest constant for these two is
 /// zero.
 ///
-/// # A zero that was met over a corpus that could not spell the case
+/// # A zero is only as strong as the shapes the generators can write
 ///
-/// The commit that first drove `over-yield` to zero did so over corpora A..G,
-/// and corpus H then answered 24. Every corpus in front of it puts its tail at
-/// the recovery cursor itself, so the DQUOTE that hides the probe is always at
-/// the value position of the element the cursor is ON — and a check asked only
-/// there was green over every one of them while RFC 9110 §11.6.1's OTHER
-/// reading of that element, a whole `challenge` opening on the continuation
-/// line §5.2's join makes, put its own parameter's DQUOTE at an offset the
-/// check never asked about. `corpus_h` is that record. The lesson is corpus G's
-/// repeated: a zero-target is only as strong as the shapes the generators can
-/// write, so a target met is a claim about the corpus as much as about the
-/// reader.
+/// Three times a met zero-target turned out to be a claim about the corpus
+/// rather than about the reader, and each time the next family answered
+/// non-zero against the commit that had declared the zero:
 ///
-/// # And met again over a corpus that could not spell the NEXT case
+/// - **A..G green, `corpus_h` = 24.** Every family in front of H puts its tail
+///   at the recovery cursor itself, so the DQUOTE that hides the probe is always
+///   at the value position of the element the cursor is ON — while RFC 9110
+///   §11.6.1's OTHER reading of that element, a whole `challenge` opening on the
+///   continuation line §5.2's join makes, puts its own parameter's DQUOTE at an
+///   offset a check asked only at the cursor never sees.
+/// - **H green, `corpus_i` = 128.** The axis H holds fixed is one byte wide:
+///   §5.6.1.2 expands its list as
+///   `#element => [ element ] *( OWS "," OWS [ element ] )`, and every
+///   continuation H writes begins with the element rather than with the `OWS`
+///   that comma may carry, so a check that never skipped the whitespace was
+///   green over all 72. One space in front of the continuation moves both
+///   openers, and the reader crossed the comma inside a `realm`. `corpus_i` and
+///   `corpus_j` say which axes were being held fixed, and
+///   `ows_after_the_join_comma_and_a_challenge_completed_in_front_are_shapes_these_generators_write`
+///   asserts that both are still being written.
+/// - **A..M green, `corpus_n` = 240.** The axis every family up to there held
+///   fixed is what the recovered SPAN contains: each varies how the epoch
+///   OPENED and puts at most one element between the refusal and the trap, so
+///   no cross of facts-at-the-opening writes a second element into the middle
+///   of a span. Four stages make the witness —
+///   `Basic a=1, a=2, y=, Bearer, x="open, Digest realm=evil, junk"` — a
+///   receiver-bound epoch, a malformed parameter-shaped element the recovery
+///   crosses, a challenge that completes and closes the epoch, and the quoted
+///   probe. The oracle graded it `over-yield` at `45da0e3` with no product
+///   change at all; what could not see it was this corpus.
+///   `over_yield_would_catch_this_witness_from_the_oracle_alone` derives the
+///   class from the oracle alone.
 ///
-/// Corpus H drove it to zero, and `corpus_i` then answered **128** against the
-/// commit that added H. The axis H holds fixed is one byte wide: §5.6.1.2
-/// expands its list as `#element => [ element ] *( OWS "," OWS [ element ] )`,
-/// and every continuation H writes begins with the element rather than with the
-/// `OWS` that comma may carry — so the openers a reader looks for at §5.2's join
-/// offset were always AT that offset, and a check that never skipped the
-/// whitespace was green over all 72. One space in front of the continuation
-/// moves both openers, and the reader crossed the comma inside a `realm`.
-///
-/// Two families, and both defects lived where the generator could
-/// not write. `corpus_i` and `corpus_j` say which axes were being held fixed —
-/// the bytes between §5.2's join comma and the element, and the challenges that
-/// COMPLETE in front of the one a recovery is behind — and
-/// `ows_after_the_join_comma_and_a_challenge_completed_in_front_are_shapes_these_generators_write`
-/// asserts that both are still being written.
-///
-/// # And a third time, over a corpus that could not spell a SEQUENCE
-///
-/// `over-yield` was zero over corpora A..M and `corpus_n` answers **240**
-/// against the commit that added M. The axis every family up to there held
-/// fixed is what the recovered SPAN contains: each of them varies how the
-/// epoch OPENED — the prefix, the fault, what completes behind it, what the
-/// trap holds — and puts at most one element between the refusal and the trap,
-/// chosen from a set whose members either open a challenge or are the trap. No
-/// cross of facts-at-the-opening writes a second element into the middle of a
-/// span, which is why a model-derived table could not enumerate this one.
-///
-/// Four stages make the witness —
-/// `Basic a=1, a=2, y=, Bearer, x="open, Digest realm=evil, junk"` — a
-/// receiver-bound epoch, a malformed parameter-shaped element the recovery
-/// crosses, a challenge that completes and closes the epoch, and the quoted
-/// probe. The oracle graded it `over-yield` at `45da0e3` with no product change
-/// at all; what could not see it was this corpus.
-/// `over_yield_would_catch_this_witness_from_the_oracle_alone` derives that
-/// class from the oracle alone, and `corpus_n` is the family that writes the
-/// shape.
-///
-/// **And 60 of the 240 are a fifth stage the first draft of that family could
+/// **And 60 of that 240 are a fifth stage the first draft of `corpus_n` could
 /// not spell either**: WHERE the refusal left the cursor. Every row of the
 /// family's first half puts its span behind an element the refused challenge
 /// already derived, so a span rule that skipped its first element was green

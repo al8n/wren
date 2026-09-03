@@ -38,21 +38,19 @@
 //! `a_bws_parameter_is_what_the_semicolon_walker_refuses` is that sentence made
 //! executable rather than merely written down.
 //!
-//! What is NOT rewritten here is anything below the parameter. An
-//! `auth-param`'s value is a real §5.6.4 quoted-string, `quoted-pair` included
-//! — unlike §8.8.3's `opaque-tag`, the case that forced [`crate::validator`] to
-//! carry a walk of its own — so §5.6.4's scanner, §5.6.2's `token`, §5.6.3's
-//! whitespace skip and [`crate::grammar::ParamValue`] are the ones this crate
-//! already holds.
+//! Nothing BELOW the parameter is rewritten. An `auth-param`'s value is a real
+//! §5.6.4 quoted-string, `quoted-pair` included — unlike §8.8.3's `opaque-tag`,
+//! the case that forced [`crate::validator`] to carry a walk of its own — so
+//! §5.6.4's scanner, §5.6.2's `token`, §5.6.3's whitespace skip and
+//! [`crate::grammar::ParamValue`] are the ones this crate already holds.
 //!
 //! # Every question this module and [`crate::grammar`] both decide
 //!
 //! Enumerated because one of them was answered twice, differently: whether a
-//! run a byte §5.6.4 forbids sealed still holds the commas
-//! behind it. `crate::grammar::Readings::absorb` said yes and
-//! `some_reading_holds` said no, and the second answer handed a caller a
-//! `Digest` built out of somebody's realm. Nothing had ever listed the
-//! questions, so nothing could notice.
+//! run a byte §5.6.4 forbids sealed still holds the commas behind it.
+//! `crate::grammar::Readings::absorb` said yes and `some_reading_holds` said
+//! no, and the second answer handed a caller a `Digest` built out of somebody's
+//! realm.
 //!
 //! **Shared, so there is one answer by construction** — this module imports it:
 //! what a §5.6.4 `quoted-string` is ([`crate::grammar::scan_quoted`]), what
@@ -87,9 +85,8 @@
 //! | what a fault does to the rest of the list | one per challenge, and the walk goes on, because §11.4 has a user agent SEARCH the list | `parameterised_list` poisons at the first `Err` |
 //!
 //! Where a row DIFFERS, the difference is a production and not a judgement, and
-//! the doc of each half names the other. Where a row AGREES, it agrees because
-//! one of the two is written and the other cites it — which is what the top
-//! group makes unnecessary and what a future row should join instead.
+//! the doc of each half names the other. A future row belongs in the top group,
+//! where one of the two is written and the other cites it.
 //!
 //! # A challenge is not always one field line
 //!
@@ -136,17 +133,15 @@
 //!   [`MAX_CHALLENGE_LINES`], **that challenge is refused, and the rest of its
 //!   extent is crossed only at the commas EVERY reading of those bytes ends an
 //!   element at** — `seek`, over `refused_element_end` — with the latched fault
-//!   returned. No DQUOTE behind the first definitive fault may steer where the
-//!   refused challenge ends, and no raw comma may either: behind a fault
-//!   nothing forces §11.2's `( token / quoted-string )` on the bytes at a value
-//!   position, so a DQUOTE there is one a reading may open and a reading may
-//!   leave shut, and where the two disagree about the next comma the walk
-//!   reports [`AuthError::ChallengeBoundaryUnknown`] and stops. Cutting there
-//!   instead is how `Basic p1=1, ..., p17=17, x="c, Digest realm=evil, junk"`
-//!   handed a caller a `Digest` challenge with a `realm` of `evil` that no
-//!   origin server sent — on one field line, with no repeated name, nothing
-//!   malformed, no byte §5.5 forbids, and a parameter list §11.2 bounds
-//!   nowhere.
+//!   returned. Behind the fault nothing forces §11.2's
+//!   `( token / quoted-string )` on the bytes at a value position, so a DQUOTE
+//!   there is one a reading may open and a reading may leave shut, and where
+//!   the two disagree about the next comma the walk reports
+//!   [`AuthError::ChallengeBoundaryUnknown`] and stops. Cutting there instead
+//!   is how `Basic p1=1, ..., p17=17, x="c, Digest realm=evil, junk"` handed a
+//!   caller a `Digest` with a `realm` of `evil` no origin server sent — one
+//!   field line, no repeated name, nothing malformed, and a parameter list
+//!   §11.2 bounds nowhere.
 //! - **And WHICH value position, which §11.6.1 answers twice.** An element the
 //!   recovery stands on is one more `auth-param` of the challenge already open,
 //!   or the `auth-scheme` of the next one — §11.6.1's value "might contain more
@@ -158,58 +153,45 @@
 //!   cursor, which §5.2's join is what puts there. `Basic a="x` and
 //!   `Digest realm="evil, Newauth realm=z, junk", Safe realm=s` are the two
 //!   field lines that needed it: a check asked only at the cursor crossed the
-//!   comma behind `evil` and handed a caller a `Newauth` challenge out of the
-//!   middle of a realm.
+//!   comma behind `evil` and invented a `Newauth` challenge out of a realm.
 //!
 //! A refusal BINDS where it is met, and is never a fact left for a later reader
 //! to remember. The four faults an element carries are returned by the check
-//! that found them, one element at a time. The fifth — the forbidden byte — is
-//! returned by the scan that met it, before that element is derived at all. The
-//! sixth — the line bound — is met at three crossings and binds at each: before
-//! an element is read on a line whose region cannot be held
-//! (`Section::outgrown`), at the crossing an element still OPEN makes, where the
-//! refusal IS the absence of a line so the scan cannot read one byte more
-//! (`Section::spend`), and on the region the challenge ends in
-//! (`Section::close`). A section that has refused holds no body at all, so a
-//! reader that went on regardless has nothing to be handed.
+//! that found them, one element at a time; the fifth — the forbidden byte — by
+//! the scan that met it, before that element is derived at all. The sixth — the
+//! line bound — is met at three crossings and binds at each: `Section::outgrown`
+//! before an element is read on a line whose region cannot be held,
+//! `Section::spend` at the crossing an element still OPEN makes, where the
+//! refusal IS the absence of a line, and `Section::close` on the region the
+//! challenge ends in. A section that has refused holds no body at all.
 //!
 //! Keeping the second scope true is a requirement on the WALK rather than on
 //! any one function: **a challenge's elements are derived in the order they
 //! arrive, and each verdict is in hand before the next element's bytes are
-//! read.** The `#challenge` walk is the only one that has to hold it — the
-//! reader for a field carrying one credential is handed a body whose extent is
-//! already settled — and it holds it by feeding every element to `BodyCheck` as
-//! it finds one. A change that moves any part of that derivation behind the
-//! boundary scan re-opens this, whatever else it fixes, and the same harm has
-//! been reached through three different such moves.
+//! read.** The `#challenge` walk is the only one that has to hold it, and it
+//! holds it by feeding every element to `BodyCheck` as it finds one. A change
+//! that moves any part of that derivation behind the boundary scan re-opens
+//! this, whatever else it fixes, and the same harm has been reached through
+//! three different such moves.
 //!
 //! The first element's verdict is the one thing held back, and only until a
 //! SECOND element exists: §11.2's `token68` alternative derives an element no
 //! `auth-param` does, so a body of exactly one element cannot be judged as a
-//! parameter list at all. `BodyCheck` carries that argument, and holding a
-//! verdict for an element that no later element's bytes are read past costs the
-//! invariant nothing.
+//! parameter list at all. `BodyCheck` carries that argument.
 //!
 //! No fault ends the walk, and [`AuthError::InvalidQuotedString`] is not the
-//! exception it looks like. The argument for carving it out — that a scan which
-//! failed inside a quoted-string can no longer tell a separating comma from
-//! data — states the premise of this invariant and then declines its
-//! conclusion, since raw-comma recovery is what a walk that cannot trust a
-//! comma DOES. The recovery it enters is the same one every other refusal
-//! enters, and it certifies as few commas: a DQUOTE at §11.2's value position
-//! opens a run whatever byte comes next, and a forbidden one means that run
-//! reaches no close and so holds every comma behind it. That variant's own
-//! documentation carries the rest.
+//! exception it looks like: the recovery it enters is the one every other
+//! refusal enters, and it certifies as few commas. That variant carries the
+//! argument.
 //!
 //! And THREE of the refusals are this reader's rather than RFC 9110's, which is
 //! the difference that decides what recovery may say behind one.
 //! [`MAX_CHALLENGE_LINES`], [`MAX_PARAMS_PER_CREDENTIAL`] and §11.2's
 //! one-name-once MUST refuse a value whose every element is exactly where
-//! §5.6.1.2 puts it: the grammar derives these bytes from end to end, and what
-//! the refusal says is that this reader will not HOLD the challenge. Behind a
-//! fault of the grammar no boundary is fixed at all, and the two regimes are
-//! not the same one. `AuthError::is_a_receiver_bound` is where that is decided
-//! once, `Epoch` is what carries it, and
+//! §5.6.1.2 puts it: what the refusal says is that this reader will not HOLD
+//! the challenge. Behind a fault of the GRAMMAR no boundary is fixed at all,
+//! and the two regimes are not the same one. `AuthError::is_a_receiver_bound`
+//! is where that is decided once, `Epoch` is what carries it, and
 //! `Basic p1=1, ..., p17=17, Bearer abc, x="open, Digest realm=z` is the value
 //! that separates them — the `Bearer` is §11.2's `token68`, no `auth-param`
 //! derives it, so the refused list has ended at it under every reading and the
@@ -224,26 +206,15 @@
 //!
 //! # Where a boundary is derived, and how many times
 //!
-//! Once, in `scan_element`, and every walk in this module gets its elements
-//! from there: the `#challenge` walk while it is still cutting a body, the
-//! `#auth-param` walk a caller reaches through [`Credential::params`], and
-//! §11.6.3's bare list. A rule that is right at one entrance and absent at a
-//! second is how each of the three moves above got in, and a boundary derived
-//! in three places is three entrances.
-//!
-//! The two walks over a CREDENTIAL are the pair that must agree, because one
-//! of them decides that the challenge parses and the other is what a caller
-//! then reads its parameters through — so a disagreement drops a parameter and
-//! reports nothing. They agree by construction and not by measurement: it is
-//! one function, and `BodyLines` hands it the same bytes both times by keeping
-//! each region uncut to the end of its field line, which is what the collecting
-//! walk read. `scan_element` reads its line from the cursor forward only, so
-//! two slices that agree from the cursor on cannot give different answers.
-//!
-//! Where the credential STOPS is not derived twice either. It is
-//! `BodyLines::held` — the collecting walk's own cursor, recorded — so a reader
-//! of the body stops where the walk that took it stopped rather than at a
-//! second opinion about the same bytes.
+//! Once, in `scan_element`, and all three walks in this module get their
+//! elements from there. A rule that is right at one entrance and absent at a
+//! second is how each of the three moves above got in. The two walks over a
+//! CREDENTIAL are the pair that must agree — one decides that the challenge
+//! parses, the other is what a caller then reads its parameters through — and
+//! they agree by construction: it is one function, and `BodyLines` hands it the
+//! same bytes both times by keeping each region uncut to the end of its field
+//! line. Where the credential STOPS is `BodyLines::held`, the collecting walk's
+//! own cursor, recorded rather than derived a second time.
 //!
 //! Names in the two sections above are plain code spans rather than intra-doc
 //! links: the functions and types the rule lives in are private, and a link to
@@ -269,12 +240,12 @@ use crate::grammar::{
 ///
 /// RFC 9110 §5.2 makes a repeated field one value — the field line values
 /// "concatenated in order, with each field line value separated by a comma" —
-/// and §5.3 is what lets a sender write it that way in the first place: it
-/// forbids repeating a field name "unless that field's definition allows
-/// multiple field line values to be recombined as a comma-separated list",
-/// which `#challenge` is. One challenge's parameter list may therefore arrive
-/// split at any element boundary in it, and a reader that borrows rather than
-/// joining has to name every line it landed on at once.
+/// and §5.3 is what lets a sender write it that way: it forbids repeating a
+/// field name "unless that field's definition allows multiple field line
+/// values to be recombined as a comma-separated list", which `#challenge` is.
+/// One challenge's parameter list may therefore arrive split at any element
+/// boundary in it, and a reader that borrows rather than joining has to name
+/// every line it landed on at once.
 ///
 /// Sixteen, and the measurement behind the number is the storage: an entry is
 /// a `&[u8]`, 16 bytes on a 64-bit target, so the array is 256 of a
@@ -299,21 +270,16 @@ use crate::grammar::{
 /// rather than the sender's, so it is the only one that can fire on a value
 /// some derivation still admits — a §5.6.4 quoted-string that would have closed
 /// on a line past the bound. The rest of such a challenge is then found by raw
-/// commas like every other refusal (`Challenges::seek`), and a comma the sender
-/// wrote INSIDE that value is read as the separator it is not: a caller can be
-/// shown a challenge those bytes were the data of.
+/// commas like every other refusal, and a comma the sender wrote INSIDE that
+/// value is read as the separator it is not: a caller can be shown a challenge
+/// those bytes were the data of.
 ///
-/// The alternative was to end the walk, and it is the worse half — which is
-/// measured rather than argued: a value this reader cannot hold may carry a
-/// byte §5.6.4 forbids past the bound, and ending the walk there hid every
-/// challenge behind it for a string that never was one. That is the same
-/// argument [`AuthError::InvalidQuotedString`] now carries for itself, and no
-/// fault in this walk ends it any more. RFC 9110 §11.4
-/// has a user agent select "the challenge with what it considers to be the most
-/// secure auth-scheme that it understands", which it cannot do over a challenge
-/// it was never shown; being shown one too many is the error a caller can see
-/// and answer, since the refusal is reported in front of it. `challenges` says
-/// what a caller does with a fault it is handed.
+/// The alternative was to end the walk, and it is the worse half — measured
+/// rather than argued: a value this reader cannot hold may carry a byte §5.6.4
+/// forbids past the bound, and ending the walk there hid every challenge behind
+/// it for a string that never was one. Being shown one challenge too many is
+/// the error a caller can see and answer, since the refusal is reported in
+/// front of it.
 ///
 /// # What it does not count
 ///
@@ -349,25 +315,23 @@ pub const MAX_CHALLENGE_LINES: usize = 16;
 /// One parameter past this many is [`AuthError::TooManyParameters`], and the
 /// list is refused rather than read with the MUST left unchecked past the last
 /// name that fit. Nothing about such a list is malformed — §11.2 bounds it
-/// nowhere — so **this is a refusal that can meet conforming input**: a sender
-/// that writes seventeen distinct parameters has written something the grammar
-/// allows and this recipient will not read. The alternative is worse than a
-/// refusal rather than merely different, which is why the bound is drawn here
-/// at all: a walk that stopped CHECKING at the last slot would hand back a
-/// list it never established was duplicate-free, and a repeat sitting past
-/// that slot would be a MUST silently un-enforced. That is the trade
-/// [`MAX_TAGS`](crate::validator::MAX_TAGS) already made in this crate, in the
-/// same words, and [`MAX_CHALLENGE_LINES`] makes again a line at a time.
+/// nowhere — so **this is a refusal that can meet conforming input**. The
+/// alternative is worse than a refusal rather than merely different, which is
+/// why the bound is drawn here at all: a walk that stopped CHECKING at the last
+/// slot would hand back a list it never established was duplicate-free, and a
+/// repeat sitting past that slot would be a MUST silently un-enforced. That is
+/// the trade [`MAX_TAGS`](crate::validator::MAX_TAGS) already made in this
+/// crate, in the same words, and [`MAX_CHALLENGE_LINES`] makes again a line at
+/// a time.
 ///
 /// # What it does not count
 ///
 /// Empty list elements spend no slot. RFC 9110 §5.6.1.2 opens "Empty elements
 /// do not contribute to the count of elements present.", so a comma flood is
-/// refused only once it carries this many real parameters, however many empty
-/// elements arrived beside them — `a_comma_flood_is_not_too_many_parameters`
-/// is that sentence made executable, in the position
-/// `a_comma_flood_is_not_too_many_tags` already pins for the crate's other
-/// bound.
+/// refused only once it carries this many real parameters —
+/// `a_comma_flood_is_not_too_many_parameters` is that sentence made executable,
+/// in the position `a_comma_flood_is_not_too_many_tags` already pins for the
+/// crate's other bound.
 ///
 /// Nor does it count a credential whose body took §11.2's other alternative. A
 /// `token68` is not a list and holds no name to repeat, so
@@ -406,8 +370,7 @@ pub const MAX_PARAMS_PER_CREDENTIAL: usize = 16;
 // `SeenNames`, which is NOT in these figures: that record is spent inside
 // `Credential::read`, and the copy `auth_info`'s walk carries lives there
 // rather than in any `Credential`. The two constants being equal is why the
-// one number reads like the other's, and the storage is separate: neither of
-// these figures follows from `MAX_PARAMS_PER_CREDENTIAL`.
+// one number reads like the other's, and the storage is separate.
 //
 // An `AuthParam` is two slices and nothing else: 32 on a 64-bit target, 16 on a
 // 32-bit one. An `AuthError` is eight fieldless variants, so one byte holds the
@@ -518,25 +481,17 @@ pub enum AuthError {
   /// processed by any downstream HTTP parser)." This IS a downstream HTTP
   /// parser, so that exception is not this reader's to take.
   ///
-  /// **So this fault refuses the challenge and the walk goes on**, like every
-  /// other refusal, and the rest of that challenge's extent is looked for the
-  /// way every other refusal's is — by `Challenges::seek`, which certifies
-  /// only the commas no reading of the bytes in front of them holds inside a
-  /// string.
-  ///
   /// # What "derives nothing" does not buy
   ///
-  /// It is tempting to read the paragraph above as licence to cross those
-  /// commas raw: a field value carrying one of these bytes derives nothing at
-  /// §5.5 before §11 is reached at all, so there is no derivation for the bytes
-  /// behind the fault to belong to. True, and beside the point. The question a
-  /// recovery asks is not what DERIVES but what the sender WROTE: §11.2 admits
-  /// a `quoted-string` at the value position, the sender opened one there, and
-  /// a run that reaches no close holds every comma behind its DQUOTE. Cutting
-  /// at one of them hands a caller a challenge assembled out of somebody's
-  /// realm — `Basic x="%x01, Digest realm=evil` is that challenge, and §11.4
-  /// has a user agent SELECT among the challenges it is shown.
-  ///
+  /// This fault refuses the challenge and the walk goes on, like every other
+  /// refusal. It is tempting to read the paragraph above as licence to cross
+  /// the commas behind it raw, since a field value carrying one of these bytes
+  /// derives nothing at §5.5 before §11 is reached at all. True, and beside the
+  /// point: the question a recovery asks is not what DERIVES but what the sender
+  /// WROTE. §11.2 admits a `quoted-string` at the value position, the sender
+  /// opened one there, and a run that reaches no close holds every comma behind
+  /// its DQUOTE — `Basic x="%x01, Digest realm=evil` is the challenge cutting at
+  /// one of them assembles out of somebody's realm.
   /// `crate::grammar::Readings::absorb` calls such a reading SEALED and has
   /// answered this way for RFC 9110 §5.6.6's `parameters` since
   /// `gzip;;x="a%x01, chunked, b", br` cut raw handed a caller a `chunked` that
@@ -544,9 +499,8 @@ pub enum AuthError {
   /// `some_reading_holds` is where the two are now one answer.
   ///
   /// `obs-text` is the pair to this and is deliberately not here — a high byte
-  /// IS `qdtext`, so a value carrying one stays one value, its commas stay
-  /// data, and what changes is whether the value DERIVES rather than what a
-  /// recovery may certify.
+  /// IS `qdtext`, so a value carrying one stays one value and its commas stay
+  /// data.
   #[error("byte forbidden inside a quoted-string")]
   InvalidQuotedString,
   /// One challenge's bytes are spread over more than [`MAX_CHALLENGE_LINES`]
@@ -574,18 +528,12 @@ pub enum AuthError {
   ///
   /// §11.2 writes it "per challenge", and that WORDING covers one of the three
   /// parameter lists §11 defines. Extending it to the other two is this
-  /// module's decision and not the RFC's text, and it is recorded here rather
-  /// than left to look like a quotation:
-  ///
-  /// - A [`credentials`] value is `auth-scheme [ 1*SP ( token68 / #auth-param ) ]`,
-  ///   the same production §11.3 names a challenge, written for a request. A
-  ///   scheme that cannot make sense of one name twice in a 401 cannot make
-  ///   sense of it twice in the `Authorization` answering that 401.
-  /// - An [`auth_info`] value is a bare `#auth-param` with no challenge around
-  ///   it for the wording to scope the rule to. Reading the sentence as
-  ///   literally as its words allow would leave that field's repeats
-  ///   unreported, which is a narrower green than "one name, once" — so the
-  ///   rule is applied to each of its lists as it is to a challenge's.
+  /// module's decision and not the RFC's text: a [`credentials`] value is the
+  /// same production §11.3 names a challenge, written for a request, and an
+  /// [`auth_info`] value is a bare `#auth-param` with no challenge around it
+  /// for the wording to scope the rule to — reading the sentence as literally
+  /// as its words allow would leave that field's repeats unreported, which is a
+  /// narrower green than "one name, once".
   ///
   /// What it is NOT applied across is two lists. Two challenges of one
   /// `WWW-Authenticate` value each carrying `realm` are two challenges and not
@@ -606,7 +554,6 @@ pub enum AuthError {
   /// A challenge was refused, and where it ENDS is not derivable — so
   /// everything behind it is left unread rather than cut at a comma some
   /// reading of the sender's own bytes holds inside a value.
-  ///
   /// This is [`challenges`]'s LAST item. RFC 9110 §11.2 admits a §5.6.4
   /// quoted-string at the first byte of every `auth-param` value —
   /// `auth-param = token BWS "=" BWS ( token / quoted-string )` — and behind a
@@ -619,18 +566,14 @@ pub enum AuthError {
   /// # Why the walk stops rather than cutting at the comma
   ///
   /// Because inventing a challenge and hiding one are the same harm, and RFC
-  /// 9110 §11.4 makes the first the worse. A user agent answers by "selecting
-  /// the challenge with what it considers to be the most secure auth-scheme
-  /// that it understands", so a scheme and realm cut out of a parameter's data
-  /// arrive indistinguishable from ones the origin server wrote — and whoever
-  /// controls that parameter's value chooses them.
+  /// 9110 §11.4 makes the first the worse: a scheme and realm cut out of a
+  /// parameter's data arrive indistinguishable from ones the origin server
+  /// wrote, and whoever controls that parameter's value chooses them.
   /// `Basic p1=1, ..., p17=17, x="open, Digest realm=z` is that input: one
-  /// field line, no repeated name, nothing malformed, no byte §5.5 forbids, and
-  /// a `quoted-string` that never closes — so no reading of the value settles
-  /// where `x`'s parameter ends. The same value with that string CLOSED behind
-  /// the probe is not this: there the element's extent is the grammar's, the
-  /// walk crosses to it, and the caller is told nothing because nothing is
-  /// unread.
+  /// field line, no repeated name, nothing malformed, and a `quoted-string`
+  /// that never closes. The same value with that string CLOSED behind the probe
+  /// is not this: there the element's extent is the grammar's, the walk crosses
+  /// to it, and nothing is unread.
   ///
   /// A caller that receives this knows exactly what it holds: the challenges
   /// yielded in front of it, and no claim at all about the rest of the value.
@@ -699,25 +642,22 @@ impl<'a> AuthParam<'a> {
   ///
   /// Never [`ParamValue::None`]. That variant is for the fields that define a
   /// bare-name parameter of their own — RFC 6455 §9.1 is one — and
-  /// `auth-param` requires the `=` and a value behind it, so this parser
-  /// produces one alternative or refuses the parameter. It is said here rather
-  /// than modelled away, because [`ParamValue`] is the crate's one parameter
-  /// value and keeps one shape for every field spelling a value this way.
+  /// `auth-param` requires the `=` and a value behind it. It is said here
+  /// rather than modelled away, because [`ParamValue`] is the crate's one
+  /// parameter value and keeps one shape for every field spelling a value this
+  /// way.
   ///
   /// Both spellings are read, and RFC 9110 §11.2 gives the reason in its own
   /// words: "Authentication scheme definitions need to accept both notations,
   /// both for senders and recipients, to allow recipients to use generic
-  /// parsing components regardless of the authentication scheme." A generic
-  /// parsing component is exactly what this is, so `realm=x` is read as
-  /// `realm="x"` is.
+  /// parsing components regardless of the authentication scheme."
   ///
   /// # Errors
   ///
   /// [`ValueSpansFieldLines`] when the value is a quoted-string whose closing
-  /// DQUOTE is not among the bytes this parameter holds. §5.2 joins repeated
-  /// field lines into one value with a comma, and a comma inside a
-  /// quoted-string is data, so a value may legally open on one line and close
-  /// on the next — which a borrowing reader cannot hand back as one slice.
+  /// DQUOTE is not among the bytes this parameter holds — a value §5.2's join
+  /// let open on one line and close on the next, which a borrowing reader
+  /// cannot hand back as one slice.
   pub fn value(&self) -> Result<ParamValue<'a>, ValueSpansFieldLines> {
     if self.value.first() != Some(&b'"') {
       return Ok(ParamValue::Token(self.value));
@@ -822,37 +762,31 @@ mod recovery {
   /// Where the end of a challenge holding an element already refused is looked
   /// for, on the field line the walk stands on.
   ///
+  /// Where the end of a challenge holding an element already refused is looked
+  /// for, on the field line the walk stands on.
+  ///
   /// An element this walk cut is one whose extent it derived by OPENING the
   /// RFC 9110 §5.6.4 quoted-string §11.2 admits at its value position. Where the
   /// element then derives NOTHING, that string was no longer forced on those
   /// bytes — a reading may leave it shut and end the element at the first comma
   /// instead — so the extent this scan produced is one reading's and not every
-  /// reading's, and a recovery beginning behind it would never see the other one.
-  /// `Basic a="x` and `trap="open, Digest realm=z` are two field lines §5.2 joins
-  /// into one value, whose open reading closes `a` at `trap="` and whose shut
-  /// reading makes `trap="open, Digest realm=z` one element with the probe inside
-  /// its value.
+  /// reading's. `Basic a="x` and `trap="open, Digest realm=z` are two field lines
+  /// §5.2 joins into one value, whose open reading closes `a` at `trap="` and
+  /// whose shut reading makes `trap="open, Digest realm=z` one element with the
+  /// probe inside its value.
   ///
   /// # Two states, and why they are every reading however many lines were crossed
   ///
   /// The walk holds ONE field line when it recovers, and the fields below are the
-  /// RFC 9110 §5.6.4 states the readings of the value stand in at that line's
-  /// head: inside the string this element opened, which closes at `floor`, and
-  /// outside every string, which is where the reading that left the DQUOTE shut
-  /// has been since the join it shut at. Nothing else is in the set, and the
-  /// reason is a fact about the lines already crossed rather than a limit of what
-  /// is stored.
-  ///
-  /// A reading that shut this element's DQUOTE begins a fresh element at the next
-  /// comma, and to be INSIDE a string here it would have to have opened one on a
-  /// line behind this one. It cannot have: for the open reading to have carried
-  /// its string across those lines, [`scan_quoted`](super::scan_quoted) must have closed on none of
-  /// them, so every DQUOTE on them stood behind the backslash of a §5.6.4
-  /// `quoted-pair`. [`param_value_at`](super::param_value_at)'s answer is `skip_ows` past an `=`, and
-  /// neither §5.6.3's `BWS` nor that `=` is a backslash — so no DQUOTE on a
-  /// crossed line stands at a value position, and no shut reading opens a string
-  /// on one. Every such reading arrives here outside every string, which is the
-  /// state the set already holds.
+  /// RFC 9110 §5.6.4 states the readings stand in at that line's head: inside the
+  /// string this element opened, which closes at `floor`, and outside every
+  /// string. Nothing else is in the set. A reading that shut this element's
+  /// DQUOTE would have to have opened a string on a line behind this one, and it
+  /// cannot have: for the open reading to have carried its string across those
+  /// lines, [`scan_quoted`](super::scan_quoted) must have closed on none of
+  /// them, so every DQUOTE on them stood behind a `quoted-pair`'s backslash —
+  /// and [`param_value_at`](super::param_value_at)'s answer is `skip_ows` past
+  /// an `=`, neither of which is a backslash.
   #[derive(Debug, Copy, Clone, Eq, PartialEq)]
   pub(super) struct Recovery {
     /// Where the element the walk refused stands on the line it NOW holds: the
@@ -862,17 +796,15 @@ mod recovery {
     /// begins.
     ///
     /// The element is the OUTER `#challenge` list's, which is not always the one
+    /// The element is the OUTER `#challenge` list's, which is not always the one
     /// [`scan_element`](super::scan_element) read: `auth-scheme 1*SP` is no §5.6.1.2 separator, so the
     /// first element of a body §11.3's `1*SP` opened is a SUFFIX of an element
-    /// that began at the scheme. `scan_element`'s `element_at` is where that
-    /// element begins and this is taken from it.
+    /// that began at the scheme.
     ///
-    /// The far side of a comma is not an element's first byte. §5.6.1.2 expands
-    /// its list as `#element => [ element ] *( OWS "," OWS [ element ] )`, so a
-    /// sender may write §5.6.3 whitespace between the two, and [`opener_at`](super::opener_at) is
-    /// where it is skipped rather than here: the commas [`floor`](Self::floor)
-    /// answers about are counted from this offset, and moving it would move which
-    /// of them the value carried across the join still holds.
+    /// The far side of a comma is not an element's first byte —
+    /// `#element => [ element ] *( OWS "," OWS [ element ] )` admits §5.6.3
+    /// whitespace between the two — and [`opener_at`](super::opener_at) is where
+    /// it is skipped rather than here.
     at: usize,
     /// The offset in front of which no comma on this line is a boundary, because
     /// the reading that opened this element's value holds every one of them: the
@@ -882,48 +814,36 @@ mod recovery {
     /// Whether RFC 9110 §5.6.1.2's comma — §5.2's join comma included — stands in
     /// front of `at`, so that §11.6.1 admits a whole `challenge` there and not
     /// only one more `auth-param` of the challenge already open, and so that the
-    /// `OWS` that comma may carry stands between `at` and the element both of
-    /// those readings are of.
-    ///
     /// The other half of what a join leaves behind, of which `floor` is the
     /// first. `floor` answers for the reading that CARRIED this element's value
     /// onto this line; this one admits the reading that shut that value AT the
     /// join, under which the continuation line opens an element of the outer
-    /// `#challenge` list — a scheme, its `1*SP` and its parameters — whose own
-    /// quoted value stands at an offset no scan from `at` would ask about.
-    /// [`opener_at`](super::opener_at) is where the two readings name their openers, and its doc
-    /// carries why they can never name two at once.
+    /// `#challenge` list whose own quoted value stands at an offset no scan from
+    /// `at` would ask about. [`opener_at`](super::opener_at) is where the two
+    /// readings name their openers.
     ///
     /// Set where a join carried this element onto the line the walk now stands
-    /// on, and there alone. The other two constructions below stand where no
-    /// challenge may open: the element's own start on the line it began on, which
-    /// [`Challenges::challenge`](super::Challenges::challenge) reaches only past an `opens_a_challenge` already
-    /// answered `false` or as the first element of a body, and the end of a value
-    /// that ran out inside a string, which begins no element at all.
+    /// on, and there alone: the other two constructions stand where no challenge
+    /// may open.
     after_comma: bool,
     /// Whether a §5.6.4 quoted-string decided the extent of the element
     /// [`at`](Self::at) begins at — which is the OUTER list's element and not
     /// always the one [`scan_element`](super::scan_element) read.
-    ///
     /// Where it did not, that element ran to the first comma read raw and every
     /// reading of it ends there, so a refusal over it needs none of the above.
     /// Asked at [`at`](Self::at) for exactly that reason: the run holds ONE value
-    /// position however it is read — [`opener_at`](super::opener_at)'s exclusion argument — and
-    /// where the two offsets part it is the outer element's, so a scan from the
-    /// body's own would answer `false` over a string the sender opened.
-    /// `Basic a=1, Broken;junk, Bearer, x ="open, Digest realm=z` is the value
-    /// that says what that costs, and one SP is the whole of the difference from
-    /// `x="open`: §11.2's `BWS` lets the SP §11.3's `1*SP` needs stand in front
-    /// of the `=` too, so the walk enters a body at the `=`, no value position
-    /// stands THERE, and the held verdict came due at
-    /// [`BodyCheck::finish`](super::BodyCheck::finish) with the comma inside `x`'s own
-    /// value already crossed.
+    /// position however it is read — [`opener_at`](super::opener_at)'s exclusion
+    /// argument — and where the two offsets part it is the outer element's, so a
+    /// scan from the body's own would answer `false` over a string the sender
+    /// opened. `Basic a=1, Broken;junk, Bearer, x ="open, Digest realm=z` is the
+    /// value that says what that costs: §11.2's `BWS` lets the SP §11.3's `1*SP`
+    /// needs stand in front of the `=` too, so the walk enters a body at the `=`
+    /// and no value position stands THERE.
     ///
     /// Where it did, RFC 9110 §11.2's `token68` alternative is dead — its
-    /// alphabet holds no DQUOTE — which is what lets [`BodyCheck`](super::BodyCheck)'s held verdict
-    /// on a FIRST element come due here rather than at
-    /// [`BodyCheck::finish`](super::BodyCheck::finish), before this element's own string
-    /// has chosen the boundary the next one is read behind.
+    /// alphabet holds no DQUOTE — which is what lets [`BodyCheck`](super::BodyCheck)'s
+    /// held verdict on a FIRST element come due at the scan, before this
+    /// element's own string has chosen the boundary the next one is read behind.
     strung: bool,
   }
 
@@ -953,12 +873,10 @@ mod recovery {
 
     /// The one funnel, and where the invariant is checked rather than argued.
     ///
-    /// **`floor > at` implies `after_comma`**, which is to say: the floor is
-    /// past the cursor only where a join carried a value here and closed it, so
-    /// the offset is one on the line the walk holds. Both constructors above
-    /// pass through this, so a third cannot be added without answering the
-    /// same question — and if it answers wrong, this reds rather than the
-    /// recovery resuming somewhere it cannot justify.
+    /// **`floor > at` implies `after_comma`**: the floor is past the cursor only
+    /// where a join carried a value here and closed it, so the offset is one on
+    /// the line the walk holds. Both constructors above pass through this, so a
+    /// third cannot be added without answering the same question.
     fn new(at: usize, floor: usize, after_comma: bool, strung: bool) -> Self {
       debug_assert!(
         floor >= at,
@@ -1004,16 +922,12 @@ use recovery::Recovery;
 /// crossing §5.2's joins for as long as a §5.6.4 quoted-string holds it open.
 ///
 /// **The one place an element's boundary is derived.** Three walks in this
-/// module ask for one — the `#challenge` walk while it is still cutting a body
-/// ([`Challenges::skip_element`]), the `#auth-param` walk re-reading a body
-/// already cut ([`ParamWalk::element`]), and §11.6.3's bare list
-/// ([`AuthInfo::element`]) — and a boundary derived in three places is three
+/// module ask for one — [`Challenges::skip_element`], [`ParamWalk::element`]
+/// and [`AuthInfo::element`] — and a boundary derived in three places is three
 /// answers a later edit can move apart. The first two produce the elements of
 /// ONE credential, one of them while deciding where that credential ends and
 /// the other when a caller asks for its parameters, so a disagreement between
-/// them would drop a parameter from a challenge that parsed and report
-/// nothing. There is nothing for them to disagree about while this is where
-/// both of them get the answer.
+/// them would drop a parameter from a challenge that parsed and report nothing.
 ///
 /// # `at` is where the element is READ from, `element_at` where a recovery
 /// behind it begins
@@ -1029,39 +943,24 @@ use recovery::Recovery;
 /// element the OUTER `#challenge` list holds began at the scheme and this
 /// scan's element is a SUFFIX of it — and [`Recovery`] is about the outer
 /// list's element, because a recovery gets past an element of the outer list.
-/// [`Challenges::read_challenge`] is the one caller that ever parts them, and
-/// its `recover_from` carries when and why.
-///
-/// So the ELEMENT is read from `at`, which is the body's question and
-/// [`BodyCheck`]'s; the RECOVERY is taken from `element_at`, which is
-/// §11.6.1's. `element_at <= at`, and only `auth-scheme 1*SP` ever stands
-/// between them — a token and a run of SP, neither of which holds a comma, so
-/// [`raw_comma_end`] answers alike from either and only
-/// [`some_reading_holds`]'s question moves.
+/// [`Challenges::read_challenge`] is the one caller that ever parts them.
+/// `element_at <= at`, and only `auth-scheme 1*SP` ever stands between them — a
+/// token and a run of SP, neither of which holds a comma, so [`raw_comma_end`]
+/// answers alike from either and only [`some_reading_holds`]'s question moves.
 ///
 /// `next` hands over the field line behind the join, `Ok(None)` where the value
 /// runs out, or the fault that crossing this one costs more than the caller may
-/// pay. It is where a caller does whatever crossing a line costs it — taking
-/// the region left behind, in the case of a walk collecting one — and the two
-/// are one operation for a reason: a caller that could not take the region has
-/// no line to hand back, so this scan cannot read one more byte of a challenge
-/// its collector has just refused. The two walks that re-read a body already
-/// collected pay nothing to cross and never answer with a fault.
-///
-/// # What it reads, and why two callers may hold different slices
+/// pay. Crossing and taking the region left behind are one operation for a
+/// reason: a caller that could not take the region has no line to hand back, so
+/// this scan cannot read one more byte of a challenge its collector has just
+/// refused.
 ///
 /// `head` is read from `at` FORWARD, as far as the delimiter that ends the
 /// element and no further; [`trim_ows_end`] then walks back over the list's own
-/// `OWS`, which stands within the element's own span. Nothing here reads a byte
-/// before `at`.
-///
-/// Two slices that agree from `at` to their end therefore give the same
-/// element, and the END of a slice is read as the comma §5.2 puts at every
-/// join — which [`raw_comma_end`], [`after_close`], [`ends_element`] and
-/// [`param_value_at`] each answer for the byte they inspect. That is what lets
-/// [`Challenges`] scan a whole field line while [`ParamWalk`] scans the SAME
-/// line from the credential's first byte on it and get the same answer:
-/// [`BodyLines`] keeps its regions uncut for exactly that reason, and says so.
+/// `OWS`. Two slices that agree from `at` to their end therefore give the same
+/// element, which is what lets [`Challenges`] scan a whole field line while
+/// [`ParamWalk`] scans the SAME line from the credential's first byte on it and
+/// get the same answer — [`BodyLines`] keeps its regions uncut for that reason.
 ///
 /// # Errors
 ///
@@ -1070,8 +969,7 @@ use recovery::Recovery;
 /// refuses to cross a join with. Every OTHER fault an element carries is
 /// [`auth_param`]'s to report over the [`Element`] this returns, because a
 /// boundary a walk has not yet found must not be decided by bytes behind a
-/// fault — and a walk cannot be handed a verdict before it has the element the
-/// verdict is about.
+/// fault.
 fn scan_element<'a, N>(
   head: &'a [u8],
   at: usize,
@@ -1097,11 +995,7 @@ where
   // of it holds a comma the raw scan from there would find. Whether a string
   // decided the extent at all is `param_value_at` answered at that same offset:
   // the run holds ONE value position however it is read, and where the two
-  // offsets differ it is `element_at`'s, which is what `opener_at`'s exclusion
-  // argument says.
-  // No join has been crossed, so what stands in front of the outer list's
-  // element is whatever the caller reached it past, and `Recovery::after_comma`
-  // says why no reading opens a challenge at it either way.
+  // offsets differ it is `element_at`'s — `opener_at`'s exclusion argument.
   let mut recovery = Recovery::within(
     element_at,
     param_value_at(head, element_at).is_some_and(|value_at| head.get(value_at) == Some(&b'"')),
@@ -1124,11 +1018,9 @@ where
       tail = ValueTail::Ends;
       // And this element is the last of its challenge, whose extent is
       // therefore complete: a string RFC 9110 §5.6.4 never closes holds every
-      // byte behind its DQUOTE, so there is nothing behind this element for a
-      // recovery to look for and no comma left to certify.
-      // The value ran out here, so no element of any list begins at this
-      // offset and neither of §11.6.1's two readings has an opener to name —
-      // and nothing was carried onto a line for a floor to be about.
+      // byte behind its DQUOTE, so no element begins at this offset, there is
+      // nothing behind it for a recovery to look for, and no comma left to
+      // certify.
       recovery = Recovery::within(cursor, recovery.strung());
       break;
     };
@@ -1150,10 +1042,6 @@ where
           ValueTail::Continues
         };
         cursor = end;
-        // The element's own bytes are no longer all on a line this walk holds,
-        // so the reading that ended it at §5.2's join comma begins at the head
-        // of THIS line — and the reading that carried the value here holds
-        // every comma in front of its close.
         // RFC 9110 §5.2's join put a comma in front of this line's first byte,
         // so the reading that left this element's value SHUT ended the element
         // on it — and what opens here is an element of the outer `#challenge`
@@ -1180,6 +1068,7 @@ where
 /// Reads one RFC 9110 §11.2 `auth-param` out of `element`.
 ///
 /// `element` is one list element with §5.6.1's `OWS` already off both ends: the
+/// `element` is one list element with §5.6.1's `OWS` already off both ends: the
 /// whitespace that separates elements belongs to the list, and the `BWS` read
 /// here belongs to the production. All of `element` must be the parameter —
 /// bytes left over behind the value are a parameter that does not parse, since
@@ -1187,11 +1076,6 @@ where
 ///
 /// `tail` says what a §5.2 join did with a quoted value this element leaves
 /// open, and it is the caller's to supply for the reason [`ValueTail`] gives.
-///
-/// # Errors
-///
-/// [`AuthError::MalformedParameter`] when `element` is not
-/// `token BWS "=" BWS ( token / quoted-string )`, and for the one shape only
 /// `tail` can report — a quoted value that closed across the join with bytes
 /// behind that close; [`AuthError::UnterminatedQuotedString`] when a quoted
 /// value is still open where `element` ends and `tail` says nothing closed it;
@@ -1266,15 +1150,11 @@ const fn is_token68_byte(b: u8) -> bool {
 /// Two runs, in that order, with no way back to the first: the alphabet's,
 /// which `1*` gives a floor of one byte, and the `=` pad, which `*` lets be
 /// empty. So `====` is not a token68 whose run happens to be empty — it is not
-/// a token68 — and `a=b` ends at the `b` rather than reading it as more of the
-/// alphabet.
+/// a token68 — and `a=b` ends at the `b`.
 ///
 /// This is the RUN, and not the reading. Whether the bytes it names are taken
 /// as a `token68` at all is [`token68`]'s question, and the answer is `no` for
 /// every run that stops short of its element's end.
-// `pub(crate)` for one caller outside this module and no other: the
-// `__no_panic_internals` forwarder the link proof's shim over it reaches it
-// through. Every other caller is in this file.
 pub(crate) fn token68_end(value: &[u8], at: usize) -> Option<usize> {
   let mut end = at;
   while value.get(end).copied().is_some_and(is_token68_byte) {
@@ -1292,14 +1172,13 @@ pub(crate) fn token68_end(value: &[u8], at: usize) -> Option<usize> {
 /// Which of RFC 9110 §11.2's two forms the credential body at `at` takes,
 /// answered as the `token68` when that is the one and `None` when the bytes are
 /// to be read as `#auth-param` instead.
-///
 /// `at` is the first byte after a scheme's `1*SP`. §11.2 puts the choice in
 /// prose — the scheme is followed by "either a comma-separated list of
 /// parameters or a single sequence of characters capable of holding
 /// base64-encoded information" — and §11.3 puts it in the grammar as
-/// `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`, which §11.4
-/// writes again as `credentials`. ABNF's `/` is an unordered choice, so nothing
-/// there orders the two and a recipient decides.
+/// `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`. ABNF's `/` is
+/// an unordered choice, so nothing there orders the two and a recipient
+/// decides.
 ///
 /// # The rule
 ///
@@ -1308,42 +1187,24 @@ pub(crate) fn token68_end(value: &[u8], at: usize) -> Option<usize> {
 /// `OWS` that comma may carry skipped on the way. Anything else is the other
 /// form. `dGVzdA==` and `mF_9.B5f-4.1JqM` are `token68`s by that rule, and
 /// `foo=bar` is not — its pad has token bytes behind it, so the run stops
-/// inside the element instead of ending it.
+/// inside the element instead of ending it. The end of `value` and that comma
+/// are one terminator rather than two: §5.2 puts a comma at every join.
 ///
-/// The end of `value` and that comma are one terminator rather than two: §5.2
-/// joins repeated field lines into one value with a comma, so a run that
-/// reaches the end of ONE line meets the comma next and is read the same way
-/// either way.
-///
-/// At that comma the element is closed and nothing reopens it. A `#challenge`
-/// walk tells a parameter of the CURRENT challenge from the scheme of the next
-/// one by looking past the comma, and asking that question here instead could
-/// change the answer only for an element both forms refuse: `Basic dGVzdA==,
-/// realm=x` has no derivation either way, since `realm=x` is no challenge
-/// without `1*SP` behind its token and `dGVzdA==` is no parameter. What such a
-/// walk is left deciding is therefore which fault to report, never whether a
-/// conforming value is read.
+/// At that comma the element is closed and nothing reopens it. Asking the
+/// boundary question here instead could change the answer only for an element
+/// both forms refuse — `Basic dGVzdA==, realm=x` has no derivation either way.
 ///
 /// # Why taking it greedily steals nothing
 ///
 /// No element this returns `Some` for is an `auth-param`, so answering the run
-/// first can take no reading away from the other form. A run that reaches the
+/// first can take no reading away from the other form: a run that reaches the
 /// end of its element leaves nothing but `=` behind its first `=`, and
 /// `auth-param = token BWS "=" BWS ( token / quoted-string )` needs a `token`
-/// or a `quoted-string` there: `=` is neither, and the production names a value
-/// rather than admitting nothing at all. `the_two_branches_are_never_both_derivable`
-/// is that argument executed.
-///
-/// The shape worth saying it out loud for is `Scheme foo=`, which reads like a
-/// parameter whose value went missing. It is not one — only the `token68`
-/// derives it — so this answers `foo=` and no fault is reported. An element
-/// that is NEITHER form is left to the parameter reading and refused there,
-/// which is why no `MalformedToken68` exists to report.
-///
-/// One element is all this decides. Whether the element it ends also ends the
-/// whole credential is [`Credential`]'s question, and the answer is `no` for a
-/// value with more of its body behind that comma — where the other branch is
-/// then the reading, and reports the fault.
+/// or a `quoted-string` there. `the_two_branches_are_never_both_derivable`
+/// is that argument executed. The shape worth saying out loud is `Scheme foo=`,
+/// which reads like a parameter whose value went missing: only the `token68`
+/// derives it, so this answers `foo=` and no fault is reported, which is why no
+/// `MalformedToken68` exists.
 fn token68(value: &[u8], at: usize) -> Option<&[u8]> {
   let end = token68_end(value, at)?;
   // Nothing behind the run inside its own element, so the run IS the element
@@ -1373,22 +1234,16 @@ fn token68(value: &[u8], at: usize) -> Option<&[u8]> {
 /// field one value, the field line values "concatenated in order, with each
 /// field line value separated by a comma", so `Basic a=1` followed by `b=2` is
 /// `Basic a=1,b=2` — ONE challenge whose parameter list a sender split at an
-/// element boundary. §11.6.1 says a parser has to be ready for both readings
-/// of such a comma: "it might contain more than one challenge, and each
-/// challenge can contain a comma-separated list of authentication parameters".
+/// element boundary. A borrowing reader cannot hand that back as one slice and
+/// this crate allocates nothing, so the bytes are held as the regions they
+/// occupy on each line, in wire order, with the boundary between two of them
+/// standing for the comma §5.2 puts there. [`MAX_CHALLENGE_LINES`] is how many.
 ///
-/// A borrowing reader cannot hand that back as one slice and this crate
-/// allocates nothing, so the bytes are held as the regions they occupy on each
-/// line, in wire order, with the boundary between two of them standing for the
-/// comma §5.2 puts there. [`MAX_CHALLENGE_LINES`] is how many, and carries the
-/// argument for the number.
-///
-/// A field line that carries no element BYTES spends no entry — only `OWS`,
-/// commas, and the empty elements between them. The rule is written on bytes
-/// rather than on elements because a line can begin no element and still be
-/// load-bearing: given `Basic a="long` and `tail"`, the second line starts
-/// nothing, yet it holds the DQUOTE that closes the value and every element
-/// behind it. Dropping it would lose them.
+/// A field line that carries no element BYTES spends no entry. The rule is
+/// written on bytes rather than on elements because a line can begin no element
+/// and still be load-bearing: given `Basic a="long` and `tail"`, the second line
+/// starts nothing, yet it holds the DQUOTE that closes the value and every
+/// element behind it.
 ///
 /// # There is no `PartialEq`
 ///
@@ -1397,8 +1252,7 @@ fn token68(value: &[u8], at: usize) -> Option<&[u8]> {
 /// §11.2 matches a parameter name case-insensitively; and a value written as a
 /// `token` is the same value written as a `quoted-string`. A `Credential` also
 /// holds the `BWS` spans no rule makes significant, and which line each region
-/// came from — a property of how the value arrived rather than of what the
-/// sender said. [`scheme_is`](Self::scheme_is) is the scheme comparison this
+/// came from. [`scheme_is`](Self::scheme_is) is the scheme comparison this
 /// type offers, and [`AuthParam`] says what to do with a parameter.
 #[derive(Debug, Copy, Clone)]
 pub struct Credential<'a> {
@@ -1417,14 +1271,11 @@ impl<'a> Credential<'a> {
   ///
   /// The body's extent is settled before this is called and nothing here can
   /// move it, so this walks the whole of it and hands every element to
-  /// [`BodyCheck`], which is where the production is decided and where a
-  /// `Credential` is built.
+  /// [`BodyCheck`], which is where the production is decided.
   ///
   /// The `#challenge` walk does NOT come here. There the body's extent is the
   /// question, and a verdict reached after that extent was found is a verdict
-  /// the bytes behind a fault helped decide — so that walk feeds its own
-  /// [`BodyCheck`] element by element as it discovers them, and
-  /// [`Challenges::challenge`] is where that is written.
+  /// the bytes behind a fault helped decide.
   ///
   /// # Errors
   ///
@@ -1438,15 +1289,12 @@ impl<'a> Credential<'a> {
     let mut walk = ParamWalk::over(body);
     while let Some((after_comma, element)) = walk.step() {
       check.settle()?;
-      // Honest rather than load-bearing here, and the difference is worth
-      // saying: this walk is handed regions that begin at the body's own first
-      // byte, so an empty element in front of a run is IN `BodyLines::cut`'s
-      // answer and `finish` sees it either way. The collecting walk is where
-      // the flag decides something — there a region of nothing but `OWS` and
-      // commas spends no entry, so those elements are gone by the time `finish`
-      // reads the body. A mutation that makes this a constant therefore
-      // survives, and what would kill it is a caller handed a body cut past its
-      // own beginning.
+      // Honest rather than load-bearing here: this walk is handed regions that
+      // begin at the body's own first byte, so an empty element in front of a
+      // run is IN `BodyLines::cut`'s answer and `finish` sees it either way.
+      // The collecting walk is where the flag decides something. A mutation
+      // that makes this a constant therefore survives, and what would kill it
+      // is a caller handed a body cut past its own beginning.
       check.element(element?, !after_comma)?;
     }
     check.finish(scheme, body)
@@ -1505,8 +1353,7 @@ impl<'a> Credential<'a> {
         at: 0,
         // A `token68` body is spent before this walk begins: §11.2's two
         // alternatives are exclusive and no element a `token68` was taken from
-        // is an `auth-param`, which `the_two_branches_are_never_both_derivable`
-        // is the argument for. A walk started over that body instead would find
+        // is an `auth-param`. A walk started over that body instead would find
         // the one element it holds, be refused there, and stop on
         // `Stop::Fault`. Both spellings yield no parameters and only the ENDING
         // tells them apart, which is what
@@ -1528,22 +1375,17 @@ impl<'a> Credential<'a> {
 ///
 /// # Why the last region is not cut, and what says where it stops
 ///
-/// Two walks produce this body's elements: [`Challenges::skip_element`] while
-/// it is still deciding where the challenge ends, and [`ParamWalk::element`]
-/// when a caller reads [`Credential::params`]. They are one walk —
+/// The two walks that produce this body's elements are one walk —
 /// [`scan_element`] — and it reads its line only from the cursor forward, so
 /// the two agree on every element as long as they are handed the same bytes
 /// from that cursor on. An entry left uncut IS the same bytes: the field line
 /// the collecting walk scanned, offset by the credential's own start on it.
-/// Cutting it at the credential's end would leave the two reading slices of
-/// different lengths and the agreement resting on an argument about what lies
-/// past an element's delimiter.
+/// Cutting it at the credential's end would leave the agreement resting on an
+/// argument about what lies past an element's delimiter.
 ///
 /// [`held`](Self::held) is where the credential stops in the last entry, and it
 /// is the collecting walk's OWN cursor, recorded rather than derived a second
-/// time — so nothing about this body is decided twice. [`cut`](Self::cut) is
-/// how the bytes a credential holds are asked for, and the only reader of an
-/// entry past it is the walk that stops there.
+/// time.
 #[derive(Copy, Clone)]
 struct BodyLines<'a> {
   /// Empty past `len`.
@@ -1584,24 +1426,16 @@ impl<'a> BodyLines<'a> {
   /// Takes what one field line contributes to this credential: `region` from
   /// the credential's first byte on that line to the line's end, of which the
   /// first `held` bytes are the credential's own.
-  ///
   /// A region of nothing but `OWS` and commas spends no entry, and that is
   /// checked BEFORE the bound: RFC 9110 §5.6.1.2 says "Empty elements do not
   /// contribute to the count of elements present.", so a sender that merged a
   /// run of empty lines into the middle of one challenge has not made it
-  /// longer. Counting them would put a number on the empty elements the same
-  /// paragraph asks a recipient to "parse and ignore".
+  /// longer.
   ///
   /// The test is on the bytes the credential HOLDS — `held` of them — and not
-  /// on the rest of the line, which may be the next challenge and is no part
-  /// of this one's length. A line that begins no element still spends an entry
-  /// when it holds any other byte, because those bytes may be the ones that
-  /// close a quoted value, and every element behind it is reached through them.
-  ///
-  /// # Errors
-  ///
-  /// [`AuthError::ChallengeSpansTooManyLines`] past [`MAX_CHALLENGE_LINES`]
-  /// entries, which is a refusal and not a cap; that constant says why.
+  /// on the rest of the line, which may be the next challenge. A line that
+  /// begins no element still spends an entry when it holds any other byte,
+  /// because those bytes may be the ones that close a quoted value.
   fn push(&mut self, region: &'a [u8], held: usize) -> Result<(), AuthError> {
     // A `held` past the region's end is not reachable — it is a cursor into
     // this same line — and taking the whole region for one is the direction
@@ -1687,11 +1521,9 @@ impl<'a> SeenNames<'a> {
   /// name repeats a recorded one is answered with the fault the SENDER
   /// committed rather than with this reader's own limit. The repeat is proven
   /// and not guessed at when that happens: the bound refuses rather than
-  /// skipping, so every name before it went into a slot and the record the
-  /// comparison runs over is the whole list so far. The crate's other
-  /// two-fault record orders its own the same way and for the same reason —
-  /// a `TagList` asks about `*` before it asks whether an element parses,
-  /// lest the caller be told which fault it was by whichever check ran first.
+  /// skipping, so every name before it went into a slot. The crate's other
+  /// two-fault record orders its own the same way — a `TagList` asks about `*`
+  /// before it asks whether an element parses.
   fn record(&mut self, name: &'a [u8]) -> Result<(), AuthError> {
     // The slots past `len` hold no name rather than an empty one — a `token`
     // has at least one byte, so nothing a caller can send matches them — and
@@ -1715,15 +1547,9 @@ impl<'a> SeenNames<'a> {
 /// RFC 9110 §11.3's `[ 1*SP ( token68 / #auth-param ) ]` decided over the
 /// elements of one credential body, and the one place a [`Credential`] is
 /// built.
-///
-/// ```text
-/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
-/// auth-param = token BWS "=" BWS ( token / quoted-string )
-/// ```
-///
 /// Two walks produce those elements — [`Credential::read`] over a body already
 /// cut, and [`Challenges::challenge`] as it cuts one — and the verdict on them
-/// is written once, here, so the two cannot drift apart on what a body derives.
+/// is written once, here.
 ///
 /// # Why the FIRST element's verdict is held
 ///
@@ -1732,13 +1558,11 @@ impl<'a> SeenNames<'a> {
 /// `the_two_branches_are_never_both_derivable` is the argument for. So the
 /// first element of a body that turns out to BE a `token68` is refused as an
 /// `auth-param` and must not be reported, and whether the body is one is not
-/// known until its extent is.
-///
-/// Held for exactly one element and no longer. A SECOND element ends the
-/// `token68` reading — that alternative is a single run and takes the whole
-/// body — so the held verdict comes due the moment one appears, which is what
-/// [`settle`](Self::settle) is and why a walk still finding a boundary calls it
-/// BEFORE it reads that second element's bytes.
+/// known until its extent is. Held for exactly one element and no longer: a
+/// SECOND element ends the `token68` reading, so the held verdict comes due the
+/// moment one appears, which is what [`settle`](Self::settle) is and why a walk
+/// still finding a boundary calls it BEFORE it reads that second element's
+/// bytes.
 struct BodyCheck<'a> {
   /// The names the list has used, for RFC 9110 §11.2's one-name-once MUST.
   seen: SeenNames<'a>,
@@ -1754,14 +1578,12 @@ struct BodyCheck<'a> {
   /// token68    = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
   /// auth-param = token BWS "=" BWS ( token / quoted-string )
   /// ```
-  ///
   /// Written for that element and no other, and it is the only element this
   /// could be true of: a `token68` is ONE run, and a second element needs the
   /// comma §5.6.1.2 separates with, which no byte of that run or of the `=`
   /// pad behind it is. So while the body is still one element long this is the
-  /// BODY's answer as well, which is the moment
-  /// [`token68_taken`](Self::token68_taken) is asked and the whole of why it
-  /// may be asked at all.
+  /// BODY's answer as well, which is the whole of why
+  /// [`token68_taken`](Self::token68_taken) may be asked at all.
   token68: bool,
 }
 
@@ -1784,9 +1606,8 @@ impl<'a> BodyCheck<'a> {
   /// of the first element and one in front of every other. It is what
   /// [`token68`](Self::token68) needs beyond the element's own bytes: a
   /// `token68` is the WHOLE body, so an empty element or §5.2's join standing
-  /// in front of the run leaves bytes the run does not reach and the body is
-  /// the other alternative whatever the run looks like. `Basic<SP>,a=` is that
-  /// value — its body is `,a=`, which no `token68` derives.
+  /// in front of the run leaves bytes the run does not reach. `Basic<SP>,a=` is
+  /// that value — its body is `,a=`, which no `token68` derives.
   ///
   /// # Errors
   ///
@@ -1807,9 +1628,7 @@ impl<'a> BodyCheck<'a> {
     self.held = verdict.err();
     // The other of RFC 9110 §11.3's two alternatives, asked of the same bytes.
     // [`token68`] answers for ONE list element with §5.6.1.2's own `OWS`
-    // already off it, which is exactly what an [`Element`] carries — so this is
-    // that question asked where the element is, and not a second spelling of
-    // it.
+    // already off it, which is exactly what an [`Element`] carries.
     self.token68 = opens_the_body && token68(element.bytes, 0).is_some();
     Ok(())
   }
@@ -1817,26 +1636,18 @@ impl<'a> BodyCheck<'a> {
   /// Whether the body is already RFC 9110 §11.3's `token68`, so a walk that has
   /// found another element has found the end of this challenge rather than more
   /// of it.
-  ///
-  /// ```text
-  /// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
-  /// auth-param = token BWS "=" BWS ( token / quoted-string )
-  /// ```
-  ///
   /// The first element being wholly a `token68` settles §11.3's choice, because
   /// the alternatives never derive one element between them: a run that reaches
   /// the end of its element leaves nothing but more `=` and §5.6.3's `OWS`
   /// behind its first `=`, and `auth-param` needs a `token` or a
   /// `quoted-string` there — `the_two_branches_are_never_both_derivable` is
-  /// that argument executed over the productions. ABNF's `/` is unordered and
-  /// nothing here orders it; what is being said is that ONE alternative derives
-  /// these bytes and the other does not derive them at all, which is not a
-  /// choice a recipient has.
+  /// that argument executed over the productions. What is being said is that
+  /// ONE alternative derives these bytes and the other does not derive them at
+  /// all, which is not a choice a recipient has.
   ///
   /// So the challenge is complete at that element's delimiter, and the element
-  /// behind the delimiter belongs to the outer `#challenge` list whatever it
-  /// turns out to be. Its bytes decide nothing here, which is why the one
-  /// caller asks this BEFORE reading them.
+  /// behind it belongs to the outer `#challenge` list whatever it turns out to
+  /// be — which is why the one caller asks this BEFORE reading it.
   const fn token68_taken(&self) -> bool {
     self.token68
   }
@@ -1846,8 +1657,7 @@ impl<'a> BodyCheck<'a> {
   ///
   /// Called before another element's BYTES are read, never after. A walk that
   /// is still deciding where a challenge ends would otherwise let those bytes
-  /// choose the extent of a challenge already refused, which is the one thing
-  /// the module doc's invariant forbids.
+  /// choose the extent of a challenge already refused.
   ///
   /// # Errors
   ///
@@ -1883,28 +1693,20 @@ impl<'a> BodyCheck<'a> {
     // §5.6.1.2's "Empty elements do not contribute to the count of elements
     // present." is why [`BodyLines`] spends no region on one that is all `OWS`
     // and commas, so a body opening with the empty elements that sentence
-    // admits arrives here as the bytes BEHIND them — and a run reading as the
-    // whole of what arrived never began the body. `Basic<SP>,` on one field
+    // admits arrives here as the bytes BEHIND them. `Basic<SP>,` on one field
     // line and `a=` opening the next are the two that showed it: §5.2 joins
     // them into a body of `,,a=`, which no `token68` derives. One region,
-    // because a body §5.2's
-    // join spread over two is longer than the run that ends on the first. And
-    // the `OWS` skip, because a run that ends its own ELEMENT with more of the
-    // body behind that element's comma has left bytes
-    // `auth-scheme [ 1*SP ( token68 / #auth-param ) ]` does not derive, which
-    // is what `Basic dGVzdA==, x=1` read as one credential is.
+    // because a body a join spread over two is longer than the run that ends on
+    // the first. And the `OWS` skip, because a run that ends its own ELEMENT
+    // with more of the body behind that element's comma has left bytes
+    // `auth-scheme [ 1*SP ( token68 / #auth-param ) ]` does not derive —
+    // `Basic dGVzdA==, x=1` read as one credential.
     //
     // The region count is the one of the three no input reaches today, and the
     // mutation that drops it survives for that reason rather than because it
-    // says nothing. `token68` and `auth_param` never derive one element between
-    // them, so a first element this run reaches the end of always leaves a
-    // verdict held — and `settle` reports a held verdict the moment a SECOND
-    // element appears, which is what a second region needs. It is written here
-    // all the same: this is where a body's extent is turned into a reading, and
-    // a rule that holds only because of what a caller does two functions away
-    // is a rule the next caller does not inherit.
-    // `a_run_that_ends_its_element_is_no_body_when_a_region_stands_behind_it`
-    // asks `Credential::read` for that body directly.
+    // says nothing. It is written here all the same: a rule that holds only
+    // because of what a caller does two functions away is one the next caller
+    // does not inherit.
     let token = match body.len {
       1 if self.token68 => match token68(only, 0) {
         Some(run) if skip_ows(only, run.len()) == only.len() => Some(run),
@@ -1943,15 +1745,11 @@ impl<'a> Iterator for AuthParamIter<'a> {
   fn next(&mut self) -> Option<Self::Item> {
     // Both faults this can meet are unreachable over a `Credential` that
     // exists: every element of its body was read and derived once before that
-    // value was built, and every fault either could carry was returned there
-    // instead. Ending the walk is the answer a fault deserves anyway — a
-    // walker that met one can no longer say which of the commas behind it were
-    // separators — but ending is not ALL that happens to it. Neither fault is
-    // dropped: `ParamWalk::element` recorded the first and this records the
-    // second, so a walk that ran past its credential and was refused on the
-    // next challenge's first element is not the same state as one that reached
-    // the credential's last byte. `Stop` is why that distinction is the one
-    // thing here a mistake would otherwise be silent about.
+    // value was built. Ending the walk is the answer a fault deserves anyway,
+    // but ending is not ALL that happens to it: `ParamWalk::element` recorded
+    // the first and this records the second, so a walk that ran past its
+    // credential and was refused on the next challenge's first element is not
+    // the same state as one that reached the credential's last byte.
     let element = match self.walk.step()? {
       // Which side of §5.6.1.2's comma this element stands on is
       // `BodyCheck`'s question and not one a caller reading a list that has
@@ -1980,20 +1778,16 @@ impl core::iter::FusedIterator for AuthParamIter<'_> {}
 /// Why a walk over a credential's `#auth-param` list has no next element.
 ///
 /// Two endings, and they are not one fact. A walk that reached the credential's
+/// Two endings, and they are not one fact. A walk that reached the credential's
 /// own last byte has read every element there was. A walk that stopped on a
 /// fault read an element no production derives — and over a [`Credential`] that
-/// exists there is no such element, since every one of them was derived once
-/// before that value was built.
+/// exists there is no such element.
 ///
 /// So [`Fault`](Self::Fault) is unreachable, and it carries the fault rather
 /// than folding into [`Spent`](Self::Spent) for exactly that reason: it is the
-/// one ending here a mistake could reach in silence. A walk that read one
-/// element too many meets the NEXT challenge's first element, [`auth_param`]
-/// refuses it, and the walk ends — leaving a parameter list that looks complete
-/// and a fault nobody was told about. [`BodyLines`]'s `held` is what stops the
-/// walk before it can happen; recording WHICH ending occurred is what keeps the
-/// two apart for a test and for a later edit, and [`walks_to_its_end`] is what
-/// asserts it of every credential this crate builds.
+/// one ending here a mistake could reach in silence, leaving a parameter list
+/// that looks complete and a fault nobody was told about. [`BodyLines`]'s
+/// `held` is what stops the walk before it can happen.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Stop {
   /// The cursor reached the credential's own last byte: [`BodyLines`]'s `held`
@@ -2008,23 +1802,18 @@ enum Stop {
 ///
 /// The invariant [`Stop`] exists for, checked where every [`Credential`] this
 /// crate builds is built rather than only where one test looks. Each element of
-/// a body was derived once as the value was assembled — by
-/// [`BodyCheck::element`], over the elements the collecting walk produced — so
-/// re-deriving them through [`Credential::params`] reads the same elements and
-/// must reach [`Stop::Spent`]. Reaching [`Stop::Fault`] instead is a walk that
-/// read an element PAST the credential, which is the one way being wrong here
-/// is silent: the caller is handed a parameter list that looks complete and no
-/// fault is reported anywhere.
+/// a body was derived once as the value was assembled, so re-deriving them
+/// through [`Credential::params`] reads the same elements and must reach
+/// [`Stop::Spent`]. Reaching [`Stop::Fault`] instead is a walk that read an
+/// element PAST the credential, which is the one way being wrong here is
+/// silent.
 ///
 /// `the_body_a_challenge_collected_reads_the_same_alone` measures that
 /// agreement over a brute force of its own. This asserts it of every credential
 /// every fixture in the suite builds, and of every credential a debug build of
-/// a caller's own program builds.
-///
-/// Compiled away where `debug_assertions` are off, so the release build the
-/// no-panic link proof is taken over carries neither the walk nor the
-/// assertion, and neither does any other release build. A debug build carries
-/// it the way it carries every other debug assertion, on every tier.
+/// a caller's own program builds — and is compiled away where
+/// `debug_assertions` are off, so the release build the no-panic link proof is
+/// taken over carries neither the walk nor the assertion.
 #[cfg(debug_assertions)]
 fn walks_to_its_end(credential: &Credential<'_>) {
   let mut params = credential.params();
@@ -2055,17 +1844,10 @@ const fn walks_to_its_end(_credential: &Credential<'_>) {}
 /// RFC 9110 §11.6.1 leaves a recipient two readings of an element behind a
 /// comma: one more `auth-param` of the challenge already open, or the
 /// `auth-scheme` of the next challenge. Handing the element back as a challenge
-/// is taking the second. Believing, at the same moment, that an `auth-param`
+/// is taking the second; believing, at the same moment, that an `auth-param`
 /// may begin at that element is holding the first. A walk that does both has
 /// not chosen, and every answer it goes on to give rests on whichever half the
 /// next line of code happens to read.
-///
-/// `inside_a_list` is what the walk holds — [`Challenges::inside_a_list`], the
-/// list a challenge left open together with the list an [`Epoch`] does — and
-/// `at` is the first byte of the element the challenge was read at.
-/// [`opens_a_challenge`] is the other half, and it is the same question
-/// [`refused_element_end`] asks of the same bytes rather than a second spelling
-/// of it.
 ///
 /// # Why it cannot fire, twice over
 ///
@@ -2073,10 +1855,9 @@ const fn walks_to_its_end(_credential: &Credential<'_>) {}
 /// three ways, and a list can be open at only the first two.
 /// [`Challenges::seek`] resumes on an element [`opens_a_challenge`] answered
 /// `true` for, and the body loop of [`Challenges::read_challenge`] breaks on
-/// one for the same reason — that is what makes the element the OUTER list's.
-/// The third is the break [`BodyCheck::token68_taken`] takes, which leaves the
-/// cursor on an element nothing has asked, and a `token68` body closes the list
-/// in front of it, so `inside_a_list` is false unless an [`Epoch`] holds one.
+/// one for the same reason. The third is the break
+/// [`BodyCheck::token68_taken`] takes, and a `token68` body closes the list in
+/// front of it.
 ///
 /// **From the productions**, which is the half that holds however the walk is
 /// rearranged. Suppose both: some `auth-param` begins at the element, so a
@@ -2092,10 +1873,6 @@ const fn walks_to_its_end(_credential: &Credential<'_>) {}
 /// suppositions cannot both hold. `an_element_that_completes_a_challenge_is_no
 /// _parameter_of_the_list_in_front_of_it` runs that argument over the
 /// productions.
-///
-/// Compiled away where `debug_assertions` are off, exactly as
-/// [`walks_to_its_end`] is, so no release build carries the check or the scan
-/// it makes.
 #[cfg(debug_assertions)]
 fn a_yielded_challenge_is_no_parameter(value: &[u8], at: usize, inside_a_list: bool) {
   debug_assert!(
@@ -2112,10 +1889,6 @@ const fn a_yielded_challenge_is_no_parameter(_value: &[u8], _at: usize, _inside_
 /// What [`Challenges::sustain_the_epoch`] hands [`auth_param`] rests on an
 /// argument rather than on a branch, and this is that argument checked.
 ///
-/// ```text
-/// auth-param = token BWS "=" BWS ( token / quoted-string )
-/// ```
-///
 /// The element it puts to RFC 9110 §11.2 is one whose value cannot still be
 /// OPEN where the element ends, so [`ValueTail`] has nothing left to decide and
 /// `Ends` is the whole of it. Two facts hold that, and they are about different
@@ -2125,13 +1898,8 @@ const fn a_yielded_challenge_is_no_parameter(_value: &[u8], _at: usize, _inside_
 /// list is open the epoch is not derivable at all, because a receiver bound is
 /// only ever met inside the body §11.3's `1*SP` opened.
 ///
-/// So this asserts the half of it that decides an ANSWER: while the epoch is
-/// still derivable, the tail is a choice with one outcome. It is checked rather
-/// than argued because an argument that has stopped holding leaves a doc that
-/// still reads correctly.
-///
-/// Compiled away where `debug_assertions` are off, exactly as
-/// [`a_yielded_challenge_is_no_parameter`] is.
+/// It is checked rather than argued because an argument that has stopped
+/// holding leaves a doc that still reads correctly.
 #[cfg(debug_assertions)]
 fn a_derivable_span_admits_one_tail(element: &[u8], derivable: bool) {
   debug_assert!(
@@ -2158,29 +1926,20 @@ const fn a_derivable_span_admits_one_tail(_element: &[u8], _derivable: bool) {}
 /// [`Origin::Unread`] says the cursor is on the first byte of an element on
 /// this line — so RFC 9110 §5.6.1.2's `OWS` is off the front of it and the
 /// comma that separated it from the element behind is already crossed. Both
-/// are checkable here, and both are what
-/// [`Challenges::sustain_the_epoch`] slices from when no element is carried:
-/// a cursor left on whitespace or on a comma would put the list's own bytes
-/// inside the element it puts to §11.2. The end of the value is the one other
-/// offset that row admits, where a walk that read every line has nothing left
-/// to stand on.
+/// are checkable here, and both are what [`Challenges::sustain_the_epoch`]
+/// slices from when no element is carried: a cursor left on whitespace or on a
+/// comma would put the list's own bytes inside the element it puts to §11.2.
 ///
-/// [`Origin::Body`] says the cursor is on the body position RFC 9110 §11.3's
-/// `1*SP` opened, which is checkable the same way: an SP stands in front of it,
-/// and §5.6.2's `tchar` excludes SP so the scheme token really did end there.
-/// The whitespace this row stands ON is why it is not [`Origin::Unread`] — a
-/// body's first element has no comma in front of it for §5.6.1.2 to hang `OWS`
-/// on.
+/// [`Origin::Body`] says the cursor is on the body position §11.3's `1*SP`
+/// opened, which is checkable the same way: an SP stands in front of it, and
+/// §5.6.2's `tchar` excludes SP so the scheme token really did end there.
 ///
 /// [`Origin::Scanned`] and [`Origin::Crossed`] are checked by the entrances
 /// themselves and not here: the first carries the element the walk cut, which
 /// is a fact no offset can confirm, and the second stands on the far side of
 /// §5.2's join wherever that join fell. What a walk CAN say about them is that
-/// they are the only two rows a cursor a join moved may take — which is what
+/// they are the only two rows a cursor a join moved may take, which is what
 /// `where_every_refusal_leaves_the_cursor` drives every entrance to show.
-///
-/// Compiled away where `debug_assertions` are off, exactly as
-/// [`a_derivable_span_admits_one_tail`] is.
 #[cfg(debug_assertions)]
 fn a_refusal_leaves_the_cursor_where_its_span_begins(line: &[u8], at: usize, origin: Origin<'_>) {
   match origin {
@@ -2240,9 +1999,7 @@ impl<'a> ParamWalk<'a> {
   ///
   /// `#element => [ element ] *( OWS "," OWS [ element ] )` puts no comma in
   /// front of the FIRST element, so the answer `false` names the element the
-  /// body opens with and `true` names one an empty element or §5.2's join
-  /// stands in front of. [`BodyCheck::element`] is the one caller that reads
-  /// it, and its `opens_the_body` carries why.
+  /// body opens with. [`BodyCheck::element`] is the one caller that reads it.
   fn step(&mut self) -> Option<(bool, Result<Element<'a>, AuthError>)> {
     let mut after_comma = false;
     loop {
@@ -2394,26 +2151,19 @@ fn rejoin(next: &[u8], escape: bool) -> Rejoin {
 /// alternative WHOLE, and §5.6.1.2 expands the list around it as
 /// `#element => [ element ] *( OWS "," OWS [ element ] )` — so between a value
 /// that closed here and the comma that ends its element there is room for that
-/// `OWS` and for nothing else. Reaching the comma, or the end of `value`, the
-/// element is what it looked like and `trails` is false; the end of a line
-/// counts as that comma, since §5.2 puts one at every join and the value ends
-/// where the lines run out.
+/// `OWS` and for nothing else. The end of a line counts as that comma, since
+/// §5.2 puts one at every join.
 ///
 /// # What a proven-malformed remainder may not decide
 ///
 /// Reaching anything ELSE, the remainder of the line derives nothing — and a
 /// run that derives nothing contains no quoted-string, so a DQUOTE in it opens
-/// none. [`raw_comma_end`] therefore takes the rest RAW, and this reports
-/// `trails` for the element.
-///
-/// Granting those bytes quoted-string semantics is how a malformed challenge
-/// hides a well-formed one:
-/// `Basic realm=x, Broken a="q` and `r"junk", Digest realm=z` are two field
-/// lines that §5.2 joins into one value, the value of `a` closes at `r"`, and
-/// a DQUOTE in `junk"` read as an opener swallows the comma in
-/// front of `Digest`. RFC 9110 §11.4 has a user agent select "the challenge
-/// with what it considers to be the most secure auth-scheme that it
-/// understands", which it cannot do over a challenge it was never shown.
+/// none. [`raw_comma_end`] takes the rest RAW and this reports `trails`;
+/// granting those bytes quoted-string semantics is how a malformed challenge
+/// hides a well-formed one. `Basic realm=x, Broken a="q` and
+/// `r"junk", Digest realm=z` are the two field lines: `a`'s value closes at
+/// `r"`, and a DQUOTE in `junk"` read as an opener swallows the comma in front
+/// of `Digest`.
 fn after_close(value: &[u8], end: usize) -> (usize, bool) {
   let at = skip_ows(value, end);
   match value.get(at) {
@@ -2427,22 +2177,18 @@ fn after_close(value: &[u8], end: usize) -> (usize, bool) {
 ///
 /// A quoted-string is something a production admits at a POSITION. Where none
 /// does, a DQUOTE is one more byte of the run — it opens nothing — so every
-/// comma in the run is the §5.6.1.2 separator it looks like, and the first of
-/// them is where the run stops.
+/// comma in the run is the §5.6.1.2 separator it looks like.
 ///
 /// Two kinds of run are read this way, and each caller says which one it holds.
 /// [`after_close`] and [`Challenges::seek`] hold bytes some production has
 /// already REFUSED, where nothing at all is admitted. [`element_end`] holds an
-/// element whose grammar puts no quoted-string in it: one that is no
-/// `auth-param`, or one whose value took §11.2's `token` alternative.
+/// element whose grammar puts no quoted-string in it. Stopping at the end of
+/// the line rather than crossing §5.2's join is the same answer: the join IS a
+/// comma.
 ///
-/// Stopping at the end of the line rather than crossing §5.2's join is the
-/// same answer: the join IS a comma, so the run ends there either way.
-///
-/// The direction this errs in is the one §11.4 needs. A run cut too EARLY
-/// shows the caller more elements than the sender wrote, each answered on its
-/// own; one cut too LATE hides them, and a hidden challenge is a challenge the
-/// caller cannot select.
+/// The direction this errs in is the one §11.4 needs: a run cut too EARLY shows
+/// the caller more elements than the sender wrote, and one cut too LATE hides
+/// them.
 fn raw_comma_end(value: &[u8], at: usize) -> usize {
   let mut at = at;
   while !matches!(value.get(at), None | Some(&b',')) {
@@ -2454,25 +2200,16 @@ fn raw_comma_end(value: &[u8], at: usize) -> usize {
 /// Where RFC 9110 §11.2's `auth-param` admits the VALUE of the element that
 /// begins at `at`, or `None` for an element that is no `auth-param` and so
 /// admits a value nowhere in itself.
-///
-/// ```text
-/// auth-param = token BWS "=" BWS ( token / quoted-string )
-/// ```
-///
 /// Three terminals stand in front of that value and all three are read here:
 /// the name `token`, the `=`, and the `BWS` RFC 9110 §5.6.3 defines as `OWS`'s
 /// own bytes, on either side of it. None of them can hold a comma, so the
 /// question is settled inside ONE list element; and none can hold one across a
-/// §5.2 join either, since a `token` carries no comma and §5.2 puts one at
-/// every join, so an element that has not reached its `=` on the line it began
-/// on never will. [`opens_a_challenge`] asks these same two questions of the
-/// same bytes for its own reason, and asks them by calling this: it IS this
-/// question answered `None`, rather than a second spelling of it.
+/// §5.2 join either, so an element that has not reached its `=` on the line it
+/// began on never will. [`opens_a_challenge`] IS this question answered `None`.
 ///
 /// `Some` is no claim that the element parses. What stands at the offset may be
 /// neither of §11.2's two alternatives, and [`auth_param`] is the one place
-/// that is decided. This answers about POSITION alone, which is all a boundary
-/// scan may take from it.
+/// that is decided. This answers about POSITION alone.
 fn param_value_at(value: &[u8], at: usize) -> Option<usize> {
   let name_end = token_end(value, at)?;
   let eq = skip_ows(value, name_end);
@@ -2488,24 +2225,14 @@ fn param_value_at(value: &[u8], at: usize) -> Option<usize> {
 /// RFC 9110 §11.6.1's ambiguity — the value "might contain more than one
 /// challenge, and each challenge can contain a comma-separated list of
 /// authentication parameters" — decided by the two terminals `auth-param` opens
-/// with. That is
-/// the same pair [`param_value_at`] reads, over the same bytes, so it IS that
-/// question asked the other way round and is written as one rather than as two
-/// spellings that could drift: an element §11.2 admits no value position in is
-/// an element no `auth-param` derives, which is exactly what makes it a scheme.
-/// [`auth_param`] refuses such an element on the same two checks, so what this
-/// answers `true` for is what that would call
-/// [`AuthError::MalformedParameter`].
+/// with. That is the same pair [`param_value_at`] reads, over the same bytes,
+/// so it IS that question asked the other way round rather than a second
+/// spelling that could drift: an element §11.2 admits no value position in is
+/// an element no `auth-param` derives, which is what makes it a scheme.
 ///
 /// An element with no leading token is not a parameter either, and this
 /// answers `true` for it: it opens a challenge, where
-/// [`AuthError::MissingScheme`] names what is wrong with it. Reporting a
-/// malformed parameter instead would blame a production the element was never
-/// being read by.
-///
-/// The `=` is looked for on THIS element's line, because a `token` carries no
-/// comma and RFC 9110 §5.2 puts one at every join — so an element that has not
-/// reached its `=` on the line it began on never will.
+/// [`AuthError::MissingScheme`] names what is wrong with it.
 fn opens_a_challenge(value: &[u8], at: usize) -> bool {
   param_value_at(value, at).is_none()
 }
@@ -2513,13 +2240,6 @@ fn opens_a_challenge(value: &[u8], at: usize) -> bool {
 /// Whether RFC 9110 §11.6.1's OTHER reading of `element` — a whole `challenge`
 /// rather than one more `auth-param` — leaves a `#auth-param` list OPEN behind
 /// it.
-///
-/// ```text
-/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
-/// auth-param = token BWS "=" BWS ( token / quoted-string )
-/// token68    = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
-/// ```
-///
 /// `element` is one §5.6.1.2 element with the list's own `OWS` off both ends,
 /// which is what an [`Element`] carries. The question is §11.3's and is asked
 /// of it whole: an `auth-scheme`, the `1*SP` that is the body's only entrance,
@@ -2527,33 +2247,21 @@ fn opens_a_challenge(value: &[u8], at: usize) -> bool {
 /// asks the same question of a challenge this walk READ; this asks it of one it
 /// did not.
 ///
-/// # A list opens at the `1*SP`, whatever the body derives
-///
 /// `[ 1*SP ( token68 / #auth-param ) ]` puts the list's first element at the
 /// first byte behind the SP run, so the list is open from there — and where
 /// nothing derives AT that element the readings are free from it, inside the
-/// list it stands in. That is the same sentence [`Epoch`] carries about a fault
-/// met inside a body, one element up: `Basic<SP><HTAB>a, a=", Digest realm=z`
-/// is a body whose first element derives nothing and whose list is open all the
-/// same.
-///
-/// So the `token68` alternative is the only thing that closes it. §11.2's
-/// alphabet holds no DQUOTE and no `=` but the trailing pad, and [`token68`]
-/// answers `Some` only where the run IS the whole body — which is what makes
-/// `Bearer abc` a challenge that opens nothing.
+/// list it stands in. `Basic<SP><HTAB>a, a=", Digest realm=z` is a body whose
+/// first element derives nothing and whose list is open all the same.
 ///
 /// # Why the two readings can BOTH be about the same element
 ///
-/// [`opener_at`]'s exclusion is about where a §5.6.4 quoted-string may OPEN,
-/// and it holds: at most one of the two readings puts a value position in the
-/// run. This is a different question. `y<SP>=<SP>1` is one `auth-param` under
+/// [`opener_at`]'s exclusion is about where a §5.6.4 quoted-string may OPEN.
+/// This is a different question. `y<SP>=<SP>1` is one `auth-param` under
 /// the reading the walk takes, and under the other it is an `auth-scheme` whose
 /// body opens AT the `=` and derives nothing — a non-derivation, but one that
 /// has already opened a list, which is exactly the state freedom starts in.
 /// `Broken<HTAB>junk, y<SP>=<SP>1, Bearer, x="open, Digest realm=z` is the
-/// value that needs it: `Challenges::seek` crosses `y<SP>=<SP>1` because
-/// [`opens_a_challenge`] answers `false` for it, and the list that reading
-/// opened is the one `x`'s DQUOTE stands at a value position of.
+/// value that needs it.
 fn opens_a_parameter_list(element: &[u8]) -> bool {
   let Some(scheme_end) = token_end(element, 0) else {
     return false;
@@ -2587,48 +2295,34 @@ fn opens_a_parameter_list(element: &[u8]) -> bool {
 /// token68    = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
 /// ```
 ///
-/// RFC 9110 §11.6.1 states the ambiguity: the value "might contain more than
-/// one challenge, and each challenge can contain a comma-separated list of
-/// authentication parameters". So an element of the OUTER list is either one
-/// more `auth-param` of the challenge already open, whose value position is
-/// [`param_value_at`] answered AT `at`; or the `auth-scheme` of a whole new
-/// challenge, whose first `auth-param` begins behind `auth-scheme 1*SP` and
-/// whose value position is [`param_value_at`] answered THERE. `parameters`
-/// admits the first and `after_comma` the second, and each is a fact about
-/// where the cursor stands rather than about these bytes:
+/// An element of the OUTER list is either one more `auth-param` of the
+/// challenge already open, whose value position is [`param_value_at`] answered
+/// AT `at`; or the `auth-scheme` of a whole new challenge, whose first
+/// `auth-param` begins behind `auth-scheme 1*SP` and whose value position is
+/// [`param_value_at`] answered THERE. `parameters` admits the first and
+/// `after_comma` the second, and each is a fact about where the cursor stands
+/// rather than about these bytes:
 ///
 /// - `parameters` is false where the refused challenge was refused at its own
 ///   `auth-scheme` or at the `1*SP` behind it, with no earlier challenge having
-///   opened a list. Nothing in what is left of it is an `auth-param`, so no
-///   DQUOTE in it stands at a value position.
-///   `Basic, type=1, x="a, Digest realm=z` is that value.
+///   opened a list. `Basic, type=1, x="a, Digest realm=z` is that value.
 /// - `after_comma` is false where no comma stands in front of `at` — the first
 ///   element of a challenge's own `#auth-param` list, which
 ///   `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` puts no
 ///   second challenge at. `Basic Digest realm="c, Newauth realm=z` is that
-///   value: `Digest realm="c` is inside `Basic`'s body, the DQUOTE behind it is
-///   at no value position of any reading, and `Newauth realm=z` stands behind a
-///   comma every reading of these bytes is outside a string at.
+///   value.
 ///
 /// # The element does not begin at the comma, and both readings are of where it
 /// does
 ///
-/// RFC 9110 §5.6.1.2 hangs `OWS` on BOTH sides of its comma —
-/// `#element => [ element ] *( OWS "," OWS [ element ] )` — so where one stands
-/// in front of `at`, what `at` names is the far side of that comma and the
-/// element begins behind whatever §5.6.3 whitespace the sender wrote there.
-/// Both readings are of the element, so both are read from THAT offset. A check
-/// asked at the comma's own far side instead finds neither shape: a SP is no
-/// `tchar`, so [`token_end`] answers `None` and the run looks like one holding
-/// no opener at all — which is how `Basic a="x` and
+/// RFC 9110 §5.6.1.2 hangs `OWS` on BOTH sides of its comma, so what `at` names
+/// is the far side of that comma and the element begins behind whatever §5.6.3
+/// whitespace the sender wrote there. A check asked at the comma's own far side
+/// finds neither shape — a SP is no `tchar` — and that is how `Basic a="x` and
 /// `<SP>realm="evil, Digest realm=z` crossed a comma standing inside `realm`'s
-/// own value. The `<SP>` is the sender's one space, written visibly here
-/// because that is the whole of the input.
-///
-/// Only [`some_reading_holds`]'s question moves. [`Recovery::at`] keeps the
-/// unskipped offset, because [`Recovery::floor`] answers about the commas on
-/// this LINE — where the value the join carried here closes — and an origin
-/// moved off the line's head would move which of them that value still holds.
+/// own value. Only [`some_reading_holds`]'s question moves: [`Recovery::at`]
+/// keeps the unskipped offset, because [`Recovery::floor`] answers about the
+/// commas on this LINE.
 ///
 /// # And never both at once, which is what keeps this ONE position
 ///
@@ -2640,20 +2334,12 @@ fn opens_a_parameter_list(element: &[u8]) -> bool {
 /// `auth-param` opens with. Take the SPs those two share: what follows is
 /// either a HTAB, which is `BWS` and is no `tchar`, so no `token` begins there
 /// and the challenge shape fails; or it is the byte both must now agree on, and
-/// §5.6.2's `tchar` holds no `=`. So at most one of the two is a shape at all,
-/// whichever bytes the sender wrote.
+/// §5.6.2's `tchar` holds no `=`. So at most one of the two is a shape at all.
 ///
 /// A SECOND opener of either kind needs a second element, a second element
 /// needs the comma §5.6.1.2 separates with, and the run ends at the first one.
-/// So the run holds one opener or none however it is read, and the choice at it
-/// — open the string, or leave it shut — is the only choice there is.
-///
-/// That is what lets [`some_reading_holds`] answer about EVERY reading with one
-/// scan. The [`crate::grammar`] walk asks the same question of RFC 9110
-/// §5.6.6's `parameters`, where a member's own `;` puts many openers in one run
-/// and a subset construction over their states is what answers; an `auth-param`
-/// is one whole element with nothing repeating inside it, so the construction
-/// collapses to a scan from the one position this names.
+/// So the run holds one opener or none however it is read, which is what lets
+/// [`some_reading_holds`] answer about EVERY reading with one scan.
 fn opener_at(value: &[u8], at: usize, parameters: bool, after_comma: bool) -> Option<usize> {
   // Where the element ACTUALLY begins. RFC 9110 §5.6.1.2 puts `OWS` behind the
   // comma `after_comma` reports, and the two readings below are both of the
@@ -2684,20 +2370,15 @@ fn opener_at(value: &[u8], at: usize, parameters: bool, after_comma: bool) -> Op
 /// Whether the run a reading of the bytes at `at` may open with the RFC 9110
 /// §5.6.4 DQUOTE standing in it still HOLDS `end`, so that a reading of these
 /// bytes has the comma there as that run's data rather than as §5.6.1.2's
-/// separator.
-///
 /// `at` is an offset every reading of the value stands OUTSIDE a string at, and
 /// `end` is [`raw_comma_end`]'s answer from it — the earliest comma, read raw.
-/// [`opener_at`] names the one position a reading may open at, `parameters` and
-/// `after_comma` are its two admissions, and its doc carries what each rules
-/// out and why there is never more than one position to scan from.
+/// [`opener_at`] names the one position a reading may open at, and `parameters`
+/// and `after_comma` are its two admissions.
 ///
-/// # The reading that leaves it shut ends the element at `end`
-///
-/// And no reading ends it earlier: an open string only ever HIDES a comma from
-/// a scan, never reveals one. So `end` is where every reading ends the element
-/// exactly when this answers `false`, and there is no earlier boundary for a
-/// certified `end` to be hiding.
+/// The reading that leaves it shut ends the element at `end`, and no reading
+/// ends it earlier: an open string only ever HIDES a comma from a scan, never
+/// reveals one. So `end` is where every reading ends the element exactly when
+/// this answers `false`.
 ///
 /// # The three states the scan can be in, and the two that hold the comma
 ///
@@ -2706,39 +2387,23 @@ fn opener_at(value: &[u8], at: usize, parameters: bool, after_comma: bool) -> Op
 ///
 /// - Still open there — [`QuotedScan::Open`], escape pending or not — and the
 ///   comma is inside it. The string need not ever close for that: RFC 9110
-///   §5.6.4 makes every byte behind an opening DQUOTE that value's data, and a
-///   sender whose line was truncated wrote them as data all the same.
+///   §5.6.4 makes every byte behind an opening DQUOTE that value's data.
 /// - Closed in front of it, and that reading stands outside the string at the
 ///   comma exactly as the shut reading does. `Basic a=1, a=2, x="p", Digest realm=z`
 ///   is that shape, and refusing to report `Digest` would hide a challenge for
 ///   nothing.
 /// - [`QuotedScan::Invalid`], and the reading that opened the string holds the
-///   comma too. A byte §5.6.4 forbids means the string reaches NO close — so
-///   that reading runs to the end of the value and every comma behind the
-///   DQUOTE is among the bytes the sender wrote as its data. It is not a
-///   `quoted-string`, and nothing here says it is: what the reading holds is a
-///   run the sender opened with a DQUOTE and never shut, which is exactly what
-///   [`crate::grammar::Readings::absorb`] calls SEALED and has ruled for RFC
-///   9110 §5.6.6's `parameters` since `gzip;;x="a%x01, chunked, b", br` cut raw
-///   handed a caller a `chunked` that stood among those bytes.
+///   comma too: a byte §5.6.4 forbids means the string reaches NO close, so
+///   that reading runs to the end of the value —
+///   [`crate::grammar::Readings::absorb`] calls it SEALED and has ruled that
+///   way for §5.6.6's `parameters` since `gzip;;x="a%x01, chunked, b", br` cut
+///   raw handed a caller a `chunked` that stood among those bytes. This module
+///   used to answer the other way: three states read as a boolean lost the
+///   third, and `Basic x="%x01, Digest realm=evil` handed a caller a `Digest`
+///   built out of bytes behind a DQUOTE that never closed.
 ///
-///   This module used to answer the other way, and the difference is the whole
-///   of what [`Readings::of`] is here for: three states read as a boolean lost
-///   the third, `refused_element_end` certified the raw comma, and
-///   `Basic x="%x01, Digest realm=evil` handed a caller a `Digest` built out of
-///   bytes behind an admitted opening DQUOTE that never closed. A forbidden
-///   byte standing BEHIND the comma is still not in front of it and decides
-///   nothing here: what the sender wrote between the DQUOTE and the comma is
-///   `qdtext` either way.
-///
-/// # Why the answer is taken from `grammar` and not spelled again
-///
-/// Because it is one question and this crate had two answers to it. The set a
-/// scan leaves is [`crate::grammar::Readings`], its [`covers`](Readings::covers)
-/// asks the very question this function is named for, and [`Readings::of`] is
-/// that set for a caller with ONE admitted opener — which [`opener_at`]'s doc
-/// is what makes this one. So the three states become readings in one place
-/// for both walks, and no later check can find them disagreeing again.
+/// The answer is taken from [`crate::grammar::Readings`] rather than spelled
+/// again because it is one question and this crate had two answers to it.
 fn some_reading_holds(
   value: &[u8],
   at: usize,
@@ -2773,35 +2438,24 @@ fn some_reading_holds(
 /// §11.2 offers at a value position is no longer forced on the bytes there — it
 /// is a reading, beside the reading that leaves the DQUOTE shut.
 /// [`some_reading_holds`] is where the two are compared, and this reports the
-/// comma only where they agree.
-///
-/// Where they do not, the answer is `None` and
-/// [`AuthError::ChallengeBoundaryUnknown`] is what the walk tells the caller.
+/// comma only where they agree. Where they do not, the answer is `None`.
 /// Cutting at the comma there is how
 /// `Basic p1=1, ..., p17=17, x="c, Digest realm=evil, junk"` — one field line,
 /// no repeated name, nothing malformed, and a value RFC 9110 §11.2 bounds
 /// nowhere — handed a caller a `Digest` challenge with a `realm` of `evil` that
-/// no origin server sent. The trigger was [`MAX_PARAMS_PER_CREDENTIAL`], which
-/// is this reader's own refusal and not the grammar's, so the input that
-/// reaches it conforms.
+/// no origin server sent. The trigger was [`MAX_PARAMS_PER_CREDENTIAL`], this
+/// reader's own refusal and not the grammar's, so the input conforms.
 ///
 /// # A join carries a second reading here, and `after_comma` is it
 ///
 /// `after_comma` says RFC 9110 §5.6.1.2's comma stands in front of `at`, which
 /// is the whole of what §11.6.1 needs to read a `challenge` there rather than
-/// one more `auth-param`. It is set where §5.2's join carried a refused element
-/// onto the line the walk now stands on: the reading that shut that element's
-/// value AT the join opens an element of the outer list at this line's head,
-/// and a challenge is what that element may be. `Basic a="x` and
+/// one more `auth-param`. `Basic a="x` and
 /// `Digest realm="evil, Newauth realm=z, junk", Safe realm=s` are the two field
-/// lines that showed it — one reading takes the DQUOTE behind `realm=` as the
-/// CLOSE of `a`'s value, and the other takes it as the OPEN of a `realm` whose
-/// data runs `evil, Newauth realm=z, junk`. The comma behind `evil` is that
-/// realm's own byte in the second reading, and crossing it handed a caller a
-/// `Newauth` challenge out of the middle of a value the sender wrote whole.
-/// [`opener_at`] is where the reading is admitted, [`Recovery::after_comma`]
-/// where it is carried, and [`Recovery::floor`] answers for the OTHER reading
-/// of the same join — the one that carried the value onto this line.
+/// lines that showed it: the DQUOTE behind `realm=` closes `a`'s value under
+/// one reading and opens a `realm` under the other, and crossing the comma
+/// behind `evil` invented a `Newauth` out of that realm's data.
+/// [`Recovery::floor`] answers for the OTHER reading of the same join.
 fn refused_element_end(
   value: &[u8],
   at: usize,
@@ -2811,15 +2465,13 @@ fn refused_element_end(
   floor: usize,
 ) -> Option<usize> {
   // Asked FIRST, because a comma in front of the carried value's close is not
-  // a comma this element ends at under any reading and `some_reading_holds` is
-  // a question about the readings admitted AT THE CURSOR — which no longer
+  // a comma this element ends at under any reading, and `some_reading_holds`
+  // is a question about the readings admitted AT THE CURSOR — which no longer
   // include the one that carried that value here. The span still derives, so
   // `( token / quoted-string )` is not a choice at its value position: the
   // element ends at the close, and `floor` is that close, an offset ON this
   // line because [`scan_element`] stops crossing joins the moment a string
-  // closes. A byte behind the close would have made this `ValueTail::Trails`,
-  // which [`auth_param`] refuses — so a span that reaches here with `forced`
-  // true has only §5.6.1.2's own `OWS` between the close and the comma.
+  // closes.
   if forced && floor > at {
     return Some(raw_comma_end(value, floor));
   }
@@ -2844,8 +2496,7 @@ fn refused_element_end(
     // nothing is where the freedom this span had claimed to be free of BEGINS.
     // `ends_element` is that test, and it is what tells `a="x,p,q"` — whose
     // string closes inside its own element — from `y="q, Bearer, x="`, whose
-    // does not: the close there is another element's opener, `open` stands
-    // behind it, and nothing derives.
+    // does not.
     QuotedScan::Closed(close) if ends_element(value, close) => Some(raw_comma_end(value, close)),
     QuotedScan::Closed(_) => None,
     // It closes nowhere on this line, so every byte behind the DQUOTE is that
@@ -2856,10 +2507,6 @@ fn refused_element_end(
 
 /// Where the RFC 9110 §5.6.1.2 element starting at `at` ends — the comma that
 /// separates it from the next, or the end of `value`.
-///
-/// [`crate::grammar::scan_quoted`] is this crate's one implementation of what
-/// a quoted-string IS, and the answer here is taken from it, so a comma inside
-/// one is data here exactly as it is everywhere else in the crate.
 ///
 /// # A DQUOTE opens nothing where no string may begin
 ///
@@ -2875,34 +2522,21 @@ fn refused_element_end(
 /// RFC 9110 §5.6.2's `tchar` excludes DQUOTE, `token68`'s alphabet excludes it,
 /// and §5.6.3's `BWS` is SP and HTAB — so the first byte of an `auth-param`
 /// value is the only place any of these admits one. [`param_value_at`] is that
-/// position. Anywhere else a DQUOTE is a byte no production admits: it opens
-/// no string, and the element ends at the first RAW comma like any other run
-/// that holds none, which is what [`raw_comma_end`] answers.
-///
-/// Reading a DQUOTE as an opener wherever it fell is how a malformed challenge
-/// hid a well-formed one. In `Basic a=x"y, Digest realm=z` the value of `a`
-/// already took the `token` alternative, so the DQUOTE behind it begins
-/// nothing — yet it opened a string that swallowed the comma in front of
-/// `Digest`, and RFC 9110 §11.4 has a user agent select "the challenge with
-/// what it considers to be the most secure auth-scheme that it understands",
-/// which it cannot do over a challenge it was never shown.
-///
-/// # And a close is not an end
-///
-/// [`after_close`]'s rule, for the one string that may open here: an
-/// `auth-param` value is one alternative taken WHOLE, so the string that closes
-/// closes the last thing the element may hold, and the scan does not go on
-/// hunting delimiters behind it.
+/// position. Anywhere else a DQUOTE is a byte no production admits, and the
+/// element ends at the first RAW comma. Reading a DQUOTE as an opener wherever
+/// it fell is how a malformed challenge hid a well-formed one: in
+/// `Basic a=x"y, Digest realm=z` the value of `a` already took the `token`
+/// alternative, so the DQUOTE behind it begins nothing — yet it opened a string
+/// that swallowed the comma in front of `Digest`. And a close is not an end:
+/// [`after_close`]'s rule, for the one string that may open here.
 ///
 /// # What the rule costs
 ///
 /// An unadmitted DQUOTE pairs with no later one, so a DQUOTE that a
 /// pair-anywhere reading would have used to CLOSE a refused run leaves the
-/// next admitted position free to OPEN instead. `Basic ",a=", Digest realm=z`
-/// reaches `Digest` under that reading, its first DQUOTE swallowing its
-/// second, and hides it under this one, where the value of `a` is the
-/// quoted-string §11.2 says it is with nothing to close it. That is not this
-/// rule erring: a string opened where one IS admitted runs to wherever it
+/// next admitted position free to OPEN instead: `Basic ",a=", Digest realm=z`
+/// reaches `Digest` under that reading and hides it under this one. That is not
+/// this rule erring — a string opened where one IS admitted runs to wherever it
 /// closes and §5.6.4 makes every comma inside it data, which is why
 /// `Basic a="x, Digest realm=z` has always answered the same way.
 fn element_end(value: &[u8], at: usize) -> Delim {
@@ -2922,11 +2556,9 @@ fn element_end(value: &[u8], at: usize) -> Delim {
 ///
 /// `#element => [ element ] *( OWS "," OWS [ element ] )` puts `OWS` on BOTH
 /// sides of every comma, so the whitespace in front of one belongs to the list
-/// and not to the element it follows. [`auth_param`] is handed an element with
-/// that whitespace already off both ends, and a walk that left the trailing
-/// half on would refuse `Basic a=1 , b=2` — §11.2's
-/// `( token / quoted-string )` is one alternative taken whole, and a token
-/// with a space behind it is neither.
+/// and not to the element it follows. A walk that left the trailing half on
+/// would refuse `Basic a=1 , b=2` — §11.2's `( token / quoted-string )` is one
+/// alternative taken whole, and a token with a space behind it is neither.
 ///
 /// Only ever called where the element ENDED on this line. A line that runs out
 /// inside a §5.6.4 quoted-string ends no element, and a space there is data the
@@ -2948,12 +2580,9 @@ fn trim_ows_end(value: &[u8], end: usize) -> usize {
 /// comma it hangs on is really behind it. §5.6.3's `OWS` is SP or HTAB, so one
 /// byte cannot answer this: the run has to be walked to what it reaches.
 ///
-/// The end of `value` counts as that comma. RFC 9110 §5.2 joins repeated field
-/// lines into one value with a comma between them, so a run reaching the end
-/// of ONE line meets the comma next; and where no line follows, the value ends
-/// and no element stands behind the whitespace either way. That is the
-/// terminator [`token68`] already reads, and this is the one place it is
-/// written.
+/// The end of `value` counts as that comma, since RFC 9110 §5.2 puts one at
+/// every join and where no line follows the value ends. That is the terminator
+/// [`token68`] already reads, and this is the one place it is written.
 fn ends_element(value: &[u8], at: usize) -> bool {
   matches!(value.get(skip_ows(value, at)), None | Some(&b','))
 }
@@ -2978,9 +2607,7 @@ fn skip_sp(value: &[u8], at: usize) -> usize {
 /// That is RFC 9110 §11.4's reading, which §11.6.2 gives `Authorization`:
 /// `Authorization = credentials` is singular, so no comma in it can end a
 /// credential and start another. §11.6.1's `WWW-Authenticate = #challenge` is
-/// the field where a comma has two possible meanings, and telling them apart
-/// is that walk's own work — it finds each challenge's regions and this reads
-/// what they hold.
+/// the field where a comma has two possible meanings.
 ///
 /// `lines` are the field's lines in wire order (§5.2). An EMPTY first line is
 /// [`AuthError::MissingScheme`] rather than an element to skip: `credentials`
@@ -3012,12 +2639,10 @@ where
       let at = skip_sp(head, scheme_end);
       // `1*SP` has taken every SP there was, so a HTAB here is whitespace the
       // parameter list owns rather than whitespace the scheme does. RFC 9110
-      // §5.6.1.2 expands a list as
-      // `#element => [ element ] *( OWS "," OWS [ element ] )`, which hangs
-      // every OWS it has on a comma: reaching that comma, the HTAB is the OWS
-      // in front of it and the section opens on the empty first element the
-      // expansion admits; reaching an element instead, nothing derives it and
-      // the section cannot start at all.
+      // §5.6.1.2 hangs every OWS a list has on a comma: reaching that comma,
+      // the HTAB is the OWS in front of it and the section opens on the empty
+      // first element the expansion admits; reaching an element instead,
+      // nothing derives it and the section cannot start at all.
       if head.get(at) == Some(&b'\t') && !ends_element(head, at) {
         return Err(AuthError::MalformedScheme);
       }
@@ -3067,18 +2692,16 @@ where
 /// `credentials` is singular. Neither field is a `#`-list, so there is no list
 /// at the top of either value for a comma to be a separator of, and every
 /// comma in one belongs to the `#auth-param` list the production ends in. The
-/// question [`challenges`] has to answer at each comma — another `auth-param`
-/// of the challenge already open, or the `auth-scheme` of the next one — has
-/// no second reading to choose between here, and this path asks it nowhere.
+/// question [`challenges`] has to answer at each comma has no second reading
+/// to choose between here, and this path asks it nowhere.
 ///
 /// A sender that writes two credentials into one value is therefore read as
 /// the field is defined rather than as it was meant. `Basic x=1, Digest y=2`
-/// puts `Digest y` where a parameter's name and its `=` belong, and RFC 9110
-/// §11.2's `auth-param = token BWS "=" BWS ( token / quoted-string )` admits
-/// only §5.6.3's `BWS` between those two, so a second token there is derived
-/// by nothing. [`AuthError::MalformedParameter`] is the answer and it is the
-/// right one: the field admits one credential, and reporting a malformed one
-/// is not the same as silently taking the first of two.
+/// puts `Digest y` where a parameter's name and its `=` belong, and §11.2's
+/// `auth-param = token BWS "=" BWS ( token / quoted-string )` admits only
+/// §5.6.3's `BWS` between those two. [`AuthError::MalformedParameter`] is the
+/// answer and it is the right one: reporting a malformed credential is not the
+/// same as silently taking the first of two.
 ///
 /// # A trailing comma, which needs a list to be an empty element of
 ///
@@ -3087,11 +2710,7 @@ where
 /// module's. There the comma is an empty element of `#challenge`, and RFC 9110
 /// §5.6.1.2 is what skips it: "A recipient MUST parse and ignore a reasonable
 /// number of empty list elements". Here `token68` has matched `dGVzdA==`, the
-/// production is complete, and no list is left for an empty element to sit in
-/// — nor is `,` one of the bytes `token68` is made of, so nothing derives it
-/// at all. The body is then read as the other alternative and refused there,
-/// which is where §11.2 has a fault to name.
-///
+/// production is complete, and no list is left for an empty element to sit in.
 /// Where the credential took the `#auth-param` branch instead —
 /// `Newauth realm="x",` — the trailing comma IS an empty element of that list,
 /// and is skipped in this singular field exactly as in the plural one.
@@ -3108,13 +2727,11 @@ where
 /// [`AuthError::InvalidQuotedString`], [`AuthError::DuplicateParameter`] for
 /// RFC 9110 §11.2's one-name-once MUST, applied to this field's list for the
 /// reason that variant records, and [`AuthError::TooManyParameters`] past
-/// [`MAX_PARAMS_PER_CREDENTIAL`] names. One `Result` and nothing behind it: there is
-/// one credential in the field, so there is nothing to continue to, and a
-/// fault anywhere in it refuses the whole value rather than a part of it.
+/// [`MAX_PARAMS_PER_CREDENTIAL`] names. One `Result` and nothing behind it: a
+/// fault anywhere in the one credential refuses the whole value.
 ///
 /// Not [`AuthError::ChallengeSpansTooManyLines`], which needs a second field
-/// line to be reachable at all: this field's value is one, and the reader
-/// beneath is handed exactly that one.
+/// line to be reachable at all: this field's value is one.
 #[inline]
 pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
   read_credential([value])
@@ -3122,6 +2739,7 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 
 /// Reads RFC 9110 §11.6.1's `WWW-Authenticate` and §11.7.1's
 /// `Proxy-Authenticate` — the two authentication fields whose value is a list
+/// of challenges rather than one credential.
 /// of challenges rather than one credential.
 ///
 /// ```text
@@ -3153,11 +2771,9 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// challenge with one parameter, and `Basic, type=1` is TWO, the second of
 /// which nothing derives. The two values differ by one byte, and a walker that
 /// split on commas with the `OWS` §5.6.1.2 hangs on them already trimmed off
-/// would have destroyed the byte that separates them. What is asked of that
-/// byte is whether it is SP, and what is asked of a HTAB is where its `OWS`
-/// run gets to: `Basic<HTAB>, Newauth x=1` is two challenges, because the
-/// scheme is followed by the list's own whitespace and then the comma that
-/// ends its element.
+/// would have destroyed the byte that separates them. What is asked of a HTAB
+/// is where its `OWS` run gets to: `Basic<HTAB>, Newauth x=1` is two
+/// challenges.
 ///
 /// **At a comma an empty element is skipped first.** §5.6.1.2: "A recipient
 /// MUST parse and ignore a reasonable number of empty list elements". The skip
@@ -3169,9 +2785,7 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// **Then the next element's leading `token` and the first non-`BWS` byte
 /// behind it decide.** `auth-param = token BWS "=" BWS ( token / quoted-string )`
 /// opens with exactly those two, so an `=` there makes the element a parameter
-/// of the CURRENT challenge and anything else — a different byte, the
-/// element's end, or no leading token at all — makes it the scheme of the
-/// next.
+/// of the CURRENT challenge and anything else makes it the scheme of the next.
 ///
 /// A challenge then closes at the end of its last VALUE, not at the end of the
 /// element that question was asked about, so nothing of the next challenge is
@@ -3189,68 +2803,36 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// [`crate::grammar::parameterised_list`], which poisons on any `Err`: a
 /// parameter list is not a list a caller searches.
 ///
-/// **What it may not do instead is invent one.** Behind the fault nothing
-/// derives, so §11.2's `( token / quoted-string )` is no longer forced on the
-/// bytes at a value position: an element standing there has a reading that
-/// opens the string and a reading that leaves it shut, and where the two
-/// disagree about the next comma the bytes behind it are that value's data
-/// under one reading and a whole challenge under the other. The walk crosses
-/// only the commas EVERY reading ends an element at — `refused_element_end` —
-/// and where none can be vouched for it reports
+/// **What it may not do instead is invent one.** The walk crosses only the
+/// commas EVERY reading ends an element at — `refused_element_end` — and where
+/// none can be vouched for it reports
 /// [`AuthError::ChallengeBoundaryUnknown`] and stops, which is the last item it
 /// yields. `Basic p1=1, ..., p17=17, x="open, Digest realm=z` is why: one field
 /// line, no repeated name, nothing malformed, and a string that never closes,
 /// so no reading of the value says where `x`'s parameter ends. Cutting at the
 /// first raw comma there is what handed a caller a `Digest` out of the middle
-/// of that parameter's data.
-///
-/// [`AuthError::InvalidQuotedString`] is the one that looks like an exception
-/// and is not — a refusal like every other, recovered from like every other. A
-/// byte that fault fires on is one RFC 9110 §5.5 admits nowhere in a field
-/// value, so no `quoted-string` DERIVES over it; what the sender wrote is
-/// unchanged by that. The DQUOTE stands where §11.2 admits a value, and a run
-/// opened there that reaches no close holds every comma behind it, so
-/// `some_reading_holds` reports it and no boundary is certified.
-/// `crate::grammar::Readings::absorb` calls that reading SEALED and is where
-/// the ruling lives, for this walk and for §5.6.6's alike. A forbidden byte
-/// standing BEHIND the candidate comma still decides nothing: the bytes between
-/// the DQUOTE and the comma are `qdtext` either way.
+/// of that parameter's data. [`AuthError::InvalidQuotedString`] is the one that
+/// looks like an exception and is not — a refusal like every other, recovered
+/// from like every other.
 ///
 /// A failed challenge is reported ONCE. The walk does not re-read what is left
 /// of it as challenges of its own, so in
 /// `Basic a=1, =x, type=b, Newauth c=1` the `type=b` is part of the failure
-/// already reported rather than a second one. That seek reports no fault of its
-/// own except the boundary it could not derive.
+/// already reported rather than a second one.
 ///
 /// # How many faults one malformed value yields
 ///
 /// Once per refused challenge, and a value can hold more refused challenges
-/// than a sender wrote. Getting past a refusal crosses only commas no reading
-/// of the bytes in front of them holds inside a §5.6.4 quoted-string, and an
-/// element whose grammar admits no string at all offers no reading to hold one
-/// — so such a comma ends the refused run here, and what stands behind it is
-/// read as a challenge of its own and refused in its turn.
-/// `Basic<HTAB>Newauth realm="a, b"` is one such value: the scheme is refused,
-/// and `Newauth realm="a, b"` is an element no `auth-param` derives — it has no
-/// `=` behind its leading token — so nothing opens a string over the comma
-/// inside `"a, b"`, and what stands behind that comma is refused in its turn.
-/// Two [`AuthError::MalformedScheme`]s here, where a quote-anywhere recovery
-/// reports one.
-///
-/// A run cut this way shows a caller more elements than the sender wrote, each
-/// answered on its own, and never fewer — the cut is at a comma every reading
-/// agrees on. What a caller can still be shown that the sender did not write is
-/// two cases and two only, and they are not the same kind of thing.
-/// [`MAX_CHALLENGE_LINES`] is this READER's refusal rather than a fault of the
-/// sender's, so it can refuse a value some derivation still admits; that
-/// constant carries the trade. [`AuthError::InvalidQuotedString`] can do the
-/// same arithmetic on a value NO derivation admits — the field value carries a
-/// byte §5.5 forbids anywhere in one — so what a caller is shown there is built
-/// out of bytes that were never a value to begin with. But a caller that COUNTS
-/// the `Err`s of a malformed value rather than reading them is counting
-/// something this reader decides and not something the sender wrote, and will
-/// see a different number than a quote-aware recovery gives. Read the faults;
-/// do not total them.
+/// than a sender wrote: what stands behind a comma this walk crosses is read as
+/// a challenge of its own and refused in its turn.
+/// `Basic<HTAB>Newauth realm="a, b"` is one such value — two
+/// [`AuthError::MalformedScheme`]s, where a quote-anywhere recovery reports
+/// one. A run cut this way shows a caller more elements than the sender wrote,
+/// never fewer, and the two that can be shown WITHOUT the sender having written
+/// them are [`MAX_CHALLENGE_LINES`], whose constant carries the trade, and
+/// [`AuthError::InvalidQuotedString`] on a value no derivation admits. A caller
+/// that COUNTS the `Err`s is counting something this reader decides. Read the
+/// faults; do not total them.
 ///
 /// Validation is eager — a challenge is walked to its end before it is yielded
 /// — which is what lets [`Credential::params`] be infallible and what lets one
@@ -3298,21 +2880,15 @@ impl AuthError {
   /// Whether this fault is a bound THIS recipient sets rather than one RFC
   /// 9110's grammar has, which is what decides whether the readings behind it
   /// are still the grammar's.
-  ///
   /// RFC 9110 §11.6.1's ambiguity is about where one element of a list ends and
   /// the next begins. Behind an element §5.6.1.2 and §11.2 derive nothing at,
   /// no boundary is fixed any more: a DQUOTE at a value position may open a
-  /// §5.6.4 quoted-string and may be left shut, and the elements behind it are
-  /// wherever the reading puts them. That is the regime a recovery
+  /// §5.6.4 quoted-string and may be left shut. That is the regime a recovery
   /// [`Epoch`] is about, and only a fault of the GRAMMAR opens one.
   ///
   /// A bound moves no boundary. [`MAX_PARAMS_PER_CREDENTIAL`] and
-  /// [`MAX_CHALLENGE_LINES`] are this reader's own — the module doc says so
-  /// where each is defined, and neither is written anywhere in RFC 9110 — so
-  /// the value they refuse is one the grammar still derives from end to end,
-  /// with every element exactly where §5.6.1.2 puts it. What the refusal says
-  /// is that this recipient will not HOLD the challenge, and never that it
-  /// cannot find the next one.
+  /// [`MAX_CHALLENGE_LINES`] are this reader's own, so the value they refuse is
+  /// one the grammar still derives from end to end.
   ///
   /// [`AuthError::DuplicateParameter`] is the third and it is a bound of the
   /// same kind, which is the one classification here that is not obvious. RFC
@@ -3320,10 +2896,7 @@ impl AuthError {
   /// prose about NAMES laid over a list §5.6.1.2 has already delimited: a
   /// repeat makes the challenge one no conforming sender wrote, and it moves no
   /// comma. `Basic a=1, a=2, Bearer abc, x="open, Digest realm=z` is where that
-  /// decides an answer — `Bearer abc` is RFC 9110 §11.2's `token68` and no
-  /// `auth-param` derives it, so the `Basic` list has ended under every reading
-  /// the grammar admits, the DQUOTE behind it stands at no value position, and
-  /// the `Digest` is a challenge rather than that value's data.
+  /// decides an answer.
   const fn is_a_receiver_bound(self) -> bool {
     match self {
       // This reader's three, none of them RFC 9110's.
@@ -3355,17 +2928,14 @@ impl AuthError {
 /// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
 /// ```
 ///
-/// [`Credential`] answers which of §11.3's two bodies the challenge took —
-/// [`Credential::token68`] is `Some` for the one and `None` for the other — but
+/// [`Credential`] answers which of §11.3's two bodies the challenge took, but
 /// it cannot answer whether there was a body at all: a bare `auth-scheme` and
 /// one whose `1*SP` is followed by nothing carry the same empty
 /// [`BodyLines`], and only the second of them opened a `#auth-param` list.
 /// `Basic` and `Basic<SP>` are those two values, and
 /// `Basic<SP>, Broken<HTAB>junk, x="open, Digest realm=z` is where telling them
-/// apart decides whether a challenge is hidden.
-///
-/// So the `1*SP` is carried here rather than re-derived from bytes the
-/// credential no longer holds, and [`Challenges::challenge`] is the one reader.
+/// apart decides whether a challenge is hidden. So the `1*SP` is carried here
+/// rather than re-derived from bytes the credential no longer holds.
 struct Complete<'a> {
   /// The challenge.
   credential: Credential<'a>,
@@ -3404,15 +2974,15 @@ enum Step {
     /// admitted by the `1*SP` in front of it and is asked nothing.
     after_comma: bool,
     /// Whether reaching it took a field LINE — RFC 9110 §5.2's join rather
+    /// Whether reaching it took a field LINE — RFC 9110 §5.2's join rather
     /// than a comma the sender wrote.
     ///
     /// Reported by [`Challenges::open_element`] because that is the only place
     /// this walk replaces the line it holds, so it is the only place that can
-    /// answer without inferring. An offset taken on the line a refusal was made
-    /// on means nothing once one of these has been crossed —
-    /// [`Epoch::floor`] is such an offset — and a walk that inferred the
-    /// crossing from a line's LENGTH would answer `false` for two lines that
-    /// happen to be as long as each other.
+    /// answer without inferring. [`Epoch::floor`] is an offset on the line a
+    /// refusal was made on and means nothing once one of these has been
+    /// crossed, and a walk that inferred the crossing from a line's LENGTH
+    /// would answer `false` for two lines as long as each other.
     crossed: bool,
   },
   /// The value has no more elements.
@@ -3462,8 +3032,7 @@ enum Refusal {
   /// Two faults arrive this way and the string is open for a different reason
   /// in each: the line bound leaves it open on a line the challenge may not
   /// hold, and a byte §5.6.4 forbids leaves it open on a run that reaches no
-  /// close at all. [`Challenges::skip_element`] is the one entrance and its doc
-  /// tells the two apart.
+  /// close at all. [`Challenges::skip_element`] is the one entrance.
   Unbounded(AuthError),
   /// The challenge's extent is already COMPLETE and the fault is reported over
   /// the whole of it, so the cursor is on the next challenge's first byte and
@@ -3509,12 +3078,10 @@ impl Refusal {
 /// SUFFIX of that element rather than on the element. Nothing checked the
 /// enumeration, so nothing said so, and `Basic a=1, a="x` and
 /// `y", Bearer, x="open, Digest realm=z` hid a `Digest` behind a claim the
-/// grammar never refuted.
-///
-/// So every entrance names its own, [`Challenges::refuse`] is the one reader,
-/// and a fault added later cannot decline to say where it left the walk.
-/// [`a_refusal_leaves_the_cursor_where_its_span_begins`] is what checks the
-/// part of each row a walk can check for itself.
+/// grammar never refuted. So every entrance names its own,
+/// [`Challenges::refuse`] is the one reader, and
+/// [`a_refusal_leaves_the_cursor_where_its_span_begins`] checks the part of
+/// each row a walk can check for itself.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Origin<'a> {
   /// The first byte of an element on the line the walk holds, with RFC 9110
@@ -3527,25 +3094,21 @@ enum Origin<'a> {
   /// §11.3 admits nothing at; [`Section::outgrown`]'s line bound met between
   /// two elements; [`BodyCheck::settle`]'s held verdict on the element behind
   /// the cursor; the fault [`Challenges::skip_element`] raises with nothing
-  /// crossed, where the scan never advanced past the element's first byte; and
-  /// the two [`Refusal::Ended`] carries, on the next challenge's own first byte
-  /// or at the end of a value whose lines the walk read to the last.
+  /// crossed; and the two [`Refusal::Ended`] carries.
   ///
   /// Only [`Section::outgrown`]'s and [`BodyCheck::settle`]'s are reached by a
   /// receiver bound, so they are the only two
-  /// [`Challenges::sustain_the_epoch`] ever slices a line at. The
-  /// [`Refusal::Ended`] pair never seeks at all.
+  /// [`Challenges::sustain_the_epoch`] ever slices a line at.
   Unread,
   /// The body position RFC 9110 §11.3's `1*SP` opened, which is the first
   /// element of this challenge's own `#auth-param` list.
   ///
   /// One entrance: the `1*SP` whose body opens on a HTAB. It is told apart from
+  /// One entrance: the `1*SP` whose body opens on a HTAB. It is told apart from
   /// [`Unread`](Self::Unread) because §5.6.1.2 hangs a list's `OWS` on its
   /// COMMAS and there is no comma in front of a body's first element — so the
   /// whitespace standing here is derived by nothing, and the cursor is on it
-  /// rather than past it. `Basic<SP><HTAB>a, a=", Digest realm=z` is the value,
-  /// and [`opener_at`] reads the first parameter's value position from exactly
-  /// this offset.
+  /// rather than past it. `Basic<SP><HTAB>a, a=", Digest realm=z` is the value.
   ///
   /// No receiver bound reaches it — [`AuthError::MalformedScheme`] is a fault
   /// of the grammar's — so no span is ever sliced from here.
@@ -3598,8 +3161,7 @@ enum Origin<'a> {
 /// after another — first monotone over the whole value, then cleared on one
 /// completion path out of three, then held past a completion by a second flag
 /// that was monotone itself. Each fix made the expiry a little more total and
-/// left one entrance open; each of those entrances is what the next fix had
-/// to close.
+/// left one entrance open.
 ///
 /// So the fact is not a flag here. It belongs to the refusal it came from, it
 /// lives exactly as long as the walk is still inside the stretch of value that
@@ -3615,34 +3177,19 @@ enum Origin<'a> {
 /// about the whole span, put to every element in it by
 /// [`Challenges::sustain_the_epoch`].
 ///
-/// # What opens one
+/// # What opens one, and what closes one
 ///
-/// Every refusal, at [`Challenges::refuse`], which is the only place one is
-/// made.
-///
-/// # What closes one
-///
-/// The first position no reading this epoch admits places inside the list it
-/// holds open — and whether such a position exists at all is
-/// [`derivable`](Self::derivable)'s.
-///
-/// - **Where the grammar still derives the value**, the readings behind the
-///   refusal are §5.6.1.2's own and nothing else's, so the first challenge that
-///   COMPLETES ends the list: its own element derives as an element of the
-///   outer `#challenge` list and derives as nothing else. That is the one
-///   position, and [`Challenges::close_the_epoch`] carries why the element
-///   [`Challenges::seek`] resumes on is not a second one. Whether the grammar
-///   still derives the value is a question about the whole SPAN and not only
-///   about the refusal that opened it — [`derivable`](Self::derivable) is that
-///   claim and [`Challenges::sustain_the_epoch`] is what every element in the
-///   span is put to.
-/// - **Where it does not**, no position does. Behind an element that derives
-///   nothing, one reading has every element since as garbage the open list
-///   still holds, and that reading has the list open behind a bare
-///   `auth-scheme` and behind a `token68` too. Such an epoch is closed by
-///   nothing, and `Basic a=1, Broken<HTAB>junk, Bearer, x="open, Digest
-///   realm=z` is the value that says so: without it the `Digest` behind `x` is
-///   read out of the middle of that parameter's own value.
+/// Every refusal opens one, at [`Challenges::refuse`]. What closes one is the
+/// first position no reading this epoch admits places inside the list it holds
+/// open — and whether such a position exists at all is
+/// [`derivable`](Self::derivable)'s. Where the grammar still derives the value,
+/// the first challenge that COMPLETES ends the list — its own element derives
+/// as an element of the outer `#challenge` list and as nothing else — and
+/// [`Challenges::close_the_epoch`] carries why the element
+/// [`Challenges::seek`] resumes on is not a second such position. Where it does
+/// not, no position does: one reading has every element since as garbage the
+/// open list still holds, even behind a bare `auth-scheme` or a `token68`.
+/// `Basic a=1, Broken<HTAB>junk, Bearer, x="open, Digest realm=z` says so.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 struct Epoch<'a> {
   /// Whether a `#auth-param` list may be open at the offset recovery starts
@@ -3663,23 +3210,13 @@ struct Epoch<'a> {
   /// It says that THIS recipient's own limit, and not RFC 9110's grammar, is
   /// why the value stopped being read — so a derivation of the whole value
   /// reaches through every element between the refusal and the position the
-  /// epoch may close at, and the claim is about all of them. Three things
-  /// carry it, and the first element the grammar derives nothing at refutes it
-  /// whichever of the three that element reaches:
-  ///
-  /// - **The refusal that opened the epoch.**
-  ///   [`AuthError::is_a_receiver_bound`] is that test and its doc is the
-  ///   argument.
-  /// - **Every element [`Challenges::seek`] crosses behind it**, the one the
-  ///   refusal left the cursor on included.
-  ///   [`Challenges::sustain_the_epoch`] is that test and its doc is the
-  ///   argument. `Basic a=1, a=2, y=, Bearer, x="open, Digest realm=evil,
-  ///   junk"` is the value that needs it: `y=` is an element the grammar
-  ///   derives nothing at, standing in a span a duplicate name opened.
-  /// - **The epoch this one was opened behind.**
-  ///   [`Epoch::reaches_past_itself`] is that test and its doc is the argument.
-  ///   An epoch opened behind one whose ambiguity can still be about these
-  ///   bytes cannot be closed either.
+  /// epoch may close at.
+  /// the refusal that opened the epoch ([`AuthError::is_a_receiver_bound`]),
+  /// every element [`Challenges::seek`] crosses behind it — the one the refusal
+  /// left the cursor on included ([`Challenges::sustain_the_epoch`]) — and the
+  /// epoch this one was opened behind ([`Epoch::reaches_past_itself`]).
+  /// `Basic a=1, a=2, y=, Bearer, x="open, Digest realm=evil, junk"` is the
+  /// value the second needs.
   ///
   /// The refutation is permanent in all three, for one reason: what makes the
   /// readings free is the FIRST element the grammar derives nothing at, and no
@@ -3695,15 +3232,12 @@ struct Epoch<'a> {
   /// that writes it. It lives HERE rather than on the walk because that is what
   /// makes it unforgettable: an epoch is built whole at
   /// [`Challenges::refuse`], so a refusal that has no join to report writes the
-  /// `false` as part of building one and cannot omit it, and the answer dies
-  /// with the epoch it was taken over rather than waiting for a later refusal
-  /// to overwrite it.
+  /// `false` as part of building one and cannot omit it.
   ///
   /// [`Challenges::seek`] takes it on its FIRST run and leaves it false,
   /// because every later cursor that loop reaches is one `open_element` left on
   /// an element's own first byte and [`opens_a_challenge`] has already answered
-  /// `false` for — so neither the challenge reading nor the `OWS` skip it
-  /// carries has anything left to do there.
+  /// `false` for.
   after_comma: bool,
   /// Where the value RFC 9110 §5.2's join carried onto this line CLOSES, or the
   /// cursor where no join carried one.
@@ -3712,10 +3246,8 @@ struct Epoch<'a> {
   /// [`Challenges::seek`] and only while [`derivable`](Self::derivable) holds:
   /// a span that still derives has ONE reading of its value position, so the
   /// element ends at that close and the commas in front of it are that value's
-  /// data in every reading rather than in some of them. Where the span does not
-  /// derive there are two readings and no offset either of them agrees to
-  /// resume at, which is what `AuthError::ChallengeBoundaryUnknown` tells the
-  /// caller.
+  /// data in every reading. Where the span does not derive there are two
+  /// readings and no offset either of them agrees to resume at.
   floor: usize,
   /// The element this refusal was made OVER, where the walk had already scanned
   /// one — which is not always the run standing at the cursor.
@@ -3724,48 +3256,32 @@ struct Epoch<'a> {
   ///
   /// [`Challenges::sustain_the_epoch`] puts the span's every element to RFC
   /// 9110 §11.2, and it needs the ELEMENT. Where §5.2's join carried the
-  /// refused element onto the line the walk now stands on,
-  /// [`Recovery::at`] is the head of that line and the run standing there is a
-  /// SUFFIX of the element — the bytes behind the close of a value that began
-  /// on a line this walk no longer holds. Slicing at the cursor and reading
-  /// that suffix as a whole `auth-param` refutes the span's claim over an
-  /// element the grammar derived: `Basic a=1, a="x` and
-  /// `y", Bearer, x="open, Digest realm=z` are the two field lines that say so
-  /// — `a`'s value is `x,y`, §11.2 derives the element whole, and the duplicate
-  /// name that refused it is a bound of this reader's and moves no comma. The
-  /// suffix `y"` derives nothing, so the epoch was refuted, `Bearer` could not
-  /// close it, and the genuine `Digest` was hidden behind
+  /// refused element onto the line the walk now stands on, [`Recovery::at`] is
+  /// the head of that line and the run standing there is a SUFFIX of the
+  /// element. Slicing at the cursor and reading that suffix as a whole
+  /// `auth-param` refutes the span's claim over an element the grammar derived:
+  /// `Basic a=1, a="x` and `y", Bearer, x="open, Digest realm=z` are the two
+  /// field lines that say so — `a`'s value is `x,y`, §11.2 derives the element
+  /// whole, and the duplicate name that refused it moves no comma. The suffix
+  /// `y"` derives nothing, so the epoch was refuted, `Bearer` could not close
+  /// it, and the genuine `Digest` was hidden behind
   /// [`AuthError::ChallengeBoundaryUnknown`].
-  ///
-  /// So the element is carried rather than reconstructed. It is the pair
-  /// [`Element`] holds — the bytes ON the line it began on, and the
-  /// [`ValueTail`] saying what §5.2's join did with a value it left open there
-  /// — which is exactly what [`auth_param`] is asked over everywhere else in
-  /// this module.
   ///
   /// # Why it may be absent
   ///
   /// Because two of the entrances that open a derivable epoch refuse at an
   /// element the walk has NOT read: [`Section::outgrown`]'s line bound and
   /// [`BodyCheck::settle`]'s held verdict are both met between elements, with
-  /// the cursor on the first byte of one no scan has touched. There is no
-  /// scanned element to carry there, the run at the cursor is a whole element
-  /// because no join carried one onto this line in front of it, and
-  /// [`Challenges::sustain_the_epoch`] reads it from the line.
+  /// the cursor on the first byte of one no scan has touched.
   /// [`a_refusal_leaves_the_cursor_where_its_span_begins`] is that enumeration
   /// asserted rather than left to this doc.
   ///
-  /// # Why it lives here
-  ///
-  /// [`after_comma`](Self::after_comma)'s reason, unchanged: an epoch is built
-  /// whole at [`Challenges::refuse`], so a refusal with no scanned element to
-  /// report writes the `None` as part of building one and cannot omit it, and
-  /// the answer dies with the epoch it was taken over rather than waiting for a
-  /// later refusal to overwrite it. [`Challenges::seek`] takes it on its FIRST
-  /// run and leaves it `None`, because every later element that loop reaches is
-  /// one `open_element` left the cursor on, and `open_element` crosses a join
-  /// only where the line it left was spent OUTSIDE a string — so no element
-  /// behind the first is a continuation of anything.
+  /// It lives here for [`after_comma`](Self::after_comma)'s reason, unchanged:
+  /// an epoch is built whole at [`Challenges::refuse`], so a refusal with no
+  /// scanned element to report writes the `None` as part of building one and
+  /// cannot omit it. [`Challenges::seek`] takes it on its FIRST run and leaves
+  /// it `None`, because `open_element` crosses a join only where the line it
+  /// left was spent OUTSIDE a string.
   scanned: Option<Element<'a>>,
 }
 
@@ -3773,45 +3289,24 @@ impl Epoch<'_> {
   /// Whether this epoch reaches PAST the challenge it refused — whether the
   /// elements behind it are ones its own ambiguity can still be about.
   ///
-  /// ```text
-  /// #element   => [ element ] *( OWS "," OWS [ element ] )
-  /// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
-  /// auth-param = token BWS "=" BWS ( token / quoted-string )
-  /// ```
-  ///
   /// # The channel, which is the whole of the answer
   ///
   /// A fault changes what the elements BEHIND it may be read as in exactly one
   /// way: at an element RFC 9110 §11.2 admits a value position in, the DQUOTE
-  /// standing there is one a reading may open and a reading may leave shut, so
-  /// the commas behind it are that value's data under one reading and
-  /// §5.6.1.2's separators under another. That is the only thing being behind a
-  /// fault buys, and so the only harm a fault can do at a distance.
-  ///
-  /// §11.2 admits a value position only inside a `#auth-param` list —
-  /// `auth-param` is the production that names one, and a list is the only
-  /// place one occurs. So **an epoch with no list has no such position, no
-  /// DQUOTE any reading may choose, and nothing it can make the bytes behind it
-  /// mean that the grammar does not already make them mean.** Its fault is a
-  /// fact about its own challenge's extent — which [`Challenges::seek`] settles
-  /// by the commas every reading ends an element at — and about nothing else.
+  /// standing there is one a reading may open and a reading may leave shut. So
+  /// **an epoch with no list has no such position, no DQUOTE any reading may
+  /// choose, and nothing it can make the bytes behind it mean that the grammar
+  /// does not already make them mean** — §11.2 admits a value position only
+  /// inside a `#auth-param` list.
   ///
   /// `Basic a=1, Broken;junk, Bearer, x="open, Digest realm=z` is the value
   /// with a channel: `Basic`'s list is open where the fault is met, so it may
-  /// still be running at `x`, and the comma inside `x`'s value is one the
-  /// readings disagree about. `Broken;junk, Safe, Basic a=1, a=2, Bearer abc,
+  /// still be running at `x`. `Broken;junk, Safe, Basic a=1, a=2, Bearer abc,
   /// x="open, Digest realm=z` is the value with none: no list is open at
   /// `Broken;junk` for a string to belong to, so `Safe` and everything behind
-  /// it is read exactly as it is with the prefix removed — and the `Basic` list
-  /// that opens three elements later is a list this fault never stood in.
+  /// it is read exactly as it is with the prefix removed.
   ///
-  /// # What reads it
-  ///
-  /// [`Challenges::refuse`], and nothing else: whether a NEW epoch inherits
-  /// this one's non-derivability is the only question anyone asks about a fault
-  /// at a distance. [`inside_a_list`](Self::inside_a_list) is asked at the
-  /// refusal it belongs to, and [`derivable`](Self::derivable) about this
-  /// epoch's own closing.
+  /// [`Challenges::refuse`] is the one reader.
   const fn reaches_past_itself(&self) -> bool {
     self.inside_a_list && !self.derivable
   }
@@ -3824,19 +3319,13 @@ struct Section<'a> {
   /// did not fit in [`MAX_CHALLENGE_LINES`].
   ///
   /// A `Result` and not a body beside a flag, because a flag is a fact someone
-  /// has to remember to read and this is a body that is no longer there. What
-  /// was collected past the bound is not the whole challenge, so
-  /// [`AuthError::ChallengeSpansTooManyLines`] is the answer rather than
-  /// whatever a partial body happens to parse as — and with the body GONE,
-  /// [`close`](Self::close) can produce one only through `?` and
-  /// [`outgrown`](Self::outgrown) answers `true` for a section that has none.
-  /// There is no state in which a refused section still hands bytes over.
+  /// has to remember to read and this is a body that is no longer there. With
+  /// the body GONE, [`close`](Self::close) can produce one only through `?` and
+  /// [`outgrown`](Self::outgrown) answers `true` for a section that has none,
+  /// so there is no state in which a refused section still hands bytes over.
   ///
   /// [`spend`](Self::spend) RETURNS the refusal at every crossing but one, and
-  /// [`leave`](Self::leave) is that one — the crossing between two elements,
-  /// where RFC 9110 §5.2's join comma may already have ended the refused
-  /// challenge and only the element behind it says so. That method carries why
-  /// no verdict can be returned there, and which two readers answer for it.
+  /// [`leave`](Self::leave) is that one.
   body: Result<BodyLines<'a>, AuthError>,
   /// Where the current line's region begins.
   start: usize,
@@ -3871,13 +3360,9 @@ impl<'a> Section<'a> {
   ///
   /// A section whose body is already gone answers `true` here as well, and not
   /// by a disjunct on a flag: a region is refused only where there is no slot
-  /// left for it, so the count below is at the bound wherever that has
-  /// happened. The refusal reaches this method through the missing body rather
-  /// than beside it, which is what leaving the disjunct out says.
-  ///
-  /// The count cannot answer for the LAST region, where a challenge that just
-  /// fits has spent every slot too — [`close`](Self::close) is what answers
-  /// there, and it does so by asking for a body that a refusal has taken away.
+  /// left for it. The count cannot answer for the LAST region, where a
+  /// challenge that just fits has spent every slot too —
+  /// [`close`](Self::close) is what answers there.
   const fn outgrown(&self) -> bool {
     match &self.body {
       Ok(body) => body.len >= MAX_CHALLENGE_LINES,
@@ -3891,9 +3376,7 @@ impl<'a> Section<'a> {
   ///
   /// The region taken is the line from this challenge's first byte on it to
   /// the line's END, and `end` says how much of that the challenge holds.
-  /// [`BodyLines`] carries why the two are not the same slice: a region a later
-  /// walk reads has to be the bytes the walk that took it read, or the two
-  /// walks are deciding an element's boundary over different inputs.
+  /// [`BodyLines`] carries why the two are not the same slice.
   ///
   /// # Errors
   ///
@@ -3924,18 +3407,14 @@ impl<'a> Section<'a> {
   /// The one crossing of the three that may not refuse on the spot. RFC 9110
   /// §5.2's join comma is a §5.6.1.2 separator here, so it may already have
   /// ended a challenge this region overran — and only the element behind it
-  /// says which: an element that opens a challenge of its own ends this one's
-  /// extent, and an element that does not belongs to it. Refusing before that
-  /// is read would put the cursor inside a run that is no longer the refused
-  /// challenge's, and hand the element behind the join to
-  /// [`Challenges::seek`]'s raw-comma scan to swallow.
+  /// says which. Refusing before that is read would put the cursor inside a run
+  /// that is no longer the refused challenge's, and hand the element behind the
+  /// join to [`Challenges::seek`]'s raw-comma scan to swallow.
   ///
   /// The refusal is not dropped for that: [`spend`](Self::spend) leaves this
-  /// section with NO body, and both readers of it bind. Which one depends on
-  /// that same element — [`outgrown`](Self::outgrown) where it belongs to this
-  /// challenge, asked before its bytes are read, and [`close`](Self::close)
-  /// where it opens the next one and this challenge's extent is complete.
-  /// Neither can be handed a partial body instead.
+  /// section with NO body, and both readers of it bind —
+  /// [`outgrown`](Self::outgrown) where the element belongs to this challenge,
+  /// and [`close`](Self::close) where it opens the next one.
   fn leave(&mut self, line: &'a [u8], end: usize) {
     let _kept = self.spend(line, end);
   }
@@ -3945,15 +3424,13 @@ impl<'a> Section<'a> {
   /// Paired with the last [`spend`](Self::spend) by consuming the section — so
   /// a walk cannot take the final region and then hand over a body that is
   /// missing one — and it can hand over nothing at all where a region did not
-  /// fit, because a refused section holds no body to hand over.
+  /// fit.
   ///
   /// # Errors
   ///
   /// [`AuthError::ChallengeSpansTooManyLines`] where any region of this
   /// challenge did not fit. It is reported with no seeking behind it: the
-  /// challenge's extent is complete by the time this is called, so the cursor
-  /// already stands on the next challenge's first byte and there is nothing
-  /// left of this one to get past.
+  /// challenge's extent is complete by the time this is called.
   fn close(mut self, line: &'a [u8], end: usize) -> Result<BodyLines<'a>, AuthError> {
     self.spend(line, end)?;
     self.body
@@ -3988,18 +3465,13 @@ struct Challenges<'a, I> {
   /// the next element begins.
   ///
   /// That challenge's own shape and nothing else's.
-  /// [`Complete::opens_a_list`] is the whole of it, it is written at the ONE
-  /// point every completion passes through — [`Challenges::challenge`] — and
-  /// no completion path can leave a value an earlier challenge wrote, because
-  /// none of them writes this at all.
-  ///
-  /// # What it is NOT
-  ///
-  /// Whether a list is open where the WALK stands, which is a different
-  /// question and the one that was found stored here. Behind a refusal the
-  /// answer is the refusal's rather than any challenge's, and [`Epoch`] is
-  /// where it lives. [`Challenges::inside_a_list`] is the two of them together
-  /// and is what a refusal asks; nothing asks this on its own.
+  /// [`Complete::opens_a_list`] is the whole of it, and it is written at the
+  /// ONE point every completion passes through — [`Challenges::challenge`] —
+  /// so no completion path can leave a value an earlier challenge wrote. It is
+  /// NOT whether a list is open where the WALK stands, which is the question
+  /// that was found stored here: behind a refusal the answer is the refusal's
+  /// rather than any challenge's, and [`Epoch`] is where it lives.
+  /// [`Challenges::inside_a_list`] is the two of them together.
   ///
   /// # Why a challenge that completes closes a list in front of it
   ///
@@ -4007,19 +3479,12 @@ struct Challenges<'a, I> {
   /// reading of that element — one more `auth-param` of the open list — does
   /// not derive it at all, since
   /// `auth-param = token BWS "=" BWS ( token / quoted-string )` needs a value
-  /// behind an `=` that neither a bare scheme nor a `token68` puts there. A
-  /// non-derivation beside a derivation is not one of the two readings §11.6.1
-  /// leaves a recipient to choose between. ABNF's `/` being unordered says a
-  /// recipient may TRY either alternative; it does not make an alternative that
-  /// derives none of these bytes into a reading of them.
-  /// `Basic a=1, Bearer, x="open, Digest realm=z` and
+  /// behind an `=` that neither a bare scheme nor a `token68` puts there. ABNF's
+  /// `/` being unordered says a recipient may TRY either alternative; it does
+  /// not make an alternative that derives none of these bytes into a reading of
+  /// them. `Basic a=1, Bearer, x="open, Digest realm=z` and
   /// `Bearer abc, x="open, Digest realm=z` are the two values that need the
-  /// close: without it `x` reads as a parameter of a list the challenge in front
-  /// of it ended, and the `Digest` behind it is hidden for nothing.
-  ///
-  /// A challenge that took RFC 9110 §11.3's `1*SP` and a `#auth-param` body
-  /// leaves one open instead, and that is the same sentence the other way
-  /// round.
+  /// close.
   list_open: bool,
   /// The recovery epoch the walk stands in, or `None` where no refusal is still
   /// about the bytes at the cursor.
@@ -4059,9 +3524,9 @@ where
       }
       // Every refusal is recovered from the same way, so there is no fault to
       // test for here: `challenge` hands each one to `refuse`, and the next
-      // step seeks the refused challenge's end by raw commas. A walk that
-      // ended on one of them would be deciding, from bytes it has already
-      // refused, that no challenge stands behind them.
+      // step seeks the refused challenge's end. A walk that ended on one of
+      // them would be deciding, from bytes it has already refused, that no
+      // challenge stands behind them.
       Step::Element { .. } => Some(self.challenge()),
     }
   }
@@ -4117,8 +3582,7 @@ where
             // rather than losing it with the error. `leave` and not `spend`
             // because this is the crossing where the comma already passed may
             // have ended the refused challenge, and the element behind it has
-            // not been read yet; that method names the two readers that bind
-            // instead.
+            // not been read yet.
             let end = section.end;
             section.leave(spent, end);
           }
@@ -4140,70 +3604,44 @@ where
   /// A field line's end does not end the element when a RFC 9110 §5.6.4
   /// quoted-string is still open there: §5.2's join comma is data inside one,
   /// so the element runs on to wherever the string closes.
-  /// `scan_quoted_after_join` is this crate's one implementation of that rule
-  /// and feeds the join's comma THROUGH any pending escape, so the escape is
-  /// spent on the comma and a DQUOTE arriving first on the next line closes
-  /// the string.
   ///
   /// `region` is the body being collected. Every byte this crosses lands in it,
   /// and the same bytes are what [`AuthParamIter`] hands a caller later — so a
   /// line this challenge may not hold is a line this scan may not read, and
-  /// taking the region and asking for the line are ONE operation for that
-  /// reason.
+  /// taking the region and asking for the line are ONE operation.
   ///
   /// # Errors
   ///
   /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
   /// quoted-string, and [`AuthError::ChallengeSpansTooManyLines`] where the
   /// line this element is still open on cannot be held. Both leave the cursor
-  /// INSIDE the challenge they refuse and both are refused by the caller, at
-  /// the one place every fault this can raise passes through — so what is left
-  /// of that challenge is got past like every other refusal, rather than
-  /// scanned on as a quoted-string whose every later byte would decide a
-  /// boundary for a challenge already refused.
+  /// INSIDE the challenge they refuse and both are refused by the caller.
   ///
-  /// The two do not carry the same [`Refusal`], and what tells them apart is
-  /// not the fault but WHERE the cursor is left — which is decided by whether
-  /// RFC 9110 §5.2's join was crossed with the element's string still open.
-  ///
-  /// - **Nothing crossed.** The scan never advanced past the element, so the
-  ///   cursor is on the ELEMENT's own first byte, an offset every reading of
-  ///   the value stands outside a string at: the DQUOTE §11.2 admits is still
-  ///   in front of the cursor, where [`some_reading_holds`] scans it for
-  ///   itself. Only [`AuthError::InvalidQuotedString`] arrives this way.
-  ///   [`Refusal::Bounded`].
-  /// - **A join crossed.** The cursor is on the first byte of the line just
-  ///   fetched, and the DQUOTE that opened this element's value is on a line
-  ///   this walk no longer holds — so no scan it may make can see the opener,
-  ///   let alone say where the string closes. A reading of the value is INSIDE
-  ///   that string here, whichever of the two faults stopped the scan:
-  ///   [`AuthError::ChallengeSpansTooManyLines`] leaves it open on a line the
-  ///   challenge may not hold, and [`AuthError::InvalidQuotedString`] leaves it
-  ///   open on a run that reaches no close at all — which
-  ///   [`crate::grammar::Readings::absorb`] calls SEALED and
-  ///   [`some_reading_holds`] would report if the opener were in reach.
-  ///   [`Refusal::Unbounded`].
-  ///
-  /// So this is the one entrance a `Refusal::Unbounded` has: the line bound met
-  /// at [`Section::outgrown`] is met BETWEEN elements and the one met at
-  /// [`Section::close`] is met with the extent already complete, and neither
-  /// stands inside a string.
+  /// They do not carry the same [`Refusal`], and what tells them apart is not
+  /// the fault but WHERE the cursor is left — which is decided by whether RFC
+  /// 9110 §5.2's join was crossed with the element's string still open. With
+  /// nothing crossed the cursor is on the ELEMENT's own first byte, an offset
+  /// every reading of the value stands outside a string at, and the DQUOTE
+  /// §11.2 admits is still in front of it for [`some_reading_holds`] to scan:
+  /// [`Refusal::Bounded`], which only [`AuthError::InvalidQuotedString`]
+  /// reaches. With a join crossed the cursor is on the first byte of the line
+  /// just fetched and the DQUOTE that opened this element's value is on a line
+  /// this walk no longer holds, so no scan it may make can see the opener:
+  /// [`Refusal::Unbounded`], for either fault. This is the one entrance that
+  /// variant has.
   ///
   /// **This is where the two spellings of one value were made to agree.** A
   /// forbidden byte met on the head line and the same byte met past a join used
   /// to recover from different points and yield different numbers of
-  /// challenges, and the note left here said making them agree needed the
-  /// OFFSET the scan choked at, which `QuotedScan::Invalid` does not carry. It
-  /// does not — and it is not needed: what the split spelling lost is not the
-  /// offset but the OPENER, and a walk that cannot see the opener may not
-  /// certify a comma behind it. `Basic realm="ab, Digest realm=z, %x00c"` and
-  /// the same value split at its first comma both answer
-  /// [`AuthError::ChallengeBoundaryUnknown`] for that reason, where the split
-  /// one crossed to a `%x00c"` the sender wrote inside a realm.
+  /// challenges. What the split spelling lost is not the OFFSET the scan choked
+  /// at — `QuotedScan::Invalid` carries none — but the OPENER, and a walk that
+  /// cannot see the opener may not certify a comma behind it.
+  /// `Basic realm="ab, Digest realm=z, %x00c"` and the same value split at its
+  /// first comma both answer [`AuthError::ChallengeBoundaryUnknown`] for that
+  /// reason, where the split one crossed to a `%x00c"` the sender wrote inside
+  /// a realm.
   ///
-  /// Every OTHER fault the element carries is in the [`Element`] this returns,
-  /// because a boundary this walk has not yet found must not be decided by
-  /// bytes behind one.
+  /// Every OTHER fault the element carries is in the [`Element`] this returns.
   fn skip_element(
     &mut self,
     region: &mut Section<'a>,
@@ -4213,18 +3651,13 @@ where
     let start = self.at;
     // Set where RFC 9110 §5.2's join was crossed with this element's
     // quoted-string still OPEN, which is the whole of what tells the two
-    // refusals apart. The closure below runs at that crossing and NOWHERE else
-    // — `scan_element` calls it only while a string holds the element open —
+    // refusals apart. The closure below runs at that crossing and NOWHERE else,
     // so every fault raised past it is raised with a string open around the
-    // cursor, and every fault raised without it is raised on the line the
-    // element began on with the cursor still on the element's first byte.
-    //
-    // Read here rather than inferred from the fault's name, because the name
-    // does not carry it either way: two other entrances raise
+    // cursor. Read here rather than inferred from the fault's name, because the
+    // name does not carry it either way: two other entrances raise
     // `ChallengeSpansTooManyLines` between elements, and
-    // `AuthError::InvalidQuotedString` is raised BOTH on the head line, where
-    // the DQUOTE is still in front of the cursor, and past a join, where it is
-    // on a line this walk no longer holds.
+    // `AuthError::InvalidQuotedString` is raised BOTH on the head line and past
+    // a join.
     let mut crossed_a_join = false;
     let scanned = {
       let walk = &mut *self;
@@ -4246,9 +3679,7 @@ where
         // challenge's — including the bytes that begin no element of their own
         // but carry the close of this one. A region that does not fit refuses
         // the challenge on the spot: there is no line to hand back, which is
-        // what keeps this scan from reading one more byte of it. The refusal
-        // itself is `challenge`'s, at the one place every fault this function
-        // can raise passes through.
+        // what keeps this scan from reading one more byte of it.
         section.spend(spent, spent.len())?;
         Ok(Some(next))
       })
@@ -4284,21 +3715,18 @@ where
   /// rather than on the completion paths themselves because there are three of
   /// those and a fourth would inherit whatever the last one wrote. Every
   /// completion passes through this `Ok`, so the state behind a challenge is
-  /// that challenge's own shape at the point it completes and is never a fact
-  /// left over from an earlier one.
+  /// that challenge's own shape at the point it completes.
   ///
   /// It is also one of the two positions a recovery [`Epoch`] can end at: a
   /// challenge that completes is an element of the outer `#challenge` list, so
   /// wherever the grammar still derives the value, a list open in front of this
-  /// challenge has ended at it. [`Epoch`]'s doc carries the other position and
-  /// why an epoch behind a fault reaches neither.
+  /// challenge has ended at it.
   ///
   /// # Errors
   ///
   /// [`read_challenge`](Self::read_challenge)'s, unchanged. A refusal is not a
   /// completion and writes nothing here: what a refusal leaves behind it is the
-  /// epoch [`refuse`](Self::refuse) opens, including the list its own fault
-  /// stands in.
+  /// epoch [`refuse`](Self::refuse) opens.
   fn challenge(&mut self) -> Result<Credential<'a>, AuthError> {
     let complete = self.read_challenge()?;
     self.list_open = complete.opens_a_list();
@@ -4323,24 +3751,16 @@ where
   /// Called from [`Challenges::challenge`] and from nowhere else, because a
   /// challenge that COMPLETES is the only such position there is. Its own
   /// element derives as an element of the outer `#challenge` list and derives
-  /// as nothing else, so wherever the grammar still reaches the cursor, a list
-  /// open in front of this challenge has ended at it.
+  /// as nothing else.
   ///
-  /// **The element [`Challenges::seek`] resumes on is not another one**, and
-  /// the difference is the whole of what this function may be called from.
+  /// **The element [`Challenges::seek`] resumes on is not another one.**
   /// [`opens_a_challenge`] says no `auth-param` BEGINS at that element; it does
-  /// not say a challenge derives there. Where the walk then refuses it, nothing
-  /// derives at that element under any reading, so the reading in which the
-  /// list is still running and the element is garbage inside it survives —
-  /// `Basic p1=1, ..., p17=17, y=1, Broken;junk, x="open, Digest realm=z` is
-  /// the value, and closing an epoch at the resume crosses the comma inside
-  /// `x`'s own value.
-  ///
-  /// An epoch behind a fault answers `false` to
-  /// [`derivable`](Epoch::derivable) and outlives even a completion, because
-  /// behind an element that derives nothing that argument is not available: the
-  /// readings include one in which every element since is garbage the open list
-  /// still holds. [`Epoch`]'s doc is that argument and the value that needs it.
+  /// not say a challenge derives there. Where the walk then refuses it, the
+  /// reading in which the list is still running and the element is garbage
+  /// inside it survives — `Basic p1=1, ..., p17=17, y=1, Broken;junk,
+  /// x="open, Digest realm=z` is the value, and closing an epoch at the resume
+  /// crosses the comma inside `x`'s own value. An epoch behind a fault answers
+  /// `false` to [`derivable`](Epoch::derivable) and outlives even a completion.
   fn close_the_epoch(&mut self) {
     if self.epoch.is_some_and(|epoch| epoch.derivable) {
       self.epoch = None;
@@ -4357,18 +3777,6 @@ where
   /// one loop rather than two — what keeps the bytes of a challenge already
   /// refused from deciding where it ends.
   ///
-  /// # A refusal is final, and its extent is not the refused bytes' to decide
-  ///
-  /// The module doc's invariant, and this is the walk it is about. The moment
-  /// an element of this challenge derives nothing, or repeats a name, or fills
-  /// the last slot there is, or carries a byte §5.6.4 forbids inside a
-  /// quoted-string, or overruns [`MAX_CHALLENGE_LINES`], the challenge is
-  /// refused — and the rest of it is handed to [`Challenges::seek`], which
-  /// crosses only the commas EVERY reading of those bytes ends an element at.
-  /// A DQUOTE behind that first fault opens a string in some readings and not
-  /// in others, so the comma in front of the next challenge is that value's
-  /// data under one of them, and neither offset is this walk's to pick.
-  ///
   /// # Errors
   ///
   /// [`AuthError::MissingScheme`] and [`AuthError::MalformedScheme`], every
@@ -4381,22 +3789,17 @@ where
   /// The scheme faults are refused from the ELEMENT's own first byte, which is
   /// where §11.6.1's two readings of it part: read as one more `auth-param` of
   /// a list still open, its value position is [`param_value_at`] answered
-  /// THERE, and a boundary scan starting behind the scheme token cannot find
-  /// it. `Basic a=1, Broken<HTAB>junk, Bearer, x="open, Digest realm=z` is the
-  /// value that shows the difference — `x=`'s DQUOTE stands at a value position
-  /// of a list `Basic` opened and a fault has left open, and a scan from behind
-  /// the `x` crossed the comma inside it. Whether that reading is admitted at
+  /// THERE. `Basic a=1, Broken<HTAB>junk, Bearer, x="open, Digest realm=z` is
+  /// the value that shows the difference. Whether that reading is admitted at
   /// all is [`inside_a_list`](Self::inside_a_list)'s, carried into
   /// [`opener_at`] as `parameters`: `Basic="q, Digest realm=z"` is the shape
-  /// where it is not, since no list is open at the head of a `#challenge` value
-  /// and so nothing in that element stands at a value position.
+  /// where it is not.
   ///
   /// Two faults are reported with the challenge's extent ALREADY COMPLETE: a
   /// body of exactly one element that no `auth-param` derives and no `token68`
   /// takes, and a [`AuthError::ChallengeSpansTooManyLines`] met on the region
   /// the challenge ENDS in. The cursor is on the next challenge's first byte in
-  /// both, so there is nothing left of this one to get past — which is
-  /// [`Refusal::Ended`], and is all that is different about them.
+  /// both — which is [`Refusal::Ended`], and is all that is different.
   fn read_challenge(&mut self) -> Result<Complete<'a>, AuthError> {
     let head = self.line;
     // Where this element begins, kept because a scheme fault is recovered from
@@ -4415,23 +3818,15 @@ where
     //
     // §11.2's `BWS` is §5.6.3's `OWS`, so the `1*SP` §11.3 needs in front of a
     // body may be the SAME whitespace an `auth-param` writes in front of its
-    // `=`. Where it is, this element derives two ways and the walk is about to
-    // take one of them — and the value position the OTHER admits stands at the
-    // element's own first byte, behind everything the challenge reading
-    // crosses. `opens_a_challenge` is that question, asked of the element the
-    // walk is reading a challenge at rather than of the ones it skips: nothing
-    // asks it HERE, because at the top of a value or behind a completed
-    // challenge no list is open and there is no second reading to lose.
-    //
-    // So the two conditions are the two halves of "the other reading exists".
-    // Where they hold, every refusal met before the body's first element has
-    // ENDED is a refusal over the element that began at `start` — no §5.6.1.2
-    // comma has been crossed, so the outer list's element has not ended — and
-    // the recovery begins there, exactly as a scheme fault's does.
+    // `=`. Where it is, this element derives two ways and the value position
+    // the reading NOT taken admits stands at the element's own first byte,
+    // behind everything the challenge reading crosses — so the two conditions
+    // are the two halves of "the other reading exists", and where they hold a
+    // refusal met before the body's first element has ENDED is a refusal over
+    // the element that began at `start`.
     // `Basic a=1, Broken;junk, Bearer, x ="open, Digest realm=z` is the value:
     // the body opens AT the `=`, no value position stands there, and a recovery
-    // from it certified the comma inside `x`'s own value and handed a caller a
-    // `Digest` with a `realm` under the sender's control.
+    // from it certified the comma inside `x`'s own value.
     let recover_from = (!opens_a_challenge(head, start) && self.inside_a_list()).then_some(start);
     let Some(scheme_end) = token_end(head, self.at) else {
       return Err(self.refuse(Refusal::Scheme(AuthError::MissingScheme), Origin::Unread));
@@ -4447,27 +3842,18 @@ where
         self.at = at;
         // `1*SP` has taken every SP there was, so a HTAB here is whitespace
         // the parameter list owns rather than whitespace the scheme does. RFC
-        // 9110 §5.6.1.2 expands a list as
-        // `#element => [ element ] *( OWS "," OWS [ element ] )`, which hangs
-        // every OWS it has on a comma: reaching that comma, the HTAB is the
-        // OWS in front of it and the section opens on the empty first element
-        // the expansion admits; reaching an element instead, nothing derives
-        // it and the section cannot start at all.
-        // [`Refusal::Bounded`] and not [`Refusal::Scheme`]: RFC 9110 §11.3's
-        // `[ 1*SP ( token68 / #auth-param ) ]` has been ENTERED, so the cursor
-        // stands at the body position and the list this fault is met inside is
-        // this challenge's own — whatever stands in front of it, and whether or
-        // not any of it derives. `Basic<SP><HTAB>a, a=", Digest realm=z` is the
-        // value that tells that apart from a fault standing in front of a list
-        // that never opened, and it is the whole of what the `1*SP` used to buy
-        // by writing a flag that then outlived the challenge. The offset is the
-        // body's own, so `opener_at` reads the first parameter's value position
-        // from where §5.6.1.2 puts it — unless `recover_from` says the element
-        // this body opened in has a reading of its own, in which case that
-        // reading's value position is at the element's first byte and the body
-        // position has already lost it. `x<SP><HTAB>="open, Digest realm=z`
-        // behind a fault is the value, and it is the SP-and-HTAB spelling of
-        // the `BWS` `x<SP>="open` writes with one SP.
+        // 9110 §5.6.1.2 hangs every OWS a list has on a comma: reaching that
+        // comma, the HTAB is the OWS in front of it and the section opens on
+        // the empty first element the expansion admits; reaching an element
+        // instead, nothing derives it and the section cannot start at all.
+        // [`Refusal::Bounded`] and not [`Refusal::Scheme`]: §11.3's
+        // `[ 1*SP ( token68 / #auth-param ) ]` has been ENTERED, so the list
+        // this fault is met inside is this challenge's own —
+        // `Basic<SP><HTAB>a, a=", Digest realm=z` is the value that tells that
+        // apart from a fault standing in front of a list that never opened.
+        // The offset is the body's own, unless `recover_from` says the element
+        // this body opened in has a reading of its own, whose value position is
+        // at the element's first byte — `x<SP><HTAB>="open, Digest realm=z`.
         if head.get(at) == Some(&b'\t') && !ends_element(head, at) {
           let fault = Refusal::Bounded(AuthError::MalformedScheme);
           return Err(match recover_from {
@@ -4512,12 +3898,12 @@ where
         Step::Element { after_comma, .. } => {
           // RFC 9110 §11.3's choice is already made where the body's first
           // element is wholly a `token68`, so this element is the next one of
-          // the OUTER list and not more of this challenge. Asked FIRST, before
-          // anything about this element is read: a challenge whose extent the
-          // grammar has already fixed is one no later byte may reopen, and
-          // `Bearer abc, x="open, Digest realm=z` is the value that shows the
-          // difference — `x` is parameter-shaped, so the break below does not
-          // fire, and `settle` would refuse a `Bearer` that derives.
+          // the OUTER list. Asked FIRST, before anything about this element is
+          // read: a challenge whose extent the grammar has already fixed is one
+          // no later byte may reopen, and `Bearer abc, x="open, Digest realm=z`
+          // is the value that shows the difference — `x` is parameter-shaped,
+          // so the break below does not fire, and `settle` would refuse a
+          // `Bearer` that derives.
           if check.token68_taken() {
             break;
           }
@@ -4526,11 +3912,9 @@ where
           }
           // This element belongs to the challenge, so everything the challenge
           // already holds has to be answered BEFORE this element's bytes are
-          // read. Both checks stand here for that one reason: a boundary found
-          // past a fault is a boundary the bytes behind the fault decided.
-          // Met BETWEEN elements, with the previous one ended at a boundary
-          // the grammar itself fixed, so the cursor is where every reading
-          // stands outside a string.
+          // read: a boundary found past a fault is a boundary the bytes behind
+          // the fault decided. Both are met BETWEEN elements, with the previous
+          // one ended at a boundary the grammar itself fixed.
           if section.outgrown() {
             return Err(self.refuse(
               Refusal::Bounded(AuthError::ChallengeSpansTooManyLines),
@@ -4542,26 +3926,22 @@ where
           }
           // Where the element the OUTER `#challenge` list holds begins on this
           // line. `after_comma` is false at the body's first element and there
-          // alone — every later turn of this loop reached its element past a
-          // §5.6.1.2 comma or §5.2's join, and both END the outer list's
-          // element — so this is the one turn at which the two can part, and
+          // alone, so this is the one turn at which the two can part, and
           // `recover_from` is whether they do.
           //
           // No mutation kills the filter, and the reason is an argument rather
           // than dead code: `recover_from` is `Some` only where
           // `param_value_at` reads a value position at the element's own first
           // byte, which puts the body at the `=` or at the `BWS` in front of
-          // one. A body opening at a HTAB is refused above; a body opening at
-          // the `=` derives nothing at its first element and is no `token68`,
-          // so [`BodyCheck::settle`] refuses at the TOP of this loop's second
-          // turn and no later turn reaches this line at all. The filter states
-          // the rule the walk relies on instead of leaving it to that chain.
+          // one — and such a body derives nothing at its first element, so
+          // [`BodyCheck::settle`] refuses at the TOP of this loop's second
+          // turn. The filter states that rule instead of leaving it to the
+          // chain.
           let element_at = recover_from.filter(|_| !after_comma).unwrap_or(self.at);
           // Both faults the scan can raise leave the cursor INSIDE the
-          // challenge they refuse — on the line the bound was met at, or on
-          // the element the forbidden byte stands in — so both are refused
-          // here and neither ends the walk. Which of the two the boundary
-          // survives is the scan's to say, and it says so in the `Refusal`.
+          // challenge they refuse, so both are refused here and neither ends
+          // the walk. Which of the two the boundary survives is the scan's to
+          // say, and it says so in the `Refusal`.
           let (element, recovery) = match self.skip_element(&mut section, element_at) {
             Ok(scanned) => scanned,
             Err((refusal, origin)) => return Err(self.refuse(refusal, origin)),
@@ -4593,10 +3973,7 @@ where
     // them with no epoch opened at all, so a body RFC 9110 §11.3 derives no
     // reading of left the walk believing the value still derived:
     // `Basic ;, Bearer, x="open, Digest realm=z` handed a caller a `Digest`
-    // read out of the middle of `x`'s own value, because the `Bearer` behind
-    // the fault closed a list no reading of these bytes closes.
-    // [`Refusal::Ended`] carries what is different about them, which is only
-    // that there is nothing left to seek.
+    // read out of the middle of `x`'s own value.
     let body = match section.close(line, end) {
       Ok(body) => body,
       Err(fault) => return Err(self.refuse(Refusal::Ended(fault), Origin::Unread)),
@@ -4624,20 +4001,15 @@ where
   /// nothing but §5.6.1.2's own `OWS` and its comma behind it took no body
   /// under ANY reading of these bytes and opened no list of its own —
   /// [`Complete::entered`] is `false` here for that reason and for no other.
-  /// What that then does to a list an earlier challenge left open is
-  /// [`Challenges::challenge`]'s, at the one point every completion passes
-  /// through, and [`Challenges::list_open`]'s doc carries the argument.
   ///
   /// A challenge is handed back here, so
-  /// [`a_yielded_challenge_is_no_parameter`] is checked here too — the other of
-  /// the two places one completes.
+  /// [`a_yielded_challenge_is_no_parameter`] is checked here too.
   ///
   /// # Errors
   ///
   /// Nothing this call can raise. [`Credential::read`] is handed a body with no
-  /// elements, so the walk it makes yields none and there is no verdict for
-  /// [`BodyCheck`] to hold — but it answers a `Result` for every body, and this
-  /// is that `Result` unchanged rather than a second reading of an empty one.
+  /// elements, so there is no verdict for [`BodyCheck`] to hold — but it
+  /// answers a `Result` for every body, and this is that `Result` unchanged.
   fn scheme_alone(
     &mut self,
     head: &'a [u8],
@@ -4663,17 +4035,12 @@ where
   /// forced on those bytes, so the extent is one reading's, and a boundary scan
   /// starting behind it would never see the reading that leaves the DQUOTE
   /// shut. [`Recovery`] carries where that reading begins and which commas the
-  /// reading that opened the string still holds; a candidate in front of the
-  /// second is one that reading is inside a value at, so no comma on this line
-  /// is a boundary and there is nothing to recover to.
+  /// reading that opened the string still holds.
   ///
   /// [`Recovery::after_comma`] is the same join's other half and is carried to
   /// [`seek`](Self::seek) rather than answered here: it admits the reading in
-  /// which a whole challenge — RFC 9110 §11.6.1's other reading of an element —
-  /// begins on the continuation line, whose own quoted parameter may hold a
-  /// comma the `floor` test knows nothing about. This is the one writer of that
-  /// flag, and it writes it at every refusal it makes, so no later refusal can
-  /// inherit an answer taken over other bytes.
+  /// which a whole challenge begins on the continuation line, whose own quoted
+  /// parameter may hold a comma the `floor` test knows nothing about.
   fn refuse_element(
     &mut self,
     element: Element<'a>,
@@ -4688,13 +4055,10 @@ where
     // Where the fault is a bound of this reader's the readings are not free:
     // the value still derives, `( token / quoted-string )` is not a choice at
     // its value position, and the element ends where the string closes. That
-    // close is [`Recovery::floor`] and it is on THIS line —
-    // [`scan_element`] stops crossing joins the moment the string closes, so a
-    // close is never left on a line the walk dropped. So there IS a boundary
-    // to find and [`Challenges::seek`] is where it is found.
-    // [`Challenges::refuse`] re-derives the whole claim, and a span this
-    // predicate calls derivable that its own test does not degrades to
-    // [`refused_element_end`]'s decline rather than to a crossing.
+    // close is [`Recovery::floor`] and it is on THIS line, so there IS a
+    // boundary to find. [`Challenges::refuse`] re-derives the whole claim, and
+    // a span this predicate calls derivable that its own test does not degrades
+    // to [`refused_element_end`]'s decline rather than to a crossing.
     let bounded =
       raw_comma_end(self.line, recovery.at()) >= recovery.floor() || fault.is_a_receiver_bound();
     self.refuse(
@@ -4721,13 +4085,11 @@ where
   /// the elements behind the fault would be read as challenges of their own. A
   /// refusal reported without `unresolved` where the cursor is inside a
   /// quoted-string the grammar opened would leave the walk standing at an
-  /// offset it cannot vouch for, reading whatever that string happens to hold
-  /// as challenges of the value. And one reported without an epoch would let a
+  /// offset it cannot vouch for. And one reported without an epoch would let a
   /// challenge completing behind it close a list on the strength of an argument
-  /// only a value that still derives has — [`Epoch`]'s doc is that argument,
-  /// and `Basic ;, Bearer, x="open, Digest realm=z` is the value that had no
-  /// epoch at all until the two faults with a complete extent were routed
-  /// through here.
+  /// only a value that still derives has — `Basic ;, Bearer, x="open, Digest
+  /// realm=z` is the value that had no epoch at all until the two faults with a
+  /// complete extent were routed through here.
   fn refuse(&mut self, refusal: Refusal, origin: Origin<'a>) -> AuthError {
     a_refusal_leaves_the_cursor_where_its_span_begins(self.line, self.at, origin);
     // Where the refusal was met, which settles the list for three of the four
@@ -4741,18 +4103,14 @@ where
       // Whether a derivation of the whole value still reaches the cursor.
       // `AuthError::is_a_receiver_bound`'s doc is the argument for this
       // refusal's own half, and `Epoch::reaches_past_itself` for the half an
-      // older epoch has: an epoch opened behind one whose ambiguity can still
-      // be ABOUT these bytes cannot be closed either, because what makes the
-      // readings free is the first element the grammar derives nothing at and
-      // no later bound of this reader's puts it back. An older epoch whose
-      // ambiguity cannot reach here says nothing about this one, and that is a
-      // fact about the CHANNEL rather than about which of the two came first.
+      // older epoch has. An older epoch whose ambiguity cannot reach here says
+      // nothing about this one, which is a fact about the CHANNEL rather than
+      // about which of the two came first.
       derivable: refusal.fault().is_a_receiver_bound()
         && self.epoch.is_none_or(|epoch| !epoch.reaches_past_itself()),
       // The join's half and the element's, both of them `Origin`'s to answer.
-      // An epoch is built WHOLE here — there is no second write to forget and
-      // no earlier refusal's answer to inherit — and the entrance that has
-      // neither says so by naming a variant that carries neither.
+      // An epoch is built WHOLE here, and the entrance that has neither says so
+      // by naming a variant that carries neither.
       after_comma: matches!(
         origin,
         Origin::Scanned {
@@ -4803,30 +4161,14 @@ where
   /// The module doc's invariant, and this is the whole of its recovery. The
   /// commas are found by [`refused_element_end`] and not by the element walk
   /// [`Challenges::skip_element`] runs, and that is the difference between
-  /// reading a challenge and getting past one. Every byte this crosses belongs
-  /// to a challenge already refused, and nothing this walk crosses is ever
-  /// derived. Letting those bytes say where a quoted-string begins would let
-  /// them say which commas separate elements, and so where the refused
-  /// challenge ends and the next one may start.
-  ///
-  /// That is not a hypothetical ordering: RFC 9110 §11.4 has a user agent
-  /// select "the challenge with what it considers to be the most secure
-  /// auth-scheme that it understands", and a sender who writes one DQUOTE into
-  /// a challenge this walk is recovering from would otherwise swallow every
-  /// comma behind it — hiding a stronger challenge inside the fault already
-  /// reported for a weaker one.
-  ///
-  /// # An element of a refused challenge may still OPEN a quoted-string
-  ///
-  /// So crossing one RAW is the other half of the same harm, and the half this
-  /// walk committed. RFC 9110 §11.2 names a value position in every element and
-  /// admits a §5.6.4 quoted-string at it; behind a fault the production no
-  /// longer forces that alternative, so the DQUOTE there is one a reading may
-  /// open and a reading may leave shut. Cutting at the first raw comma resumes
-  /// the walk wherever the sender's own value happens to hold one — which is
-  /// how `Basic p1=1, ..., p17=17, x="c, Digest realm=evil, junk"` handed a
-  /// caller a `Digest` challenge with a `realm` of `evil`, out of the middle of
-  /// `x`'s value and on input RFC 9110 §11.2 bounds nowhere.
+  /// reading a challenge and getting past one. Letting bytes already refused
+  /// say where a quoted-string begins would let them say which commas separate
+  /// elements, hiding a stronger challenge inside the fault already reported
+  /// for a weaker one. Crossing one RAW is the other half of the same harm, and
+  /// the half this walk committed:
+  /// `Basic p1=1, ..., p17=17, x="c, Digest realm=evil, junk"` handed a caller
+  /// a `Digest` with a `realm` of `evil`, on input RFC 9110 §11.2 bounds
+  /// nowhere.
   ///
   /// # And RFC 9110 §11.6.1 names that position twice
   ///
@@ -4837,34 +4179,24 @@ where
   /// on that comma, so neither DQUOTE is at the offset the join left.
   /// [`opener_at`] reads both openers from the element's real start, and the
   /// second is admitted only where a comma stands in front of the cursor —
-  /// which is exactly what §5.2's join puts there, and which is why this loop
-  /// takes `after_comma` from [`refuse_element`](Self::refuse_element) on its
-  /// first run and never again: every later cursor is one `opens_a_challenge`
-  /// has already answered `false` for.
+  /// which is why this loop takes `after_comma` from
+  /// [`refuse_element`](Self::refuse_element) on its first run and never again.
   ///
   /// So this asks [`refused_element_end`]: whether ANY reading of these bytes
   /// holds the earliest comma inside a string. Where none does, that comma is a
   /// separator whichever reading is the sender's and this crosses to it —
   /// `x="c", Digest realm=evil` is the same element with a string that CLOSES
   /// in front of the comma, and `Digest` is reported. Where one does, the walk
-  /// stops rather than resume somewhere it cannot justify, and
-  /// [`AuthError::ChallengeBoundaryUnknown`] is what the caller is told.
-  ///
-  /// Every refusal comes here, and not only the scheme's. [`refuse`](Self::refuse)
-  /// is the one writer of the flags, and its doc says why there is exactly one.
+  /// stops rather than resume somewhere it cannot justify.
   ///
   /// # The line's end is §5.2's comma only where a line follows it
   ///
   /// A string still open where the line runs out holds §5.2's join comma, so
   /// the reading that opened it and the reading that left it shut disagree —
   /// unless the value ends there, where both end the element at the same
-  /// offset and there is no comma for them to disagree about. That is what the
-  /// `next_line` below asks, and asking it is what keeps `Basic, type="x` from
-  /// reporting an unread remainder that does not exist.
-  ///
-  /// No other fault is reported from here, because none can be: a comma this
-  /// crosses is one no reading holds inside a string, and a §5.6.1.2 comma or
-  /// the end of the value is all it ever stops at.
+  /// offset. That is what the `next_line` below asks, and asking it is what
+  /// keeps `Basic, type="x` from reporting an unread remainder that does not
+  /// exist.
   fn seek(&mut self) {
     // Where the value RFC 9110 §5.2's join carried onto the line the refusal was
     // made on CLOSES. It is an offset on THAT line, so it means nothing once
@@ -4877,9 +4209,7 @@ where
       // Taken rather than read: RFC 9110 §11.6.1's challenge reading is
       // admitted at the offset a join left the cursor on and at no other, since
       // every cursor the rest of this loop reaches is one `opens_a_challenge`
-      // has already answered `false` for — and an element that opens no
-      // challenge admits a value position of its own instead, which is the
-      // exclusion `opener_at` derives.
+      // has already answered `false` for.
       let after_comma = self
         .epoch
         .as_mut()
@@ -4887,8 +4217,7 @@ where
       // Taken on the same terms and for the same reason: the element the
       // refusal was made over is the one the cursor stands on now, and every
       // later element this loop reaches is one `open_element` left the cursor
-      // on the first byte of. `Epoch::scanned`'s doc carries what a suffix read
-      // as a whole element cost.
+      // on the first byte of.
       let scanned = self.epoch.as_mut().and_then(|epoch| epoch.scanned.take());
       let parameters = self.inside_a_list();
       // Whether a derivation of the whole value still reaches the cursor, which
@@ -4900,13 +4229,11 @@ where
       let Some(end) =
         refused_element_end(self.line, self.at, parameters, after_comma, forced, resume)
       else {
-        // No boundary. The cursor still moves to the end of the run — the walk
-        // stands past the bytes it read rather than in front of them — and
-        // then the one question left is whether anything is unread at all. A
-        // comma some reading holds inside a value leaves the rest of the value
+        // No boundary. The cursor still moves to the end of the run, and then
+        // the one question left is whether anything is unread at all. A comma
+        // some reading holds inside a value leaves the rest of the value
         // unread; the end of a field LINE is that comma only where a line
-        // follows it, and where none does the value ends inside the string,
-        // every reading ends the element there, and nothing stands behind it.
+        // follows it.
         self.at = raw_comma_end(self.line, self.at);
         if self.at < self.line.len() || self.next_line().is_some() {
           self.unresolved = true;
@@ -4915,9 +4242,8 @@ where
       };
       // The boundary is certified now and not before, so this is where the
       // element behind the cursor becomes one every reading of these bytes
-      // ends HERE — and so an element the epoch's own claim is about. Asked
-      // any earlier, the question would be about an element some reading holds
-      // inside a value, which is no element at all.
+      // ends HERE. Asked any earlier, the question would be about an element
+      // some reading holds inside a value, which is no element at all.
       self.sustain_the_epoch(end, scanned);
       self.at = end;
       match self.open_element(None) {
@@ -4926,22 +4252,18 @@ where
         // on one, or at the line end RFC 9110 §5.2 puts one at.
         Step::Element { crossed: join, .. } => {
           // Taken from the one place a line is replaced rather than inferred
-          // from what the line looks like afterwards. `Epoch::floor` is an
+          // from what the line looks like afterwards: `Epoch::floor` is an
           // offset on the line the refusal was made on, so a join crossed here
-          // retires it — and a walk that compared line LENGTHS would keep it
-          // over two lines of equal length.
+          // retires it.
           crossed = crossed || join;
           // The epoch does NOT end here, and the element this stops on is why:
           // [`opens_a_challenge`] says no `auth-param` begins at it, which is
           // not the same as saying a list ended in front of it. An element that
           // derives nothing derives no challenge either, so the reading in
           // which the list is still running and this element is garbage inside
-          // it survives — and `Basic p1=1, ..., p17=17, y=1, Broken;junk,
-          // x="open, Digest realm=z` is the value that says so: `Broken;junk`
-          // is where the walk resumes AND the next thing it refuses, and a list
-          // closed here crosses the comma inside `x`'s own value. Only a
-          // challenge that COMPLETES ends an epoch, and
-          // [`Challenges::challenge`] is where that is done.
+          // it survives — `Basic p1=1, ..., p17=17, y=1, Broken;junk,
+          // x="open, Digest realm=z` is the value that says so. Only a
+          // challenge that COMPLETES ends an epoch.
           if opens_a_challenge(self.line, self.at) {
             return;
           }
@@ -4961,19 +4283,11 @@ where
   ///
   /// [`Epoch::derivable`] says a derivation of the whole value still reaches
   /// the cursor — that THIS recipient's own limit, and not RFC 9110's grammar,
-  /// is why the value stopped being read.
-  /// [`AuthError::is_a_receiver_bound`] is what the opening refusal
-  /// contributes to that, and the refusal is only the span's first element: a
-  /// derivation of the whole value has to reach through every element between
-  /// it and the position the epoch may close at, so the claim is about all of
-  /// them.
-  ///
-  /// The first of them the grammar derives nothing at falsifies it. The
-  /// grammar is then a reason the value stopped deriving too, and "not the
-  /// grammar" is false. The refutation is permanent for the same reason a
-  /// fault's own is: what makes the readings free is the FIRST element the
-  /// grammar derives nothing at, and no later bound of this reader's puts it
-  /// back.
+  /// is why the value stopped being read. The opening refusal is only the
+  /// span's first element: a derivation of the whole value has to reach through
+  /// every element between it and the position the epoch may close at, so the
+  /// claim is about all of them, and the first of them the grammar derives
+  /// nothing at falsifies it permanently.
   ///
   /// # Why every element it crosses has to be asked
   ///
@@ -4985,91 +4299,53 @@ where
   /// `Basic a=1, a=2, y=, Bearer, x="open, Digest realm=evil, junk"` is the
   /// value that says what that costs: the duplicate opens a derivable epoch,
   /// `y=` is skipped, `Bearer` closes the epoch on a claim `y=` had already
-  /// falsified, and the scheme fault at `x=` then stands in front of no open
-  /// list and crosses the comma inside `x`'s own value — handing a caller a
-  /// `Digest` challenge with a `realm` of `evil` that no origin server sent.
+  /// falsified, and the `Digest` the caller is then handed came out of `x`'s
+  /// own value.
   ///
-  /// # Including the element the refusal left the cursor ON
-  ///
-  /// Which is the whole span and not the span less its first element, because
-  /// that element is not always one the refused challenge derived.
-  /// `Basic a1=1` through `a16=16` on sixteen field lines, and a seventeenth
-  /// opening with the element `y=` in front of `Bearer` and a trap whose string
-  /// never closes, is a value whose span begins at an element §11.2 derives
-  /// nothing at — and whose `Digest` was invented out of that trap's own data
-  /// while this rule skipped the span's first element. So there is no
-  /// first-element exception.
+  /// The span includes the element the refusal left the cursor ON, because that
+  /// element is not always one the refused challenge derived: `Basic a1=1`
+  /// through `a16=16` on sixteen field lines, and a seventeenth opening with
+  /// `y=` in front of `Bearer` and a trap whose string never closes, is a value
+  /// whose `Digest` was invented out of that trap's own data while this rule
+  /// skipped the span's first element.
   ///
   /// # And taking it from the walk where the walk has it
   ///
   /// `scanned` is that element where the refusal was made over one the walk had
-  /// already read, and the difference is not cosmetic. Where RFC 9110 §5.2's
-  /// join carried that element onto the line the walk now stands on, the cursor
-  /// is at the HEAD of this line and the run standing there is the element's
-  /// own SUFFIX — the bytes behind the close of a value that began on a line
-  /// this walk no longer holds. Read as a whole `auth-param` it derives
-  /// nothing, and the span's claim is refuted over an element the grammar
-  /// derived: `Basic a=1, a="x` and `y", Bearer, x="open, Digest realm=z` hid a
-  /// `Digest` for exactly that. [`Epoch::scanned`] is where the element is
-  /// carried and why it may be absent.
+  /// already read. Where RFC 9110 §5.2's join carried it onto the line the walk
+  /// now stands on, the run at the cursor is the element's own SUFFIX; read as
+  /// a whole `auth-param` it derives nothing, and the span's claim is refuted
+  /// over an element the grammar derived. `Basic a=1, a="x` and
+  /// `y", Bearer, x="open, Digest realm=z` hid a `Digest` for exactly that.
+  /// [`Epoch::scanned`] is where the element is carried and why it may be
+  /// absent; where it is absent the run at the cursor IS a whole element, which
+  /// [`a_refusal_leaves_the_cursor_where_its_span_begins`] checks rather than
+  /// argues. RFC 9110 §5.6.1.2's leading `OWS` is not skipped here: such a
+  /// cursor now arrives as a `scanned` element instead, so the skip was a
+  /// second, weaker answer to the question [`Epoch::scanned`] answers, and no
+  /// mutation could kill it for exactly that reason.
   ///
-  /// Where it is absent the run at the cursor IS a whole element, because the
-  /// two entrances that leave a derivable epoch with no scanned element —
-  /// [`Section::outgrown`]'s line bound and [`BodyCheck::settle`]'s held
-  /// verdict — are met between elements, on a line no join carried an element
-  /// onto in front of the cursor.
-  /// [`a_refusal_leaves_the_cursor_where_its_span_begins`] is that enumeration
-  /// checked rather than argued.
-  ///
-  /// # And RFC 9110 §5.6.1.2's leading `OWS` is not skipped here
-  ///
-  /// It was, and the skip is gone with the reason for it. A cursor standing
-  /// behind that `OWS` is a cursor §5.2's join left at a line head, and such a
-  /// cursor now arrives as a `scanned` element instead — so the skip was a
-  /// second, weaker answer to the question [`Epoch::scanned`] answers, and it
-  /// could not be killed by any mutation for exactly that reason: the only
-  /// remaining cursor it moved was [`Origin::Body`]'s, whose fault is the
-  /// grammar's and whose epoch is therefore never derivable.
-  ///
-  /// What replaces it is a claim rather than a skip:
-  /// [`Origin::Unread`] says the cursor is on an element's first byte, and
-  /// `a_refusal_leaves_the_cursor_where_its_span_begins` is where that is
-  /// checked at every refusal that makes one.
-  ///
-  /// # A bound met inside the span is no refutation
-  ///
-  /// [`auth_param`] is RFC 9110's grammar and nothing else, so a repeated name
-  /// and a seventeenth parameter pass here exactly as they pass anywhere: they
-  /// move no comma, which is the whole of what
-  /// [`AuthError::is_a_receiver_bound`] records. The claim is about what
-  /// DERIVES, and only the grammar refutes it.
+  /// A bound met inside the span is no refutation: [`auth_param`] is RFC 9110's
+  /// grammar and nothing else, so a repeated name and a seventeenth parameter
+  /// move no comma here as they move none anywhere.
   ///
   /// # The element's extent
   ///
   /// [`Challenges::open_element`] left the cursor on the element's first byte
   /// with RFC 9110 §5.6.1.2's leading `OWS` already off it, and `end` is the
-  /// boundary [`refused_element_end`] has just CERTIFIED for it — the offset
-  /// every reading of these bytes ends the element at — with [`trim_ows_end`]
-  /// taking the list's own trailing whitespace off the far end. That is why
-  /// the caller asks this a turn later than it meets the element: asked at the
-  /// meeting, the question would be about an element some reading holds inside
-  /// a value, which is no element at all, and `Basic a1="x` and
-  /// `y", Bearer, x="c` is the pair of field lines that says so.
+  /// boundary [`refused_element_end`] has just CERTIFIED for it, with
+  /// [`trim_ows_end`] taking the list's own trailing whitespace off the far
+  /// end. That is why the caller asks this a turn later than it meets the
+  /// element: asked at the meeting, the question would be about an element some
+  /// reading holds inside a value, and `Basic a1="x` and `y", Bearer, x="c` is
+  /// the pair of field lines that says so.
   ///
   /// [`ValueTail::Ends`] is the tail of an element read FROM THE LINE, and it
-  /// is the only one that can matter there. Where a `#auth-param` list is open,
-  /// a string still open at that comma is one [`some_reading_holds`] reports
-  /// and [`refused_element_end`] answers `None` for, so the walk stops rather
-  /// than arrive here; and where none is open the epoch is already underivable,
-  /// since a receiver bound is only ever met inside the body §11.3's `1*SP`
-  /// opened. That is an argument rather than a branch, so
-  /// [`a_derivable_span_admits_one_tail`] is what checks it instead of leaving
-  /// it to this doc. A `scanned` element brings its own tail and is asked with
-  /// it: that one crossed a join by construction, and what the join did with
-  /// its value is the whole of what [`ValueTail`] exists to say.
+  /// is the only one that can matter there — an argument rather than a branch,
+  /// so [`a_derivable_span_admits_one_tail`] is what checks it. A `scanned`
+  /// element brings its own tail and is asked with it.
   ///
-  /// So this only ever CLEARS the flag, and an epoch already carrying a fault
-  /// is one it leaves exactly as it found it.
+  /// So this only ever CLEARS the flag.
   fn sustain_the_epoch(&mut self, end: usize, scanned: Option<Element<'a>>) {
     let element = scanned.unwrap_or_else(|| {
       let bytes = self
@@ -5088,22 +4364,14 @@ where
     if let Some(epoch) = self.epoch.as_mut() {
       // RFC 9110 §11.6.1's OTHER reading of the same element, which
       // [`auth_param`] cannot see: where the element takes §11.3's `1*SP`, that
-      // reading opened a `#auth-param` list and its body derives nothing —
-      // every element this loop crosses is one [`opens_a_challenge`] answered
-      // `false` for, so its body begins at an `=` or at the `BWS` in front of
-      // one and §11.2 derives neither.
-      //
-      // **It is a reading only where this element does not derive.** An
+      // reading opened a `#auth-param` list and its body derives nothing.
+      // **It is a reading only where this element does not derive**, because an
       // alternative that derives nothing is not one of the two §11.6.1 leaves a
-      // recipient to choose between — the rule `Challenges::list_open` carries
-      // for a completed challenge, read here for a crossed element — so where
-      // the span still derives AND §11.2 derives this element, the challenge
-      // branch failing at the body's `=` says nothing at all.
+      // recipient to choose between.
       // `Basic p1=1, …, p17=17, y = 1, Bearer, x="open, Digest realm=z` is the
-      // value that cost: `TooManyParameters` opens a derivable epoch,
-      // `y<SP>=<SP>1` is a whole `auth-param`, and letting its failed branch refute
-      // the span kept `Bearer` from closing the epoch and hid a `Digest` every
-      // complete derivation of the value agrees on.
+      // value that cost: `y<SP>=<SP>1` is a whole `auth-param`, and letting its
+      // failed challenge branch refute the span kept `Bearer` from closing the
+      // epoch and hid a `Digest` every complete derivation agrees on.
       let opens = !(epoch.derivable && derives) && opens_a_parameter_list(element.bytes);
       // Only §11.2's reading — the one that DERIVES — answers the span's claim.
       epoch.derivable = epoch.derivable && derives;
@@ -5136,34 +4404,23 @@ where
 ///
 /// `lines` are the field's lines in wire order. §5.2 makes a repeated field
 /// one value, its field line values "concatenated in order, with each field
-/// line value separated by a comma", so a sender that split this list at an
-/// element boundary wrote the same list as one that did not — and a value may
-/// legally open on one line and close on the next, which the walk crosses.
-///
-/// `#auth-param` carries neither bound of §5.6.1's `<n>#<m>element`, so an
-/// empty field value is an empty list rather than a fault.
-///
-/// # What a join can still take away
-///
-/// One VALUE's contiguity, and nothing else. A parameter whose quoted-string
-/// crosses a join keeps its boundaries and its name, so the walk yields it and
-/// [`AuthParam::name`] answers; [`AuthParam::value`] is where
-/// [`ValueSpansFieldLines`] is reported, exactly as it is for a parameter
-/// reached through [`Credential::params`]. The rule is one rule at all three
-/// entry points, and §11.6.3's field is not the place it changes.
+/// line value separated by a comma", so a value may legally open on one line
+/// and close on the next, which the walk crosses. `#auth-param` carries neither
+/// bound of §5.6.1's `<n>#<m>element`, so an empty field value is an empty list
+/// rather than a fault. What a join can still take away is one VALUE's
+/// contiguity, which [`AuthParam::value`] reports as
+/// [`ValueSpansFieldLines`].
 ///
 /// # No line bound
 ///
 /// [`MAX_CHALLENGE_LINES`] bounds what one [`Credential`] can NAME at once,
 /// because a challenge is handed over whole and a borrowing reader has to hold
 /// every region it spans. This walk hands over one parameter at a time and
-/// never names more than the line that parameter began on, so nothing here is
-/// bounded by it: a list spread over more lines than a challenge may occupy is
-/// read rather than refused.
-///
-/// A bound on the PARAMETERS is a different question and this walk does carry
-/// one: [`MAX_PARAMS_PER_CREDENTIAL`], for the record RFC 9110 §11.2's one-name-once
-/// MUST is checked against. Lines are unbounded here and names are not.
+/// never names more than the line that parameter began on, so a list spread
+/// over more lines than a challenge may occupy is read rather than refused.
+/// [`MAX_PARAMS_PER_CREDENTIAL`] still applies, for the record RFC 9110 §11.2's
+/// one-name-once MUST is checked against: lines are unbounded here and names
+/// are not.
 ///
 /// # A trailer's lines, which are field lines
 ///
@@ -5172,23 +4429,18 @@ where
 /// §11.7.3 writes the same sentence for the proxy's field.
 ///
 /// Nothing here honours that, because nothing here can tell. This reader takes
-/// field lines and takes nothing else: no section reaches it, so no branch in
-/// it can turn on one, and a trailer section's lines are read identically to a
-/// header section's BY CONSTRUCTION rather than by a check that could be got
-/// wrong. §6.5 is what makes that sound rather than lucky — a trailer field is
-/// a §5 field that happens to be located in a trailer section, with the same
-/// syntax it would have had in a header one. Whether the scheme allows the
-/// field there at all is the caller's, since this crate implements no
-/// authentication scheme.
+/// field lines and takes nothing else: no section reaches it, so a trailer
+/// section's lines are read identically to a header section's BY CONSTRUCTION
+/// rather than by a check that could be got wrong. §6.5 is what makes that
+/// sound rather than lucky — a trailer field is a §5 field that happens to be
+/// located in a trailer section. Whether the scheme allows the field there at
+/// all is the caller's, since this crate implements no authentication scheme.
 ///
 /// # What follows a fault
 ///
 /// One, and then the walk ends. A `#challenge` value is a list a caller
-/// SEARCHES — §11.4 has a user agent choose "the challenge with what it
-/// considers to be the most secure auth-scheme that it understands" — so
-/// [`challenges`] reports a fault and goes on, lest one unreadable challenge
-/// hide the readable one behind it. A parameter list is not searched that way,
-/// and this crate's other parameter walk,
+/// SEARCHES, so [`challenges`] reports a fault and goes on; a parameter list is
+/// not searched that way, and this crate's other parameter walk,
 /// [`crate::grammar::parameterised_list`], poisons on any `Err`. This one does
 /// the same, so a caller reading a fault knows the rest of the list was not
 /// silently dropped one parameter at a time.
@@ -5203,15 +4455,11 @@ where
 /// forbids inside one; [`AuthError::DuplicateParameter`] for RFC 9110 §11.2's
 /// one-name-once MUST, applied to this field's list for the reason that
 /// variant records; and [`AuthError::TooManyParameters`] past
-/// [`MAX_PARAMS_PER_CREDENTIAL`] names.
-///
-/// The last two are reported AT the parameter that broke the rule, which is
-/// where this walk differs from the other two entry points rather than in the
-/// rule it applies. A [`Credential`] is validated whole before it exists, so a
-/// repeat anywhere in it refuses the whole credential; here the parameters in
-/// front of the repeat were already handed over, and what the fault says is
-/// that the walk ends there — the same thing every other fault on this path
-/// says, and the reason none of them is silently dropped.
+/// [`MAX_PARAMS_PER_CREDENTIAL`] names. The last two are reported AT the
+/// parameter that broke the rule, which is where this walk differs from the
+/// other two entry points rather than in the rule it applies: a [`Credential`]
+/// is validated whole before it exists, and here the parameters in front of the
+/// repeat were already handed over.
 #[inline]
 pub fn auth_info<'a, I>(lines: I) -> impl Iterator<Item = Result<AuthParam<'a>, AuthError>>
 where
@@ -5306,41 +4554,30 @@ where
   ///
   /// # Why this may derive an element after finding its extent
   ///
-  /// [`Challenges::challenge`] may not, and the module doc says why: a verdict
-  /// reached after the extent was found is a verdict the bytes behind a fault
-  /// helped decide, and in a `#challenge` value those bytes can steer the
-  /// boundary past a whole challenge. This walk is the same shape and is safe,
-  /// and it is safe for two reasons rather than by luck — both of which a
-  /// change here has to keep true.
+  /// [`Challenges::challenge`] may not, and the module doc says why. This walk
+  /// is the same shape and is safe for two reasons rather than by luck, both of
+  /// which a change here has to keep true.
   ///
   /// - **`Authentication-Info = #auth-param` has one level.** There is no
   ///   production nested inside this list for a boundary to be moved past, so
   ///   the most an element's extent can decide is where the NEXT `auth-param`
   ///   of the same list begins. There is no §11.4 choice to be denied here,
-  ///   because there is no challenge to hide: the harm the `#challenge` rule
-  ///   exists against has nothing in this field to happen to.
+  ///   because there is no challenge to hide.
   /// - **The walk STOPS at the first fault**, so no byte behind one is ever
   ///   read at all. [`refuse`](Self::refuse) is the one writer of `done` on a
-  ///   fault and every fault site goes through it, and
-  ///   `one_fault_ends_the_parameter_walk` is that stop pinned.
+  ///   fault, and `one_fault_ends_the_parameter_walk` is that stop pinned.
   ///
-  /// The second premise is the load-bearing one. A change that let this walk
-  /// CONTINUE past a fault — a caller wanting the parameters behind a bad one
-  /// — would put bytes a production has already refused in front of the next
-  /// element's extent, which is the `#challenge` walk's own harm arriving in
-  /// this field. Such a
-  /// change has to bring [`Challenges::challenge`]'s discipline with it: derive
-  /// each element before the next element's bytes are read, and find the rest
-  /// of a refused run by raw commas. It is not enough to keep this function and
-  /// drop the `done`.
+  /// The second premise is the load-bearing one: a change that let this walk
+  /// CONTINUE past a fault would have to bring
+  /// [`Challenges::challenge`]'s discipline with it, and it is not enough to
+  /// keep this function and drop the `done`.
   ///
   /// # Errors
   ///
-  /// [`AuthError::InvalidQuotedString`] for a byte §5.6.4 forbids inside a
-  /// quoted-string, whatever [`auth_param`] makes of the element, and
-  /// [`AuthError::DuplicateParameter`] or [`AuthError::TooManyParameters`]
-  /// from the record of names this field's list has already used. Any of them
-  /// ends the walk.
+  /// [`AuthError::InvalidQuotedString`], whatever [`auth_param`] makes of the
+  /// element, and [`AuthError::DuplicateParameter`] or
+  /// [`AuthError::TooManyParameters`] from the record of names this field's
+  /// list has already used. Any of them ends the walk.
   fn element(&mut self) -> Result<AuthParam<'a>, AuthError> {
     let head = self.line;
     let start = self.at;
