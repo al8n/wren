@@ -730,17 +730,22 @@ const AXIS: [Pinned; 16] = [
   // takes §11.3's `1*SP` opens a `#auth-param` list whose body derives nothing.
   // The 135 are `hider-excused` — that list is what puts the probe inside a
   // value.
+  // `over-yield` stood at 108 for one commit, and the GRADER is what moved:
+  // `oracle::covers` was taking the same failed challenge branch the reader had
+  // just stopped taking, and opening a list on it. The 108 are
+  // `yields-underivable` now — shown, and no reading of the value holds them
+  // inside a value.
   (
     "N",
     7_872,
     &[
-      ("hider-excused", 2_864),
+      ("hider-excused", 2_756),
       ("hider-unresolved", 76),
       ("yields", 372),
-      ("yields-underivable", 4_560),
+      ("yields-underivable", 4_668),
     ],
-    11_730,
-    19_482,
+    11_838,
+    19_410,
   ),
   // The family that found both inventions, and neither cell it
   // found them in is a zero-target standing at a number any more.
@@ -1185,7 +1190,7 @@ const ANSWERS: [(&str, &str); 16] = [
   ),
   (
     "N",
-    "4623a16a476c6b2000dd030f4cb35d88570b8b2ce3b1492abe984c13928fb535",
+    "6468df293e9840feeec27ebd30d350d3b8b1e84aa16b8ff5c96a109fe3936fa9",
   ),
   (
     "O",
@@ -1197,7 +1202,7 @@ const ANSWERS: [(&str, &str); 16] = [
   ),
 ];
 
-const WHOLE: &str = "096ab2536a697f1e1209b44159a94aad04b30bf0c238838171c7ad89ea907fc1";
+const WHOLE: &str = "d465ccf284678af51f4900ae08ffde818fd3879b52730b8e2d529b6a5ec5d6ca";
 
 /// Feeds `hash` what `auth-diff` digests: each record's `answer` column and the
 /// newline behind it, in record order.
@@ -1400,11 +1405,11 @@ const FAULTS: [(&str, &[(&str, usize)]); 16] = [
   (
     "N",
     &[
-      ("ChallengeBoundaryUnknown", 2_013),
+      ("ChallengeBoundaryUnknown", 1_905),
       ("ChallengeSpansTooManyLines", 1_392),
       ("DuplicateParameter", 1_440),
       ("MalformedParameter", 2_367),
-      ("MalformedScheme", 5_556),
+      ("MalformedScheme", 5_592),
       ("MissingScheme", 720),
       ("TooManyParameters", 5_376),
       ("UnterminatedQuotedString", 618),
@@ -2462,11 +2467,11 @@ const ELEMENT_START_REACH: [(&str, usize); 16] = [
 /// fixes cost — one of them 172 disagreements in the other direction and 313
 /// moved axis verdicts. It is pinned so the divergence cannot move quietly
 /// while somebody reconciles the two walks.
-const ELEMENT_START_DISAGREEMENTS: usize = 6_415;
+const ELEMENT_START_DISAGREEMENTS: usize = 6_427;
 
 /// How many of those are offsets `oracle::derives_as_a_challenge` is actually
 /// asked at, which is the only kind an axis verdict can turn on.
-const ELEMENT_START_DISAGREEMENTS_AT_A_PROBE: usize = 323;
+const ELEMENT_START_DISAGREEMENTS_AT_A_PROBE: usize = 335;
 
 /// What the two derivations of an element start SHARE, and what this
 /// differential therefore cannot see.
@@ -2528,6 +2533,85 @@ fn element_start_questions(line: &str) -> (Vec<u8>, Vec<usize>) {
   at.sort_unstable();
   at.dedup();
   (joined, at)
+}
+
+/// What makes `Challenges::read_challenge`'s `!after_comma` filter unkillable,
+/// pinned so that either may go and a reader can say which.
+///
+/// ```text
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// token68    = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+/// ```
+///
+/// A mutation campaign left one guard no mutation can
+/// kill: dropping `.filter(|_| !after_comma)` from the body loop's
+/// `element_at` moves no answer. This workspace's own rule is that such a
+/// guard usually has a redundant PARTNER rather than being dead, and this is
+/// the partner — `BodyCheck::settle`'s call at the top of that loop, which
+/// refuses before `skip_element` is reached on every later turn.
+///
+/// What makes it refuse there is a fact about the productions, and this is that
+/// fact rather than the guard: `recover_from` is `Some` only where an
+/// `auth-param` begins at the element's own first byte, which puts §11.3's
+/// `1*SP` in front of a body that opens AT the `=`. `=` is no §5.6.2 `tchar`,
+/// so no `auth-param` derives that first element; and §11.2's `token68`
+/// alphabet holds no `=` but its trailing pad, so no `token68` takes it either.
+/// The verdict `BodyCheck` holds is therefore always an error, and the second
+/// turn of the loop never reaches the line the filter is on.
+///
+/// So either may go: delete the filter and the code is correct through this
+/// fact, or keep it and the rule is stated where the walk relies on it. It is
+/// kept, and this is what makes that a choice rather than a guess.
+#[test]
+fn a_body_recover_from_opened_derives_nothing_at_its_first_element() {
+  let mut premise = 0usize;
+  for len in 1..=6_u32 {
+    for element in payloads(len) {
+      // The two halves of `recover_from`'s own condition, read over the
+      // element the walk would be reading a challenge at.
+      let Some(scheme_end) = crate::oracle::token_end(&element, 0) else {
+        continue;
+      };
+      if element.get(scheme_end) != Some(&b' ')
+        || crate::oracle::value_position(&element, 0).is_none()
+      {
+        continue;
+      }
+      premise = premise.saturating_add(1);
+      let body = crate::oracle::skip_sp(&element, scheme_end);
+      let first = trimmed(
+        element
+          .get(body..crate::oracle::raw_comma_end(&element, body))
+          .unwrap_or_default(),
+      );
+      // The body opens AT the `=`, which is the whole of it.
+      assert_eq!(
+        first.first(),
+        Some(&b'='),
+        "a body `recover_from` opened elsewhere: {}",
+        escape(&element)
+      );
+      assert!(
+        !crate::oracle::derives_a_parameter(first),
+        "§11.2 derives the first element of a body opening at the `=`: {}",
+        escape(&element)
+      );
+      assert!(
+        crate::oracle::token68_end(&element, body)
+          .is_none_or(|end| crate::oracle::boundary(&element, end).is_none()),
+        "§11.3's `token68` takes a body opening at the `=`: {}",
+        escape(&element)
+      );
+    }
+  }
+  // And the premise is one this alphabet can spell, so the three assertions
+  // above are about something. `ALPHABET` holds the SP and the `=` the
+  // condition needs and the `a`/`x` a `token` needs.
+  assert_eq!(
+    premise, 2_034,
+    "the elements `recover_from` fires on, over payloads of one to six bytes"
+  );
 }
 
 #[test]
@@ -3781,14 +3865,17 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
         // only where that epoch can be CLOSED: by a bound of this reader's
         // whose whole span derived.
         // A span that opens a `#auth-param` list of its own is a list in front
-        // of the trap wherever it stands, so a fault that opened none no longer
-        // leaves the value list-free; and the value has stopped deriving inside
-        // that list, so an epoch a bound opened cannot be closed behind it
-        // either. Both terms are one fact —
-        // `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` — read
-        // at the two places this rule asks about a list.
-        let list_free = !(a_list_in_front || its_own_list || opens);
-        let shown = list_free || (bound && derives == Some(true) && !opens);
+        // of the trap wherever it stands — but its challenge branch is a
+        // READING only where §11.2's is not available. Where a list is already
+        // open
+        // and §11.2 derives the span, that branch derives nothing beside one
+        // that derives and §11.6.1 leaves a recipient no choice between them;
+        // where none is, §11.2 has no list to derive the span INTO and the
+        // challenge branch is the only reading there is.
+        let list = a_list_in_front || its_own_list;
+        let opens_here = opens && !(list && derives == Some(true));
+        let list_free = !(list || opens_here);
+        let shown = list_free || (bound && derives == Some(true) && !opens_here);
         for line in rows {
           assert_eq!(
             columns(line)[4].contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
@@ -3841,7 +3928,11 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
         // list-free case of the family above cannot arise here. The probe is
         // shown exactly where the epoch can be closed: a bound of this
         // reader's, whose whole span derived.
-        let shown = bound && derives == Some(true) && !opens;
+        // Every one of these refusals is met INSIDE a body, so a list is always
+        // open where the epoch starts — and a span §11.2 derives into that list
+        // has no challenge branch to testify. `opens` cannot fire here.
+        let _ = opens;
+        let shown = bound && derives == Some(true);
         for line in rows {
           assert_eq!(
             columns(line)[4].contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
@@ -3891,7 +3982,12 @@ fn the_four_stage_absorbed_element_sequence_is_a_shape_this_generator_writes() {
       for line in rows {
         assert_eq!(
           columns(line)[4].contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
-          derives == Some(true) && !opens,
+          {
+            // The line bound is met inside the body §11.3's `1*SP` opened, so
+            // a list is open here too and the same argument holds.
+            let _ = opens;
+            derives == Some(true)
+          },
           "corpus N, line-bound-head, {opener}, {span}: {line}"
         );
       }
@@ -3992,14 +4088,15 @@ fn the_span_that_opens_a_list_is_one_the_recovery_crosses() {
     "corpus N: the invented challenges"
   );
 
-  // Identified by SHAPE and not by the verdict they used to carry: the span
-  // opens a `#auth-param` list under RFC 9110 §11.6.1's challenge reading, a
-  // closer that ENDS a list stands behind it, and the trap carries a DQUOTE at
-  // a value position of the list the span opened. Every one of them hides the
-  // probe, and every one says so — 135 of the 198 answered the other way at
-  // `7c25761`, and the rest were already excused by an epoch that could not
-  // close.
-  let mut shaped = 0usize;
+  // The 198 rows of the shape split exactly on whether the span had already
+  // stopped deriving where the recovery crossed it, which is the whole of the
+  // corrected rule: 90 refused by a fault of the GRAMMAR'S, where §11.2 has no
+  // surviving reading of the span and the challenge branch is the only one
+  // there is — those stay hidden, and the invention this family found stays
+  // closed; and 108 refused by a bound of THIS READER'S, where §11.2 derives
+  // the span whole and a failed alternative may not testify against it.
+  let mut hidden = 0usize;
+  let mut shown = 0usize;
   for line in &n {
     let [_, _, spelling, axis, answer] = columns(line);
     let trap = spelling
@@ -4012,24 +4109,34 @@ fn the_span_that_opens_a_list_is_one_the_recovery_crosses() {
     {
       continue;
     }
-    assert_eq!(
-      axis, "hider-excused",
-      "corpus N: a span that opens a list graded elsewhere: {line}"
-    );
-    assert!(
-      !answer.contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
-      "corpus N: a span that opens a list still yields the probe: {line}"
-    );
-    assert!(
-      answer.contains("Err(ChallengeBoundaryUnknown)"),
-      "corpus N: a span that opens a list hides in silence: {line}"
-    );
-    shaped += 1;
+    let yields = answer.contains(&format!("Ok[{}", escape(PROBE_SCHEME)));
+    if yields {
+      assert_eq!(
+        axis, "yields-underivable",
+        "corpus N: a span shown that some reading still holds inside a value: {line}"
+      );
+      shown += 1;
+    } else {
+      assert_eq!(
+        axis, "hider-excused",
+        "corpus N: a span that opens a list graded elsewhere: {line}"
+      );
+      assert!(
+        answer.contains("Err(ChallengeBoundaryUnknown)"),
+        "corpus N: a span that opens a list hides in silence: {line}"
+      );
+      hidden += 1;
+    }
   }
   assert_eq!(
-    shaped, 198,
-    "corpus N: two openers by nine refusals, three closing closers, three \
-     DQUOTE traps"
+    hidden, 90,
+    "corpus N: the spans refused by a fault of the grammar's, where the \
+     challenge branch is the only reading and the invention stays closed"
+  );
+  assert_eq!(
+    shown, 108,
+    "corpus N: the spans refused by a bound of this reader's, where §11.2 \
+     derives the span whole"
   );
 
   // And the one-line witness, graded by the ORACLE alone. No reader is in this
@@ -5444,6 +5551,96 @@ fn one_value_spelled_over_three_line_counts_answers_two_ways() {
 /// derives whole. `the_cut_a_carried_value_covers_is_one_no_family_wrote`
 /// carries what that costs.
 const SETTLED_COMMA_DECLINED: &[u8] = b"Basic a=1, a=\"x,p,q\",x=\"c\", Digest realm=z";
+
+/// The refusals of corpus N that are bounds of THIS READER'S rather than faults
+/// of the grammar's, named for the metamorphic assertion below.
+///
+/// `AuthError::is_a_receiver_bound` is the rule and these are its rows across
+/// the three sub-families: `corpus_n`'s own, `corpus_n_at_the_cursor`'s line
+/// bound, and `corpus_n_across_a_join`'s pair. A refusal here leaves the value
+/// still deriving, which is the whole of what the assertion needs.
+const N_REFUSAL_IS_A_BOUND: [&str; 6] = [
+  "too-many-params",
+  "duplicate",
+  "too-many-lines",
+  "line-bound-head",
+  "join-duplicate",
+  "join-over-bound",
+];
+
+#[test]
+fn a_parameter_inserted_into_a_derivable_span_moves_no_answer() {
+  // The rule to verify: inserting or removing a valid `y = 1` inside
+  // a receiver-bound, otherwise-derivable span must not change the answer after
+  // an unambiguous `Bearer`. Both endpoints already existed — `span=none` and
+  // `span=bws-sp` — and this is the differential assertion that was missing.
+  //
+  // It is the direct gate on the finding `f48ab1f` fixed. A rule that lets
+  // the FAILED challenge branch of `y<SP>=<SP>1` refute the span keeps the
+  // closer from closing the epoch, so the trap behind it hides a challenge the
+  // `span=none` spelling of the same shape shows — and every one of these pairs
+  // parts.
+  let n = records(corpus_n);
+  let mut cells: HashMap<String, HashMap<String, String>> = HashMap::new();
+  for line in &n {
+    let [_, _, spelling, _, answer] = columns(line);
+    let span = spelling
+      .split_once(" span=")
+      .and_then(|(_, rest)| rest.split(' ').next())
+      .expect("every corpus N spelling names its span");
+    let cell = spelling
+      .split(' ')
+      .filter(|field| !field.starts_with("span="))
+      .collect::<Vec<_>>()
+      .join(" ");
+    cells
+      .entry(cell)
+      .or_default()
+      .insert(span.to_owned(), answer.to_owned());
+  }
+
+  let mut bound = 0usize;
+  let mut free = 0usize;
+  let mut parted = 0usize;
+  for (cell, spans) in &cells {
+    let (Some(none), Some(inserted)) = (spans.get("none"), spans.get("bws-sp")) else {
+      continue;
+    };
+    let refusal = cell
+      .split_once(" refusal=")
+      .and_then(|(_, rest)| rest.split(' ').next())
+      .expect("every corpus N spelling names its refusal");
+    if N_REFUSAL_IS_A_BOUND.contains(&refusal) {
+      // The value still derives where the recovery crosses the inserted
+      // element, and a list is open for §11.2 to derive it INTO — so it is one
+      // `auth-param` and its challenge branch derives nothing beside it.
+      // Inserting it may move nothing at all.
+      assert_eq!(
+        none, inserted,
+        "corpus N, {cell}: a valid parameter inserted into a derivable span \
+         moved the answer"
+      );
+      bound = bound.saturating_add(1);
+    } else {
+      // And the control, which is what says the assertion above is about the
+      // BOUND and not about the bytes. Where a fault of the grammar's refused
+      // the value, no list is open for §11.2 to derive `y<SP>=<SP>1` into, so
+      // the same bytes are no parameter at all — the challenge branch is the
+      // only reading there is, it opens a list, and the trap behind it is that
+      // list's data. `parted` is how many of these the insertion moves, and a
+      // zero here would mean the two endpoints had stopped being different
+      // insertions.
+      free = free.saturating_add(1);
+      parted = parted.saturating_add(usize::from(none != inserted));
+    }
+  }
+  assert_eq!(bound, 240, "the receiver-bound cells with both endpoints");
+  assert_eq!(free, 240, "the grammar-fault cells with both endpoints");
+  assert_eq!(
+    parted, 27,
+    "corpus N: the list-free cells the same insertion does move"
+  );
+}
 
 #[test]
 fn the_cut_a_carried_value_covers_is_one_no_family_wrote() {

@@ -1377,6 +1377,27 @@ fn a_crossed_element_may_open_a_list_the_reading_that_derives_does_not() {
   // read over an element the walk would have stopped at rather than crossed.
   assert!(opens_a_parameter_list(b"Basic a=1"));
 
+  // And the mirror of the same rule, which this fix over-corrected.
+  // `y<SP>=<SP>1` is a whole `auth-param` here, because a list
+  // IS open where the recovery crosses it and the span still derives — so the
+  // challenge branch failing at the body's `=` is an alternative that derives
+  // nothing beside one that derives, and §11.6.1 leaves a recipient no choice
+  // between those. It opens no list, `Bearer` closes the epoch a receiver bound
+  // opened, and the `Digest` behind `x` is one every complete derivation of the
+  // value agrees on.
+  let derivable: &[u8] = b"Basic p1=1, p2=2, p3=3, p4=4, p5=5, p6=6, p7=7, p8=8, \
+                           p9=9, p10=10, p11=11, p12=12, p13=13, p14=14, p15=15, \
+                           p16=16, p17=17, y = 1, Bearer, x=\"open, Digest realm=z";
+  let [bound, bearer, scheme, digest] = walk::<4>([derivable]);
+  assert_eq!(bound.unwrap().unwrap_err(), AuthError::TooManyParameters);
+  assert_eq!(bearer.unwrap().unwrap().scheme(), b"Bearer");
+  assert_eq!(scheme.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(
+    digest.unwrap().unwrap().scheme(),
+    b"Digest",
+    "a failed alternative may not refute a span the grammar still derives"
+  );
+
   // And the walk, over the value the two spellings part on. Both are shown at
   // `7c25761`; only the second may be, because only the first has a reading
   // that holds the probe inside `x`'s value.

@@ -253,6 +253,14 @@ fn element(value: &[u8], here: State, opens: &mut BTreeSet<usize>, work: &mut Ve
   // number of empty list elements".
   derived |= step(boundary(value, at), here, list, work);
 
+  // Whether §11.2's reading DERIVES this element, which decides whether the
+  // challenge reading of the same bytes is a reading at all. An alternative
+  // that derives nothing is not one of the two RFC 9110 §11.6.1 leaves a
+  // recipient to choose between, so a challenge whose body derives nothing may
+  // not open a list beside an `auth-param` that derives — read here the way
+  // `oracle::covers` reads it.
+  let derives_as_a_parameter = list && parameter_derives(value, at);
+
   // The element read as a whole `challenge`.
   if let Some(scheme_end) = token_end(value, at) {
     if value.get(scheme_end) == Some(&b' ') {
@@ -269,7 +277,9 @@ fn element(value: &[u8], here: State, opens: &mut BTreeSet<usize>, work: &mut Ve
       // And `#auth-param`, whose FIRST element is the body itself — an element
       // start inside this outer one, where §11.6.1 puts no second challenge.
       // Its own successors are the outer list's, with that list now open.
-      entered |= parameter(value, body, here, opens, work);
+      if !derives_as_a_parameter {
+        entered |= parameter(value, body, here, opens, work);
+      }
       // Including when that first element is EMPTY. `#auth-param` carries
       // neither bound of §5.6.1's `<n>#<m>element`, so the empty list derives —
       // and a challenge whose `1*SP` was taken has ENTERED a body, so the list
@@ -278,14 +288,16 @@ fn element(value: &[u8], here: State, opens: &mut BTreeSet<usize>, work: &mut Ve
       // DQUOTE stands at a value position of the list `Basic<SP>` opened, and a
       // reading that had `Basic<SP>` close its list instead puts the probe
       // outside every string.
-      entered |= step(boundary(value, body), here, true, work);
+      if !derives_as_a_parameter {
+        entered |= step(boundary(value, body), here, true, work);
+      }
       // And where NOTHING derives the body's first element, the recipient that
       // took the `1*SP` is standing inside the list §11.3's `1*SP` opened, with
       // its first element the thing that failed. The elements behind it may be
       // more parameters of THAT list, whatever stood in front of the challenge
       // — `Basic<SP><HTAB>a, a=", Digest realm=z` is the value that tells this
       // apart from a fault standing in front of a list that never opened.
-      if !entered {
+      if !entered && !derives_as_a_parameter {
         cross(value, body, true, work);
       }
       derived |= entered;
@@ -310,6 +322,36 @@ fn element(value: &[u8], here: State, opens: &mut BTreeSet<usize>, work: &mut Ve
   if free || !derived {
     cross(value, at, list, work);
   }
+}
+
+/// Whether RFC 9110 §11.2 derives the WHOLE element at `at` as one
+/// `auth-param`, ending where §5.6.1.2 lets a list element end.
+///
+/// ```text
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// `( token / quoted-string )` is one alternative taken WHOLE, so a value with
+/// bytes behind it derives nothing and a string that never closes derives
+/// nothing either. Composed here from this file's own imports rather than taken
+/// from `oracle::derives_a_parameter`, which is that walk's composition of the
+/// same three terminals.
+fn parameter_derives(value: &[u8], at: usize) -> bool {
+  let Some(start) = value_position(value, at) else {
+    return false;
+  };
+  let end = if value.get(start) == Some(&b'"') {
+    match scan_quoted(value, start.saturating_add(1)) {
+      Quoted::Closed(end) => end,
+      Quoted::Open | Quoted::Invalid => return false,
+    }
+  } else {
+    match token_end(value, start) {
+      Some(end) => end,
+      None => return false,
+    }
+  };
+  boundary(value, end).is_some()
 }
 
 /// The element at `at` read as RFC 9110 §11.2's `auth-param`, with the list its
