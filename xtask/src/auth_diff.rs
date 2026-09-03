@@ -18,6 +18,16 @@
 //!   documented direction is more faults and never fewer challenges, so a loss
 //!   is a regression whatever else the range did, and it is reported on its own
 //!   line.
+//!
+//!   With one split, because a challenge the caller was handed that no
+//!   derivation of the value puts there is not a challenge. `over-yield` is the
+//!   axis class for exactly that, so a record that graded `over-yield` on the
+//!   base side and yields one challenge fewer on the head side has had an
+//!   INVENTION withdrawn — the direction every fix on this axis moves — and is
+//!   counted on its own line rather than as a loss. Everything else stays a
+//!   loss and still fails the run. Without the split this harness reds on its
+//!   own successes, which is what it did the first time a corpus could spell a
+//!   value the reader invented a challenge out of and a fix stopped it.
 //! - **What the axis says**, per corpus and per side: how many inputs hide a
 //!   challenge a conforming reading would have shown, how many of those are
 //!   excused by a quoted-string that never closes, and how many challenges the
@@ -138,6 +148,9 @@ fn report(base_label: &str, base: &Path, head_label: &str, head: &Path) -> Resul
   let mut head_side = Side::default();
   let mut moved: BTreeMap<Move, (usize, Vec<String>)> = BTreeMap::new();
   let mut lost_challenges = Vec::new();
+  let mut lost_count = 0_usize;
+  let mut withdrawn = Vec::new();
+  let mut withdrawn_count = 0_usize;
 
   let mut base_lines = BufReader::new(fs::File::open(base)?).lines();
   let mut head_lines = BufReader::new(fs::File::open(head)?).lines();
@@ -175,8 +188,20 @@ fn report(base_label: &str, base: &Path, head_label: &str, head: &Path) -> Resul
     if left.answer != right.answer {
       let challenges = count(right.answer, "Ok[") as i64 - count(left.answer, "Ok[") as i64;
       let faults = count(right.answer, "Err(") as i64 - count(left.answer, "Err(") as i64;
-      if challenges < 0 && lost_challenges.len() < EXAMPLES {
-        lost_challenges.push(left.key.clone());
+      match fewer(left.axis, challenges) {
+        None => {}
+        Some(Fewer::Withdrawn) => {
+          withdrawn_count = withdrawn_count.saturating_add(1);
+          if withdrawn.len() < EXAMPLES {
+            withdrawn.push(left.key.clone());
+          }
+        }
+        Some(Fewer::Lost) => {
+          lost_count = lost_count.saturating_add(1);
+          if lost_challenges.len() < EXAMPLES {
+            lost_challenges.push(left.key.clone());
+          }
+        }
       }
       let kind = Move {
         axis: if left.axis == right.axis {
@@ -225,16 +250,59 @@ fn report(base_label: &str, base: &Path, head_label: &str, head: &Path) -> Resul
   }
 
   println!();
+  if withdrawn_count == 0 {
+    println!("no answer withdrew an invention");
+  } else {
+    println!("inventions withdrawn: {withdrawn_count}");
+    for key in &withdrawn {
+      println!("  {key}");
+    }
+  }
+
+  println!();
   if lost_challenges.is_empty() {
     println!("no answer lost a challenge");
   } else {
-    println!("ANSWERS LOST A CHALLENGE:");
+    println!("ANSWERS LOST A CHALLENGE: {lost_count}");
     for key in &lost_challenges {
       println!("  {key}");
     }
     return Err("the head side hides a challenge the base side showed".into());
   }
   Ok(())
+}
+
+/// What a record that yields FEWER challenges than the base side did is.
+#[derive(Debug, Eq, PartialEq)]
+enum Fewer {
+  /// A challenge the caller was handed that no derivation of the value puts
+  /// there, and no longer is.
+  Withdrawn,
+  /// A challenge the caller was shown and is not any more.
+  Lost,
+}
+
+/// Which of the two a record's move is, or `None` where it lost no challenge.
+///
+/// The axis has already answered it for the BASE side. `over-yield` is the
+/// class of a challenge built out of bytes a sender wrote as some value's own
+/// data — `auth-corpus`'s `axis` defines it and drives it to zero — so a record
+/// that graded `over-yield` and yields one challenge fewer has had that
+/// invention withdrawn. That is the direction every fix on this axis moves, and
+/// counting it as a hidden challenge makes this harness red on its own
+/// successes.
+///
+/// Everything else is a loss and still fails the run, `-2` from an
+/// `over-yield` record included: one invention was withdrawn there and
+/// something else went with it, and this cannot say what.
+const fn fewer(axis: &str, challenges: i64) -> Option<Fewer> {
+  if challenges >= 0 {
+    return None;
+  }
+  if challenges == -1 && matches!(axis.as_bytes(), b"over-yield") {
+    return Some(Fewer::Withdrawn);
+  }
+  Some(Fewer::Lost)
 }
 
 /// One record of the dump, borrowed out of the line it was read from.
@@ -427,4 +495,31 @@ fn work_dir() -> Result<PathBuf, Error> {
   }
   fs::create_dir_all(&dir)?;
   Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{Fewer, fewer};
+
+  // Both directions of the one split this harness makes, because a split that
+  // is only asserted in the direction it was added for is one half of a rule.
+  // The `over-yield` row is why the split exists: `auth-corpus` grades a
+  // challenge no derivation of the value puts there into that class, and a
+  // commit that stops inventing one shows up here as a challenge fewer.
+  #[test]
+  fn only_a_single_invention_is_counted_as_withdrawn() {
+    assert_eq!(fewer("over-yield", -1), Some(Fewer::Withdrawn));
+    // A record that was not inventing, so the challenge it stopped showing is
+    // one a reading of the value put there.
+    assert_eq!(fewer("yields", -1), Some(Fewer::Lost));
+    assert_eq!(fewer("yields-underivable", -1), Some(Fewer::Lost));
+    assert_eq!(fewer("hider-excused", -1), Some(Fewer::Lost));
+    // And more than the one invention: something else went with it, and this
+    // cannot say what.
+    assert_eq!(fewer("over-yield", -2), Some(Fewer::Lost));
+    // Nothing lost is nothing to report either way.
+    assert_eq!(fewer("over-yield", 0), None);
+    assert_eq!(fewer("over-yield", 1), None);
+    assert_eq!(fewer("yields", 0), None);
+  }
 }

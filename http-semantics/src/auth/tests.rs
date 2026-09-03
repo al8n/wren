@@ -9,6 +9,17 @@ fn auth_param_alone(element: &[u8]) -> Result<AuthParam<'_>, AuthError> {
   auth_param(element, ValueTail::Ends)
 }
 
+/// The eight bytes the brute forces here run every element over.
+///
+/// `a` is a §5.6.2 `tchar` and one of RFC 9110 §11.2's `token68` alphabet; `/`
+/// is one of §11.2's and no `tchar`; `!` is a `tchar` and none of §11.2's; `=`
+/// is `token68`'s pad and `auth-param`'s own terminal; DQUOTE and `\` are what
+/// §5.6.4 gives meaning to; SP and HTAB are §5.6.3's `OWS`.
+///
+/// A comma is deliberately absent: a comma is what ENDS a §5.6.1.2 element, so
+/// no element holds one.
+const ELEMENT_ALPHABET: [u8; 8] = *b"a/!=\"\\ \t";
+
 // ── RFC 9110 §11.2: the two spellings of a value ─────────────────────────────
 
 #[test]
@@ -329,6 +340,40 @@ fn the_two_branches_are_never_both_derivable() {
   }
   // Neither column is vacuously empty.
   assert_eq!((runs, params), (6, 3));
+
+  // And the same claim over every element of length 1..=5 the productions give
+  // a meaning to, because the whole of `Challenges::challenge`'s `token68`
+  // completion and `Challenges::list_open`'s close now rest on it. A table
+  // answers for its own rows; this answers for the alphabet.
+  //
+  // [`ELEMENT_ALPHABET`] is the eight bytes and its doc says why each is there.
+  const ALPHABET: [u8; 8] = ELEMENT_ALPHABET;
+  let (mut examined, mut runs, mut params) = (0usize, 0usize, 0usize);
+  let mut element = [0_u8; 5];
+  for len in 1..=5_usize {
+    for mut index in 0..ALPHABET
+      .len()
+      .pow(u32::try_from(len).unwrap_or_else(|_| unreachable!("a length of five fits in a u32")))
+    {
+      for slot in element.iter_mut().take(len) {
+        *slot = ALPHABET[index % ALPHABET.len()];
+        index /= ALPHABET.len();
+      }
+      let element = element.get(..len).unwrap_or_default();
+      let is_token68 = token68(element, 0).is_some();
+      let is_param = auth_param_alone(element).is_ok();
+      assert!(
+        !(is_token68 && is_param),
+        "both branches derive {element:?}"
+      );
+      examined += 1;
+      runs += usize::from(is_token68);
+      params += usize::from(is_param);
+    }
+  }
+  // The counts, so a run that stopped writing elements says so rather than
+  // passing an assertion nothing reaches.
+  assert_eq!((examined, runs, params), (37_448, 402, 222));
 }
 
 // ── RFC 9110 §5.2: a challenge is not always one field line ──────────────────
@@ -771,9 +816,18 @@ fn a_quote_where_no_string_may_open_hides_no_challenge() {
   let [first, past] = info::<2>([&b"a=\"x\x00y\", b=2"[..]]);
   assert_eq!(first.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
   assert!(past.is_none());
-  let [broken, newauth, past] = walk::<3>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
+  let [broken, unknown, past] = walk::<3>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
   assert_eq!(broken.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
-  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  // And the `#challenge` walk does NOT go on past this one, which is the pair's
+  // whole point: the DQUOTE here stands where §11.2 admits a value, so a
+  // reading opens a string that the %x00 keeps from ever closing, and that
+  // reading holds the comma in front of `Newauth` as `a`'s own data. The
+  // element above met no string at all, so its comma is a boundary every
+  // reading agrees on and `Newauth` is reached there.
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
   assert!(past.is_none());
 
   // And what the rule may not cost: at that admitted position the string still
@@ -869,28 +923,46 @@ fn the_control_is_that_the_trap_hides_a_challenge_on_its_own() {
 const CERTAIN: &[u8] = b"safe=\"shut\", Digest realm=z";
 
 /// Every fault that refuses a challenge while the walk is still deciding where
-/// that challenge ends, and the head that carries it.
+/// that challenge ends, the head that carries it, and whether the boundary
+/// behind that head is one EVERY reading of it agrees on.
 ///
 /// Driven twice — once behind [`CERTAIN`] and once behind [`TRAP`] — so that
 /// the two tests below differ in the TAIL and in nothing else. A trigger added
-/// to one is added to the other.
-const REFUSED_HEADS: [(&[u8], AuthError); 6] = [
+/// to one is added to the other. The third column is read by the [`CERTAIN`]
+/// test alone: behind [`TRAP`] the readings part in the tail whatever the head
+/// did, and every row answers `ChallengeBoundaryUnknown`.
+const REFUSED_HEADS: [(&[u8], AuthError, bool); 6] = [
   // A value that closed with bytes behind that close.
-  (b"Basic a=\"x\"j", AuthError::MalformedParameter),
+  (b"Basic a=\"x\"j", AuthError::MalformedParameter, true),
   // An element that is no `auth-param` at all: two `=` where the production
   // admits one value.
-  (b"Basic a=b=c", AuthError::MalformedParameter),
+  (b"Basic a=b=c", AuthError::MalformedParameter, true),
   // A value that is neither of §11.2's alternatives taken whole.
-  (b"Basic a=x y", AuthError::MalformedParameter),
-  // A `token68` run where the body holds more than the run.
-  (b"Basic dGVzdA==", AuthError::MalformedParameter),
+  (b"Basic a=x y", AuthError::MalformedParameter, true),
+  // A `token68` run that stops INSIDE its own element, so neither of RFC 9110
+  // §11.2's alternatives derives it: the run ends at its `=` pad and `x` stands
+  // behind that pad, where `auth-param = token BWS "=" BWS ( token /
+  // quoted-string )` wanted a value. `Basic dGVzdA==` is NOT this shape and
+  // cannot stand here — its run reaches the element's end, so `token68` derives
+  // the body and the challenge completes rather than being refused.
+  (b"Basic dGVzdA==x", AuthError::MalformedParameter, true),
   // §11.2's one-name-once MUST.
-  (b"Basic a=1, a=2", AuthError::DuplicateParameter),
-  // A byte §5.6.4 forbids INSIDE a string that legitimately opened. It stands
-  // in FRONT of the comma that ends this element, so no `quoted-string` derives
-  // over that comma in any reading and the recovery crosses it — the ruling
-  // `AuthError::InvalidQuotedString` records, and RFC 9110 §5.5 is why.
-  (b"Basic a=\"x\x00y\"", AuthError::InvalidQuotedString),
+  (b"Basic a=1, a=2", AuthError::DuplicateParameter, true),
+  // A byte §5.6.4 forbids INSIDE a string that legitimately opened, standing in
+  // FRONT of the comma that ends this element — and the ONE row whose boundary
+  // no recovery may take.
+  //
+  // This row said `true`, on the reading that a forbidden byte means no
+  // `quoted-string` derives over the comma in ANY reading. It does
+  // mean that, and it is not the question: the DQUOTE stands where RFC 9110
+  // §11.2 admits a value, the sender wrote every byte behind it as that value's
+  // data, and a string that reaches no close holds every comma left in the
+  // field. `crate::grammar::Readings::absorb` had already ruled so for §5.6.6's
+  // `parameters` — it calls that reading SEALED — and this module answered
+  // otherwise, which is how
+  // `Basic x="%x01, Digest realm=evil` handed a caller a `Digest` built out of
+  // those bytes.
+  (b"Basic a=\"x\x00y\"", AuthError::InvalidQuotedString, false),
 ];
 
 /// `head`, a comma, and `tail`.
@@ -913,15 +985,28 @@ fn every_way_a_challenge_is_refused_reaches_a_challenge_behind_a_certain_comma()
   // `CERTAIN`, then `Digest` — and every one of them reaches `Digest`, because
   // the comma in front of it is one no reading of the bytes ahead of it holds
   // inside a §5.6.4 quoted-string.
-  for (head, fault) in REFUSED_HEADS {
+  for (head, fault, certain) in REFUSED_HEADS {
     let value = behind(head, CERTAIN);
-    let [refused, digest, past] = walk::<3>([&*value]);
+    let [refused, second, past] = walk::<3>([&*value]);
     assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
-    assert_eq!(
-      digest.unwrap().unwrap().scheme(),
-      b"Digest",
-      "the challenge behind {head:?}"
-    );
+    if certain {
+      assert_eq!(
+        second.unwrap().unwrap().scheme(),
+        b"Digest",
+        "the challenge behind {head:?}"
+      );
+    } else {
+      // The one row where a reading of the HEAD holds every comma behind it,
+      // `CERTAIN` tail or not: the string that opened at `a`'s value position
+      // reaches no close, so `safe="shut"` and `Digest realm=z` are among the
+      // bytes it holds. A tail whose own boundary every reading agrees on
+      // cannot put that right — what is uncertain is where the head ENDS.
+      assert_eq!(
+        second.unwrap().unwrap_err(),
+        AuthError::ChallengeBoundaryUnknown,
+        "the boundary behind {head:?}"
+      );
+    }
     assert!(past.is_none(), "{head:?}");
   }
 
@@ -995,15 +1080,23 @@ fn every_way_a_challenge_is_refused_reaches_a_challenge_behind_a_certain_comma()
   assert!(past.is_none());
 
   // The forbidden byte met on the far side of §5.2's join, where the string
-  // opened on one field line and the byte stands first on the next. No
-  // `quoted-string` derives over those bytes either, so the comma behind the
-  // byte is a separator in every reading.
-  let [refused, digest, past] = walk::<3>([&b"Basic a=\"x"[..], b"\x00, Digest realm=z"]);
+  // opened on one field line and the byte stands first on the next. The DQUOTE
+  // that opened it is on a line this walk no longer holds, so no scan it may
+  // make can even SEE the opener, let alone say the string ever closes — and it
+  // does not: `Challenges::skip_element` reports `Refusal::Unbounded` for that
+  // reason and the caller is told the rest is unread.
+  //
+  // This asserted `Digest`, the same manufactured challenge as the one-line
+  // spelling's and one line further away from the DQUOTE it came out of.
+  let [refused, unknown, past] = walk::<3>([&b"Basic a=\"x"[..], b"\x00, Digest realm=z"]);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::InvalidQuotedString
   );
-  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
   assert!(past.is_none());
 
   // A whole challenge on the continuation line, whose own quoted parameter
@@ -1188,7 +1281,7 @@ fn every_way_a_challenge_is_refused_invents_no_challenge_out_of_a_value() {
   //
   // Every trigger reaches the same recovery, which is why the table above is
   // driven through both tails rather than one.
-  for (head, fault) in REFUSED_HEADS {
+  for (head, fault, _) in REFUSED_HEADS {
     let value = behind(head, TRAP);
     let [refused, unknown, past] = walk::<3>([&*value]);
     assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
@@ -1464,7 +1557,7 @@ fn a_value_the_grammar_admits_is_never_cut_into_a_challenge() {
   // Every trigger reaches that recovery, so every trigger is driven through the
   // same tail. The first six are the ones #77 enumerates; the two scheme faults
   // reach it as well and are here for the same reason.
-  for (head, fault) in REFUSED_HEADS {
+  for (head, fault, _) in REFUSED_HEADS {
     let value = behind(head, INVENTED);
     let [refused, unknown, past] = walk::<3>([&*value]);
     assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
@@ -1554,7 +1647,7 @@ const SCHEME_REFUSALS: [(&[u8], AuthError); 3] = [
 const OPEN_TRAP: &[u8] = b"x=\"open, Digest realm=z";
 
 #[test]
-fn a_list_lives_from_its_1_sp_to_the_scheme_that_stands_alone() {
+fn a_list_lives_from_its_1_sp_to_the_challenge_that_derives_past_it() {
   // What a refusal at an `auth-scheme` inherits is the value's list state, not
   // the refused challenge's: RFC 9110 §11.6.1 lets a challenge already open
   // take the refused element as a malformed `auth-param` of its own, and under
@@ -1566,8 +1659,10 @@ fn a_list_lives_from_its_1_sp_to_the_scheme_that_stands_alone() {
   // challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
   // ```
   //
-  // `1*SP` is the body's only entrance. A challenge that took it opened a list;
-  // a challenge that did not took no body at all, in any reading of its bytes.
+  // `1*SP` is the body's only entrance, and what closes a list is a challenge
+  // that COMPLETES with a body §11.3's `#auth-param` alternative is not: no
+  // body at all, or a `token68`. Both close it for one reason — their own
+  // element derives as a challenge and derives as nothing else.
   for (prefix, reached) in [
     // No list has opened anywhere in the value.
     (&b""[..], true),
@@ -1585,17 +1680,21 @@ fn a_list_lives_from_its_1_sp_to_the_scheme_that_stands_alone() {
     // And a list reopened behind that scheme is open again.
     (b"Basic a=1, Bearer, Newauth b=2", false),
     (b"Bearer, Basic a=1", false),
-    // A `token68` body closes NOTHING, and this is the row that says so.
-    // §11.3 writes `token68 / #auth-param` as an ABNF `/`, which orders
-    // nothing, so the same bytes read as `#auth-param` are a list whose first
-    // element derives nothing — and behind a fault this walk holds both
-    // readings. Under that one `open, Digest realm=z` is `x`'s own data, so
-    // crossing to it would hand a caller a challenge no sender wrote. A
-    // `token68` is exactly as much a fault, under the other alternative, as the
-    // scheme faults this flag is consulted for.
-    (b"Bearer abc", false),
-    (b"Bearer dGVzdA==", false),
-    (b"Basic a=1, Bearer abc", false),
+    // A `token68` body closes one for the SAME reason, and these are the rows
+    // that say so. `token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" /
+    // "/" ) *"="` puts nothing but more `=` behind its first one, and
+    // `auth-param = token BWS "=" BWS ( token / quoted-string )` needs a
+    // `token` or a `quoted-string` there — so the `#auth-param` alternative
+    // derives none of these bytes rather than deriving them badly. ABNF's `/`
+    // being unordered says a recipient may try either alternative; it does not
+    // make one that derives nothing into a reading. So no list is open behind
+    // the challenge and the `Digest` is a challenge the sender wrote.
+    (b"Bearer abc", true),
+    (b"Bearer dGVzdA==", true),
+    (b"Basic a=1, Bearer abc", true),
+    // And a list reopened behind THAT is open again, exactly as it is behind a
+    // bare scheme.
+    (b"Basic a=1, Bearer abc, Newauth b=2", false),
   ] {
     for (refusal, fault) in SCHEME_REFUSALS {
       let mut value = prefix.to_vec();
@@ -1677,6 +1776,1029 @@ fn a_list_lives_from_its_1_sp_to_the_scheme_that_stands_alone() {
 }
 
 #[test]
+fn a_fault_takes_away_the_argument_a_completed_challenge_closes_a_list_with() {
+  // The condition on the close, and the shape no other test here spells: a
+  // challenge that completes BEHIND a fault. The argument the two closing
+  // bodies share — a bare `auth-scheme` and RFC 9110 §11.2's `token68` — is
+  // that every reading of the value has this element as a challenge, since
+  // `auth-param = token BWS "=" BWS ( token / quoted-string )` derives none of
+  // its bytes. Behind a fault that is no longer a fact about the value: nothing
+  // derives there, so the readings include one in which every element since the
+  // fault is garbage the open list still holds, and THAT reading has the list
+  // open behind this challenge too.
+  //
+  // So the close is conditioned, and these are the values that condition it.
+  // Each is `Basic a=1` — a list — then a fault, then a challenge that would
+  // close the list if it stood in front of that fault, then the open trap. The
+  // trap's DQUOTE is at a value position of `Basic`'s list under the surviving
+  // reading, so the comma inside it is not a boundary and the walk says so.
+  for closer in [&b"Bearer"[..], b"Bearer abc", b"Bearer dGVzdA=="] {
+    for (refusal, _) in SCHEME_REFUSALS {
+      let mut value = b"Basic a=1, Broken;junk, ".to_vec();
+      value.extend_from_slice(closer);
+      value.extend_from_slice(b", ");
+      value.extend_from_slice(refusal);
+      value.extend_from_slice(b", ");
+      value.extend_from_slice(OPEN_TRAP);
+
+      let last = challenges([value.as_slice()])
+        .last()
+        .unwrap_or_else(|| panic!("{value:?}"));
+      assert_eq!(
+        last.unwrap_err(),
+        AuthError::ChallengeBoundaryUnknown,
+        "a list a fault left open was crossed: {value:?}"
+      );
+      yields_no_invented_scheme(&[&value], &value);
+    }
+  }
+
+  // The control in the other direction, which says the condition is the FAULT
+  // and not the second challenge: the same values with the fault removed reach
+  // `Digest` from every closer.
+  for closer in [&b"Bearer"[..], b"Bearer abc", b"Bearer dGVzdA=="] {
+    for (refusal, _) in SCHEME_REFUSALS {
+      let mut value = b"Basic a=1, ".to_vec();
+      value.extend_from_slice(closer);
+      value.extend_from_slice(b", ");
+      value.extend_from_slice(refusal);
+      value.extend_from_slice(b", ");
+      value.extend_from_slice(OPEN_TRAP);
+
+      let last = challenges([value.as_slice()])
+        .last()
+        .unwrap_or_else(|| panic!("{value:?}"));
+      assert_eq!(
+        last.unwrap_or_else(|_| panic!("{value:?}")).scheme(),
+        b"Digest",
+        "a list every reading closed hid a challenge: {value:?}"
+      );
+    }
+  }
+}
+
+/// The three refusals this reader sets that RFC 9110 does not, each written as
+/// the field-line fragments it takes.
+///
+/// [`AuthError::is_a_receiver_bound`] names them, and its doc is the argument.
+/// The grammar derives every byte of these values, with every element of every
+/// list where §5.6.1.2 puts it; what the refusal says is that this reader will
+/// not HOLD the challenge, and never that it cannot find the next one.
+const RECEIVER_BOUNDS: [(&[&[u8]], AuthError); 3] = [
+  // One name past `MAX_PARAMS_PER_CREDENTIAL`.
+  (
+    &[b"Basic p1=1, p2=2, p3=3, p4=4, p5=5, p6=6, p7=7, p8=8, p9=9, p10=10, p11=11, p12=12, p13=13, p14=14, p15=15, p16=16, p17=17"],
+    AuthError::TooManyParameters,
+  ),
+  // RFC 9110 §11.2's one-name-once MUST, which is prose about names laid over a
+  // list §5.6.1.2 has already delimited: it moves no comma.
+  (&[b"Basic a=1, a=1"], AuthError::DuplicateParameter),
+  // One region past `MAX_CHALLENGE_LINES`, with SIXTEEN names and not
+  // seventeen: the first parameter's value crosses §5.2's join, so it spends
+  // two regions on one name and this row is about the line bound alone.
+  (
+    &[
+      b"Basic a1=\"x",
+      b"y\"",
+      b"a2=2",
+      b"a3=3",
+      b"a4=4",
+      b"a5=5",
+      b"a6=6",
+      b"a7=7",
+      b"a8=8",
+      b"a9=9",
+      b"a10=10",
+      b"a11=11",
+      b"a12=12",
+      b"a13=13",
+      b"a14=14",
+      b"a15=15",
+      b"a16=16",
+    ],
+    AuthError::ChallengeSpansTooManyLines,
+  ),
+];
+
+/// The challenges that complete between two refusals, each of which ends a
+/// `#auth-param` list the grammar still has open.
+///
+/// ```text
+/// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+const CLOSING_BODIES: [&[u8]; 3] = [b"Bearer", b"Bearer abc", b"Bearer dGVzdA=="];
+
+#[test]
+fn a_bound_this_reader_sets_leaves_every_boundary_where_the_grammar_put_it() {
+  // This holds in both directions: a refusal is one of two things, and the
+  // recovery behind it is not the same for both.
+  //
+  // ```text
+  // #element   => [ element ] *( OWS "," OWS [ element ] )
+  // challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+  // auth-param = token BWS "=" BWS ( token / quoted-string )
+  // ```
+  //
+  // Behind an element RFC 9110 derives no part of, no boundary is fixed: a
+  // DQUOTE at a §11.2 value position is a reading's to open or to leave shut,
+  // and one reading has every element since as garbage the open list still
+  // holds. Behind a bound of THIS reader's the grammar is untouched — every
+  // element is where §5.6.1.2 puts it — so the first element no `auth-param`
+  // derives ends the list, and `Bearer abc` is such an element.
+  //
+  // `Basic <seventeen parameters>, Bearer abc, x="open, Digest realm=z` is the
+  // value: `MAX_PARAMS_PER_CREDENTIAL` refuses the `Basic`, recovery reaches
+  // and yields the `Bearer`, and the `Digest` behind `x` is a challenge no
+  // reading of these bytes holds inside a value.
+  for (bound, fault) in RECEIVER_BOUNDS {
+    for closer in CLOSING_BODIES {
+      for opener in [&b""[..], b"Basic a=1"] {
+        // A fixed shape rather than a growable one, so this reads on the
+        // `no_std` tier where the name `Vec` is not in scope.
+        let mut lines: [_; MAX_CHALLENGE_LINES + 1] = core::array::from_fn(|_| b"".to_vec());
+        let held = bound.len();
+        for (index, (line, fragment)) in lines.iter_mut().zip(bound).enumerate() {
+          if index == 0 && !opener.is_empty() {
+            line.extend_from_slice(opener);
+            line.extend_from_slice(b", ");
+          }
+          line.extend_from_slice(fragment);
+        }
+        let tail = lines
+          .get_mut(held.saturating_sub(1))
+          .expect("a bound takes at least one line and at most the array's");
+        tail.extend_from_slice(b", ");
+        tail.extend_from_slice(closer);
+        tail.extend_from_slice(b", ");
+        tail.extend_from_slice(OPEN_TRAP);
+        let lines = lines.get(..held).unwrap_or_default();
+
+        let mut walk =
+          challenges(lines.iter().map(|line| line.as_slice())).skip_while(|read| read.is_ok());
+        assert_eq!(
+          walk
+            .next()
+            .unwrap_or_else(|| panic!("{lines:?}"))
+            .unwrap_err(),
+          fault,
+          "{lines:?}"
+        );
+        assert_eq!(
+          walk
+            .next()
+            .unwrap_or_else(|| panic!("{lines:?}"))
+            .unwrap_or_else(|_| panic!("{lines:?}"))
+            .scheme(),
+          closer.get(..6).unwrap_or_default(),
+          "the challenge recovery reached: {lines:?}"
+        );
+        assert_eq!(
+          walk
+            .next()
+            .unwrap_or_else(|| panic!("{lines:?}"))
+            .unwrap_err(),
+          AuthError::MalformedScheme,
+          "{lines:?}"
+        );
+        assert_eq!(
+          walk
+            .next()
+            .unwrap_or_else(|| panic!("{lines:?}"))
+            .unwrap_or_else(|_| panic!("{lines:?}"))
+            .scheme(),
+          b"Digest",
+          "a bound this reader sets hid a challenge behind it: {lines:?}"
+        );
+        assert!(walk.next().is_none(), "{lines:?}");
+      }
+    }
+  }
+
+  // The control in the other direction, and the whole of what separates the two
+  // regimes: the same shape with a fault of the GRAMMAR in the bound's place.
+  // Nothing derives behind it, so the `Bearer` closes no list and the walk says
+  // the rest is unread rather than crossing a comma some reading holds inside
+  // `x`'s value.
+  for (refusal, fault) in SCHEME_REFUSALS {
+    for closer in CLOSING_BODIES {
+      let mut value = b"Basic a=1, ".to_vec();
+      value.extend_from_slice(refusal);
+      value.extend_from_slice(b", ");
+      value.extend_from_slice(closer);
+      value.extend_from_slice(b", ");
+      value.extend_from_slice(OPEN_TRAP);
+
+      let mut walk = challenges([value.as_slice()]).skip_while(|read| read.is_ok());
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_err(),
+        fault,
+        "{value:?}"
+      );
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_or_else(|_| panic!("{value:?}"))
+          .scheme(),
+        closer.get(..6).unwrap_or_default(),
+        "{value:?}"
+      );
+      assert_eq!(
+        challenges([value.as_slice()])
+          .last()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_err(),
+        AuthError::ChallengeBoundaryUnknown,
+        "a list a fault left open was crossed: {value:?}"
+      );
+      yields_no_invented_scheme(&[&value], &value);
+    }
+  }
+}
+
+#[test]
+fn the_element_recovery_resumes_on_is_not_a_challenge_that_completed() {
+  // `Challenges::seek` stops on an element [`opens_a_challenge`] answers `true`
+  // for, and it is tempting to read that as the list having ended there. It is
+  // not the same sentence.
+  //
+  // ```text
+  // #element   => [ element ] *( OWS "," OWS [ element ] )
+  // auth-param = token BWS "=" BWS ( token / quoted-string )
+  // ```
+  //
+  // `opens_a_challenge` says no `auth-param` BEGINS at the element. Where the
+  // walk goes on to refuse that same element at its `auth-scheme`, nothing
+  // derives there under any reading — so the reading in which RFC 9110
+  // §11.6.1's list is still running and this element is garbage inside it
+  // survives, and the list has not ended after all.
+  //
+  // `Basic <seventeen parameters>, Broken;junk, x="open, Digest realm=z` is the
+  // value. `MAX_PARAMS_PER_CREDENTIAL` refuses the `Basic`, recovery resumes on
+  // `Broken;junk`, and `Broken;junk` is then refused itself — so the DQUOTE at
+  // `x`'s value position still stands at a value position of `Basic`'s list and
+  // the comma inside it is no boundary.
+  for (bound, fault) in RECEIVER_BOUNDS {
+    for tail in [&b"Broken;junk, "[..], b"y=1, Broken;junk, "] {
+      let mut lines: [_; MAX_CHALLENGE_LINES + 1] = core::array::from_fn(|_| b"".to_vec());
+      let held = bound.len();
+      for (line, fragment) in lines.iter_mut().zip(bound) {
+        line.extend_from_slice(fragment);
+      }
+      let last = lines
+        .get_mut(held.saturating_sub(1))
+        .expect("a bound takes at least one line and at most the array's");
+      last.extend_from_slice(b", ");
+      last.extend_from_slice(tail);
+      last.extend_from_slice(OPEN_TRAP);
+      let lines = lines.get(..held).unwrap_or_default();
+
+      let mut walk =
+        challenges(lines.iter().map(|line| line.as_slice())).skip_while(|read| read.is_ok());
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{lines:?}"))
+          .unwrap_err(),
+        fault,
+        "{lines:?}"
+      );
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{lines:?}"))
+          .unwrap_err(),
+        AuthError::MalformedScheme,
+        "{lines:?}"
+      );
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{lines:?}"))
+          .unwrap_err(),
+        AuthError::ChallengeBoundaryUnknown,
+        "the element recovery resumed on closed a list it did not derive: {lines:?}"
+      );
+      assert!(walk.next().is_none(), "{lines:?}");
+    }
+  }
+
+  // The control, and the whole of the difference: the same bound with a
+  // challenge that COMPLETES where the fault stood. Its own element derives as
+  // an element of the outer list and derives as nothing else, so the list has
+  // ended and the probe is reached.
+  for (bound, fault) in RECEIVER_BOUNDS {
+    for closer in CLOSING_BODIES {
+      let mut lines: [_; MAX_CHALLENGE_LINES + 1] = core::array::from_fn(|_| b"".to_vec());
+      let held = bound.len();
+      for (line, fragment) in lines.iter_mut().zip(bound) {
+        line.extend_from_slice(fragment);
+      }
+      let last = lines
+        .get_mut(held.saturating_sub(1))
+        .expect("a bound takes at least one line and at most the array's");
+      last.extend_from_slice(b", ");
+      last.extend_from_slice(closer);
+      last.extend_from_slice(b", ");
+      last.extend_from_slice(OPEN_TRAP);
+      let lines = lines.get(..held).unwrap_or_default();
+
+      let last = challenges(lines.iter().map(|line| line.as_slice()))
+        .last()
+        .unwrap_or_else(|| panic!("{lines:?}"));
+      assert_eq!(
+        last.unwrap_or_else(|_| panic!("{lines:?}")).scheme(),
+        b"Digest",
+        "a list a completed challenge ended hid a challenge: {lines:?}"
+      );
+    }
+    let _ = fault;
+  }
+}
+
+#[test]
+fn a_fault_reaches_past_itself_only_through_the_list_it_stood_in() {
+  // A fault of RFC 9110's grammar, and then a bound THIS reader sets. The bound
+  // alone would leave the readings behind it the grammar's, so the next
+  // completed challenge ends the list. Whether the fault in front of it takes
+  // that away is `Epoch::reaches_past_itself`, and its doc is the argument: a
+  // fault changes what the bytes behind it may be read as in exactly one way —
+  // the DQUOTE at a §11.2 value position becomes a choice — and §11.2 admits a
+  // value position only inside a `#auth-param` list. So a fault met inside a
+  // list reaches past itself and one met where none is open does not.
+  //
+  // ```text
+  // challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+  // auth-param = token BWS "=" BWS ( token / quoted-string )
+  // ```
+  //
+  // Both directions over the same shape, which is the whole of the claim.
+  for (prefix, reaches) in [
+    // A list is open where the fault is met, so it may still be running at the
+    // trap: `Bearer abc` closes nothing and the DQUOTE behind it stands at a
+    // value position of a list some reading still has open.
+    (&b"Basic a=1, Broken;junk, "[..], true),
+    // And none is. `Broken;junk` is the value's first element, so no reading
+    // has a list at it for a string to belong to — and the `Basic` list that
+    // opens behind it is one this fault never stood in. The elements behind it
+    // must read exactly as they do with the prefix removed.
+    (b"Broken;junk, ", false),
+  ] {
+    for (bound, fault) in RECEIVER_BOUNDS {
+      for closer in CLOSING_BODIES {
+        let mut lines: [_; MAX_CHALLENGE_LINES + 1] = core::array::from_fn(|_| b"".to_vec());
+        let held = bound.len();
+        for (index, (line, fragment)) in lines.iter_mut().zip(bound).enumerate() {
+          if index == 0 {
+            line.extend_from_slice(prefix);
+          }
+          line.extend_from_slice(fragment);
+        }
+        let last = lines
+          .get_mut(held.saturating_sub(1))
+          .expect("a bound takes at least one line and at most the array's");
+        last.extend_from_slice(b", ");
+        last.extend_from_slice(closer);
+        last.extend_from_slice(b", ");
+        last.extend_from_slice(OPEN_TRAP);
+        let lines = lines.get(..held).unwrap_or_default();
+
+        // The fault and the bound are reported in that order either way.
+        let mut walk =
+          challenges(lines.iter().map(|line| line.as_slice())).skip_while(|read| read.is_ok());
+        assert_eq!(
+          walk
+            .next()
+            .unwrap_or_else(|| panic!("{lines:?}"))
+            .unwrap_err(),
+          AuthError::MalformedScheme,
+          "{lines:?}"
+        );
+        assert_eq!(
+          walk
+            .next()
+            .unwrap_or_else(|| panic!("{lines:?}"))
+            .unwrap_err(),
+          fault,
+          "{lines:?}"
+        );
+
+        let last = challenges(lines.iter().map(|line| line.as_slice()))
+          .last()
+          .unwrap_or_else(|| panic!("{lines:?}"));
+        if reaches {
+          assert_eq!(
+            last.unwrap_err(),
+            AuthError::ChallengeBoundaryUnknown,
+            "a bound behind a fault with a list put the grammar back: {lines:?}"
+          );
+          for credential in challenges(lines.iter().map(|line| line.as_slice())).flatten() {
+            assert_ne!(
+              credential.scheme(),
+              b"Digest",
+              "a scheme built out of a parameter's own data: {lines:?}"
+            );
+          }
+        } else {
+          assert_eq!(
+            last.unwrap_or_else(|_| panic!("{lines:?}")).scheme(),
+            b"Digest",
+            "a fault with no list reached past itself and hid a challenge: {lines:?}"
+          );
+        }
+      }
+    }
+  }
+}
+
+/// The elements a recovery ABSORBS, and what RFC 9110 §11.2 says about each.
+///
+/// ```text
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// Every one of these is an element `opens_a_challenge` answers `false` for, so
+/// `Challenges::seek` crosses it rather than stopping on it. The flag is
+/// whether §11.2 derives it, which is the only thing an epoch's own claim turns
+/// on: `BWS` is admitted on both sides of the `=` and a repeated name is
+/// §11.2's own MUST rather than a fault of the grammar, so both of those must
+/// SUSTAIN the claim; `( token / quoted-string )` is one alternative taken
+/// whole, so the two `trailing` spellings refute it.
+///
+/// `y=1"x` is the one row that is not about the value's own shape: the DQUOTE
+/// stands behind a `token` the value already took, so §11.2 admits no
+/// quoted-string at it, it opens nothing, and what is left is a `token`
+/// alternative with bytes behind it.
+///
+/// `y=1<SP>` is the row that says the list's own whitespace is not the
+/// element's. §5.6.1.2 hangs `OWS` on BOTH sides of its comma, so the space in
+/// front of one belongs to the list — an absorbed element read with it still on
+/// is a `token` with a space behind it, which is neither of §11.2's
+/// alternatives, and the span would be refuted by whitespace the sender was
+/// entitled to write.
+///
+/// The last pair is the same two elements in both orders, because the claim is
+/// about every element of the span and a rule that asked only the first would
+/// answer one of them wrong.
+const ABSORBED: [(&[u8], bool); 12] = [
+  (b"y=1", true),
+  (b"y=\"q\"", true),
+  (b"y\t=\ta", true),
+  (b"a=1", true),
+  (b"y=1, z=2", true),
+  (b"y=1 ", true),
+  (b"y=", false),
+  (b"y=1 z", false),
+  (b"y=\"q\"z", false),
+  (b"y=1\"x", false),
+  (b"y=1, z=", false),
+  (b"y=, z=1", false),
+];
+
+#[test]
+fn an_epoch_is_derivable_only_while_every_element_of_its_span_still_derives() {
+  // A recovery epoch opened by a bound of THIS reader's claims that the
+  // bound, and not RFC 9110's grammar, is why the
+  // value stopped deriving — which is what lets a challenge that completes
+  // behind it end the `#auth-param` list the refusal left open.
+  //
+  // ```text
+  // #element   => [ element ] *( OWS "," OWS [ element ] )
+  // challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+  // auth-param = token BWS "=" BWS ( token / quoted-string )
+  // ```
+  //
+  // That is a claim about every element between the refusal and the close: a
+  // derivation of the whole value has to reach through all of them. So the
+  // first one §11.2 derives nothing at falsifies it — the grammar is then a
+  // reason too — and the epoch may no longer be closed.
+  //
+  // `Basic a=1, a=2, y=, Bearer, x="open, Digest realm=z` is the witness. `y=`
+  // is skipped by `seek` because an `auth-param` BEGINS at it, `Bearer` closed
+  // the epoch on the strength of a claim `y=` had already refuted, and the
+  // scheme fault at `x=` then stood in front of no open list and crossed the
+  // comma inside `x`'s own value — handing back a `Digest` challenge out of the
+  // middle of it.
+  //
+  // Both directions over one shape: where the span derives, the probe is a
+  // challenge and must still be shown.
+  for (bound, fault) in RECEIVER_BOUNDS {
+    for closer in CLOSING_BODIES {
+      for (span, derives) in ABSORBED {
+        let mut lines: [_; MAX_CHALLENGE_LINES + 1] = core::array::from_fn(|_| b"".to_vec());
+        let held = bound.len();
+        for (line, fragment) in lines.iter_mut().zip(bound) {
+          line.extend_from_slice(fragment);
+        }
+        let last = lines
+          .get_mut(held.saturating_sub(1))
+          .expect("a bound takes at least one line and at most the array's");
+        last.extend_from_slice(b", ");
+        last.extend_from_slice(span);
+        last.extend_from_slice(b", ");
+        last.extend_from_slice(closer);
+        last.extend_from_slice(b", ");
+        last.extend_from_slice(OPEN_TRAP);
+        let lines = lines.get(..held).unwrap_or_default();
+
+        // The bound is still the first fault reported, whatever the span holds:
+        // a refusal binds where it is met and the span is behind it.
+        assert_eq!(
+          challenges(lines.iter().map(|line| line.as_slice()))
+            .find(|read| read.is_err())
+            .unwrap_or_else(|| panic!("{lines:?}"))
+            .unwrap_err(),
+          fault,
+          "{lines:?}"
+        );
+        // And the closer still completes, so what moves is the epoch's claim
+        // and not which challenges the walk reaches.
+        assert!(
+          challenges(lines.iter().map(|line| line.as_slice()))
+            .flatten()
+            .any(|credential| credential.scheme() == b"Bearer"),
+          "the challenge that closes the epoch was not read: {lines:?}"
+        );
+
+        let last = challenges(lines.iter().map(|line| line.as_slice()))
+          .last()
+          .unwrap_or_else(|| panic!("{lines:?}"));
+        if derives {
+          assert_eq!(
+            last.unwrap_or_else(|_| panic!("{lines:?}")).scheme(),
+            b"Digest",
+            "a span the grammar derives cost a challenge: {lines:?}"
+          );
+        } else {
+          assert_eq!(
+            last.unwrap_err(),
+            AuthError::ChallengeBoundaryUnknown,
+            "a span the grammar derives nothing at still closed an epoch: {lines:?}"
+          );
+          for credential in challenges(lines.iter().map(|line| line.as_slice())).flatten() {
+            assert_ne!(
+              credential.scheme(),
+              b"Digest",
+              "a scheme built out of a parameter's own data: {lines:?}"
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
+#[test]
+fn the_element_a_refusal_leaves_the_cursor_on_is_in_the_span_it_opens() {
+  // The span rule has no first-element exception, and this is the shape that
+  // says why it may not. RFC 9110 §5.2 joins the field lines into one value;
+  // `MAX_CHALLENGE_LINES` is met when the challenge needs a line this reader
+  // may not hold, and it is met with the cursor at the HEAD of that line — on
+  // an element the walk has not read and nothing has derived.
+  //
+  // ```text
+  // #element   = [ element ] *( OWS "," OWS [ element ] )
+  // challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+  // auth-param = token BWS "=" BWS ( token / quoted-string )
+  // ```
+  //
+  // So the first element of the span is the first element of that line. A rule
+  // that measured only the elements BEHIND the cursor was green over every
+  // other shape on this branch and handed a caller the `Digest` below, read
+  // out of `x`'s own value.
+  // `a1` is on the first line, so the names behind it start at `a2`: a repeat
+  // would be refused by RFC 9110 §11.2's one-name-once MUST before the line
+  // bound this test is about is ever met. Written out because no allocator is
+  // assumed here.
+  const NAMES: [&[u8]; MAX_CHALLENGE_LINES] = [
+    b"Basic a1=1",
+    b"a2=1",
+    b"a3=1",
+    b"a4=1",
+    b"a5=1",
+    b"a6=1",
+    b"a7=1",
+    b"a8=1",
+    b"a9=1",
+    b"a10=1",
+    b"a11=1",
+    b"a12=1",
+    b"a13=1",
+    b"a14=1",
+    b"a15=1",
+    b"a16=1",
+  ];
+  for (span, derives) in ABSORBED {
+    let mut lines: [_; MAX_CHALLENGE_LINES + 1] = core::array::from_fn(|_| b"".to_vec());
+    for (line, name) in lines.iter_mut().zip(NAMES) {
+      line.extend_from_slice(name);
+    }
+    let last = lines
+      .last_mut()
+      .expect("the array holds one line past the bound");
+    last.extend_from_slice(span);
+    last.extend_from_slice(b", Bearer, ");
+    last.extend_from_slice(OPEN_TRAP);
+
+    // The bound is what refused it, and the closer behind the span still
+    // completes — so what moves is the epoch's claim and not the walk's reach.
+    let read = lines.iter().map(|line| line.as_slice());
+    assert_eq!(
+      challenges(read)
+        .find(|answer| answer.is_err())
+        .unwrap_or_else(|| panic!("{lines:?}"))
+        .unwrap_err(),
+      AuthError::ChallengeSpansTooManyLines,
+      "{lines:?}"
+    );
+    assert!(
+      challenges(lines.iter().map(|line| line.as_slice()))
+        .flatten()
+        .any(|credential| credential.scheme() == b"Bearer"),
+      "the challenge that closes the epoch was not read: {lines:?}"
+    );
+
+    let last = challenges(lines.iter().map(|line| line.as_slice()))
+      .last()
+      .unwrap_or_else(|| panic!("{lines:?}"));
+    if derives {
+      assert_eq!(
+        last.unwrap_or_else(|_| panic!("{lines:?}")).scheme(),
+        b"Digest",
+        "a span the grammar derives cost a challenge: {lines:?}"
+      );
+    } else {
+      assert_eq!(
+        last.unwrap_err(),
+        AuthError::ChallengeBoundaryUnknown,
+        "the element the cursor stands on was left out of the span: {lines:?}"
+      );
+    }
+  }
+}
+
+#[test]
+fn a_bound_met_inside_a_span_refutes_nothing_the_grammar_did_not() {
+  // The other direction of the same rule, and the one that says it is RFC
+  // 9110's grammar being asked and not the walk's own bookkeeping. A repeated
+  // name and a nineteenth parameter are refusals THIS reader makes; §11.2
+  // derives every byte of the elements carrying them, with every element where
+  // §5.6.1.2 puts it, so neither moves a comma and neither may refute a span.
+  //
+  // The `a=1` row is a real repeat: `Basic a=1, a=1` is the refused challenge,
+  // so the absorbed element carries a name that challenge already used. The
+  // long row is nineteen more parameters behind a bound of seventeen, which is
+  // `MAX_PARAMS_PER_CREDENTIAL` exceeded twice over inside one span.
+  for span in [
+    &b"a=1"[..],
+    b"q1=1, q2=1, q3=1, q4=1, q5=1, q6=1, q7=1, q8=1, q9=1, q10=1, q11=1, q12=1, q13=1, q14=1, q15=1, q16=1, q17=1, q18=1, q19=1",
+  ] {
+    let mut value = b"Basic a=1, a=1, ".to_vec();
+    value.extend_from_slice(span);
+    value.extend_from_slice(b", Bearer, ");
+    value.extend_from_slice(OPEN_TRAP);
+    let read: [&[u8]; 1] = [value.as_slice()];
+    assert_eq!(
+      challenges(read)
+        .last()
+        .unwrap_or_else(|| panic!("{value:?}"))
+        .unwrap_or_else(|_| panic!("{value:?}"))
+        .scheme(),
+      b"Digest",
+      "a bound met inside a span refuted it: {value:?}"
+    );
+  }
+}
+
+#[test]
+fn a_list_free_fault_in_front_of_a_value_hides_none_of_its_challenges() {
+  // The strongest form of the same claim: prefixing a value with a fault
+  // that opens no `#auth-param` list must expose exactly the challenges it
+  // exposed without the prefix, in the same order.
+  //
+  // `Broken;junk` is that prefix. It is an element of the outer `#challenge`
+  // list that derives nothing, at the head of the value where no list is open,
+  // and `Challenges::seek` settles its extent by the commas every reading ends
+  // an element at. There is nothing left of it to reach forward with.
+  //
+  // **Challenges, not answers.** The FAULT count may fall by one, because
+  // §11.6.1's ambiguity is resolved once per challenge and `seek` reads a
+  // parameter-shaped element behind the refusal as part of the fault already
+  // reported rather than as a second one — `Basic="q` behind this prefix is
+  // absorbed that way.
+  //
+  // **What that costs, and the scope of the argument, which is the whole of
+  // it.** THIS epoch is list-free, so two things hold together and neither is
+  // a fact about absorption in general. `refused_element_end` admits no
+  // opener, so every comma `seek` crosses is one every reading ends an element
+  // at; and a receiver bound is only ever met inside the body RFC 9110 §11.3's
+  // `1*SP` opened, so a list-free epoch is never derivable and has no claim for
+  // an absorbed element to falsify. An element absorbed here can therefore cost
+  // a fault report and nothing else. It is an element `opens_a_challenge`
+  // answered `false` for, which
+  // `an_element_that_completes_a_challenge_is_no_parameter_of_the_list_in_front_of_it`
+  // proves can never complete a challenge, so nothing is hidden — and there is
+  // no derivability left to lose, so nothing is invented.
+  //
+  // **That scope did not cover this.** Read as a claim about absorption
+  // rather than about THIS epoch, it says a skipped
+  // element costs only a report; and in a DERIVABLE epoch it costs the claim
+  // itself, because the element the grammar derives nothing at is precisely the
+  // evidence that the grammar is a reason the value stopped deriving.
+  // `an_epoch_is_derivable_only_while_every_element_of_its_span_still_derives`
+  // is that half, and the two are the two regimes an epoch has rather than a
+  // rule and its exception.
+  for tail in [
+    &b"Safe, Basic a=1, a=2, Bearer abc, x=\"open, Digest realm=z"[..],
+    b"Basic a=1, a=2, Bearer abc, x=\"open, Digest realm=z",
+    b"Basic a=1, Bearer, x=\"open, Digest realm=z",
+    b"Bearer abc, x=\"open, Digest realm=z",
+    b"Basic a=1, Broken;junk, Bearer, x=\"open, Digest realm=z",
+    b"Basic ;, Bearer, x=\"open, Digest realm=z",
+    b"Basic=\"q, Digest realm=z",
+    b"Basic p1=1, Bearer dGVzdA==, x=\"open, Digest realm=z",
+  ] {
+    let mut prefixed = b"Broken;junk, ".to_vec();
+    prefixed.extend_from_slice(tail);
+
+    let bare: [_; 8] = core::array::from_fn(|_| None);
+    let mut bare = bare;
+    for (slot, scheme) in bare.iter_mut().zip(
+      challenges([tail])
+        .flatten()
+        .map(|credential| credential.scheme()),
+    ) {
+      *slot = Some(scheme);
+    }
+    let with: [_; 8] = core::array::from_fn(|_| None);
+    let mut with = with;
+    for (slot, scheme) in with.iter_mut().zip(
+      challenges([prefixed.as_slice()])
+        .flatten()
+        .map(|credential| credential.scheme()),
+    ) {
+      *slot = Some(scheme);
+    }
+    assert_eq!(bare, with, "a list-free fault moved a challenge: {tail:?}");
+    // And the prefix is reported, so the caller is not told a value it never
+    // received: the fault is the walk's FIRST answer either way.
+    assert_eq!(
+      challenges([prefixed.as_slice()])
+        .next()
+        .unwrap_or_else(|| panic!("{tail:?}"))
+        .unwrap_err(),
+      AuthError::MalformedScheme,
+      "{tail:?}"
+    );
+  }
+}
+
+#[test]
+fn a_fault_reported_over_a_complete_extent_is_a_refusal_like_every_other() {
+  // Two faults are reported with the challenge's extent ALREADY complete — a
+  // body neither of RFC 9110 §11.3's alternatives derives, and the line bound
+  // met on the region the challenge ends in — and previously they reached the
+  // caller without the walk recording a refusal at all.
+  //
+  // `Basic ;` is the first of them: `;` is no §5.6.2 `tchar`, so the body is no
+  // `#auth-param` list, and §11.2's `token68` alphabet does not hold it either.
+  // Nothing derives from there, so nothing behind it does — and the `Bearer`
+  // standing behind it closes no list. A walk that recorded nothing let it, and
+  // handed a caller a `Digest` read out of the middle of `x`'s own value.
+  for closer in CLOSING_BODIES {
+    for opener in [&b""[..], b"Basic a=1"] {
+      let mut value = b"".to_vec();
+      if !opener.is_empty() {
+        value.extend_from_slice(opener);
+        value.extend_from_slice(b", ");
+      }
+      value.extend_from_slice(b"Basic ;, ");
+      value.extend_from_slice(closer);
+      value.extend_from_slice(b", ");
+      value.extend_from_slice(OPEN_TRAP);
+
+      let mut walk = challenges([value.as_slice()]).skip_while(|read| read.is_ok());
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_err(),
+        AuthError::MalformedParameter,
+        "{value:?}"
+      );
+      assert_eq!(
+        walk
+          .next()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_or_else(|_| panic!("{value:?}"))
+          .scheme(),
+        closer.get(..6).unwrap_or_default(),
+        "{value:?}"
+      );
+      assert_eq!(
+        challenges([value.as_slice()])
+          .last()
+          .unwrap_or_else(|| panic!("{value:?}"))
+          .unwrap_err(),
+        AuthError::ChallengeBoundaryUnknown,
+        "a body no reading derives left a list the `Bearer` behind it closed: {value:?}"
+      );
+      yields_no_invented_scheme(&[&value], &value);
+    }
+  }
+
+  // And the control that says this is the BODY and not the `Basic`: the same
+  // value with a body §11.2's `#auth-param` derives leaves no fault behind it,
+  // the `Bearer` closes the list it opened, and the `Digest` is reached.
+  for closer in CLOSING_BODIES {
+    let mut value = b"Basic a=1, ".to_vec();
+    value.extend_from_slice(closer);
+    value.extend_from_slice(b", ");
+    value.extend_from_slice(OPEN_TRAP);
+    assert_eq!(
+      challenges([value.as_slice()])
+        .last()
+        .unwrap_or_else(|| panic!("{value:?}"))
+        .unwrap_or_else(|_| panic!("{value:?}"))
+        .scheme(),
+      b"Digest",
+      "{value:?}"
+    );
+  }
+}
+
+#[test]
+fn an_element_that_completes_a_challenge_is_no_parameter_of_the_list_in_front_of_it() {
+  // The argument `a_yielded_challenge_is_no_parameter` rests on, executed over
+  // the productions rather than asserted in its doc.
+  //
+  // ```text
+  // challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+  // auth-param = token BWS "=" BWS ( token / quoted-string )
+  // token68    = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+  // ```
+  //
+  // Suppose an element is both. Some `auth-param` begins at it, so a `token`,
+  // then `BWS`, then `=` stand at its head; and it completes as a challenge, so
+  // `auth-scheme 1*SP` stands there too and the body opens at the first byte
+  // behind the SP run. `BWS` is §5.6.3's `OWS`, and a HTAB between the scheme
+  // and the `=` is refused before any body is read — so the run is SP alone and
+  // the body opens AT the `=`. `#auth-param` needs a `token` at its first
+  // element and `=` is no §5.6.2 `tchar`; `token68` needs one of its own base
+  // alphabet, where `=` is only the trailing pad. The body derives nothing, the
+  // challenge is refused rather than completed, and the two cannot both hold.
+  //
+  // [`ELEMENT_ALPHABET`], the same eight bytes the other brute force here runs
+  // over, written once so the two answer over the same elements.
+  const ALPHABET: [u8; 8] = ELEMENT_ALPHABET;
+  let (mut examined, mut parameters, mut completed) = (0usize, 0usize, 0usize);
+  let mut element = [0_u8; 5];
+  for len in 1..=5_usize {
+    for mut index in 0..ALPHABET
+      .len()
+      .pow(u32::try_from(len).unwrap_or_else(|_| unreachable!("a length of five fits in a u32")))
+    {
+      for slot in element.iter_mut().take(len) {
+        *slot = ALPHABET[index % ALPHABET.len()];
+        index /= ALPHABET.len();
+      }
+      let element = element.get(..len).unwrap_or_default();
+      let a_parameter = param_value_at(element, 0).is_some();
+      // The element read as a whole value, which is the element read as a
+      // `#challenge` list of one: no comma is in the alphabet, so the walk
+      // yields one answer and it is this element's.
+      let completes = matches!(challenges([element]).next(), Some(Ok(_)));
+      assert!(
+        !(a_parameter && completes),
+        "an element completed a challenge and admits an auth-param at its head: {element:?}"
+      );
+      examined += 1;
+      parameters += usize::from(a_parameter);
+      completed += usize::from(completes);
+    }
+  }
+  // Neither column is vacuously empty, which is the half a `false` on either
+  // side would pass without.
+  assert_eq!((examined, parameters, completed), (37_448, 2_034, 990));
+}
+
+#[test]
+fn a_run_that_ends_its_element_is_no_body_when_a_region_stands_behind_it() {
+  // ```text
+  // challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+  // token68   = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+  // ```
+  //
+  // `token68` is the WHOLE body, and a run that ends its own list ELEMENT has
+  // ended one element rather than the body. `Basic dGVzdA==` and `x=1` are two
+  // field lines RFC 9110 §5.2 makes one value, `Basic dGVzdA==,x=1`, whose body
+  // is `dGVzdA==,x=1` — and no `token68` holds a comma.
+  //
+  // `Credential::read` is where a body already cut is derived, so this is asked
+  // of it directly: the `#challenge` walk never hands it one of these, because
+  // it ends the challenge at the run's own comma before a second region can be
+  // taken. That is what makes the region count a rule of `BodyCheck::finish`
+  // rather than a fact about one caller.
+  let mut body = BodyLines::new();
+  body.push(b"dGVzdA==", 8).expect("the first region");
+  body.push(b"x=1", 3).expect("the second");
+  assert_eq!(body.len, 2, "two regions, which is a body §5.2 joined");
+  assert_eq!(
+    Credential::read(b"Basic", body).unwrap_err(),
+    AuthError::MalformedParameter,
+    "a run that ends its element is not a body two regions long"
+  );
+
+  // The control that says the rule is the SECOND region and not the run: the
+  // same first region alone is the body, and the `token68` is taken.
+  let mut body = BodyLines::new();
+  body.push(b"dGVzdA==", 8).expect("the one region");
+  assert_eq!(
+    Credential::read(b"Basic", body).unwrap().token68(),
+    Some(&b"dGVzdA=="[..])
+  );
+}
+
+#[test]
+fn an_empty_element_in_front_of_a_run_is_a_body_no_token68_derives() {
+  // `token68` is not a list, so it has no empty elements and nothing may stand
+  // in front of it inside the body:
+  //
+  // ```text
+  // challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+  // token68   = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+  // ```
+  //
+  // RFC 9110 §5.6.1.2 admits those empty elements in the OTHER alternative —
+  // "A recipient MUST parse and ignore a reasonable number of empty list
+  // elements" — so a body that opens with one took `#auth-param`, whatever the
+  // bytes behind it look like.
+  //
+  // It has to be answered at the ELEMENT rather than read off the body, because
+  // `BodyLines` spends no region on one that is all `OWS` and commas: the same
+  // sentence is why, and the cost is that a body whose empty elements stand on
+  // the line §5.2's join left behind arrives here as the bytes behind them.
+  let [fault, digest, past] = walk::<3>([&b"Basic ,"[..], b"a=, Digest realm=z"]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // The one-line spelling of the same value, which is what it has to agree
+  // with: RFC 9110 §5.2 makes those two lines one value,
+  // `Basic ,,a=, Digest realm=z`.
+  let [fault, digest, past] = walk::<3>([&b"Basic ,,a=, Digest realm=z"[..]]);
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // And the control that says the rule is about the empty element and not about
+  // the run: the same run with nothing in front of it IS the body.
+  let credential = one([&b"Basic a="[..]]);
+  assert_eq!(credential.token68(), Some(&b"a="[..]));
+}
+
+#[test]
+fn a_scheme_fault_is_recovered_from_the_element_s_own_first_byte() {
+  // RFC 9110 §11.6.1 gives the element two readings and they open a §5.6.4
+  // quoted-string in different places. A scheme refusal is the challenge
+  // reading failing; the OTHER reading is one `auth-param` whose value position
+  // is `param_value_at` answered at the element's FIRST byte, and a recovery
+  // that begins behind the scheme token has already walked past it.
+  //
+  // `Basic a=1, Broken;junk, Bearer, x="open, Digest realm=z` is the value: a
+  // list `Basic` opened and the fault left open, a `Bearer` that cannot close
+  // it, and then `x="open` refused at its own scheme with `x=`'s DQUOTE
+  // standing at a value position of that list. Read from behind the `x`, the
+  // opener is invisible and the comma inside the string is crossed.
+  let value = &b"Basic a=1, Broken;junk, Bearer, x=\"open, Digest realm=z"[..];
+  let [basic, broken, bearer, malformed, unknown, past] = walk::<6>([value]);
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(broken.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(bearer.unwrap().unwrap().scheme(), b"Bearer");
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+  yields_no_invented_scheme(&[value], value);
+
+  // And the control that says the origin is admitted by `Challenges::list_open`
+  // rather than taken unconditionally: with no list open anywhere, the same
+  // element's DQUOTE stands at no value position of any reading and the comma
+  // in front of `Digest` is a boundary. `Basic="q` is that element read at its
+  // own first byte, and §11.6.1 has no challenge open at the head of a
+  // `#challenge` value for a parameter to belong to.
+  let [malformed, digest, past] = walk::<3>([&b"Basic=\"q, Digest realm=z"[..]]);
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+}
+
+#[test]
 fn a_forbidden_byte_is_the_one_thing_a_high_byte_is_not() {
   // The pair that says the recovery above is about the bytes RFC 9110 §5.6.4
   // forbids and not about DQUOTEs. `obs-text` IS `qdtext` — the production is
@@ -1716,32 +2838,313 @@ fn a_forbidden_byte_is_the_one_thing_a_high_byte_is_not() {
   }
 
   // The control, one byte apart: a CTL is neither `qdtext` nor an octet a
-  // `quoted-pair` may escape, so the value derives nothing, the challenge is
-  // refused, and the comma the sender wrote inside the realm ends the refused
-  // run. What the recovery reaches here is a fault and not a challenge —
-  // `realm=z"` is no parameter, since the DQUOTE that would have closed the
-  // realm is still in the run — and the `obs-text` rows above are never
-  // recovered from at all.
-  let [refused, malformed, past] = walk::<3>([&b"Basic realm=\"a\x00b, Digest realm=z\""[..]]);
+  // `quoted-pair` may escape, so no `quoted-string` derives here and the
+  // challenge is refused. What the sender wrote is unchanged by that — every
+  // byte behind the DQUOTE is still what they typed between it and a close that
+  // never comes — so the comma inside the realm is that run's data under the
+  // reading that opened it, and the walk declines it rather than cross. The
+  // `obs-text` rows above are never recovered from at all.
+  //
+  // This asserted `MalformedParameter`, which is what the walk said after
+  // crossing that comma and reading `Digest realm=z"` as an element of its
+  // own. One byte to the left it would have said `Digest`.
+  let [refused, unknown, past] = walk::<3>([&b"Basic realm=\"a\x00b, Digest realm=z\""[..]]);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::InvalidQuotedString
   );
   assert_eq!(
-    malformed.unwrap().unwrap_err(),
-    AuthError::MalformedParameter
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+}
+
+#[test]
+fn a_string_a_forbidden_byte_sealed_holds_every_comma_behind_its_dquote() {
+  // `Basic x="%x01, Digest realm=evil` handed a caller a `Digest` with a
+  // `realm` of `evil` that no origin server sent. RFC 9110 §11.2 admits a value
+  // at `x`'s position, the sender opened a §5.6.4 quoted-string there, and the
+  // %x01 means it reaches no close — so every comma behind that DQUOTE is among
+  // the bytes the sender wrote as `x`'s data, the `Digest` included.
+  //
+  // Four spellings of the one shape, because the DQUOTE and the byte can stand
+  // in four places relative to the walk, and the boundary is uncertifiable in
+  // all four.
+  for lines in [
+    // The original shape, on one field line.
+    &[&b"Basic x=\"\x01, Digest realm=z"[..]][..],
+    // With bytes of the realm on either side of the byte, which is the shape
+    // `auth-corpus`'s corpus F writes.
+    &[b"Basic realm=\"a\x01b, Digest realm=z"],
+    // Behind a tail whose OWN boundary every reading agrees on: it cannot put
+    // right an uncertain boundary in front of it.
+    &[b"Basic a=\"x\x00y\", safe=\"shut\", Digest realm=z"],
+    // And with RFC 9110 §5.2's join between the DQUOTE and the byte, where the
+    // opener is on a line this walk no longer holds. `Challenges::skip_element`
+    // answers that one, and `Refusal::Unbounded` is how.
+    &[b"Basic a=\"x", b"y\x01, Digest realm=z"],
+  ] {
+    let [refused, unknown, past] = walk::<3>(lines.iter().copied());
+    assert_eq!(
+      refused.unwrap().unwrap_err(),
+      AuthError::InvalidQuotedString,
+      "{lines:?}"
+    );
+    assert_eq!(
+      unknown.unwrap().unwrap_err(),
+      AuthError::ChallengeBoundaryUnknown,
+      "{lines:?}"
+    );
+    assert!(past.is_none(), "{lines:?}");
+  }
+
+  // And the answer `crate::grammar` had already given the same question, which
+  // is where this one now comes from. RFC 9110 §10.1.4's `transfer-parameter`
+  // is a different production with the same DQUOTE in it: `Readings::absorb`
+  // calls a string a forbidden byte sealed one that covers every comma left, so
+  // that walk answers `MemberBoundaryUnknown` and hands back no `chunked` cut
+  // out of `x`'s value. This module answered otherwise.
+  let mut read = crate::grammar::parameterised_list(
+    [&b"gzip;;x=\"a\x01, chunked, b\", br"[..]],
+    crate::grammar::ParamSyntax::TransferParameter,
+  );
+  assert!(
+    read.next().is_some_and(|read| read.is_ok()),
+    "§10.1.4's walk yields the member in front of the fault"
+  );
+  assert!(
+    matches!(
+      read.next(),
+      Some(Err(crate::grammar::ListError::MemberBoundaryUnknown))
+    ),
+    "and declines the boundary a sealed string holds"
+  );
+  assert!(read.next().is_none(), "and yields nothing behind it");
+
+  // The control, one byte apart, in both walks: `obs-text` IS `qdtext`, so the
+  // string closes, the commas inside it are data, and each walk hands back one
+  // member whose value holds the lot. Without this the pair above would pass
+  // over a rule that simply refused every DQUOTE.
+  let credential = one([&b"Basic realm=\"a\xffb, Digest realm=z\""[..]]);
+  assert_eq!(credential.scheme(), b"Basic");
+  assert_eq!(names::<2>(&credential), [Some(&b"realm"[..]), None]);
+  let mut read = crate::grammar::parameterised_list(
+    [&b"gzip;;x=\"a\xff, chunked, b\", br"[..]],
+    crate::grammar::ParamSyntax::TransferParameter,
+  );
+  assert!(read.next().is_some_and(|read| read.is_ok()));
+  assert!(
+    matches!(
+      read.next(),
+      Some(Err(crate::grammar::ListError::MemberBoundaryUnknown))
+    ),
+    "and the high byte leaves the empty slot's own fault, not a `chunked`"
+  );
+}
+
+#[test]
+fn an_element_a_join_carried_here_is_put_to_the_grammar_whole() {
+  // A second, hiding-direction form of the same class. RFC 9110 §5.2 joins
+  // these two field lines into
+  // `Basic a=1, a="x,y", Bearer, x="open, Digest realm=z`: `a`'s value is the
+  // one string `x,y`, §11.2 derives that element whole, and what refuses the
+  // challenge is the repeated NAME — a bound of this reader's, which moves no
+  // comma and leaves every boundary where §5.6.1.2 put it.
+  //
+  // So the span stays derivable, `Bearer` derives as an element of the outer
+  // list and closes the epoch, the DQUOTE behind `x=` then stands at no value
+  // position, and the comma in front of `Digest` is the separator it looks
+  // like.
+  //
+  // What stood in the way was where the recovery cursor lands: at the head of
+  // the continuation line, where the run is `y"` — the SUFFIX of `a`'s element
+  // and no `auth-param` of its own. Slicing there and reading that suffix as a
+  // whole element refuted a claim the grammar never refuted, and the genuine
+  // `Digest` went behind `ChallengeBoundaryUnknown`.
+  let [refused, bearer, malformed, digest, past] = walk::<5>([
+    &b"Basic a=1, a=\"x"[..],
+    b"y\", Bearer, x=\"open, Digest realm=z",
+  ]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert_eq!(bearer.unwrap().unwrap().scheme(), b"Bearer");
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // The pair that says the answer is about the ELEMENT and not about the join:
+  // the same refusal on ONE field line, where the cursor lands on the element's
+  // own first byte and the suffix never existed. `Digest` is shown there too.
+  let [refused, bearer, malformed, digest, past] =
+    walk::<5>([&b"Basic a=1, a=\"xy\", Bearer, x=\"open, Digest realm=z"[..]]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert_eq!(bearer.unwrap().unwrap().scheme(), b"Bearer");
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert!(past.is_none());
+
+  // And what the pair does NOT say, kept here rather than left to be found:
+  // §5.2 joins the two lines above into `Basic a=1, a="x,y", Bearer, ...`, and
+  // that value written on one line answers differently. It is not this rule's
+  // doing. `Recovery::floor` is: on one line the recovery begins in FRONT of
+  // `a`'s DQUOTE, so the earliest comma from there is the one INSIDE `a`'s own
+  // value and `some_reading_holds` reports it; across the join it begins behind
+  // the close, where that comma is already spent. The asymmetry is the
+  // recovery's origin and not the span's claim, and the value below is where it
+  // shows.
+  let [refused, unknown, past] =
+    walk::<3>([&b"Basic a=1, a=\"x,y\", Bearer, x=\"open, Digest realm=z"[..]]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+
+  // And the control that says the epoch is doing the work rather than the
+  // recovery simply crossing everything: the same two lines with an element the
+  // GRAMMAR derives nothing at inside the span. `y=` is no `auth-param`, so the
+  // claim is refuted for the reason it exists to be refuted for, `Bearer` may
+  // not close the epoch, and the `Digest` behind `x="open` is that parameter's
+  // own data.
+  let [refused, bearer, malformed, unknown, past] = walk::<5>([
+    &b"Basic a=1, a=\"x"[..],
+    b"y\", y=, Bearer, x=\"open, Digest realm=z",
+  ]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert_eq!(bearer.unwrap().unwrap().scheme(), b"Bearer");
+  assert_eq!(malformed.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+}
+
+#[test]
+fn where_every_refusal_leaves_the_cursor() {
+  // `Origin`'s enumeration, driven one entrance at a time. It was prose across
+  // four doc comments, and one of the rows was wrong: the entrance that
+  // recovers from the far side of RFC 9110
+  // §5.2's join said it left the cursor at an element's own start, and it
+  // leaves it on that element's SUFFIX.
+  //
+  // Each row below reaches ONE entrance and asserts what the cursor there
+  // decides — which is what the walk hands the caller, since where a recovery
+  // starts is the only thing that moves these answers. The tail is the same
+  // everywhere: a `Newauth` whose boundary every reading agrees on, so a cursor
+  // in the wrong place shows up as a different item and not as a different
+  // fault.
+  //
+  // `Origin::Unread`, five faults and `Origin::Body`'s one, each reaching the
+  // tail. The fault may not be the walk's FIRST item — some of these values
+  // carry a challenge that completes in front of the refusal, which is what
+  // opens the `#auth-param` list the recovery then has to reckon with — so the
+  // walk is read from its first `Err`.
+  for (value, fault) in [
+    // `Origin::Unread`: no `auth-scheme` token at all.
+    (&b"Basic a=1, =x, Newauth b=1"[..], AuthError::MissingScheme),
+    // A scheme with bytes behind it RFC 9110 §11.3 admits nothing at, refused
+    // at the element's own first byte and not behind the token.
+    (
+      b"Basic\tNewauth b=1, Newauth c=1",
+      AuthError::MalformedScheme,
+    ),
+    // `BodyCheck::settle`'s held verdict on the element behind the cursor.
+    (
+      b"Basic a=x y, b=2, Newauth c=1",
+      AuthError::MalformedParameter,
+    ),
+    // `Challenges::skip_element`'s fault with no join crossed, where the scan
+    // never advanced past the element's first byte. The DQUOTE stands where
+    // §11.2 admits NO value — `a`'s value took the `token` alternative — so it
+    // opens nothing in any reading and the comma behind it is a separator.
+    (
+      b"Basic a=x\"\x00y, Newauth b=1",
+      AuthError::MalformedParameter,
+    ),
+    // `Origin::Body`: the cursor is ON the whitespace §11.3's `1*SP` did not
+    // take, which is the body position — the one row where §5.6.1.2 hangs no
+    // `OWS` in front of the element, because there is no comma there to hang
+    // it on.
+    (b"Basic \ta, Newauth b=1", AuthError::MalformedScheme),
+  ] {
+    let mut read = challenges([value]).skip_while(|read| read.is_ok());
+    assert_eq!(
+      read
+        .next()
+        .unwrap_or_else(|| panic!("{value:?}"))
+        .unwrap_err(),
+      fault,
+      "{value:?}"
+    );
+    let last = read
+      .next()
+      .unwrap_or_else(|| panic!("{value:?}: the walk stopped"));
+    assert_eq!(
+      last.unwrap().scheme(),
+      b"Newauth",
+      "the cursor behind {value:?}"
+    );
+    assert!(read.next().is_none(), "{value:?}");
+  }
+
+  // `Origin::Unread` with a receiver bound, which is the one row
+  // `Challenges::sustain_the_epoch` ever slices a line at:
+  // `Section::outgrown`'s line bound, met BETWEEN two elements with the cursor
+  // on the first byte of one no scan has read. Seventeen field lines is one
+  // more than `MAX_CHALLENGE_LINES` holds.
+  let mut lines = [&b""[..]; 18];
+  lines[..SEVENTEEN_LINES.len()].copy_from_slice(&SEVENTEEN_LINES);
+  lines[17] = b"Newauth b=1";
+  let [refused, newauth, past] = walk::<3>(lines);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::ChallengeSpansTooManyLines
+  );
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  assert!(past.is_none());
+
+  // `Origin::Scanned`, the element's own first byte, no join crossed: the run
+  // at the cursor IS the element, and reading it from the line or from the
+  // `Element` the walk cut gives the same bytes.
+  let [refused, bearer, newauth, past] =
+    walk::<4>([&b"Basic a=1, a=\"x\", Bearer, Newauth b=1"[..]]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert_eq!(bearer.unwrap().unwrap().scheme(), b"Bearer");
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  assert!(past.is_none());
+
+  // `Origin::Scanned`, the head of the line §5.2's join left: the run at the
+  // cursor is `y"`, the element is `a="x` + the join + `y"`, and only the
+  // second derives. The epoch stays derivable, `Bearer` closes it, and
+  // `Newauth` is a challenge rather than a parameter of a list nothing closed.
+  let [refused, bearer, newauth, past] =
+    walk::<4>([&b"Basic a=1, a=\"x"[..], b"y\", Bearer, Newauth b=1"]);
+  assert_eq!(refused.unwrap().unwrap_err(), AuthError::DuplicateParameter);
+  assert_eq!(bearer.unwrap().unwrap().scheme(), b"Bearer");
+  assert_eq!(newauth.unwrap().unwrap().scheme(), b"Newauth");
+  assert!(past.is_none());
+
+  // `Origin::Crossed`, the head of the line §5.2's join left with a string
+  // still open around the cursor. Nothing seeks from there and nothing behind
+  // it is read, which is the one row whose answer is the absence of the tail.
+  let [refused, unknown, past] = walk::<3>([&b"Basic a=\"x"[..], b"\x00, Newauth b=1"]);
+  assert_eq!(
+    refused.unwrap().unwrap_err(),
+    AuthError::InvalidQuotedString
+  );
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
   );
   assert!(past.is_none());
 }
 
 #[test]
 fn where_a_forbidden_byte_is_recovered_from_is_where_the_scan_stood() {
-  // A KNOWN cost of recovering from where the scan stands, kept visible rather
-  // than left to be found: RFC 9110 §5.2 makes these two field line lists ONE
-  // value, and they still do not answer the same. What they no longer do is
-  // disagree about a CHALLENGE — neither spelling yields `Digest realm=z` out
-  // of the middle of a realm — so what is left of the cost is which fault the
-  // walk ends on.
+  // What used to be a KNOWN cost here, and is not one any more: RFC 9110 §5.2
+  // makes these two field line lists ONE value, and they now answer the same.
   //
   // On one line the scan never advanced past the element, so the cursor is on
   // the element's first byte, the earliest comma from there is the one inside
@@ -1763,27 +3166,34 @@ fn where_a_forbidden_byte_is_recovered_from_is_where_the_scan_stood() {
 
   // Split at that same comma, the element's earlier bytes are on a field line
   // this walk no longer holds, so the cursor is on the first byte of the line
-  // the scan choked on. No string is admitted at THAT offset — ` Digest` opens
-  // with the list's own `OWS` and no `auth-param` value position stands there —
-  // so the comma behind `realm=z` is a separator in every reading and is
-  // crossed, and what stands behind it opens no challenge either.
+  // the scan choked on — and the DQUOTE that opened `realm`'s value is behind
+  // it, on a line this walk may not read again. A walk that cannot see the
+  // opener may not certify a comma behind it, whatever the bytes at the cursor
+  // look like, so the refusal is `Refusal::Unbounded` and the answer is the
+  // one-line spelling's.
+  //
+  // The note left here said making the two agree needed the OFFSET the scan
+  // choked at, which `QuotedScan::Invalid` does not carry. It does not — and it
+  // was never the missing thing. What the split spelling lost is the OPENER,
+  // and the answer to a lost opener is to decline rather than to reconstruct
+  // it. Until then this asserted `MissingScheme`, the walk having crossed to a
+  // `%x00c"` the sender wrote inside a realm.
   let split: [&[u8]; 2] = [b"Basic realm=\"ab", b" Digest realm=z, \x00c\""];
-  let [refused, missing, past] = walk::<3>(split);
+  let [refused, unknown, past] = walk::<3>(split);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::InvalidQuotedString
   );
-  assert_eq!(missing.unwrap().unwrap_err(), AuthError::MissingScheme);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
   assert!(past.is_none());
 
-  // What makes the remainder a cost and not a defect: neither spelling shows a
-  // challenge at the probe's offset, and no derivation of the value puts one
-  // there either — the value carries a byte RFC 9110 §5.5 admits nowhere in
-  // one, so `Digest realm=z` is no challenge, and the reading that makes it a
-  // realm's data is the reading the one-line spelling stops on. What differs is
-  // the last fault: a boundary the walk could not derive against an element
-  // that derives nothing. Making them agree needs the OFFSET the scan choked
-  // at, which `QuotedScan::Invalid` does not carry.
+  // Neither spelling shows a challenge at the probe's offset, and no derivation
+  // of the value puts one there either — the value carries a byte RFC 9110 §5.5
+  // admits nowhere in one, so `Digest realm=z` is no challenge, and the reading
+  // that makes it a realm's data is the reading both spellings now stop on.
   //
   // The control that says the two spellings are otherwise one value: with the
   // forbidden byte gone, both are one challenge with one realm.
@@ -2843,17 +4253,20 @@ fn the_walk_continues_while_the_commas_are_still_trustworthy() {
     assert_eq!(last.unwrap().scheme(), b"Newauth", "{value:?}");
   }
 
-  // And the row that looks like it should not continue. It does: the argument
-  // for stopping — that a failed quoted-string scan can no longer tell which
-  // commas were separators — is the premise raw-comma recovery answers, and
-  // the byte it fails on is one RFC 9110 §5.5 admits nowhere in a field value,
-  // so there is no reading of what follows for the recovery to be wrong about.
-  let [fault, newauth, past] = walk::<3>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
+  // And the row that looks like it should not continue, and does not. The
+  // argument for continuing was that the byte the scan fails on is one RFC 9110
+  // §5.5 admits nowhere in a field value, so there is no reading of what
+  // follows for the recovery to be wrong about. There is: the DQUOTE stands
+  // where §11.2 admits a value, the sender wrote every byte behind it as that
+  // value's data, and a run that reaches no close holds the comma in front of
+  // `Newauth` too. So this row is the walk telling the caller the rest is
+  // unread, and `Newauth` is what §11.4's user agent is told it has not been
+  // shown — rather than being handed a `Newauth` cut out of `a`'s own value.
+  let [fault, unknown, past] = walk::<3>([&b"Basic a=\"x\x00y\", Newauth b=1"[..]]);
   assert_eq!(fault.unwrap().unwrap_err(), AuthError::InvalidQuotedString);
   assert_eq!(
-    newauth.unwrap().unwrap().scheme(),
-    b"Newauth",
-    "§11.4's user agent is shown the challenge behind a forbidden byte too"
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
   );
   assert!(past.is_none());
 
@@ -2920,10 +4333,19 @@ fn a_challenge_split_across_field_lines_is_still_one_challenge() {
   assert_eq!(names::<3>(&credential), [Some(&b"a"[..]), Some(b"b"), None]);
 
   // A name split by a join is not a name: RFC 9110 §5.2 joins these to
-  // `Basic real,m=x`, and at that comma `m` has an `=` behind it, so the
-  // challenge goes on and `real` is a parameter name with no value.
-  let [fault, past] = walk::<2>([&b"Basic real"[..], b"m=x"]);
-  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  // `Basic real,m=x`, and `real` is wholly a `token68` at that comma. So the
+  // body took §11.3's `token68` alternative, `Basic real` is a whole challenge,
+  // and `m=x` is the next element of the outer list — where `m` is a `token`
+  // with `=` behind it and `challenge = auth-scheme [ 1*SP ( token68 /
+  // #auth-param ) ]` admits nothing, so it is refused at its scheme.
+  //
+  // The other reading — one `#auth-param` list whose first element is `real`
+  // and second is `m=x` — is not one: `auth-param` needs a value behind an `=`
+  // and `real` has no `=` at all, so that alternative derives none of these
+  // bytes rather than deriving them badly.
+  let [basic, fault, past] = walk::<3>([&b"Basic real"[..], b"m=x"]);
+  assert_eq!(basic.unwrap().unwrap().token68(), Some(&b"real"[..]));
+  assert_eq!(fault.unwrap().unwrap_err(), AuthError::MalformedScheme);
   assert!(past.is_none());
 
   // And a boundary is found across a join exactly as it is inside a line.
@@ -3095,22 +4517,29 @@ fn a_value_still_open_at_the_line_bound_is_refused_before_it_reads_on() {
   assert!(past.is_none());
 
   // ONE line fewer is sixteen regions, and there the byte IS read — the region
-  // it stands on is one this challenge holds. That fault leaves a boundary
-  // behind it, because a %x00 in front of the comma means no `quoted-string`
-  // derives over that comma in any reading, so `Digest` is reached — and the
-  // FAULT is what tells the two rows apart: this pair says the refusal above is
-  // the bound being met FIRST rather than the byte being unreachable, and an
-  // edit that made the bound fire a line late would answer
-  // `InvalidQuotedString` here as well.
+  // it stands on is one this challenge holds. The FAULT is what tells the two
+  // rows apart, and it still does: this pair says the refusal above is the
+  // bound being met FIRST rather than the byte being unreachable, and an edit
+  // that made the bound fire a line late would answer
+  // `ChallengeSpansTooManyLines` here as well.
+  //
+  // What follows the fault is the same either way, and that is not the bound's
+  // doing: `a`'s string is open across §5.2's join in both, so the DQUOTE that
+  // opened it is on a line this walk no longer holds and no comma behind it may
+  // be certified. This asserted `Digest`, and that `Digest` came out of
+  // `a`'s own value.
   let mut within = [&b"j"[..]; 17];
   within[0] = b"Basic a=\"x";
   within[16] = b"\x00, Digest realm=z";
-  let [refused, digest, past] = walk::<3>(within);
+  let [refused, unknown, past] = walk::<3>(within);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::InvalidQuotedString
   );
-  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
   assert!(past.is_none());
 
   // And with no forbidden byte at all on the line the challenge could not
