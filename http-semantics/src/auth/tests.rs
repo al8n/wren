@@ -1265,6 +1265,58 @@ fn where_a_recovery_stands_says_whether_a_challenge_may_open_there() {
   assert!(!scanned.recovery.after_comma);
 }
 
+/// And the other half of `read_challenge`'s `recover_from`: an element the walk
+/// reads a challenge at that no `auth-param` begins at is one the recovery must
+/// NOT take at the challenge's own first byte.
+///
+/// ```text
+/// challenge  = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// `opens_a_challenge` answers `true` for `Newauth a="x,y"z`, so RFC 9110
+/// §11.6.1 has no second reading of that element to lose and the value position
+/// that decides its extent is its BODY's — `param_value_at` answered at `a`,
+/// not at `Newauth`. Recovering from the scheme instead would answer
+/// [`Recovery::strung`] `false` over a body a §5.6.4 quoted-string decided, so
+/// the held verdict would come due at [`BodyCheck::finish`] with the comma
+/// inside `"x,y"` already crossed — and the reading that leaves that DQUOTE
+/// shut ends the element there.
+///
+/// It needs a list open IN FRONT of the challenge, because that is what
+/// `recover_from`'s other half asks: `Basic p=1` opens one and `Broken;junk`
+/// leaves it open behind a fault. Without it the walk is at the head of a value
+/// where §11.6.1 admits no `auth-param` at all, and the two offsets answer
+/// alike.
+#[test]
+fn a_challenge_no_parameter_begins_at_recovers_at_its_body() {
+  let value: &[u8] = b"Basic p=1, Broken;junk, Newauth a=\"x,y\"z, Digest realm=z";
+  let [basic, scheme, body, unknown, past] = walk::<5>([value]);
+  assert_eq!(basic.unwrap().unwrap().scheme(), b"Basic");
+  assert_eq!(scheme.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(body.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown,
+    "the comma inside `\"x,y\"` is one the shut reading ends the element at"
+  );
+  assert!(past.is_none());
+
+  // The control that says it is about the LIST and not about the bytes: the
+  // same challenge with no list open in front of it. `Broken;junk` at the head
+  // of a value opens none, so §11.6.1 reads no `auth-param` at `Newauth` under
+  // any reading and the recovery is the body's either way.
+  let control: &[u8] = b"Broken;junk, Newauth a=\"x,y\"z, Digest realm=z";
+  let [scheme, body, unknown, past] = walk::<4>([control]);
+  assert_eq!(scheme.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(body.unwrap().unwrap_err(), AuthError::MalformedParameter);
+  assert_eq!(
+    unknown.unwrap().unwrap_err(),
+    AuthError::ChallengeBoundaryUnknown
+  );
+  assert!(past.is_none());
+}
+
 /// The recovery over a body's FIRST element is the OUTER list's element, and
 /// `element_at` is the whole of the difference.
 ///

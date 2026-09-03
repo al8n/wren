@@ -4392,6 +4392,16 @@ where
           // §5.6.1.2 comma or §5.2's join, and both END the outer list's
           // element — so this is the one turn at which the two can part, and
           // `recover_from` is whether they do.
+          //
+          // No mutation kills the filter, and the reason is an argument rather
+          // than dead code: `recover_from` is `Some` only where
+          // `param_value_at` reads a value position at the element's own first
+          // byte, which puts the body at the `=` or at the `BWS` in front of
+          // one. A body opening at a HTAB is refused above; a body opening at
+          // the `=` derives nothing at its first element and is no `token68`,
+          // so [`BodyCheck::settle`] refuses at the TOP of this loop's second
+          // turn and no later turn reaches this line at all. The filter states
+          // the rule the walk relies on instead of leaving it to that chain.
           let element_at = recover_from.filter(|_| !after_comma).unwrap_or(self.at);
           // Both faults the scan can raise leave the cursor INSIDE the
           // challenge they refuse — on the line the bound was met at, or on
