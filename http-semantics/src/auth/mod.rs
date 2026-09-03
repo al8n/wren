@@ -624,8 +624,13 @@ pub enum AuthError {
   /// that it understands", so a scheme and realm cut out of a parameter's data
   /// arrive indistinguishable from ones the origin server wrote — and whoever
   /// controls that parameter's value chooses them.
-  /// `Basic p1=1, ..., p17=17, x="c, Digest realm=evil, junk"` is that input:
-  /// one field line, no repeated name, nothing malformed, no byte §5.5 forbids.
+  /// `Basic p1=1, ..., p17=17, x="open, Digest realm=z` is that input: one
+  /// field line, no repeated name, nothing malformed, no byte §5.5 forbids, and
+  /// a `quoted-string` that never closes — so no reading of the value settles
+  /// where `x`'s parameter ends. The same value with that string CLOSED behind
+  /// the probe is not this: there the element's extent is the grammar's, the
+  /// walk crosses to it, and the caller is told nothing because nothing is
+  /// unread.
   ///
   /// A caller that receives this knows exactly what it holds: the challenges
   /// yielded in front of it, and no claim at all about the rest of the value.
@@ -3121,10 +3126,11 @@ pub fn credentials(value: &[u8]) -> Result<Credential<'_>, AuthError> {
 /// only the commas EVERY reading ends an element at — `refused_element_end` —
 /// and where none can be vouched for it reports
 /// [`AuthError::ChallengeBoundaryUnknown`] and stops, which is the last item it
-/// yields. `Basic p1=1, ..., p17=17, x="c, Digest realm=evil, junk"` is why:
-/// one field line, no repeated name, nothing malformed, and a `Digest` with a
-/// `realm` of `evil` that no origin server sent, chosen by whoever wrote that
-/// parameter's value.
+/// yields. `Basic p1=1, ..., p17=17, x="open, Digest realm=z` is why: one field
+/// line, no repeated name, nothing malformed, and a string that never closes,
+/// so no reading of the value says where `x`'s parameter ends. Cutting at the
+/// first raw comma there is what handed a caller a `Digest` out of the middle
+/// of that parameter's data.
 ///
 /// [`AuthError::InvalidQuotedString`] is the one that looks like an exception
 /// and is not — a refusal like every other, recovered from like every other. A
