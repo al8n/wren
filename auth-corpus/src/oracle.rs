@@ -685,7 +685,21 @@ fn covers(
       // ABNF's `/` is unordered and nothing here orders it. What this says is
       // that ONE alternative derives these bytes and the other derives none of
       // them, which is not a choice §11.6.1 leaves a recipient.
-      if run.is_none() {
+      // And the same exclusion one level up, applied here to the grader.
+      // Where a `#auth-param` list is already
+      // open and §11.2 derives THIS element whole, the challenge reading — an
+      // `auth-scheme`, its `1*SP`, and a body that derives nothing at its first
+      // element — is a non-derivation beside a derivation, and §11.6.1 leaves a
+      // recipient no choice between those. Taking it anyway opens a list on a
+      // reading nobody has, which is how `Basic p1=1, …, p17=17, y = 1, Bearer,
+      // x="open, Digest realm=z` was excused: `y<SP>=<SP>1` is a whole
+      // `auth-param` of the list `Basic` opened, and the probe behind `x` is
+      // inside no value under any reading of the bytes.
+      let derives_as_a_parameter = list
+        && auth_param(value, at)
+          .and_then(|param| param.end)
+          .is_some_and(|end| boundary(value, end).is_some());
+      if run.is_none() && !derives_as_a_parameter {
         hit |= covers(
           value,
           Position {

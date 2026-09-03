@@ -4886,17 +4886,30 @@ where
       }
     });
     let derives = auth_param(element.bytes, element.tail).is_ok();
-    // RFC 9110 §11.6.1's OTHER reading of the same element, which [`auth_param`]
-    // cannot see. Where the element takes §11.3's `1*SP`, that reading has
-    // opened a `#auth-param` list and its body derives nothing — every element
-    // this loop crosses is one [`opens_a_challenge`] answered `false` for, so
-    // its body begins at an `=` or at the `BWS` in front of one and §11.2
-    // derives neither. So the reading exists, it stops deriving, and it stops
-    // INSIDE a list: the span's claim is refuted over it, and a list may be
-    // open behind it whatever was open in front.
-    let opens = opens_a_parameter_list(element.bytes);
     if let Some(epoch) = self.epoch.as_mut() {
-      epoch.derivable = epoch.derivable && derives && !opens;
+      // RFC 9110 §11.6.1's OTHER reading of the same element, which
+      // [`auth_param`] cannot see: where the element takes §11.3's `1*SP`, that
+      // reading opened a `#auth-param` list and its body derives nothing —
+      // every element this loop crosses is one [`opens_a_challenge`] answered
+      // `false` for, so its body begins at an `=` or at the `BWS` in front of
+      // one and §11.2 derives neither.
+      //
+      // **It is a reading only where this element does not derive.** An
+      // alternative that derives nothing is not one of the two §11.6.1 leaves a
+      // recipient to choose between — the rule `Challenges::list_open` carries
+      // for a completed challenge, read here for a crossed element — so where
+      // the span still derives AND §11.2 derives this element, the challenge
+      // branch failing at the body's `=` says nothing at all.
+      // `Basic p1=1, …, p17=17, y = 1, Bearer, x="open, Digest realm=z` is the
+      // value that cost: `TooManyParameters` opens a derivable epoch, `y = 1`
+      // is a whole `auth-param`, and letting its failed challenge branch refute
+      // the span kept `Bearer` from closing the epoch and hid a `Digest` every
+      // complete derivation of the value agrees on.
+      let opens = !(epoch.derivable && derives) && opens_a_parameter_list(element.bytes);
+      // Only §11.2's reading — the one that DERIVES — answers the span's claim.
+      epoch.derivable = epoch.derivable && derives;
+      // And where the challenge branch is the reading, the list it opened is
+      // open behind this element whatever was open in front.
       epoch.inside_a_list = epoch.inside_a_list || opens;
     }
   }
