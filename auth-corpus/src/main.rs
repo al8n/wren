@@ -20,13 +20,16 @@
 //! corpus <TAB> case <TAB> spelling <TAB> axis <TAB> answer
 //! ```
 //!
-//! - `corpus` — which generator produced the input: `A`..`J`.
+//! - `corpus` — which generator produced the input: `A`..`N`.
 //! - `case` — the field lines, escaped, `|`-separated. `(corpus, case,
 //!   spelling)` is the record's key, and it is unique everywhere but the 32
 //!   inputs corpus D writes six times each — see
 //!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`,
-//!   which pins that exception and says what it costs. 935 692 records stand
-//!   for 935 532 distinct inputs. **Every corpus D figure quoted from this
+//!   which pins that exception and says what it costs. 943 270 records stand
+//!   for 943 110 distinct inputs — the two figures
+//!   `tests::the_records_that_share_a_key_are_the_ones_no_mid_can_tell_apart`
+//!   asserts, and they are quoted from it rather than counted again here.
+//!   **Every corpus D figure quoted from this
 //!   crate is a count of RECORDS, not of distinct inputs**;
 //!   `corpus_d`'s own doc carries the arithmetic, and
 //!   `tests::what_corpus_d_says_about_distinct_inputs_is_not_what_its_records_say`
@@ -61,6 +64,9 @@
 // gate-exempt: trap="open, Digest realm=z — one field value shown in prose, a
 // tail this corpus names to contrast with its own; not a production of any RFC.
 mod oracle;
+/// The second derivation of `oracle::Verdict::excused`, and the differential
+/// over the two. Its own doc says what the two share and what they do not.
+mod readings;
 /// FIPS 180-4's SHA-256, shared with `xtask` by path rather than copied.
 ///
 /// `tests` pins a digest of the ANSWER column and
@@ -84,11 +90,11 @@ use std::{
   env,
   fs::File,
   io::{BufWriter, Write},
-  process,
+  iter, process,
 };
 
 use http_semantics::{
-  auth::{AuthError, Credential, auth_info, challenges, credentials},
+  auth::{AuthError, Credential, MAX_CHALLENGE_LINES, auth_info, challenges, credentials},
   grammar::ParamValue,
 };
 
@@ -130,7 +136,7 @@ fn main() {
 
 /// Writes every record, and the per-corpus counts to stderr.
 fn emit(out: &mut impl Write) -> std::io::Result<()> {
-  let mut counts = [0_usize; 10];
+  let mut counts = [0_usize; 14];
   corpus_a(out, &mut counts[0])?;
   corpus_b(out, &mut counts[1])?;
   corpus_c(out, &mut counts[2])?;
@@ -141,11 +147,17 @@ fn emit(out: &mut impl Write) -> std::io::Result<()> {
   corpus_h(out, &mut counts[7])?;
   corpus_i(out, &mut counts[8])?;
   corpus_j(out, &mut counts[9])?;
+  corpus_k(out, &mut counts[10])?;
+  corpus_l(out, &mut counts[11])?;
+  corpus_m(out, &mut counts[12])?;
+  corpus_n(out, &mut counts[13])?;
   out.flush()?;
   let total: usize = counts.iter().sum();
-  for (name, count) in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
-    .iter()
-    .zip(counts)
+  for (name, count) in [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N",
+  ]
+  .iter()
+  .zip(counts)
   {
     eprintln!("auth-corpus: {name} {count}");
   }
@@ -637,10 +649,11 @@ const PREFIXES: [(&str, &[u8]); 8] = [
   // A list, open behind it: `Basic` took the `1*SP`, so the element behind the
   // comma may be one more parameter of it.
   ("list", b"Basic a=1"),
-  // A `token68` body, which looks conclusive and is not. `token68 / #auth-param`
-  // is an unordered ABNF choice, so the same bytes read as `#auth-param` are a
-  // list whose first element derives nothing — and the list is open behind that
-  // fault.
+  // A `token68` body, which closes a list for the same reason a bare scheme
+  // does: `auth-param = token BWS "=" BWS ( token / quoted-string )` needs a
+  // value behind an `=`, and a `token68` puts nothing but more `=` there — so
+  // the `#auth-param` alternative derives none of these bytes rather than
+  // deriving them badly, and no reading has a list open behind the challenge.
   ("token68", b"Bearer abc"),
   // The padded spelling of the same run.
   ("token68-pad", b"Bearer dGVzdA=="),
@@ -705,11 +718,17 @@ const TRAPS: [(&str, &[u8]); 5] = [
 /// yet `x` was read as a possible parameter and the `Digest` behind it hidden.
 ///
 /// The rows this family exists to keep are the ones where the list is still
-/// open: `list`, `token68` and `list-token68`. A `token68` body is a fault
-/// under §11.3's other alternative, so the list stands open behind it and the
-/// probe really is inside a value under some reading — which makes crossing it
-/// an invention rather than a recovery. Those rows and the `bare` ones move in
-/// opposite directions, which is what makes this family a pin in both.
+/// open — `list`, `bare-list` and the reopening spellings — beside the ones
+/// where every reading has it closed: `bare`, `token68`, `token68-pad`,
+/// `list-bare` and `list-token68`. The two sets move in OPPOSITE directions,
+/// which is what makes this family a pin in both: a walk that stopped closing
+/// lists hides the `Digest` behind the first set, and one that closed them
+/// unconditionally invents a `Digest` out of the second's trap.
+///
+/// Every completed challenge here stands in FRONT of the refusal, where the
+/// argument for closing a list is whole: nothing has failed to derive yet, so
+/// every reading of the value has that element as a challenge. Corpus L is the
+/// same question asked BEHIND a fault, where it is not.
 fn corpus_j(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
   for (prefix_name, prefix) in PREFIXES {
     for (fault_name, fault) in SCHEME_FAULTS {
@@ -725,6 +744,654 @@ fn corpus_j(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
         let spelling =
           format!("challenges-prefix prefix={prefix_name} fault={fault_name} trap={trap_name}");
         record(out, "J", &[&line], &spelling, count)?;
+      }
+    }
+  }
+  Ok(())
+}
+
+/// Corpus H's shapes with the list's own `OWS` at the END of every line RFC
+/// 9110 §5.2's join puts a comma behind.
+///
+/// # The axis corpora A..J hold fixed
+///
+/// How the field LINES are spelled. Every line every generator in front of this
+/// one writes begins with an element's first byte and ends with an element's
+/// last, so §5.6.1.2's
+/// `#element => [ element ] *( OWS "," OWS [ element ] )` has whitespace on
+/// neither side of §5.2's join comma. Corpus I unfixed the side BEHIND that
+/// comma; this is the side in front of it, and the two together are all that
+/// expansion admits there.
+///
+/// It is not the same question. Behind the comma the whitespace moves an
+/// element, and both of the openers §11.6.1 reads move with it. In FRONT of the
+/// comma the whitespace is inside the element §5.2's join carries — and whether
+/// it is §5.6.1.2's `OWS` at all depends on the reading: where the head's
+/// §5.6.4 quoted-string is still open at the line's end those bytes are
+/// `qdtext` and are the value's, and where the reading that leaves the DQUOTE
+/// shut ends the element at the join they are the list's. So the two readings
+/// disagree about BYTES rather than about a position, which is a disagreement
+/// nothing else here spells. The `OWS` trim an element's end is taken with,
+/// `Recovery::floor`'s offsets, and the region a challenge holds on the line it
+/// leaves are each measured over it.
+fn corpus_k(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for head in OPEN_HEADS {
+    for (name, ows) in LIST_OWS {
+      for continuation in CONTINUATIONS {
+        for joins in [1_usize, 2] {
+          let mut trailed = head.to_vec();
+          trailed.extend_from_slice(ows);
+          let mut middle = UNCLOSING.to_vec();
+          middle.extend_from_slice(ows);
+          let mut lines: Vec<&[u8]> = Vec::with_capacity(3);
+          lines.push(&trailed);
+          if joins == 2 {
+            lines.push(&middle);
+          }
+          lines.push(continuation);
+          let spelling = format!("challenges-join-trailing-ows joins={joins} ows={name}");
+          record(out, "K", &lines, &spelling, count)?;
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+/// The challenges corpus L completes BEHIND the fault, each of which would
+/// close a `#auth-param` list if it stood in front of one.
+///
+/// ```text
+/// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+const CLOSERS: [(&str, &[u8]); 4] = [
+  // No body at all.
+  ("bare", b"Bearer"),
+  // RFC 9110 §11.2's `token68`, which is not a list.
+  ("token68", b"Bearer abc"),
+  // The padded spelling of the same run.
+  ("token68-pad", b"Bearer dGVzdA=="),
+  // The control: a body that IS a list, so this one opens one rather than
+  // closing anything, and the trap behind it stands at a value position under
+  // every reading.
+  ("list", b"Newauth b=2"),
+];
+
+/// What stands in front of corpus L's fault, which is the list state that fault
+/// leaves behind it.
+const OPENERS: [(&str, &[u8]); 2] = [
+  // Nothing: no list has opened anywhere in the value.
+  ("none", b""),
+  // A list, open where the fault is met.
+  ("list", b"Basic a=1"),
+];
+
+/// Corpus M's openers: [`OPENERS`] and two more, which together are the axis
+/// this family's own dimension crosses.
+///
+/// A recovery epoch already open when the family's refusal is met makes some of
+/// these rows THREE epochs, and what matters about that earlier epoch is not
+/// that it exists but **whether a `#auth-param` list was open where its fault
+/// was met.** RFC 9110 §11.2 admits a value position only inside a list, so a
+/// fault with no list has no DQUOTE any reading may choose behind it and can
+/// change nothing about the elements it precedes; a fault met inside one may
+/// still be about them. The last two openers are that pair, over the same
+/// fault:
+///
+/// - `fault` — `Broken;junk` at the head of the value, where no list is open.
+///   Its rows must answer exactly as the `none` rows do, and
+///   `a_second_recovery_epoch_is_a_shape_this_generator_writes`
+///   asserts that pairing directly.
+/// - `list-fault` — the same fault behind `Basic a=1`, so a list IS open where
+///   it is met. Its rows must hide the probe wherever the `list` rows do and
+///   wherever a bound behind it would otherwise have been closed by a
+///   completing challenge.
+/// - `bound` — a bound of this RECIPIENT's, with no completed challenge behind
+///   it, so the epoch standing in front of the family's own refusal carries a
+///   list AND is closable. It must poison nothing either, and it is the row
+///   that says the channel is a list that a FAULT left open rather than any
+///   list at all.
+///
+/// Those four are the whole cross of the two facts an earlier epoch has, less
+/// the one combination that cannot occur: a receiver bound is only ever met
+/// inside a body §11.3's `1*SP` opened, so an epoch that is closable and
+/// carries no list is not a state `Challenges::refuse` can build.
+///
+/// The pair is the shape a generator was thought unable to write: a
+/// list-free grammar fault followed by an independent receiver-bound epoch.
+/// It could, in fact, write one — the `fault` opener already existed — but
+/// the oracle grading it carried the same defect the reader did, so the rows
+/// answered `hider-excused` and pinned the wrong direction.
+/// `oracle::resume`'s doc carries that.
+const M_OPENERS: [(&str, &[u8]); 5] = [
+  ("none", b""),
+  ("list", b"Basic a=1"),
+  ("fault", b"Broken;junk"),
+  ("list-fault", b"Basic a=1, Broken;junk"),
+  ("bound", b"Basic p1=1, p2=2, p3=3, p4=4, p5=5, p6=6, p7=7, p8=8, p9=9, p10=10, p11=11, p12=12, p13=13, p14=14, p15=15, p16=16, p17=17"),
+];
+
+/// A value whose completed challenge stands BEHIND the fault rather than in
+/// front of it.
+///
+/// # The shape corpus J holds fixed
+///
+/// Corpus J varies what completes in FRONT of the refusal, and there the
+/// argument for closing a list is whole: that challenge's own element derives,
+/// RFC 9110 §11.6.1's other reading of it derives nothing, and every reading of
+/// the value therefore has the list closed at the comma in front of it. Behind
+/// a fault the argument is gone. Nothing derives there, so the readings include
+/// one in which every element since the fault is garbage the open list still
+/// holds — and under THAT reading the list is open behind this challenge too,
+/// and the trap's DQUOTE stands at a value position §11.2 admits.
+///
+/// `Basic a=1, Broken;junk, Bearer, x="open, Digest realm=z` is the value, and
+/// the `Digest` a walk handed back for it was read out of the middle of `x`'s
+/// own. No generator in front of this one can write it: each of them ends at
+/// the trap, so nothing completes between the refusal and the probe.
+///
+/// The `list` closer is the control that says this family is about the fault
+/// and not about the second challenge: it opens a list of its own, so its rows
+/// hide the probe whichever way the condition goes.
+fn corpus_l(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for (opener_name, opener) in OPENERS {
+    for (fault_name, fault) in SCHEME_FAULTS {
+      for (closer_name, closer) in CLOSERS {
+        for (trap_name, trap) in TRAPS {
+          let mut line = Vec::new();
+          if !opener.is_empty() {
+            line.extend_from_slice(opener);
+            line.extend_from_slice(b", ");
+          }
+          line.extend_from_slice(fault);
+          line.extend_from_slice(b", ");
+          line.extend_from_slice(closer);
+          line.extend_from_slice(b", ");
+          line.extend_from_slice(trap);
+          let spelling = format!(
+            "challenges-behind opener={opener_name} fault={fault_name} closer={closer_name} trap={trap_name}"
+          );
+          record(out, "L", &[&line], &spelling, count)?;
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+/// What refuses corpus M's first challenge, and which regime the refusal leaves
+/// behind it.
+///
+/// Each is written as the field-line fragments it takes, because one of them
+/// takes seventeen.
+const REFUSALS: [(&str, &[&[u8]]); 7] = [
+  // ── RFC 9110's own faults. Each is an element the grammar derives no part
+  //    of, so behind it no boundary is fixed and every DQUOTE at a §11.2 value
+  //    position is a reading's to open or to leave shut.
+  //
+  // `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` writes `1*SP`,
+  // and §5.6.3's HTAB is not one.
+  ("htab", &[b"Broken\tjunk"]),
+  // No leading `token` at all.
+  ("no-token", &[b"=x"]),
+  // A byte behind the token the production admits nothing after.
+  ("punct", &[b"Broken;junk"]),
+  // And one inside the BODY rather than at the scheme: `;` is no §5.6.2
+  // `tchar`, so the body is neither of §11.2's two alternatives. This is the
+  // fault reported over an extent already complete, which used to reach a
+  // caller without passing through the walk's own refusal.
+  ("body", &[b"Basic ;"]),
+  // ── and this recipient's three, none of them RFC 9110's. The grammar
+  //    derives every byte of these, with every element where §5.6.1.2 puts it;
+  //    what the refusal says is that this reader will not HOLD the challenge.
+  //
+  // One name past `MAX_PARAMS_PER_CREDENTIAL`.
+  ("too-many-params", &[b"Basic p1=1, p2=2, p3=3, p4=4, p5=5, p6=6, p7=7, p8=8, p9=9, p10=10, p11=11, p12=12, p13=13, p14=14, p15=15, p16=16, p17=17"]),
+  // The same name twice, which is §11.2's one-name-once MUST and not a comma
+  // anywhere.
+  ("duplicate", &[b"Basic a=1, a=1"]),
+  // One region past `MAX_CHALLENGE_LINES`, with sixteen names and not
+  // seventeen: the first parameter's value crosses §5.2's join, so it spends
+  // two regions on one name and the line bound is what this row is about.
+  (
+    "too-many-lines",
+    &[
+      b"Basic a1=\"x",
+      b"y\"",
+      b"a2=2",
+      b"a3=3",
+      b"a4=4",
+      b"a5=5",
+      b"a6=6",
+      b"a7=7",
+      b"a8=8",
+      b"a9=9",
+      b"a10=10",
+      b"a11=11",
+      b"a12=12",
+      b"a13=13",
+      b"a14=14",
+      b"a15=15",
+      b"a16=16",
+    ],
+  ),
+];
+
+/// A value that opens TWO recovery epochs, with a challenge that completes
+/// between them.
+///
+/// # The axis corpora A..L hold fixed
+///
+/// **How many recovery epochs the value opens, and what kind each is.** Every
+/// family in front of this one varies bytes WITHIN one epoch — which prefix
+/// stands in front of the fault, which fault it is, what completes behind it,
+/// what the trap holds — and every one of them opens exactly one. The count has
+/// been fixed at one since the first family, so no generator here could write a
+/// value in which a refusal's ambiguity has to end before a later refusal's
+/// question can be answered.
+///
+/// That is a shape that kept hiding defects no corpus could spell.
+/// `Basic <seventeen parameters>, Bearer abc, x="open, Digest
+/// realm=z` is the value: `MAX_PARAMS_PER_CREDENTIAL` refuses the
+/// `Basic`, recovery reaches `Bearer abc`, RFC 9110 §11.2's `token68` completes
+/// it — and the list the refusal left open has to END there, because the
+/// grammar derives every byte in front of the cursor and no `auth-param`
+/// derives `Bearer abc`. Where it does not, the scheme refusal at `x=` reads
+/// that element's DQUOTE as a parameter value's opener and the `Digest` behind
+/// it is never shown.
+///
+/// # What it crosses
+///
+/// - **What opens the first epoch**, which is this family's own dimension:
+///   four faults of RFC 9110's grammar and three bounds of this recipient's.
+///   The two regimes differ in exactly one thing — whether a derivation of the
+///   value still reaches the cursor — and every row is the same shape either
+///   side of it.
+/// - **What stands in front of it**, [`M_OPENERS`]: no list, a list, and the
+///   same grammar fault twice — once where no list is open and once where one
+///   is. That pair is the axis this family adds: an earlier epoch reaches
+///   past its own challenge only through a list it stood in, so the first of
+///   them must change no answer at all and the second must change the same ones
+///   `list` does.
+/// - **What stands between the two epochs**: [`CLOSERS`], the empty separator
+///   that puts the second refusal straight behind the first, and a fault of the
+///   grammar. [`CLOSERS`] are the challenge that has to stand between two
+///   epochs — one that parses, with a bare body or §11.2's
+///   `token68` — and `list` is their control, since that separator opens a list
+///   of its own and its rows hide the probe whichever way the condition goes.
+///
+///   The `fault` separator is the other direction and the one that says what an
+///   epoch may NOT be closed by: the walk resumes recovery on an element no
+///   `auth-param` begins at, which is not the same as an element a challenge
+///   derives at, and this separator is the element it resumes on AND the next
+///   thing it refuses.
+/// - **The trap**, [`TRAPS`], which is what opens the SECOND epoch — and the
+///   `probe` trap, which opens none, so the family spans one epoch and two.
+fn corpus_m(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for (opener_name, opener) in M_OPENERS {
+    for (refusal_name, refusal) in REFUSALS {
+      for (separator_name, separator) in iter::once(("none", &b""[..]))
+        .chain(CLOSERS)
+        .chain(iter::once(("fault", &b"Broken;junk"[..])))
+      {
+        for (trap_name, trap) in TRAPS {
+          let mut lines: Vec<Vec<u8>> = Vec::with_capacity(refusal.len());
+          for (index, fragment) in refusal.iter().enumerate() {
+            let mut line = Vec::new();
+            if index == 0 && !opener.is_empty() {
+              line.extend_from_slice(opener);
+              line.extend_from_slice(b", ");
+            }
+            line.extend_from_slice(fragment);
+            lines.push(line);
+          }
+          // The separator and the trap stand behind the refusal, on its last
+          // line: RFC 9110 §5.2's join would put a comma of its own between
+          // them, and what this family is about is not where the field lines
+          // are cut.
+          let tail = lines.last_mut().expect("a refusal takes at least one line");
+          if !separator.is_empty() {
+            tail.extend_from_slice(b", ");
+            tail.extend_from_slice(separator);
+          }
+          tail.extend_from_slice(b", ");
+          tail.extend_from_slice(trap);
+          let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+          let spelling = format!(
+            "challenges-two-epochs opener={opener_name} refusal={refusal_name} separator={separator_name} trap={trap_name}"
+          );
+          record(out, "M", &refs, &spelling, count)?;
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+/// What corpus N puts INSIDE the recovered span: the elements a recovery
+/// absorbs between the refusal that opened it and the challenge that closes it.
+///
+/// ```text
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// Every one of these is an element `opens_a_challenge` answers `false` for, so
+/// the walk crosses it rather than stopping on it, and RFC 9110 §11.2 is the
+/// only production that has anything to say about it. The two halves are the
+/// two directions this family is a pin in:
+///
+/// - **§11.2 derives it**, so the span's claim survives and the epoch still
+///   closes. `bws` is RFC 9110 §5.6.3's `BWS` on both sides of the `=`, which
+///   the production admits and a check written from the printed examples would
+///   not.
+///
+///   `duplicate` and `over-bound` are the pair that says the span rule asks
+///   §11.2's GRAMMAR and not the walk's own bookkeeping. `duplicate` names `a`,
+///   `a1` and `p1` — one name from each of [`REFUSALS`]'s three bounds, so it
+///   is a genuine repeat behind every one of them rather than behind one in
+///   seven; `over-bound` is nineteen parameters, which is
+///   `MAX_PARAMS_PER_CREDENTIAL` exceeded inside a single span. Both are
+///   refusals THIS reader makes and neither is a fault of RFC 9110's, so both
+///   must SUSTAIN the claim.
+///
+///   Neither can be reddened by any mutation of the reader as it stands, and
+///   they are not counted as coverage: `auth_param` cannot see a repeated name
+///   or a slot count, so what these rows pin is the SHAPE of the rule. They red
+///   against a design that routed an absorbed element through the walk's own
+///   `BodyCheck` — the obvious wrong implementation of the same sentence — and
+///   `tests::the_two_rows_that_pin_the_span_rule_s_shape_can_fail` is the
+///   injection that measures it rather than asserting it.
+/// - **§11.2 derives nothing at it**, so the claim is false from that element
+///   on and no challenge behind it may close the epoch. `( token /
+///   quoted-string )` is one alternative taken WHOLE, which is what makes the
+///   two `trailing` spellings faults rather than parameters with something
+///   after them.
+///
+/// `open-quoted` is neither: the string it opens is still open at the comma, so
+/// some reading holds that comma as the value's own data, the walk declines the
+/// boundary and never reaches the span rule at all. Its rows must answer
+/// exactly as they did before this family existed.
+///
+/// The last two are the same two elements in both orders, because the claim is
+/// about EVERY element of the span and a rule that asked only the first would
+/// be green over one of them.
+const SPANS: [(&str, &[u8]); 14] = [
+  // Nothing absorbed at all: corpus M's own shape, and the control every other
+  // row here is read against.
+  ("none", b""),
+  // ── the ones RFC 9110 §11.2 derives.
+  ("param", b"y=1"),
+  ("quoted", b"y=\"q\""),
+  ("bws", b"y\t=\t1"),
+  ("duplicate", b"a=1, a1=1, p1=1"),
+  ("over-bound", b"q1=1, q2=1, q3=1, q4=1, q5=1, q6=1, q7=1, q8=1, q9=1, q10=1, q11=1, q12=1, q13=1, q14=1, q15=1, q16=1, q17=1, q18=1, q19=1"),
+  ("two-params", b"y=1, z=2"),
+  // RFC 9110 §5.6.1.2 hangs `OWS` on BOTH sides of its comma, so this trailing
+  // space belongs to the list and not to the element. An absorbed element read
+  // with it still on is a `token` with a space behind it, which §11.2 derives
+  // nothing at — so this row must sustain the claim and not refute it.
+  ("ows-tail", b"y=1 "),
+  // ── and the ones it does not.
+  //
+  // The production names a value and the `=` is not one.
+  ("no-value", b"y="),
+  // One `token` is the whole of a value.
+  ("trailing-token", b"y=1 z"),
+  // And one `quoted-string` is, so bytes behind its close derive nothing.
+  ("trailing-quoted", b"y=\"q\"z"),
+  // ── the element the walk never gets past.
+  ("open-quoted", b"y=\"q"),
+  // ── and the two orders.
+  ("param-then-fault", b"y=1, z="),
+  ("fault-then-param", b"y=, z=1"),
+];
+
+/// Whether an earlier recovery epoch stands in front of corpus N's own refusal.
+///
+/// `bound` is [`M_OPENERS`]'s: a refusal of this recipient's with a
+/// `#auth-param` list open where it was met, so the epoch in front of the
+/// family's refusal carries a list AND is closable. It is here because the
+/// span's claim is inherited as well as sustained — a new epoch opened behind
+/// one whose ambiguity can still reach it is underivable whatever its own span
+/// holds — and a rule written for the sustaining half alone would be green over
+/// these rows for the wrong reason.
+const N_OPENERS: [(&str, &[u8]); 2] = [("none", b""), ("bound", M_OPENERS[4].1)];
+
+/// A value whose recovery ABSORBS elements, and the axis that is about what
+/// those elements are.
+///
+/// # The axis corpora A..M hold fixed
+///
+/// **What the recovered span CONTAINS.** Every family in front of this one
+/// varies how the epoch OPENED — which prefix stands in front of the fault,
+/// which fault it is, what completes behind it, what the trap holds — and each
+/// puts at most one element between the refusal and the trap, chosen from a set
+/// whose members either open a challenge or are the trap itself. Nothing
+/// measures the elements a recovery crosses WITHOUT deriving them.
+///
+/// That cost is real: `Basic a=1, a=2, y=,
+/// Bearer, x="open, Digest realm=evil, junk"` is a
+/// four-stage sequence: a receiver-bound epoch, then a malformed
+/// parameter-shaped element the recovery absorbs, then a challenge that
+/// completes and closes the epoch, then the quoted probe. `y=` is an element
+/// RFC 9110 §11.2 derives nothing at, so the grammar is a reason this value
+/// stopped deriving and the epoch's claim — that this recipient's own limit is
+/// the ONLY reason — was false from `y=` onward. The reader skipped it,
+/// `Bearer` closed the epoch anyway, and the scheme fault at `x=` then stood in
+/// front of no open list and crossed the comma inside `x`'s own value.
+///
+/// A model-derived table cannot enumerate a sequence: corpus M's dimensions are
+/// the FACTS an epoch has when it opens, and no cross of them writes a second
+/// element into the middle of a span. So this family's own dimension is the
+/// span's contents, and [`SPANS`] is it.
+///
+/// # What it crosses
+///
+/// - [`N_OPENERS`] — whether an epoch already stands in front of the refusal,
+///   which is the inheriting half of the same claim.
+/// - [`REFUSALS`] — what opens this family's epoch. The three bounds are the
+///   rows where the claim exists at all and the four grammar faults are the
+///   control: those epochs are underivable from their first byte, so no span
+///   element can change them and every one of their rows must answer as it did
+///   before.
+/// - [`SPANS`] — what the recovery absorbs, which is this family's own axis.
+/// - [`CLOSERS`] — the challenge that closes the epoch, which is the stage the
+///   span's claim is spent at. `list` is their control: it opens a list of its
+///   own, so its rows hide the probe whichever way the claim goes.
+/// - [`TRAPS`] — the quoted probe, which is what the certified boundary is
+///   read over.
+fn corpus_n(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for (opener_name, opener) in N_OPENERS {
+    for (refusal_name, refusal) in REFUSALS {
+      for (span_name, span) in SPANS {
+        for (closer_name, closer) in CLOSERS {
+          for (trap_name, trap) in TRAPS {
+            let mut lines: Vec<Vec<u8>> = Vec::with_capacity(refusal.len());
+            for (index, fragment) in refusal.iter().enumerate() {
+              let mut line = Vec::new();
+              if index == 0 && !opener.is_empty() {
+                line.extend_from_slice(opener);
+                line.extend_from_slice(b", ");
+              }
+              line.extend_from_slice(fragment);
+              lines.push(line);
+            }
+            // The span, the closer and the trap all stand behind the refusal on
+            // its last line: RFC 9110 §5.2's join would put a comma of its own
+            // between them, and what this family is about is not where the
+            // field lines are cut.
+            let tail = lines.last_mut().expect("a refusal takes at least one line");
+            if !span.is_empty() {
+              tail.extend_from_slice(b", ");
+              tail.extend_from_slice(span);
+            }
+            tail.extend_from_slice(b", ");
+            tail.extend_from_slice(closer);
+            tail.extend_from_slice(b", ");
+            tail.extend_from_slice(trap);
+            let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+            let spelling = format!(
+              "challenges-span opener={opener_name} refusal={refusal_name} span={span_name} closer={closer_name} trap={trap_name}"
+            );
+            record(out, "N", &refs, &spelling, count)?;
+          }
+        }
+      }
+    }
+  }
+  corpus_n_at_the_cursor(out, count)?;
+  corpus_n_across_a_join(out, count)
+}
+
+/// The refusals corpus N crosses RFC 9110 §5.2's join with: each is met over an
+/// element whose §5.6.4 quoted-string spans one, so the recovery cursor lands
+/// at the HEAD of the continuation line and the run standing there is that
+/// element's suffix rather than an element of its own.
+///
+/// Two receiver bounds and one grammar fault, over the same shape. The bounds
+/// are the rows where the span's claim exists at all — §11.2 derives
+/// `a="x` + the join + `y"` whole, and a repeated name and a seventeenth
+/// parameter move no comma — and the fault is the control, whose epoch is
+/// underivable from its first byte whatever the span holds.
+const JOINED_REFUSALS: [(&str, [&[u8]; 2]); 3] = [
+  // §11.2's one-name-once MUST, over a value the join carried here.
+  ("duplicate", [b"Basic a=1, a=\"x", b"y\""]),
+  // `MAX_PARAMS_PER_CREDENTIAL` met at the seventeenth name, which is the one
+  // that spans.
+  (
+    "over-bound",
+    [
+      b"Basic p1=1, p2=2, p3=3, p4=4, p5=5, p6=6, p7=7, p8=8, p9=9, p10=10, p11=11, p12=12, p13=13, p14=14, p15=15, p16=16, p17=\"x",
+      b"y\"",
+    ],
+  ),
+  // The control: `( token / quoted-string )` is one alternative taken WHOLE, so
+  // a `z` behind the close derives nothing and the fault is the grammar's.
+  ("malformed", [b"Basic a=\"x", b"y\"z"]),
+];
+
+/// The rows where RFC 9110 §5.2's join stands between the refused element's
+/// DQUOTE and its close, so the span begins on a line the element did not.
+///
+/// # The stage the two families above cannot vary
+///
+/// Where a refusal leaves the cursor RELATIVE TO THE ELEMENT it is over. Every
+/// row of `corpus_n` refuses an element that began and ended on one field line,
+/// so the cursor lands on that element's own first byte; `corpus_n_at_the_cursor`
+/// moves the cursor to a line head, but onto an element the walk never read.
+/// Neither writes the third position: a cursor at a line head with the refused
+/// element's own bytes BEHIND it.
+///
+/// `Basic a=1, a="x` and `y", Bearer, x="open, Digest realm=z` are two field
+/// lines §5.2 joins into one value: `a`'s value is the one string `x,y`, §11.2
+/// derives the element whole, and the repeated name that refused the challenge
+/// is a bound of this recipient's. So the span is derivable, `Bearer` closes
+/// the epoch, and the `Digest` is a challenge whose boundary every reading
+/// agrees on. The reader sliced the continuation line at the cursor instead,
+/// read the suffix `y"` as a whole `auth-param`, found that §11.2 derives
+/// nothing at it, and refuted a claim the grammar never refuted — hiding the
+/// `Digest` behind `AuthError::ChallengeBoundaryUnknown`.
+///
+/// Every generator in front of this one was green over that, and this is the
+/// dimension none of them has.
+fn corpus_n_across_a_join(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  for (opener_name, opener) in N_OPENERS {
+    for (refusal_name, fragments) in JOINED_REFUSALS {
+      for (span_name, span) in SPANS {
+        for (closer_name, closer) in CLOSERS {
+          for (trap_name, trap) in TRAPS {
+            let mut head = Vec::new();
+            if !opener.is_empty() {
+              head.extend_from_slice(opener);
+              head.extend_from_slice(b", ");
+            }
+            head.extend_from_slice(fragments[0]);
+            // The span, the closer and the trap stand behind the CLOSE of the
+            // value the join carried here — which is what makes the first
+            // element of the span begin at an offset the element it belongs to
+            // does not.
+            let mut tail = fragments[1].to_vec();
+            if !span.is_empty() {
+              tail.extend_from_slice(b", ");
+              tail.extend_from_slice(span);
+            }
+            tail.extend_from_slice(b", ");
+            tail.extend_from_slice(closer);
+            tail.extend_from_slice(b", ");
+            tail.extend_from_slice(trap);
+            let spelling = format!(
+              "challenges-span opener={opener_name} refusal=join-{refusal_name} span={span_name} closer={closer_name} trap={trap_name}"
+            );
+            record(out, "N", &[&head, &tail], &spelling, count)?;
+          }
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+/// The rows where the span begins AT the offset the refusal left the cursor on,
+/// rather than one element behind it.
+///
+/// # The stage the family above cannot vary
+///
+/// Where a refusal leaves the cursor. Every row above appends its span behind
+/// the last element of the refused challenge, so the element the walk stands on
+/// when recovery starts is always one the challenge already DERIVED — and a
+/// span rule that skipped that element was green over all of them.
+///
+/// `MAX_CHALLENGE_LINES` is the one refusal that leaves it somewhere else. RFC
+/// 9110 §5.2 joins the field lines into one value, the bound is met when the
+/// challenge needs a line it may not hold, and it is met with the cursor at the
+/// HEAD of that line — on an element the walk has not read. So the first
+/// element of the span is the first element of that line, and `Basic a1=1`
+/// through `a16=16` on sixteen lines, with a seventeenth opening at the element
+/// `y=` in front of `Bearer` and a trap whose string never closes, is the
+/// value: `y=` is where the cursor stands, RFC 9110 §11.2 derives nothing at
+/// it, and the `Digest` behind that trap was read out of its own data while a
+/// rule with a first-element exception looked past it.
+///
+/// Sixteen fragments and not the seventeen [`REFUSALS`] writes, because the
+/// span itself is what the seventeenth line has to begin with.
+fn corpus_n_at_the_cursor(out: &mut impl Write, count: &mut usize) -> std::io::Result<()> {
+  let (_, fragments) = REFUSALS[6];
+  for (opener_name, opener) in N_OPENERS {
+    for (span_name, span) in SPANS {
+      // `none` is not a position. With nothing at the head of that line the
+      // closer stands there instead, `opens_a_challenge` answers `true` for it,
+      // and RFC 9110 §11.3's body ends in front of it — so the challenge
+      // COMPLETES within the bound and this family has no refusal to be about.
+      if span.is_empty() {
+        continue;
+      }
+      for (closer_name, closer) in CLOSERS {
+        for (trap_name, trap) in TRAPS {
+          let mut lines: Vec<Vec<u8>> = Vec::with_capacity(MAX_CHALLENGE_LINES + 1);
+          for (index, fragment) in fragments.iter().take(MAX_CHALLENGE_LINES).enumerate() {
+            let mut line = Vec::new();
+            if index == 0 && !opener.is_empty() {
+              line.extend_from_slice(opener);
+              line.extend_from_slice(b", ");
+            }
+            line.extend_from_slice(fragment);
+            lines.push(line);
+          }
+          // The line the challenge may not hold, and the span is what it opens
+          // with.
+          let mut tail = Vec::new();
+          tail.extend_from_slice(span);
+          tail.extend_from_slice(b", ");
+          tail.extend_from_slice(closer);
+          tail.extend_from_slice(b", ");
+          tail.extend_from_slice(trap);
+          lines.push(tail);
+          let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+          let spelling = format!(
+            "challenges-span opener={opener_name} refusal=line-bound-head span={span_name} closer={closer_name} trap={trap_name}"
+          );
+          record(out, "N", &refs, &spelling, count)?;
+        }
       }
     }
   }
@@ -863,24 +1530,58 @@ fn render_param(param: &http_semantics::auth::AuthParam<'_>) -> String {
 ///   the probe, and showing it anyway is the whole point of not letting a
 ///   malformed challenge hide a well-formed one. What it says about the
 ///   caller's answer is only that no reading of the value licenses it — never
-///   that a sender wrote those bytes as data, which is `over-yield`. One
-///   SUBSET of it is stronger than that: where the value carries a byte RFC
-///   9110 §5.5 admits nowhere in a field value, there is no reading of those
-///   bytes for the challenge to be the data of either. Corpus F is where that
-///   subset lives; corpora A, B and C cannot spell it.
+///   that a sender wrote those bytes as data, which is `over-yield`.
+///
+///   A subset of it USED to be claimed as stronger than that: where the value
+///   carries a byte RFC 9110 §5.5 admits nowhere in a field value, there was
+///   said to be no reading of those bytes for the challenge to be the data of
+///   either. That is a claim about what DERIVES, and it is not the question
+///   this axis asks. A DQUOTE at §11.2's value position opens a run whatever
+///   stands behind it, a forbidden byte means that run reaches no close, and
+///   the sender wrote every byte behind the DQUOTE — the probe included — as
+///   its data. `oracle::open_at` carries the correction and what collapsing it
+///   cost: 137 records of this corpus graded here while the reader handed a
+///   caller a `Digest realm=z` cut out of a realm, and both derivations of
+///   `excused` agreed, because that judgement was the one line they share.
 /// - `hider-excused` — the reader did not show it, and some reading puts it
 ///   inside a quoted-string. Not a defect: under that reading there is no
 ///   challenge there to show.
 /// - `hider-unresolved` — the reader did not show it, no reading puts it inside
-///   a quoted-string, and the reader SAID SO: its answer carries
+///   a quoted-string, the reader SAID SO — its answer carries
 ///   `ChallengeBoundaryUnknown`, which is the walk telling the caller that the
-///   rest of the value is unread. A challenge nobody was shown and nobody was
+///   rest of the value is unread — **and some RFC 9110 §5.6.1.2 comma in front
+///   of the probe is one the readings disagree about**, so the walk had a
+///   boundary it could not place. A challenge nobody was shown and nobody was
 ///   told about is the harm this axis exists against, and this is the other
-///   thing: RFC 9110 §11.4's user agent knows it has not seen the whole list
-///   and can act on that. It is a cost and not a defect, and `tests` pins its
-///   count with the three shapes it is made of.
-/// - `hider-unexcused` — the same, with no such reading and no such notice.
-///   **This is the number this module is driven to zero on**, beside
+///   thing: §11.4's user agent knows it has not seen the whole list and can act
+///   on that. It is a cost and not a defect, and `tests` pins its count with the
+///   three shapes it is made of.
+/// - `hider-conforming` — the same notice, and some derivation of the WHOLE
+///   value reads the probe as a challenge. The grammar has no complaint
+///   anywhere in these bytes, so what refused them is a bound of this
+///   recipient's, and the only such refusal that ends the walk is the line
+///   bound met with a value still open across §5.2's join. The close that would
+///   settle the boundary is on a line `MAX_CHALLENGE_LINES` forbids this reader
+///   to hold, and that constant records the trade where it is defined. A cost,
+///   like `hider-unresolved`, and a different one.
+/// - `hider-declined` — the same notice, nothing derives, and no comma in front
+///   of the probe is one the readings disagree about. Every element boundary
+///   between the head of the value and the probe is one every reading places in
+///   the same byte, so there was nothing for the walk to decline: it stopped at
+///   a boundary the grammar had already made for it, and told the caller about
+///   an ambiguity that is not there. **This is the third number this module is
+///   driven to zero on.**
+///
+///   It is the hiding direction's own zero-target, and it exists because
+///   `hider-unresolved` was one class doing three jobs. A defect hid a
+///   challenge behind a `ChallengeBoundaryUnknown` the value did not warrant,
+///   and no metric here could see it: the class it graded into was pinned at a
+///   non-zero constant, so the whole hiding direction of this axis was
+///   unwatched while the inventing direction had two zero-targets.
+///   `oracle::every_comma_in_front_is_settled` is the split, and
+///   `Verdict::reached` is what holds the recipient's own bound apart from it.
+/// - `hider-unexcused` — the same, with no such reading and no notice at all.
+///   **This is the second number this module is driven to zero on**, beside
 ///   `over-yield`.
 fn axis(lines: &[&[u8]]) -> String {
   let joined = join(lines);
@@ -898,12 +1599,30 @@ fn axis(lines: &[&[u8]]) -> String {
       (false, false) => "yields-underivable",
     });
   }
-  String::from(if verdict.excused {
-    "hider-excused"
-  } else if says_the_rest_is_unread(lines) {
-    "hider-unresolved"
+  if verdict.excused {
+    return String::from("hider-excused");
+  }
+  if !says_the_rest_is_unread(lines) {
+    return String::from("hider-unexcused");
+  }
+  // The notice was given, and whether it was WARRANTED is a second question.
+  // Two things warrant it and they are different things.
+  if verdict.reached {
+    // Some derivation of the WHOLE value reads the probe as a challenge, so
+    // the grammar has no complaint anywhere in these bytes and what refused
+    // them is a bound of this recipient's. `MAX_CHALLENGE_LINES` records that
+    // trade where the constant is defined: the walk stopped inside a value it
+    // may not finish reading, and the close that would settle the boundary is
+    // on a line it may not hold.
+    return String::from("hider-conforming");
+  }
+  // Nothing derives, so the walk is in recovery — and a walk in recovery may
+  // decline a comma the readings disagree about and may not decline one they
+  // do not.
+  String::from(if oracle::every_comma_in_front_is_settled(&joined, probe) {
+    "hider-declined"
   } else {
-    "hider-unexcused"
+    "hider-unresolved"
   })
 }
 

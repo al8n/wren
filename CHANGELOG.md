@@ -135,16 +135,59 @@ data.
   `Challenges::list_open` now says so. `Basic a=1, Bearer,
   Broken<HTAB>junk, x="open, Digest realm=z` reaches `Digest`; it did not.
 
-  **A `token68` body closes nothing**, and the walk does not pretend otherwise.
-  §11.3 writes `token68 / #auth-param` as an ABNF `/`, which orders nothing, so
-  the same bytes read as `#auth-param` are a list whose FIRST element derives
-  nothing — and behind a fault this walk holds both readings, which is the whole
-  of what the boundary rule is. In `Bearer abc, Broken<HTAB>junk, x="open,
-  Digest realm=z` that reading makes `open, Digest realm=z` the data of `x`, so
-  the comma in front of `Digest` is one no boundary may be taken at and
-  `AuthError::ChallengeBoundaryUnknown` is the answer. Crossing it would
-  manufacture a challenge — the corpus grades that `over-yield`, and corpus J
-  pins both directions side by side.
+  **A `token68` body closes one for the same reason.** §11.3 writes
+  `token68 / #auth-param` as an ABNF `/`,
+  and RFC 5234 §3.2's unordered choice says a recipient may TRY either
+  alternative; it does not make an alternative that derives NONE of these bytes
+  into a reading of them. Where the run reaches the end of its own element,
+  `auth-param = token BWS "=" BWS ( token / quoted-string )` derives nothing
+  there: `token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`
+  puts nothing but more `=` and §5.6.3's `OWS` behind its first `=`, and the
+  production needs a `tchar` or a DQUOTE. So the challenge derives, no list is
+  open behind it, and `Bearer abc, Broken<HTAB>junk, x="open, Digest realm=z`
+  reaches `Digest` — as does `Bearer abc, x="open, Digest realm=z`, which the
+  walk used to REFUSE the `Bearer` of, because the parameter-shaped element
+  behind the run made the body loop settle a verdict on a body §11.2 had already
+  decided. `Challenges::challenge` now finalises the challenge at that element's
+  delimiter before reading a byte of it, and
+  `the_two_branches_are_never_both_derivable` is the disjointness the rule rests
+  on, executed over 37 448 elements.
+
+  **What takes that argument away is a fault in front of the challenge.** It
+  rests on every reading of the value having this element as a challenge, and
+  behind a fault nothing derives — so the readings include one in which every
+  element since the fault is garbage the open list still holds. The expiry is
+  conditioned on `Challenges::faulted` for that reason, and
+  `Basic a=1, Broken<HTAB>junk, Bearer, x="open, Digest realm=z` is the value
+  that needed it: a bare scheme that closed a list it could not close, and a
+  `Digest` read out of the middle of `x`'s value. Corpus L is that shape.
+
+  **And the expiry is one write for every completion path.** It was three
+  completion paths with the `false` on one of them, which is how a fourth would
+  have inherited a stale `true`; `Challenges::challenge` now derives it from
+  `Complete::opens_a_list` at the single point every completion passes through.
+
+- **A scheme fault is recovered from the ELEMENT's own first byte**, not from
+  behind the scheme token. §11.6.1 gives that element two readings and they open
+  a §5.6.4 quoted-string in different places: read as one more `auth-param` of a
+  list still open, its value position is behind its own `token BWS "="`, and a
+  scan starting past the token never looks there. `Basic a=1, Broken<HTAB>junk,
+  Bearer, x="open, Digest realm=z` is the value — `x=`'s DQUOTE stands at a
+  value position of a list `Basic` opened, and the walk crossed the comma inside
+  it. Whether that reading is admitted at all is still `Challenges::list_open`'s
+  to say, so `Basic="q, Digest realm=z` — where no list is open anywhere —
+  reaches `Digest` exactly as before.
+
+- **A `token68` is the whole BODY, and an empty element in front of it is part
+  of that body.** §5.6.1.2's "Empty elements do not contribute to the count of
+  elements present." is why `BodyLines` spends no region on one that is all
+  `OWS` and commas — so a body whose empty elements stood on the line §5.2's
+  join left behind arrived at `BodyCheck::finish` as the bytes BEHIND them, and
+  a run reading as the whole of what arrived was taken as the body. `Basic<SP>,`
+  and `a=` on two field lines are `Basic ,,a=` under §5.2, whose body no
+  `token68` derives; the same value on ONE line always answered
+  `MalformedParameter`, and the two now agree. The question is asked at the
+  element instead, where the empty elements are still visible.
 
 - **The line bound met with a value still OPEN across §5.2's join leaves no
   boundary at all.** Every comma behind that DQUOTE is the value's data in the
@@ -154,6 +197,87 @@ data.
   with different numbers of challenges; they now answer alike, and
   `the_line_bound_met_inside_a_value_leaves_the_two_spellings_the_same_answer`
   is that agreement pinned where the disagreement used to be recorded.
+
+- **The ambiguity a refusal leaves behind it is scoped to a recovery epoch, and
+  a bound this reader sets opens none.** This class showed up in three places,
+  one after another: a list-open bit monotone over the whole value, then the
+  same bit cleared on one completion path out of three, then a global
+  `faulted` latch that held it past a completion RFC 9110 had already settled.
+  Each fix made the expiry a little more total and left one entrance open;
+  each of those entrances is what the next fix had to close. The flags are
+  gone. What one
+  refusal leaves behind it is an `Epoch`: whether an `#auth-param` list was open
+  where the refusal was met, and whether a derivation of the value still reaches
+  the cursor. `Challenges::list_open` is now the completed challenge's own shape
+  and nothing carried across one — no completion path writes it, because there
+  is only one place it is written at all — and the `1*SP` no longer writes it
+  either: a fault met at the body position is `Refusal::Bounded`, which says a
+  list is open by construction.
+
+  **Which refusals open an epoch is decided once**, by
+  `AuthError::is_a_receiver_bound`, and the match is exhaustive so a variant
+  added later cannot skip the question. §11.6.1's ambiguity is about where
+  one element ends and the next begins; behind an element the grammar derives no
+  part of, no boundary is fixed. `MAX_CHALLENGE_LINES`, `MAX_PARAMS_PER_CREDENTIAL`
+  and §11.2's one-name-once MUST move no comma: the grammar derives every byte
+  of the value they refuse, with every element where §5.6.1.2 puts it, so the
+  first element no `auth-param` derives ends the list exactly as it would have
+  with no refusal at all.
+  `Basic p1=1, …, p17=17, Bearer abc, x="open, Digest realm=z` is the value:
+  `Bearer abc` is §11.2's `token68`, no `auth-param`
+  derives it, and the `Digest` behind `x` was declined for a list that had ended
+  three elements earlier.
+
+- **A fault reaches past its own challenge only through the list it stood in.**
+  The rule that an epoch opened behind an unclosable epoch is itself unclosable
+  was written without a condition, and it should not have been. A fault changes what the bytes
+  behind it may be read as in exactly one way — the DQUOTE at a RFC 9110 §11.2
+  value position becomes a reading's to open and a reading's to leave shut — and
+  §11.2 admits a value position only inside a `#auth-param` list. So an epoch
+  with no list has no such position, no DQUOTE any reading may choose, and
+  nothing it can make the bytes behind it mean that the grammar does not already
+  make them mean. `Epoch::reaches_past_itself` is that channel, and it is what
+  `refuse` asks before inheriting an older epoch's non-derivability.
+
+  `Broken;junk, Safe, Basic a=1, a=2, Bearer abc, x="open, Digest realm=z` is
+  the value: `Broken;junk` opens no list, yet its epoch poisoned the
+  `DuplicateParameter` epoch three elements later, stopped `Bearer abc` closing
+  it, and declined the `Digest`. With the prefix removed the same value yields
+  it. `a_list_free_fault_in_front_of_a_value_hides_none_of_its_challenges` pins
+  that pairing over eight tails, and corpus M pins it over 210 (refusal,
+  separator, trap) triples.
+
+- **The two faults reported over an extent already complete are refusals like
+  every other.** A body neither of §11.3's alternatives derives, and the line
+  bound met on the region the challenge ENDS in, reached the caller through `?`
+  and recorded nothing at all — so `Basic ;, Bearer, x="open, Digest realm=z`
+  handed back a `Digest` read out of the middle of `x`'s own value: the body of
+  `;` derives nothing, nothing behind it does either, and a walk that recorded
+  no fault let the `Bearer` close a list no reading of these bytes closes. Both
+  now pass through `Challenges::refuse` as `Refusal::Ended`, whose only
+  difference from the others is that there is nothing left to seek.
+
+- **An epoch ends at a challenge that COMPLETES, and at nothing else.** The
+  element `seek` resumes on is not a second such position and the difference is
+  what the mutation table caught: `opens_a_challenge` says no `auth-param`
+  BEGINS at that element, which is not the same as a challenge deriving there.
+  Where the walk goes on to refuse it, nothing derives at that element under any
+  reading, so the reading in which the list is still running and the element is
+  garbage inside it survives —
+  `Basic p1=1, ..., p17=17, y=1, Broken;junk, x="open, Digest realm=z` is the
+  value, and closing an epoch at the resume crosses the comma inside `x`'s own
+  value.
+
+- **A challenge that is yielded may not simultaneously be treated as possibly
+  inside an earlier list**, and that is now checked rather than argued.
+  `a_yielded_challenge_is_no_parameter` is asserted at both places a challenge
+  completes, on every credential a debug build produces, and it cannot fire:
+  suppose an element is both, and `auth-param`'s `token BWS "="` puts the body
+  of the challenge reading AT the `=`, where neither `#auth-param` nor `token68`
+  derives anything —
+  `an_element_that_completes_a_challenge_is_no_parameter_of_the_list_in_front_of_it`
+  runs that over 37 448 elements. It is compiled away where `debug_assertions`
+  are off, as `walks_to_its_end` is.
 
 ### Added
 
@@ -175,7 +299,8 @@ first and the parameter bound was unreachable by the harness built to find it.
 
 - **`over-yield` and `hider-unexcused` are zero-targets**, asserted by
   `the_two_classes_this_module_is_driven_to_zero_on_are_zero` rather than
-  pinned. Both are 0 over all 935 692 records.
+  pinned. Both are 0 over all 937 150 records, and `hider-declined` — the
+  hiding direction's own target, added later in this entry — is the third.
 
 - **Corpus H reaches the challenge a join opens**: 72 records over four heads
   that leave a quoted-string open where their field line ends, nine
@@ -199,11 +324,137 @@ first and the parameter bound was unreachable by the harness built to find it.
   refuses the value's FIRST challenge, so the list state a recovery reads was
   written by the very challenge that failed and nothing measured what an
   intervening one left behind. It answered `hider-unresolved` **6** against that
-  same commit and 0 here. It also pins the direction that must NOT move: the
-  `token68` prefixes stay `hider-excused`, and
+  same commit, **18** against the one that closed the OWS defect, and 0 here —
+  the 18 being the `token68` prefixes, whose probe the walk hid for an argument
+  that does not hold. It also pins the direction that must NOT move, and
   `ows_after_the_join_comma_and_a_challenge_completed_in_front_are_shapes_these_generators_write`
   asserts both halves per prefix, so a family that stopped writing its own shape
   reds rather than going quiet.
+
+- **Corpus K reaches the `OWS` in FRONT of the join comma**: corpus H's 4 heads
+  and 9 continuations, times §5.6.3's 4 spellings of `OWS` written at the END of
+  every line §5.2 puts a comma behind, times one join or two — 288 records.
+  Corpus I unfixed the side behind that comma and this is the side in front of
+  it, which is not the same question: behind the comma the whitespace moves an
+  element and both of §11.6.1's openers with it, and in front of it the
+  whitespace is INSIDE the element the join carries, so whether it is the list's
+  at all depends on whether the head's quoted-string is still open there. K and
+  I answer alike record for record over inputs that differ in every record, and
+  that agreement is asserted rather than left to two tallies that happen to
+  match. The other half of the same axis — whitespace at the value's own head —
+  is closed by argument and a control instead:
+  `Challenges::open_element` takes §5.6.3's `OWS` at every cursor including the
+  value's first, so the answer for such a value IS the answer for the value
+  without it, and
+  `whitespace_at_the_head_of_the_value_is_the_one_edge_that_cannot_matter`
+  measures that over 288 comparisons rather than asserting it.
+
+- **Corpus L reaches what a challenge BEHIND the fault leaves open**: 2 list
+  states in front of the fault, times 3 elements refused at their `auth-scheme`,
+  times 4 challenges completing behind that refusal, times 5 tails carrying the
+  probe — 120 records. Corpus J varies what completes in FRONT of the refusal,
+  where the argument for closing a list is whole; nothing measured a challenge
+  completing behind one, and a bare scheme closing a list there is how
+  `Basic a=1, Broken<HTAB>junk, Bearer, x="open, Digest realm=z` handed a caller
+  a `Digest` out of the middle of `x`'s value. It answered `over-yield` **6**
+  against the commit that closed the stale-list defect and 0 here. Three
+  families, and each defect lived where the generators could not
+  write.
+
+- **Corpus M reaches the SECOND recovery epoch**: 3 states in front of the first
+  refusal — no list, a list, and a fault that opens a THIRD epoch nothing can
+  close — times 7 refusals, four faults of the grammar and this reader's three
+  bounds, times 6 things standing between the two epochs, times 5 tails carrying
+  the probe: 630 records. Every family in front of it varies bytes
+  WITHIN one epoch, and the epoch count had been fixed at one since the first
+  generator, so no corpus could write a value in which one refusal's ambiguity
+  has to END before a later refusal's question can be answered. It answered
+  `over-yield` **12** and `hider-unresolved` **36** against `338e37a` and 0 and
+  0 here, and the 48 records it moved are the whole of what it moved: the
+  other twelve families are byte-identical, answer for answer, over 936 100
+  records. Its own two extra dimensions moved nothing and pin two directions
+  instead — a bound met behind a fault of the grammar is a bound whose epoch
+  cannot be closed either, and an epoch is closed by no element recovery merely
+  RESUMES on. Four families, and each defect lived where the
+  generators could not write.
+  `a_second_recovery_epoch_is_a_shape_this_generator_writes` asserts
+  the family's shape, the fault each row is about, and both directions of the
+  axis it adds.
+
+- **The hiding direction has a zero-target of its own: `hider-declined`.** Two
+  of the three classes this module drove to zero watched a challenge being
+  INVENTED, and the third watched one hidden in silence. Nothing watched a
+  challenge hidden behind a notice, because `hider-unresolved` was pinned at a
+  non-zero constant, and a defect graded into it. Under the split, that defect
+  reds: corpus M answers `hider-declined` **36** against `338e37a` and **0**
+  here, and the 36 are the whole of that class, its own witness included.
+
+  The split is two questions, because `hider-unresolved` was one class doing
+  three jobs. `oracle::every_comma_in_front_is_settled` asks whether any RFC
+  9110 §5.6.1.2 comma in front of the probe is one the readings DISAGREE about
+  — a walk may decline such a comma and may not decline any other — and
+  `Verdict::reached` asks whether the whole value derives, since a walk that
+  refused conforming input refused it for a bound of its own.
+  `hider-conforming` is that third job with a name: 6 records in corpus D and 5
+  in corpus E, all of them `MAX_CHALLENGE_LINES` met with a quoted-string that
+  CLOSES on a line this reader may not hold. `hider-unresolved` keeps the
+  remaining 32.
+
+- **The oracle can now tell a string the grammar FORCES from one a reading
+  chooses.** `covers` gained a `Regime`: `Every` is the walk it always made, and
+  `Forced` drops both ways a covering reading can be a choice — the free regime
+  behind a fault, and a `quoted-string` whose own element derives nothing, since
+  `( token / quoted-string )` is one alternative taken WHOLE. So a comma inside
+  `a="x,y"` is settled as that parameter's DATA and one inside `a=","a` is a
+  disagreement, which is the difference the new class turns on. `Regime::Every`
+  is byte-for-byte the old walk: the axis column moves on 11 records and every
+  one of them is `hider-unresolved` → `hider-conforming`.
+
+- **`oracle::covers` carried a comment that was provably false, and the code it
+  described was right.** It said RFC 9110 §11.2's one-name-once MUST "makes no
+  difference" to where a quoted-string may open. It makes one:
+  `Basic a=1, a=2, Bearer abc, x="open, Digest realm=z` is `excused: false` as
+  the code reads it and `excused: true` if the repeat is made an element nothing
+  derives. The code is right and the sentence was not, and the sentence is now
+  the argument — §5.6.1.2 delimits the list before §11.2 says anything about
+  names, so honouring the MUST moves no comma and un-derives no element, and
+  this function asks a question about element boundaries. What the MUST does
+  decide is whether the value CONFORMS, which is `Verdict::reached`'s question;
+  `step` applies it for exactly that reason and the two functions differ because
+  they are asked different things. Nothing in the graded counts moves, because
+  no code path changed: the rule reaches 362 records, 328 of them graded on the
+  axis.
+
+- **The oracle carried the module's own defect, so the new zero-target could not
+  see it.** `covers` set `faulted` unconditionally in `resume`, so a fault at an
+  element with no list open still switched every later element into the free
+  regime — where the walk re-entered a list opened three elements behind it and
+  found a reading in which the probe was that list's data. `excused` was `true`,
+  and `axis` excuses a hiding before it asks whether the notice was warranted.
+  **`hider-declined` graded this shape `hider-excused` at the commit that
+  introduced the target.** `resume` now
+  propagates `list` rather than `true`, on the same channel argument as the
+  reader's, and with it the target reds: corpus M answers `hider-declined` 12
+  against `684fe2f` and 0 here. An oracle that shares a defect with the module
+  cannot grade the module for it.
+
+- **Corpus M crosses the earlier epoch's own state**, which was the missing
+  shape. `M_OPENERS` is five: nothing, a list, a
+  list-free grammar fault, the same fault inside a list, and a bound of this
+  recipient's — the whole cross of the two facts an earlier epoch has, less the
+  one combination `refuse` cannot build, since a receiver bound is only ever met
+  inside a body. 1050 records, and the family asserts the pairing directly: the
+  list-free prefix moves no probe over any of its 210 triples, the same fault
+  inside a list moves exactly the 18 a bound would otherwise have closed, and it
+  never moves one in the direction of showing more.
+
+- **A per-corpus digest is keyed to the corpus it is about.** Corpus I and
+  corpus K answer alike record for record — §5.6.1.2 spells one list two ways,
+  and the identity is asserted where it belongs — so their two rows in `ANSWERS`
+  held the same sixty-four characters and a maintainer pasting one family's
+  actual digest into the OTHER family's row was green. The corpus name goes into
+  the hash first, the table is asserted to hold no repeat, and `WHOLE` stays
+  unkeyed because it is the number `auth-diff` prints.
 
 - **Corpus G reaches the parameter bound**: 180 records writing 2 to 21 distinct
   parameters on ONE field line, behind nine tails — the eight corpora D and E
@@ -224,6 +475,18 @@ first and the parameter bound was unreachable by the harness built to find it.
   it. A `challenge` is read only at an element of the outer list, and an
   `auth-param` only where a list is open.
 
+  **And it located the first fault in a branch that failed rather than in the
+  value.** `covers` entered the `#auth-param` alternative at every body position,
+  so a body §11.2's `token68` derives whole was read as a list whose first
+  element derives nothing — a fault at a position no reading of the value is at.
+  Every DQUOTE behind it then became a free choice, and 222 records were excused
+  on the strength of a reading nobody has. The alternative is now taken only
+  where `token68` does not derive the body, and the two never derive one element
+  between them. Measured over the same reader: `Verdict::derives` moves on 0 of
+  the 523 648 probe-carrying records, `Verdict::reached` on 0, and
+  `Verdict::excused` on 222 — every one of them `true → false`, and every one of
+  them a value with a `token68` challenge standing in front of its fault.
+
 - **A third class, `hider-unresolved`**, for the 43 records where the reader
   declined to place a boundary and SAID SO. A challenge nobody was shown and
   nobody was told about is the harm this axis exists against; a challenge the
@@ -238,12 +501,14 @@ first and the parameter bound was unreachable by the harness built to find it.
   checked — `RECOVERED` identifies the record set one earlier commit moved and
   asserts its size — and the move itself is tabulated at `AXIS`.
 
-`cargo test -p http-semantics --all-features` reports 432 unit tests passing, 93
+`cargo test -p http-semantics --all-features` reports 442 unit tests passing, 103
 of them this module's, beside the no-panic harness's fifteen and one doctest;
-`cargo test -p auth-corpus` reports 15. `xtask/snapshots/http-semantics-documented.txt`
-gains 65 lines and loses one — `Challenges.opened_a_list`, renamed `list_open`
-because it no longer only ever turns on: `grep -vc '^#'` counts 697 documented
-items on it at `9dd8708` and 762 here.
+`cargo test -p auth-corpus` reports 20 over 937 150 records.
+`xtask/snapshots/http-semantics-documented.txt` gains 86 lines and loses four —
+`Challenges.opened_a_list`, renamed `list_open` because it no longer only ever
+turns on, and `Challenges.faulted`, `Challenges.parameters` and
+`Challenges.after_comma`, which `Epoch` took over: `git diff --numstat 9dd8708 --` is those two figures, and
+`grep -vc '^#'` counts 697 documented items on it at `9dd8708` and 779 here.
 
 ## `xtask` — a production that is not a rule, a rule no line could hold, and a `miri` budget that stops rather than reports
 

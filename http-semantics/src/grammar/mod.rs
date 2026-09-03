@@ -2155,7 +2155,7 @@ fn raw_comma_end(value: &[u8], at: usize) -> usize {
 /// over any bytes at all — so all three flags clear says every reading is
 /// outside, and [`Readings::covers`] is the question that asks it.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
-struct Readings {
+pub(crate) struct Readings {
   /// Some reading is inside a `quoted-string` with no `quoted-pair` pending.
   inside: bool,
   /// Some reading is inside one whose previous byte was the backslash of a
@@ -2169,10 +2169,31 @@ struct Readings {
 }
 
 impl Readings {
+  /// The set one scan leaves, beside the reading that opened nothing.
+  ///
+  /// The whole of what a caller with ONE admitted opener needs: it stands
+  /// outside every string at the offset the scan began, so the set there is the
+  /// reading that leaves the DQUOTE shut — which is [`Self::default`], all
+  /// three flags clear — and the reading that opens it, which is `step`
+  /// absorbed. `crate::auth::some_reading_holds` is that caller: RFC 9110
+  /// §11.2's `auth-param` is one whole element with nothing repeating inside
+  /// it, so the subset construction [`readings_at`] runs collapses to a single
+  /// scan and this is where its answer is taken.
+  ///
+  /// Written here rather than at the caller so that [`Self::absorb`] stays the
+  /// ONE place a [`QuotedScan`] becomes a reading. A second reader of those
+  /// three states is a second ruling on [`QuotedScan::Invalid`], and the two
+  /// were free to differ — which is what they did.
+  pub(crate) fn of(step: QuotedScan) -> Self {
+    let mut open = Self::default();
+    open.absorb(step);
+    open
+  }
+
   /// Whether ANY reading has the offset this set was taken at inside a
   /// quoted-string — which is what would make a comma there that reading's
   /// data rather than RFC 9110 §5.6.1.2's separator.
-  const fn covers(self) -> bool {
+  pub(crate) const fn covers(self) -> bool {
     self.inside || self.escaped || self.sealed
   }
 
@@ -2219,6 +2240,12 @@ impl Readings {
       // leaves only the readings that opened nothing there — but the sender
       // still wrote those bytes between DQUOTEs, and `gzip;;x="a\x01, chunked,
       // b", br` cut raw hands back a `chunked` that stood among them.
+      //
+      // The same ruling answers for RFC 9110 §11.2's `auth-param` through
+      // [`Self::of`], and it did not always: `auth` read the three states
+      // itself and collapsed this one to "no reading opens here", so
+      // `Basic x="<%x01>, Digest realm=z` handed a caller a `Digest` built out
+      // of the bytes behind that DQUOTE.
       QuotedScan::Invalid => self.sealed = true,
     }
   }
