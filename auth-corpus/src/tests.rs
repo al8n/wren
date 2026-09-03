@@ -594,6 +594,22 @@ type Pinned = (
 /// an answer moves a cell here, and the point is that it moves in the DIFF —
 /// where a reader can ask which cell and why — rather than in a figure nobody
 /// can recompute. Re-derive them from a failure's own message.
+///
+/// # What the grader changes of this branch invalidated
+///
+/// The axis has three inputs and two of them were corrected on this branch, so
+/// a per-corpus figure quoted from before those commits is a figure taken with
+/// a different classifier:
+///
+/// | commit | what moved | what it invalidates |
+/// |---|---|---|
+/// | `915752d` | `derives_as_a_challenge` gained `starts_an_element`; 24 verdicts | every `AXIS` cell quoted before it |
+/// | `326407c` | `covers` and `readings` stopped taking a failed challenge branch; 108 verdicts | every `AXIS` cell quoted before it |
+///
+/// Neither moved the ANSWER column, so every `ANSWERS` digest and [`WHOLE`]
+/// figure survives both — which is the split those tables are for. **Any
+/// figure this branch quotes outside the tree must be re-taken at the final
+/// tree**, not carried forward from an earlier one.
 const AXIS: [Pinned; 16] = [
   (
     "A",
@@ -677,7 +693,7 @@ const AXIS: [Pinned; 16] = [
       ("yields-underivable", 60),
     ],
     259,
-    152,
+    146,
   ),
   (
     "H",
@@ -723,7 +739,7 @@ const AXIS: [Pinned; 16] = [
       ("yields-underivable", 774),
     ],
     2_102,
-    3_214,
+    3_202,
   ),
   // `over-yield` stood at 135 and stands at 0: `sustain_the_epoch` asks a
   // crossed element both of RFC 9110 §11.6.1's readings now, and the one that
@@ -787,14 +803,13 @@ const AXIS: [Pinned; 16] = [
     "P",
     1_152,
     &[
-      ("hider-declined", 72),
       ("hider-excused", 576),
       ("hider-unresolved", 144),
       ("yields", 144),
-      ("yields-underivable", 216),
+      ("yields-underivable", 288),
     ],
-    552,
-    1_608,
+    624,
+    1_488,
   ),
 ];
 
@@ -1162,7 +1177,7 @@ const ANSWERS: [(&str, &str); 16] = [
   ),
   (
     "G",
-    "544d4e11490978d356cc2c528c65877a5a7b13c0d8d4b74b6cb672f279f29b5e",
+    "7b142bda6003046f738aa0170ade6cfa37148dad779f2ce4511c31c94550d006",
   ),
   (
     "H",
@@ -1186,7 +1201,7 @@ const ANSWERS: [(&str, &str); 16] = [
   ),
   (
     "M",
-    "0b95a8bdee78c39fc371f4d70ab830c0fc31d9d3d286d4636861d335eeefd3f9",
+    "c575418947a436f4476ae89a3117943a51825b1d2c36ed3ec70a18cda1379288",
   ),
   (
     "N",
@@ -1198,11 +1213,11 @@ const ANSWERS: [(&str, &str); 16] = [
   ),
   (
     "P",
-    "4051295e29b5ac64cb6d30bdcb4a95c3f6d608fc0bb75f2e8c92f2bc6a2d61d3",
+    "c1b70c55a581c39fa6878b7ffe2d030d8fc950b7814498e33a898e321b05c890",
   ),
 ];
 
-const WHOLE: &str = "d465ccf284678af51f4900ae08ffde818fd3879b52730b8e2d529b6a5ec5d6ca";
+const WHOLE: &str = "f5a1c109964ec55a70708b1189d1bbbaec360e45423b0e764f561fa8ec1f2dbf";
 
 /// Feeds `hash` what `auth-diff` digests: each record's `answer` column and the
 /// newline behind it, in record order.
@@ -1340,7 +1355,7 @@ const FAULTS: [(&str, &[(&str, usize)]); 16] = [
   (
     "G",
     &[
-      ("ChallengeBoundaryUnknown", 11),
+      ("ChallengeBoundaryUnknown", 5),
       ("MalformedScheme", 40),
       ("MissingScheme", 40),
       ("TooManyParameters", 46),
@@ -1392,7 +1407,7 @@ const FAULTS: [(&str, &[(&str, usize)]); 16] = [
   (
     "M",
     &[
-      ("ChallengeBoundaryUnknown", 327),
+      ("ChallengeBoundaryUnknown", 315),
       ("ChallengeSpansTooManyLines", 180),
       ("DuplicateParameter", 180),
       ("MalformedParameter", 285),
@@ -1428,7 +1443,7 @@ const FAULTS: [(&str, &[(&str, usize)]); 16] = [
   (
     "P",
     &[
-      ("ChallengeBoundaryUnknown", 648),
+      ("ChallengeBoundaryUnknown", 528),
       ("DuplicateParameter", 288),
       ("MalformedParameter", 576),
       ("UnterminatedQuotedString", 96),
@@ -2464,9 +2479,28 @@ const ELEMENT_START_REACH: [(&str, usize); 16] = [
 ///
 /// **Not a zero and not a target.** `oracle::starts_an_element`'s doc carries
 /// what this measures, which way round it goes, and what its two attempted
-/// fixes cost — one of them 172 disagreements in the other direction and 313
+/// fixes cost — one of them 168 disagreements in the other direction and 313
 /// moved axis verdicts. It is pinned so the divergence cannot move quietly
 /// while somebody reconciles the two walks.
+///
+/// # A known-wrong shape, awaiting the redesign
+///
+/// It is not a cost with an argument behind it the way [`UNRESOLVED`] is. The
+/// rule this counts against is one a local read of §5.6.1.2 cannot express —
+/// whether an element BEGINS somewhere is a fact about which readings reach
+/// there — and the constant stands only so that the divergence is visible until
+/// the two walks are reconciled. Nothing here is claimed to be right.
+///
+/// It moved **6 415 -> 6 427**, and its probe half **323 -> 335**, when
+/// `oracle::covers` and `readings` gained the exclusion that a failed challenge
+/// branch is no reading beside an `auth-param` that derives. `readings`
+/// reaches twelve fewer positions and the rule at one offset cannot see it,
+/// which is the same known-wrong shape moving rather than a new one.
+///
+/// **And that edit is the second thing this branch has learnt about its own
+/// gates**: `covers` and `readings` both needed it, and only the `excused`
+/// differential noticed — 216 disagreements the moment `covers` changed. This
+/// gate did not, because the two derivations part here already.
 const ELEMENT_START_DISAGREEMENTS: usize = 6_427;
 
 /// How many of those are offsets `oracle::derives_as_a_challenge` is actually
@@ -4236,13 +4270,20 @@ fn the_notice_that_separates_the_two_classes_is_read_from_the_answer() {
   // zero-target being met. So the two answers are separated here instead, over
   // one value of each kind.
   //
-  // The first is al8n/wren#77's own shape behind a duplicate name: the walk
-  // refuses to place the boundary and says so. The second is a value refused
-  // for a fault whose boundary every reading agrees on, so the walk crosses it
-  // and reports nothing about the rest.
+  // The first is al8n/wren#77's own shape behind a duplicate name. The walk no
+  // longer declines there and no longer needs to: a duplicate name is a bound
+  // of THIS reader's, so the value still derives, `( token / quoted-string )`
+  // is not a choice at `x`'s value position, and the element ends where that
+  // string closes — at the end of the value, with nothing behind it to be
+  // unread. What it must not do is report an unread remainder that does not
+  // exist.
   assert!(
-    says_the_rest_is_unread(&[b"Basic a=1, a=2, x=\"c, Digest realm=z, junk\""]),
-    "a walk that declined to place a boundary must say so"
+    !says_the_rest_is_unread(&[b"Basic a=1, a=2, x=\"c, Digest realm=z, junk\""]),
+    "a walk that placed the boundary must not claim a remainder"
+  );
+  assert!(
+    !yields_the_probe(&[b"Basic a=1, a=2, x=\"c, Digest realm=z, junk\""]),
+    "and the probe is inside `x`'s value in every derivation"
   );
   assert!(
     !says_the_rest_is_unread(&[b"Basic a=1, a=2, x=\"c\", Digest realm=z"]),
@@ -5401,6 +5442,42 @@ fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_w
 /// How many of corpus O's cells answer differently depending on where §5.2's
 /// join was cut, and what shape every one of them has.
 ///
+/// # The class is 80 of 192 cells, and this branch introduced it
+///
+/// **Headline, measured at this tree, and not a footnote.** Corpus P cuts a
+/// value inside the run a carried value COVERS — the run `Recovery::floor` is
+/// an offset into — and 80 of its 192 cells answer differently by where the
+/// sender cut them. The 36 below are corpus O's cut axis, which only ever cuts
+/// inside a leading run of EMPTY elements. It was 104 before the recovery
+/// learned to resume at the close a join carried here, which is the first
+/// change to this class that SHRANK it rather than moving it.
+///
+/// The same 1 152 records fed to `main`'s reader at `2384bba`, over a probe
+/// crate built against a worktree of it:
+///
+///     0 of 192 cells part
+///
+/// **So this branch introduced the parting.** `main` has no `Recovery` at all,
+/// crosses every raw comma, and has nothing to be representation-dependent
+/// about. What that uniformity costs is on the same records: `main` shows the
+/// probe in 1 008 of 1 152 against this tree's 432, they differ on 576, and
+/// **432 of those 576 are `hider-excused`** — challenges `main` manufactures
+/// out of a value's own data and this tree does not. The other 144 are this
+/// tree's whole remaining cost, `hider-unresolved`, where the caller is told
+/// the rest is unread. **No record is `hider-declined` any more**: the 72 that
+/// were are closed, so nothing here is hidden behind a boundary every reading
+/// settles.
+///
+/// # What this constant is, and what it is not
+///
+/// **An acknowledged representation-dependent limitation, and not a
+/// correctness proof.** Retaining `AuthError::ChallengeBoundaryUnknown` where
+/// the readings part is fail-closed: no challenge is manufactured, and the
+/// caller is told the rest of the value is unread. What is not claimed is that
+/// the answer is a function of the VALUE — it is a function of the value and
+/// of where §5.2's joins fell in it, and 80 of 192 cells is the size of that
+/// dependence rather than a bound on it.
+///
 /// # The argument this constant used to lack
 ///
 /// [`UNRESOLVED`] and [`CONFORMING`] are pinned because each is a cost this
@@ -5469,14 +5546,13 @@ fn leading_empty_elements_before_a_quoted_parameter_are_a_shape_this_generator_w
 /// that one byte, and neither offset is one every reading is outside a string
 /// at.
 ///
-/// # And 36 is a LOWER BOUND on the class
+/// # And 36 counts corpus O's cut axis alone
 ///
-/// Corpus O's `cut` axis moves §5.2's join inside a leading run of EMPTY
-/// elements, which is the only place any generator here cuts a value. The class
-/// is about a cut falling anywhere the carried value runs, and
-/// [`ONE_VALUE_THREE_SPELLINGS`] is a value that parts at THIS commit over a
-/// cut no family writes: three field lines show the probe where one and two
-/// decline. So this number counts what corpus O can see and not what there is.
+/// It was written as a lower bound with nothing behind it. Corpus P is what is
+/// behind it now: 80 of 192 over the run a carry covers, measured above.
+/// [`ONE_VALUE_THREE_SPELLINGS`] remains the hand witness of the same class —
+/// three field lines show the probe where one and two decline, over a cut no
+/// family wrote before corpus P.
 const CUTS_THAT_PART: usize = 36;
 
 /// One value, spelled over one, two and three field lines, that this walk
@@ -5548,8 +5624,14 @@ fn one_value_spelled_over_three_line_counts_answers_two_ways() {
 ///
 /// Corpus P's `head=dup close=clean` rows refuse at RFC 9110 §11.2's
 /// one-name-once MUST — a bound of THIS reader's — over an element the grammar
-/// derives whole. `the_cut_a_carried_value_covers_is_one_no_family_wrote`
-/// carries what that costs.
+/// derives whole. Every derivation of this value has the DQUOTE behind `a=`
+/// opening a §5.6.4 quoted-string: §5.6.2's `tchar` excludes DQUOTE so no
+/// `token` starts there, and a `quoted-string` must both open and close, so a
+/// reading that leaves it shut derives no value at all and the element is no
+/// element of any `#challenge`. The comma inside `x,p,q` is therefore that
+/// value's data in EVERY reading, the element ends at the comma behind its
+/// close, and the probe behind that is a challenge whose boundary nothing
+/// disputes. The walk crosses it now.
 const SETTLED_COMMA_DECLINED: &[u8] = b"Basic a=1, a=\"x,p,q\",x=\"c\", Digest realm=z";
 
 /// The refusals of corpus N that are bounds of THIS READER'S rather than faults
@@ -5698,56 +5780,74 @@ fn the_cut_a_carried_value_covers_is_one_no_family_wrote() {
   // **The measurement.** `CUTS_THAT_PART` counts 36
   // cells over corpus O's cut axis, and its doc calls that a lower bound
   // because no family cut a value anywhere but inside a leading empty run.
-  // This is the run the carry covers, and the class is 104 of 192 cells —
-  // more than half of everything this family writes, against 36 of corpus O's
-  // 1 176.
+  // This is the run the carry covers, and the class is 80 of 192 cells —
+  // against 36 of corpus O's 1 176. It was 104 before the recovery learned to
+  // resume at the close a join carried onto the line it holds.
   assert_eq!(
-    parted, 104,
+    parted, 80,
     "corpus P: the cells whose cuts answer differently"
   );
 
-  // And a THIRD finding, from a different cause than the cut. All 72 are
-  // `head=dup close=clean`: the element the carry ends in DERIVES as an
+  // And a third finding, from a different cause than the cut, now CLOSED. All
+  // 72 were `head=dup close=clean`: the element the carry ends in DERIVES as an
   // `auth-param`, so the DQUOTE at its value position is FORCED and the comma
   // inside that value is the value's data under EVERY reading — `settled` is
-  // what says so, and `hider-declined` is the class for declining a boundary
-  // no reading disagrees about.
+  // what says so, and `hider-declined` is the class for declining a boundary no
+  // reading disagrees about.
   //
-  // What the walk does instead is give up at that comma. `some_reading_holds`
+  // What the walk did instead was give up at that comma. `some_reading_holds`
   // answers `true` for it, which is correct and is not a reason to stop: a
   // comma every reading holds inside a value is one the element does not end
-  // at, so the walk should cross it as data and look for the offset where the
-  // element DOES end. `refused_element_end` answers `None` at the first raw
-  // comma instead, and the rest of the value goes unread.
+  // at, so the walk crosses it as data and looks for the offset where the
+  // element DOES end. That offset is the close, and `Recovery::floor` is where
+  // the walk has been carrying it all along.
   //
-  // It is the same shape as [`CUTS_THAT_PART`]'s — a recovery that stops at
-  // the first comma rather than at the element's real end — reached from the
-  // other side, and it is left standing here for the same reason: closing it
-  // is a redesign of the single-opener argument rather than a patch.
-  let declined: Vec<&String> = p
-    .iter()
-    .filter(|line| columns(line)[3] == "hider-declined")
-    .collect();
+  // Pinned by SHAPE, because a zero whose subject stopped being written goes
+  // quiet rather than red: every row of the shape shows the probe now, and none
+  // of them carries a notice.
   assert_eq!(
-    declined.len(),
-    72,
+    of(&tally(&p, |_| true), "hider-declined"),
+    0,
     "corpus P: the boundaries declined for nothing"
   );
-  for line in &declined {
-    let [_, _, spelling, _, answer] = columns(line);
-    assert!(
-      spelling.contains(" head=dup ") && spelling.contains(" close=clean "),
-      "corpus P: a hider-declined outside the shape this test names: {line}"
-    );
+  let mut settled = 0usize;
+  for line in &p {
+    let [_, _, spelling, axis, answer] = columns(line);
+    if !(spelling.contains(" head=dup ") && spelling.contains(" close=clean ")) {
+      continue;
+    }
     assert!(
       answer.contains("Err(DuplicateParameter)"),
-      "corpus P: a hider-declined refused by something other than a bound: {line}"
+      "corpus P: a `head=dup` row refused by something other than a bound: {line}"
+    );
+    // The traps whose own string covers the probe are `hider-excused` whatever
+    // the walk does with this boundary, so what this pins is the other half:
+    // where the trap leaves the probe outside every string, the boundary the
+    // carry's close settles is one the walk CROSSES, and it says nothing about
+    // an unread remainder because there is none.
+    if axis == "hider-excused" {
+      continue;
+    }
+    assert_eq!(
+      axis, "yields-underivable",
+      "corpus P: a boundary every reading settles is graded elsewhere: {line}"
     );
     assert!(
-      answer.contains("Err(ChallengeBoundaryUnknown)"),
-      "corpus P: a hider-declined with no notice: {line}"
+      answer.contains(&format!("Ok[{}", escape(PROBE_SCHEME))),
+      "corpus P: a boundary every reading settles is not crossed: {line}"
     );
+    assert!(
+      !answer.contains("Err(ChallengeBoundaryUnknown)"),
+      "corpus P: a boundary every reading settles is declined all the same: {line}"
+    );
+    settled = settled.saturating_add(1);
   }
+  assert_eq!(
+    settled, 144,
+    "corpus P: four runs by two spacings by the three traps that leave the \
+     probe outside every string, over every subset of the commas the carry \
+     covers"
+  );
 
   // The same fact over the one-line witness, with the ORACLE's own verdict
   // beside it and no reader in the derivation.
@@ -5776,12 +5876,12 @@ fn the_cut_a_carried_value_covers_is_one_no_family_wrote() {
      the comma inside `\"x,p,q\"` is that value's data in EVERY one of them"
   );
   assert!(
-    !yields_the_probe(&[SETTLED_COMMA_DECLINED]),
-    "the challenge this walk declines to place"
+    yields_the_probe(&[SETTLED_COMMA_DECLINED]),
+    "a boundary every reading settles is one this walk crosses"
   );
   assert!(
-    says_the_rest_is_unread(&[SETTLED_COMMA_DECLINED]),
-    "and it does say so, which is all that keeps it out of `hider-unexcused`"
+    !says_the_rest_is_unread(&[SETTLED_COMMA_DECLINED]),
+    "and nothing is left unread behind it"
   );
 }
 

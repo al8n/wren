@@ -1723,12 +1723,14 @@ fn a_value_the_grammar_admits_is_never_cut_into_a_challenge() {
   let mut exact = SEVENTEEN_CHALLENGE.to_vec();
   exact.extend_from_slice(b", ");
   exact.extend_from_slice(INVENTED);
-  let [refused, unknown, past] = walk::<3>([exact.as_slice()]);
+  // The bound is this reader's, so the value still DERIVES — and where it does,
+  // `( token / quoted-string )` is not a choice at `x`'s value position. The
+  // element ends where that string closes, which is the end of the value, so
+  // there is no `Digest` to invent AND no remainder to report. The notice this
+  // row used to carry was an over-report of an unread stretch that does not
+  // exist.
+  let [refused, past] = walk::<2>([exact.as_slice()]);
   assert_eq!(refused.unwrap().unwrap_err(), AuthError::TooManyParameters);
-  assert_eq!(
-    unknown.unwrap().unwrap_err(),
-    AuthError::ChallengeBoundaryUnknown
-  );
   assert!(past.is_none());
   yields_no_invented_scheme(&[exact.as_slice()], SEVENTEEN_CHALLENGE);
 
@@ -1753,14 +1755,27 @@ fn a_value_the_grammar_admits_is_never_cut_into_a_challenge() {
   // reach it as well and are here for the same reason.
   for (head, fault, _) in REFUSED_HEADS {
     let value = behind(head, INVENTED);
-    let [refused, unknown, past] = walk::<3>([&*value]);
-    assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
-    assert_eq!(
-      unknown.unwrap().unwrap_err(),
-      AuthError::ChallengeBoundaryUnknown,
-      "{head:?}"
-    );
-    assert!(past.is_none(), "{head:?}");
+    if fault.is_a_receiver_bound() {
+      // The value still DERIVES, so `( token / quoted-string )` is not a choice
+      // at the trap's value position: the element ends where that string
+      // closes, which is the end of the value. Nothing to invent, and no
+      // remainder to report.
+      let [refused, past] = walk::<2>([&*value]);
+      assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
+      assert!(past.is_none(), "{head:?}");
+    } else {
+      // A fault of the GRAMMAR'S, so nothing derives behind it and the DQUOTE
+      // at the trap's value position is a reading beside the one that leaves it
+      // shut. The walk declines and says so.
+      let [refused, unknown, past] = walk::<3>([&*value]);
+      assert_eq!(refused.unwrap().unwrap_err(), fault, "{head:?}");
+      assert_eq!(
+        unknown.unwrap().unwrap_err(),
+        AuthError::ChallengeBoundaryUnknown,
+        "{head:?}"
+      );
+      assert!(past.is_none(), "{head:?}");
+    }
     yields_no_invented_scheme(&[&value], head);
   }
 
@@ -1768,14 +1783,13 @@ fn a_value_the_grammar_admits_is_never_cut_into_a_challenge() {
   let mut lines = [&b""[..]; 18];
   lines[..SEVENTEEN_LINES.len()].copy_from_slice(&SEVENTEEN_LINES);
   lines[17] = INVENTED;
-  let [refused, unknown, past] = walk::<3>(lines);
+  // `MAX_CHALLENGE_LINES` is this reader's bound too, so the same rule holds:
+  // the trap's string is forced, the element ends where it closes, and there is
+  // nothing behind it.
+  let [refused, past] = walk::<2>(lines);
   assert_eq!(
     refused.unwrap().unwrap_err(),
     AuthError::ChallengeSpansTooManyLines
-  );
-  assert_eq!(
-    unknown.unwrap().unwrap_err(),
-    AuthError::ChallengeBoundaryUnknown
   );
   assert!(past.is_none());
   yields_no_invented_scheme(&lines, INVENTED);
@@ -3186,14 +3200,18 @@ fn an_element_a_join_carried_here_is_put_to_the_grammar_whole() {
   // the close, where that comma is already spent. The asymmetry is the
   // recovery's origin and not the span's claim, and the value below is where it
   // shows.
-  let [refused, unknown, past] =
-    walk::<3>([&b"Basic a=1, a=\"x,y\", Bearer, x=\"open, Digest realm=z"[..]]);
+  // On ONE line the recovery now crosses it: a duplicate name leaves the value
+  // deriving, so `a="x,y"` is one `auth-param` in every reading, the comma
+  // inside it is that value's data in all of them, and the element ends at the
+  // comma behind its close. `Bearer` then closes the list in every derivation,
+  // `x="open` stands in front of none, and the `Digest` behind it is a
+  // challenge whose boundary nothing disputes.
+  let [refused, bearer, scheme, digest] =
+    walk::<4>([&b"Basic a=1, a=\"x,y\", Bearer, x=\"open, Digest realm=z"[..]]);
   assert_eq!(refused.unwrap().unwrap_err(), AuthError::DuplicateParameter);
-  assert_eq!(
-    unknown.unwrap().unwrap_err(),
-    AuthError::ChallengeBoundaryUnknown
-  );
-  assert!(past.is_none());
+  assert_eq!(bearer.unwrap().unwrap().scheme(), b"Bearer");
+  assert_eq!(scheme.unwrap().unwrap_err(), AuthError::MalformedScheme);
+  assert_eq!(digest.unwrap().unwrap().scheme(), b"Digest");
 
   // And the control that says the epoch is doing the work rather than the
   // recovery simply crossing everything: the same two lines with an element the
