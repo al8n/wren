@@ -685,7 +685,7 @@ async fn a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget() {
 
   // Built from `close_budget_starts_at_flush_not_at_batching`, which is the
   // test that reliably gets a Close FLUSHED through a bounded pipe. Once it is
-  // flushed, `close_pending` is clear and `close_flushed_at` is anchored — and a
+  // flushed, `close_owed` is discharged and `close_flushed_at` is anchored — and a
   // peer Ping arriving then produces a Pong-only batch with
   // `carries_close == false`. The old two-way timer choice parked exactly that
   // batch on `pending()`, so a peer that stops reading wedges it forever and the
@@ -798,7 +798,7 @@ async fn a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget() {
 
   // Ten owed Pongs coalesce into one post-Close batch of 100 bytes, which
   // cannot fit, so the write wedges with `carries_close == false` and
-  // `close_pending == false` — Codex's path exactly.
+  // `close_owed == None` — Codex's path exactly.
   const {
     assert!(
       PINGS * PONG_LEN > PIPE_CAPACITY,
@@ -810,7 +810,7 @@ async fn a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget() {
     .expect(
       "a post-Close Pong flush is bounded by the REMAINING echo budget \
        (`close_flushed_at + close_budget`), not parked unbounded because the \
-       batch carries no Close and `close_pending` is already clear",
+       batch carries no Close and `close_owed` is already discharged",
     )
     .unwrap();
   let elapsed = t0.elapsed();
@@ -1544,5 +1544,239 @@ async fn a_peer_close_reaches_the_pump_through_a_wedged_post_close_write() {
     Some(0x8A),
     "the wedged prefix starts at the first Pong: {:02x?}",
     tail.get(..8).unwrap_or(&[])
+  );
+}
+
+#[compio::test]
+async fn a_spent_budget_refuses_a_write_that_was_ready_to_go() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // F7 on its own. `select_biased!` polls the drive before the timer, so a
+  // bound that has already reached zero still lets an immediately ready write
+  // complete: the deadline is a boundary only because zero remaining resolves
+  // to `FlushArm::Budget` BEFORE the drive is polled. Every other close
+  // regression WEDGES its write, and a wedged write cannot tell the two orders
+  // apart — the drive is `Pending` either way.
+  //
+  // So this pipe has room and the batch would go out at once. The driver's
+  // echo anchor is moved into the past BY HAND, and that is what isolates the
+  // arm: the protocol's own close deadline stays in the future, so
+  // `effective_deadline` — the later of the two — has NOT elapsed and Phase
+  // 1's settle does not fire. The only thing that is spent is Phase 3's arm-2
+  // remaining time.
+  const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let reader = compio_runtime::spawn(async move {
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      if let Err(e) = m {
+        ended = Some(e);
+        break;
+      }
+    }
+    (ended, cread)
+  });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, ours) = sr.read(Vec::with_capacity(64)).await;
+  let n = res.expect("the peer drains our Close");
+  assert_eq!(
+    ours.get(..n).and_then(<[u8]>::first).copied(),
+    Some(0x88),
+    "our Close, masked: {:02x?}",
+    ours.get(..n).unwrap_or(&[])
+  );
+
+  // The pump is parked here, so nothing else holds the borrow: move its echo
+  // anchor a whole budget into the past.
+  {
+    let mut guard = probe.borrow_mut();
+    guard.close_flushed_at = Some(
+      std::time::Instant::now()
+        .checked_sub(BUDGET + std::time::Duration::from_millis(50))
+        .expect("the test clock is far enough past the epoch"),
+    );
+  }
+  // One Ping, so a Pong batch is built and enters Phase 3 under arm 2 with
+  // nothing left of the budget and a transport that would take it at once.
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x89_u8, 0x00]).await;
+  res.expect("the peer's ping");
+
+  let (ended, _cread) = compio::time::timeout(std::time::Duration::from_secs(2), reader)
+    .await
+    .expect("a spent budget ends the connection")
+    .unwrap();
+  let mut tail = Vec::new();
+  loop {
+    match compio::time::timeout(
+      std::time::Duration::from_millis(200),
+      sr.read(Vec::with_capacity(64)),
+    )
+    .await
+    {
+      Err(_elapsed) => break,
+      Ok(compio_buf::BufResult(Ok(0) | Err(_), _)) => break,
+      Ok(compio_buf::BufResult(Ok(n), buf)) => tail.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+    }
+  }
+  assert!(
+    tail.is_empty(),
+    "the budget was spent before the drive was polled, so nothing may reach the wire: {tail:02x?}"
+  );
+  assert!(
+    matches!(&ended, Some(Error::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut),
+    "a spent budget tears down; it does not write and then notice: {ended:?}"
+  );
+}
+
+#[compio::test]
+async fn a_recorded_outcome_discards_the_batch_it_finds_rather_than_writing_it() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+  use std::future::Future;
+
+  // Phase 4 cannot meet a recorded outcome — the terminal check returns before
+  // it parks — but Phase 3 could: Phase 1's settle records an unclean close
+  // and Phase 3 then finds a Pong batch left over from a cancelled pass and
+  // treats it as live. §5.5.1 (line 2023 of `.rfc-cache/rfc6455.txt`) and the
+  // elapsed deadline both say that batch is moot, so it is discarded and the
+  // recorded outcome is what the pump reports.
+  //
+  // The batch is left over rather than built here: `next_message` is polled
+  // ONCE and dropped, which is the documented cancellation path — the guard
+  // restores the partial batch into `Inner` instead of losing it.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  // A masked client Pong for a 4-byte payload: 2 header + 4 mask key + 4.
+  const PONG_LEN: usize = 10;
+  // A masked client Close carrying a code and no reason: 2 + 4 + 2.
+  const CLOSE_LEN: usize = 8;
+  const BUDGET: std::time::Duration = std::time::Duration::from_millis(30);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacity(PIPE_CAPACITY);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  // Queue the Close without waiting for it: the marker frame stays queued and
+  // the pump coalesces it with the Close on its next pass.
+  {
+    let mut fut = Box::pin(cwrite.close(CloseCode::Normal, ""));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  // One pass puts it on the wire.
+  {
+    let mut fut = Box::pin(cread.next());
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  assert!(
+    probe.borrow().close_flushed_at.is_some(),
+    "the Close reached the wire, so the echo budget is running"
+  );
+
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(
+    res.expect("the peer drains our Close"),
+    CLOSE_LEN,
+    "the whole pipe is free for the Pong batch that follows"
+  );
+
+  // The peer stops reading here. Ten Pings owe `PINGS * PONG_LEN` bytes of
+  // Pongs; only `PIPE_CAPACITY` of them can land.
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let sent = pings.len();
+  assert!(sent <= PIPE_CAPACITY, "the pings fit the pipe in one write");
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  assert_eq!(
+    res.expect("the pings"),
+    sent,
+    "every ping reaches the driver"
+  );
+
+  // ONE poll reads them, builds the batch and wedges it; dropping the future
+  // parks the partial batch rather than losing it.
+  {
+    let mut fut = Box::pin(cread.next());
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  assert!(
+    probe.borrow().pending_write.is_some(),
+    "the cancelled pass parked its partial batch"
+  );
+
+  // Past the budget, so the NEXT pass records the outcome in Phase 1 — before
+  // Phase 3 ever looks at that batch.
+  compio::time::sleep(BUDGET * 2).await;
+  let outcome = compio::time::timeout(std::time::Duration::from_secs(2), cread.next())
+    .await
+    .expect("the pump settles rather than parking");
+  assert!(
+    outcome.is_none(),
+    "the outcome was recorded before Phase 3 ran; the pump reports it rather than \
+     the moot batch's own timeout: {outcome:?}"
+  );
+  let closed = cread.closed().expect("the settle recorded an outcome");
+  assert!(!closed.clean(), "no echo ever arrived: {closed:?}");
+
+  let mut tail = Vec::new();
+  loop {
+    match compio::time::timeout(
+      std::time::Duration::from_millis(200),
+      sr.read(Vec::with_capacity(4096)),
+    )
+    .await
+    {
+      Err(_elapsed) => break,
+      Ok(compio_buf::BufResult(Ok(0) | Err(_), _)) => break,
+      Ok(compio_buf::BufResult(Ok(n), buf)) => tail.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+    }
+  }
+  assert_eq!(
+    tail.len(),
+    PIPE_CAPACITY,
+    "only what the cancelled pass had already written, not all {} Pong bytes",
+    PINGS * PONG_LEN
   );
 }
