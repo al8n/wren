@@ -108,7 +108,18 @@ pub(crate) struct Inner<Ro, S> {
   /// the echo the protocol queued for a received Close) and has not been
   /// flushed yet. While set, the close deadline is suspended — its budget
   /// cannot start before the peer can possibly have seen our Close.
+  ///
+  /// Written only by [`Inner::request_close`], which is what keeps it and
+  /// `close_requested_at` from ever disagreeing.
   close_pending: bool,
+  /// When the Close now owed was FIRST requested — the absolute anchor the
+  /// flush bound is measured from. A bound recomputed as a fresh whole budget
+  /// on every re-entry is not a bound: a doorbell ring restores the partial
+  /// batch and re-enters, so a local sender that rings faster than the budget
+  /// keeps a wedged Close flush alive forever. Reading the remaining time from
+  /// a fixed instant instead makes it monotone across cancellation, doorbell
+  /// re-entry, and resume.
+  close_requested_at: Option<Instant>,
   /// When the close-carrying batch reached the wire. The protocol arms
   /// its deadline when the Close DRAINS into a batch; under backpressure
   /// the flush can consume that whole budget, so the driver re-anchors
@@ -126,6 +137,24 @@ pub(crate) struct Inner<Ro, S> {
   pings_seen: usize,
   #[cfg(test)]
   pongs_seen: usize,
+}
+
+impl<Ro, S> Inner<Ro, S> {
+  /// Records that a Close is owed to the wire, and anchors the budget for
+  /// getting it there.
+  ///
+  /// The SOLE writer of `close_pending`, so that the flag and its anchor are
+  /// set in one statement and no later site can raise one without the other.
+  /// The anchor is the FIRST request's instant: a second Close requested while
+  /// one is still pending (our `close()` and then the peer's, before either
+  /// reached the wire) does not extend the budget, because the budget is for
+  /// getting a Close out and that started at the first request.
+  fn request_close(&mut self, now: Instant) {
+    if !self.close_pending {
+      self.close_pending = true;
+      self.close_requested_at = Some(now);
+    }
+  }
 }
 
 /// An established WebSocket connection over `S`.
@@ -226,6 +255,7 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
         closed: None,
         staged_close: None,
         close_pending: false,
+        close_requested_at: None,
         close_flushed_at: None,
         close_budget,
         poisoned: None,
@@ -328,7 +358,7 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
       if inner.closed.is_none() {
         debug!(code = ?code, reason, "starting close handshake");
         inner.conn.close(code, reason)?;
-        inner.close_pending = true;
+        inner.request_close(Instant::now());
       }
     }
     loop {
@@ -527,6 +557,28 @@ async fn send_frame<Ro: role::Role, S: Duplex>(
   }
 }
 
+/// A timer over a caller-supplied duration that cannot panic.
+///
+/// `compio::time::sleep(d)` is `sleep_until(Instant::now() + d)`, and that
+/// addition is the PANICKING one — so every duration this driver derives from
+/// `close_timeout` would abort the process inside the timer for a budget the
+/// caller is allowed to configure ([`ClientOptions::with_close_timeout`]
+/// accepts any `Duration`, `Duration::MAX` included). A deadline the clock
+/// cannot represent is a deadline that can never be reached, so it parks
+/// instead — which is what an unreachable budget means, and it leaves the
+/// other arms of every `select_biased!` this feeds exactly as they were.
+///
+/// The `Instant::now()` is read ONCE and the absolute deadline handed to
+/// `sleep_until`, so the check and the arming cannot disagree about the time.
+///
+/// [`ClientOptions::with_close_timeout`]: crate::ClientOptions::with_close_timeout
+async fn sleep_for(duration: core::time::Duration) {
+  match Instant::now().checked_add(duration) {
+    Some(at) => compio::time::sleep_until(at).await,
+    None => futures_util::future::pending::<()>().await,
+  }
+}
+
 /// Tears the transport down after the close handshake (or on abandonment):
 /// best-effort write-side close (TLS close_notify / TCP FIN), then drop.
 /// The attempt runs under the close budget — a close_notify against a
@@ -542,7 +594,7 @@ async fn teardown<Ro, S: Duplex>(inner: &Rc<RefCell<Inner<Ro, S>>>) {
   };
   trace!("shutting the transport down");
   let close = stream.close().fuse();
-  let timer = compio::time::sleep(budget).fuse();
+  let timer = sleep_for(budget).fuse();
   futures_util::pin_mut!(close, timer);
   futures_util::select_biased! {
     _ = close => {}
@@ -614,13 +666,36 @@ fn close_flush_timed_out<Ro: role::Role, S: Duplex>(
 /// when the Close drains into a batch, which under backpressure can be a
 /// whole budget earlier than the peer could possibly have seen it. The
 /// keepalive needs no correction (the protocol only arms it while open).
+///
+/// **Phase 3 does NOT go through this function, and that is deliberate.** Its
+/// bound on a write performed after the Close has flushed reads
+/// `close_flushed_at + close_budget` directly, because this function answers
+/// `None` once the peer's Close has cleared the protocol timer
+/// (`conn.poll_timeout()` is `None` on a terminal connection) — and a `None`
+/// there would leave a post-Close Pong batch unbounded, which is the defect
+/// that bound exists to close. The two readings of `close_flushed_at`
+/// therefore differ on purpose, and an edit to either has to be checked
+/// against the other.
+///
+/// The echo deadline is `checked_add`: `close_timeout` is a caller-supplied
+/// `Duration` and `flushed + budget` can leave the clock's range, where the
+/// panicking `Add` would kill the process. Overflow answers `None` — no
+/// deadline — and that is the right answer rather than a clamp, because what
+/// this function returns is the LATER of the protocol's deadline and the echo
+/// deadline, and an echo deadline that cannot be represented is infinitely far
+/// away. A `None` here means the pump parks on the peer, which is exactly what
+/// a budget that large asks for.
 fn effective_deadline<Ro: role::Role, S>(guard: &Inner<Ro, S>) -> Option<Instant> {
   let at = guard.conn.poll_timeout()?;
   if guard.close_pending {
     return None;
   }
   match guard.close_flushed_at {
-    Some(flushed) => Some(at.max(flushed + guard.close_budget)),
+    // Overflow: unreachable, hence later than `at`, hence the answer.
+    Some(flushed) => match flushed.checked_add(guard.close_budget) {
+      Some(echo_at) => Some(at.max(echo_at)),
+      None => None,
+    },
     None => Some(at),
   }
 }
@@ -644,6 +719,14 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         let mut input = std::mem::take(&mut guard.pending_input);
         let inner_mut = &mut *guard;
         let now = Instant::now();
+        // The event cursor borrows `conn`, so nothing inside the loop may take
+        // `&mut Inner` as a whole: the transition is flagged there and made
+        // through its single writer once the cursor is gone, below. Deferring
+        // it cannot lose the transition — `Closed` makes the connection
+        // terminal and the cursor answers `None` from there on, and the
+        // assembler passes `Closed` through as `Ok(None)`, so no early return
+        // can sit between the flag and the call.
+        let mut close_owed = false;
         match inner_mut.conn.handle(now, &mut input) {
           Ok(mut events) => {
             while let Some(event) = events.next() {
@@ -660,7 +743,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
                 // Stage, do not publish: the outcome only holds once the
                 // echo the protocol just queued reaches the wire.
                 inner_mut.staged_close = Some(*closed);
-                inner_mut.close_pending = true;
+                close_owed = true;
               }
               match inner_mut.assembler.push(&event) {
                 Ok(Some(message)) => inner_mut.ready.push_back(message),
@@ -671,7 +754,12 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
           }
           Err(e) => return Some(Err(e.into())),
         }
-        // All input is consumed by the cursor (drop-drains).
+        // All input is consumed by the cursor (drop-drains). The cursor is
+        // gone here, so the whole `Inner` is borrowable again — and this runs
+        // BEFORE the settle below, which reads `close_pending`.
+        if close_owed {
+          guard.request_close(now);
+        }
       }
       // Settle overdue protocol timers on every pass — AFTER the input
       // feed, so an echo that already arrived beats the deadline clock
@@ -739,41 +827,90 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       effective_deadline(&guard)
     };
 
-    // Phase 3 (IO, guarded): put the batch on the wire. While a Close is
-    // owed (in this batch, or queued behind it), the flush itself gets
-    // the close budget — close_timeout must bound the whole handshake
-    // even against a peer that stopped reading, and the echo budget only
-    // starts once the Close is out (it re-arms at flush). A plain flush
-    // instead parks unbounded, but listens to the doorbell: a close
-    // requested mid-flush re-enters as a bounded flush (the dropped
-    // drive's progress survives in the cursor).
+    // Phase 3 (IO, guarded): put the batch on the wire, under one of THREE
+    // bounds. While a Close is owed (in this batch, or queued behind it),
+    // the flush gets the whole close budget — close_timeout must bound the
+    // handshake even against a peer that stopped reading, and the echo
+    // budget only starts once the Close is out (it re-arms at flush).
+    //
+    // Once the Close HAS flushed, any further write — a post-Close Pong
+    // batch, which exists now that the protocol keeps answering Pings until
+    // the peer's Close arrives — is bounded by what REMAINS of that echo
+    // budget. It must be: such a batch carries no Close and `close_pending`
+    // is already cleared, so the old two-way choice parked it unbounded and
+    // a peer that filled the socket and stopped reading wedged it forever,
+    // defeating the very bound `close_timeout` documents. The remaining time
+    // is read from `close_flushed_at` DIRECTLY rather than through
+    // `effective_deadline`, which answers `None` once the peer's Close has
+    // cleared the protocol timer — and `None` there would leave exactly this
+    // batch unbounded again.
+    //
+    // BOTH bounded arms are remaining time from an ABSOLUTE anchor, never a
+    // fresh budget: `close_requested_at` for the first, `close_flushed_at`
+    // for the second. A `Reconsider` re-entry recomputes from the same
+    // anchor, so the bound only shrinks — a doorbell cannot buy a wedged
+    // flush another budget, which is what made `close_timeout` unbounded in
+    // the presence of any local sender. Zero remaining resolves to
+    // `FlushArm::Budget` BEFORE the drive is polled: `select_biased!` polls
+    // the drive first, so an already-ready write would otherwise complete
+    // after the budget was spent, and the deadline is a hard boundary.
+    //
+    // Only a plain flush with no Close anywhere in its past parks unbounded,
+    // and it still listens to the doorbell: a close requested mid-flush
+    // re-enters as a bounded flush (the dropped drive's progress survives in
+    // the cursor).
     while inner.borrow().pending_write.is_some() {
-      let close_involved = {
+      // `None` is the unbounded plain flush; `Some(d)` is what is LEFT of this
+      // flush's slice of the close budget.
+      let bound: Option<core::time::Duration> = {
         let guard = inner.borrow();
-        guard.close_pending
-          || guard
-            .pending_write
-            .as_ref()
-            .is_some_and(|p| p.carries_close)
+        let carries_close = guard
+          .pending_write
+          .as_ref()
+          .is_some_and(|p| p.carries_close);
+        let now = Instant::now();
+        // Subtract, never add: `close_budget` is whatever the caller passed to
+        // `with_close_timeout`, and `anchor + budget` can leave the clock's
+        // range and panic. An elapsed duration cannot.
+        let remaining = |anchor: Instant| {
+          guard
+            .close_budget
+            .saturating_sub(now.saturating_duration_since(anchor))
+        };
+        if guard.close_pending || carries_close {
+          // `request_close` is the only writer of `close_pending` and it sets
+          // the anchor in the same statement, so `None` here is unreachable.
+          // It resolves to the whole budget rather than to no bound, because
+          // an unbounded close flush is the defect `close_timeout` exists to
+          // prevent and a lost anchor must not reintroduce it.
+          Some(
+            guard
+              .close_requested_at
+              .map_or(guard.close_budget, remaining),
+          )
+        } else {
+          guard.close_flushed_at.map(remaining)
+        }
       };
-      let budget = inner.borrow().close_budget;
       let mut io = PumpIo::take(inner);
-      let outcome = {
+      let outcome = if bound.is_some_and(|remaining| remaining.is_zero()) {
+        FlushArm::Budget
+      } else {
         let drive = drive_pending_write(&mut io, doorbell).fuse();
         let timer = async {
-          if close_involved {
-            compio::time::sleep(budget).await;
-          } else {
-            futures_util::future::pending::<()>().await;
+          match bound {
+            Some(remaining) => sleep_for(remaining).await,
+            None => futures_util::future::pending::<()>().await,
           }
         }
         .fuse();
         let bell = doorbell.listen().fuse();
         futures_util::pin_mut!(drive, timer, bell);
-        // Lost-wake guard: a close queued between the close_involved
-        // read and the listener registration above would have rung an
-        // unregistered bell — re-enter instead of parking unbounded.
-        if !close_involved && inner.borrow().close_pending {
+        // Lost-wake guard: a close queued between the bound computation
+        // above and the listener registration would have rung an
+        // unregistered bell — re-enter instead of parking unbounded. Keyed
+        // on the timer being unbounded, which is what "parking" means here.
+        if bound.is_none() && inner.borrow().close_pending {
           FlushArm::Reconsider
         } else {
           futures_util::select_biased! {
@@ -793,8 +930,8 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         }
         FlushArm::Done(Err(e)) => return Some(Err(e)),
         FlushArm::Budget => return close_flush_timed_out(inner, io, doorbell),
-        // Re-evaluate close_involved (the guard restores the partial
-        // batch); ordinary sender wake-ups simply resume the flush.
+        // Re-evaluate the bound (the guard restores the partial batch);
+        // ordinary sender wake-ups simply resume the flush.
         FlushArm::Reconsider => drop(io),
       }
     }
@@ -829,10 +966,10 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       let read = stream.read(&mut scratch).fuse();
       let timer = async {
         match deadline {
-          Some(at) => {
-            let now = Instant::now();
-            compio::time::sleep(at.saturating_duration_since(now)).await;
-          }
+          // An ABSOLUTE deadline, so no `Instant + Duration` anywhere on the
+          // path: `sleep_until` takes the instant `effective_deadline` already
+          // computed with `checked_add`, and a past one resolves at once.
+          Some(at) => compio::time::sleep_until(at).await,
           None => futures_util::future::pending::<()>().await,
         }
       }

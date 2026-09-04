@@ -144,7 +144,7 @@ impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
         return Err(Error::Closed);
       }
       inner.conn.close(code, reason)?;
-      inner.close_pending = true;
+      inner.request_close(std::time::Instant::now());
     }
     // Empty marker frame: the pump coalesces the queue and the protocol
     // transmits into one write, so its `Written` transition means the write
