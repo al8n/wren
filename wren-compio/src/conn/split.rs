@@ -162,6 +162,14 @@ impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
       if !inner.read_half_alive {
         return Err(Error::ReadHalfGone);
       }
+      // The protocol's `Terminal` refusal covers the ENCODE step that ran
+      // before this one; this covers the QUEUE. Nothing put here after the
+      // handshake completed would ever be written — §5.5.1 (line 2023 of
+      // `.rfc-cache/rfc6455.txt`) — so it is refused rather than parked on a
+      // pump that will not pick it up.
+      if inner.closed.is_some() {
+        return Err(Error::Closed);
+      }
       inner.outbound.push_back(OutboundFrame {
         bytes: frame,
         state: state.clone(),
@@ -174,6 +182,10 @@ impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
         FrameState::Written => return Ok(()),
         FrameState::Failed(kind) => return Err(Error::Io(kind.into())),
         FrameState::Orphaned => return Err(Error::ReadHalfGone),
+        // Not `Io` (the transport is fine) and not `ReadHalfGone` (the pump
+        // is alive and just finished the handshake): the connection closed
+        // under a frame that was legal when it was encoded.
+        FrameState::ClosedBeforeWrite => return Err(Error::Closed),
       }
       let listener = self.doorbell.listen();
       if state.get() != FrameState::Queued {

@@ -64,6 +64,11 @@ pub(crate) enum FrameState {
   Failed(std::io::ErrorKind),
   /// The read half was dropped before the pump wrote it.
   Orphaned,
+  /// The close handshake completed before the pump wrote it. Not a failure
+  /// of the transport and not an abandoned queue: the frame was legal when
+  /// it was encoded and the peer's Close overtook it, and §5.5.1 (line 2023
+  /// of `.rfc-cache/rfc6455.txt`) leaves nowhere for it to go.
+  ClosedBeforeWrite,
 }
 
 pub(crate) struct OutboundFrame {
@@ -710,6 +715,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
     // Phase 1 (borrow): feed pending input through the state machine.
     // Buffered `ready` messages drain even after the close is recorded
     // (they arrived before the peer's Close); new input does not.
+    let mut wake_senders = false;
     {
       let mut guard = inner.borrow_mut();
       if let Some(kind) = guard.poisoned {
@@ -740,10 +746,31 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
               }
               if let Event::Closed(closed) = &event {
                 debug!(code = ?closed.code(), clean = closed.clean(), "connection closed");
-                // Stage, do not publish: the outcome only holds once the
-                // echo the protocol just queued reaches the wire.
-                inner_mut.staged_close = Some(*closed);
-                close_owed = true;
+                if inner_mut.close_flushed_at.is_some() {
+                  // Our Close is ALREADY on the wire, so the peer's completes
+                  // the handshake right here: no echo is owed, nothing is
+                  // staged, and the outcome holds now. §5.5.1 (line 2023 of
+                  // `.rfc-cache/rfc6455.txt`) closes the connection at this
+                  // instant, so every frame the pump has not written yet has
+                  // missed its chance — the queue, and a batch already
+                  // half-written whose remaining bytes would follow both
+                  // Closes onto the wire.
+                  inner_mut.closed = Some(*closed);
+                  while let Some(frame) = inner_mut.outbound.pop_front() {
+                    frame.state.set(FrameState::ClosedBeforeWrite);
+                  }
+                  if let Some(pending) = inner_mut.pending_write.take_if(|p| !p.carries_close) {
+                    for state in &pending.states {
+                      state.set(FrameState::ClosedBeforeWrite);
+                    }
+                  }
+                  wake_senders = true;
+                } else {
+                  // Stage, do not publish: the outcome only holds once the
+                  // echo the protocol just queued reaches the wire.
+                  inner_mut.staged_close = Some(*closed);
+                  close_owed = true;
+                }
               }
               match inner_mut.assembler.push(&event) {
                 Ok(Some(message)) => inner_mut.ready.push_back(message),
@@ -783,6 +810,10 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         }
       }
     }
+    // Outside the borrow, as every other notify in this file is.
+    if wake_senders {
+      doorbell.notify(usize::MAX);
+    }
 
     // Phase 2 (borrow): if no batch is in progress, coalesce queued writer
     // frames + protocol transmits into one. Queue first: a writer frame
@@ -799,6 +830,13 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         }
         let mut scratch = [0u8; TRANSMIT_SCRATCH];
         let now = Instant::now();
+        // The batch is labelled by its CONTENT, asked of the protocol across
+        // the drain: `close_pending` is the driver's "a Close is owed", which
+        // stays set until the frame FLUSHES and therefore also labels every
+        // batch built while it sits unflushed — batches that carry no Close at
+        // all. A mislabelled batch settles `close_pending` and re-anchors the
+        // echo budget on a flush that put no Close on the wire.
+        let close_sent_before = guard.conn.close_sent();
         loop {
           match guard.conn.poll_transmit(now, &mut scratch) {
             Ok(Some(n)) => bytes.extend_from_slice(scratch.get(..n).unwrap_or(&[])),
@@ -806,16 +844,24 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
             Err(e) => return Some(Err(e.into())),
           }
         }
+        let carries_close = !close_sent_before && guard.conn.close_sent();
         if !bytes.is_empty() {
           guard.pending_write = Some(PendingWrite {
             bytes,
             cursor: 0,
             states,
-            carries_close: guard.close_pending,
+            carries_close,
           });
         } else if guard.close_pending {
-          // Nothing left to transmit: the owed Close is already on the
-          // wire (e.g. the peer echoed a close we flushed earlier).
+          // A Close is owed and the protocol has nothing to give: it drained
+          // into a batch that then never reached the wire (a cancelled pump's
+          // batch is restored, not dropped, so this is the torn-down cases).
+          // The peer-echoed-a-close-we-flushed case that used to arrive here
+          // is settled a phase earlier now — Phase 1 completes the handshake
+          // on receipt when `close_flushed_at` is set, and never marks a Close
+          // owed for it. Kept rather than deleted because it is the only other
+          // publisher of a staged outcome, and dropping it would leave one
+          // stranded instead of failing loudly.
           guard.close_pending = false;
           if guard.closed.is_none()
             && let Some(staged) = guard.staged_close.take()

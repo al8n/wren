@@ -325,6 +325,31 @@ where
     matches!(self.lifecycle, Lifecycle::Terminal)
   }
 
+  /// True once this endpoint's Close frame has been handed to
+  /// [`poll_transmit`](Connection::poll_transmit)'s caller.
+  ///
+  /// It says the Close LEFT this crate, not that it reached the wire — that
+  /// second fact belongs to whoever owns the transport, and only that owner
+  /// can know it. The distinction is why this is public: a driver that
+  /// coalesces `poll_transmit` output into wire batches has to know which
+  /// batch the Close is in, and the alternative — reading its own "a close is
+  /// owed" flag — labels the NEXT batch too, because that flag is still set
+  /// while the Close sits unflushed. §5.5.1 (line 2023 of
+  /// `.rfc-cache/rfc6455.txt`) is what makes a wrong answer a protocol
+  /// violation rather than a bookkeeping slip: after both sending and
+  /// receiving a Close the connection is closed and nothing more may go out,
+  /// so a batch mislabelled as the one carrying the Close is a frame written
+  /// past the completed handshake.
+  ///
+  /// Compare [`is_terminal`](Connection::is_terminal), which answers about the
+  /// close EXCHANGE: this flips when OUR Close drains, that flips when the
+  /// peer's Close arrives (or the connection fails). Both true is the
+  /// completed handshake; this one alone is `CloseSent` with the frame
+  /// drained.
+  pub const fn close_sent(&self) -> bool {
+    self.send.close_sent
+  }
+
   /// Returns the next deadline the caller must arrange to fire
   /// [`handle_timeout`](Connection::handle_timeout) at. Returns `None` when
   /// no timers are armed. It takes no `now`, so it never refuses.

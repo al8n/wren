@@ -1202,3 +1202,107 @@ async fn a_ping_storm_cannot_restart_the_close_flush_budget() {
   assert!(matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut));
   drop(storm);
 }
+
+#[compio::test]
+async fn a_queued_ping_is_not_written_after_both_close_frames() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+  use std::future::Future;
+
+  // Our Close has flushed and the pump is parked. The peer's Close and a
+  // locally queued Ping then become ready together: Phase 4's `select_biased!`
+  // is read-biased, so the Close is processed first and the handshake is
+  // complete — §5.5.1 (line 2023 of `.rfc-cache/rfc6455.txt`) says the
+  // connection is closed and the TCP connection MUST be closed, so nothing
+  // more may go out. Phase 2 nevertheless drained the queued Ping, labelled
+  // the batch `carries_close` from the driver's own "a close is owed" flag
+  // although the protocol had no Close left to give, wrote the Ping past the
+  // completed handshake, told its sender it succeeded, and treated that flush
+  // as the Close's.
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  // A second write half, because `close()` and `ping()` each want `&mut` and
+  // this is a race between two senders (see the ping-storm regression).
+  let mut pinger = WriteHalf {
+    inner: cread.inner.clone(),
+    doorbell: cread.doorbell.clone(),
+  };
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let reader = compio_runtime::spawn(async move {
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      if let Err(e) = m {
+        ended = Some(e);
+        break;
+      }
+    }
+    (ended, cread)
+  });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+  // The pump ran to its Phase 4 park to publish that flush, so it is parked
+  // now.
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, ours) = sr.read(Vec::with_capacity(64)).await;
+  let n = res.expect("the peer drains our Close");
+  assert_eq!(
+    ours.get(..n).and_then(<[u8]>::first).copied(),
+    Some(0x88),
+    "our Close, masked: {:02x?}",
+    ours.get(..n).unwrap_or(&[])
+  );
+
+  // Both of these complete without yielding — the pipe write takes its ready
+  // path and `enqueue` pushes and notifies before its first await — so the
+  // parked pump sees the peer's Close AND the queued Ping on the same wakeup.
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the peer's Close");
+  let mut ping = Box::pin(pinger.ping(b"hi"));
+  futures_util::future::poll_fn(|cx| {
+    assert!(ping.as_mut().poll(cx).is_pending());
+    std::task::Poll::Ready(())
+  })
+  .await;
+
+  // Now let the reader run.
+  let (ended, cread) = compio::time::timeout(std::time::Duration::from_secs(2), reader)
+    .await
+    .expect("the peer's Close completes the handshake")
+    .unwrap();
+  assert!(
+    ended.is_none(),
+    "a completed handshake is not an error: {ended:?}"
+  );
+  let after = compio::time::timeout(
+    std::time::Duration::from_millis(100),
+    sr.read(Vec::with_capacity(64)),
+  )
+  .await;
+  let bytes = match after {
+    Err(_elapsed) => Vec::new(),
+    Ok(compio_buf::BufResult(Ok(n), buf)) => buf.get(..n).unwrap_or(&[]).to_vec(),
+    Ok(compio_buf::BufResult(Err(_), _)) => Vec::new(),
+  };
+  assert!(
+    bytes.is_empty(),
+    "nothing may be written after both Close frames, got {bytes:02x?}"
+  );
+  let ping_result = ping.await;
+  assert!(
+    matches!(&ping_result, Err(Error::Closed)),
+    "the frame the handshake overtook is refused, not reported written: {ping_result:?}"
+  );
+  assert!(
+    cread.closed().expect("the handshake completes").clean(),
+    "both Closes were exchanged"
+  );
+}
