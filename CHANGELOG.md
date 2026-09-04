@@ -828,6 +828,43 @@ five times on CI (al8n/wren#87).
   asserts it on `SendState` directly, which is where it is reachable; deleting
   the guard reds 1 test.
 
+- **`prepare_binary` / `prepare_text`: the zero-copy send is now the obvious
+  one.** A whole message with no payload copy was spelled
+  `prepare_fragment(FragmentKind::BinaryStart, true, payload)` — correct, and
+  reading like fragmentation — while `encode_binary`, which COPIES the payload
+  into the output buffer, read like the main path. The two new methods are thin
+  aliases with the same lifecycle and sequencing rules, documented as the path a
+  `writev` / `IORING_OP_WRITEV` driver takes: the header comes back as an
+  `EncodedHeader`, the payload is masked in place, and for a 64 KiB message that
+  is 64 KiB of `memcpy` per send that does not happen.
+
+  `prepare_text` takes `&mut [u8]` rather than `encode_text`'s `&str`, and the
+  difference is forced: masking rewrites the bytes, and a masked UTF-8 string is
+  not UTF-8, so writing through a `&mut str` would break that type's invariant —
+  which a `forbid(unsafe_code)` crate cannot do at all. RFC 6455 §8.1 validity
+  is checked instead, before anything is masked, so a rejected send leaves the
+  buffer byte-identical for a retry.
+
+  Both are link-checked in `tests/no_panic.rs` over the CLIENT role, which is
+  the one whose `prepare_*` writes to the payload. Their bodies answer different
+  types over different opcodes so identical code folding cannot satisfy two
+  declared shims with one body — a sibling branch found the linker doing exactly
+  that, leaving one proof empty while `shim-check` read green. Verified from the
+  symbol table rather than argued: `shim_prepare_text` and `shim_prepare_binary`
+  are defined at distinct addresses (`0x…0ed0` and `0x…1100`), and no two of the
+  crate's seven shims share one.
+
+  `prepare_fragment` and `plan_data_send` (and the two new forwarders) gained
+  `#[inline]`, and that is load-bearing rather than a codegen guess: this crate's
+  `no-panic` step runs WITHOUT fat LTO on purpose, and without the annotation
+  the release link reds with `ERROR[no-panic]: detected panic in function
+  `shim_prepare_text`` and the same for `shim_prepare_binary`. Bisected:
+  `plan_data_send` alone still reds both, `prepare_fragment` + `plan_data_send`
+  links clean. `CARGO_PROFILE_RELEASE_LTO=fat` also links clean, which is how
+  the failure was identified as cross-CGU opacity rather than a real panic edge
+  — moving this crate's step to fat LTO is what its own comments forbid, so the
+  annotation is the fix and the profile is unchanged.
+
 ### What was NOT consolidated, and the sequence that decides it
 
 - **`RecvState::control_buf` — the inbound accumulator — stays its own buffer.**

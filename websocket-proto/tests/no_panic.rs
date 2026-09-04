@@ -133,7 +133,10 @@ use core::hint::black_box;
 
 use websocket_proto::{
   __no_panic_internals::{Utf8Validator, base64_encode},
-  connection::{Connection, ConnectionConfig, role::Server},
+  connection::{
+    Connection, ConnectionConfig,
+    role::{Client, Server},
+  },
   frame::{FrameHeader, Opcode, mask},
   negotiation::Negotiated,
   time::Instant,
@@ -327,6 +330,152 @@ fn base64_encode_is_panic_free() {
   assert!(!shim_base64(
     black_box(b"x".as_slice()),
     black_box(&mut [][..])
+  ));
+}
+
+// ── the no-copy whole-message sends ──────────────────────────────────────────
+//
+// `prepare_binary` / `prepare_text` are the zero-copy path a `writev`-style
+// driver takes, so they are hot in the sense this file cares about: they run
+// per message, and they WRITE THROUGH the caller's buffer. Unlike
+// `Connection::handle` below they are shallow enough to link-check — the whole
+// tree is `plan_data_send`, the UTF-8 validator, `FrameHeader::encode` and
+// `mask`, all monomorphized into this crate at the `Connection<Clock,
+// Client<ShimRng>>` instantiation, which is what lets `no-panic` see the body
+// without fat LTO (see the module doc's LTO section).
+//
+// THE TWO SHIMS MUST NOT SHARE A BODY. `shim-check` asks the linker for one
+// DEFINED `no_panic::<shim>` symbol per declared shim, and identical code
+// folding satisfies two names with one body — which leaves one proof empty
+// while both look present. A sibling branch hit exactly that. These two answer
+// different types (`usize` and `bool`) over different opcodes and, for text,
+// a §8.1 validation the binary path does not run, so no folding can apply; the
+// symbol addresses are checked to differ rather than assumed.
+
+/// A deterministic mask-key source. The CLIENT role is deliberate: it is the
+/// role whose `prepare_*` writes to the payload (`mask` in place), so the
+/// server instantiation's paths are a strict subset of what this proves.
+struct ShimRng(u8);
+
+impl rand_core::TryRng for ShimRng {
+  type Error = core::convert::Infallible;
+
+  fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+    let mut b = [0u8; 4];
+    self.try_fill_bytes(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+  }
+
+  fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+    let mut b = [0u8; 8];
+    self.try_fill_bytes(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+  }
+
+  fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+    for d in dest {
+      *d = self.0;
+      self.0 = self.0.wrapping_add(1);
+    }
+    Ok(())
+  }
+}
+
+fn client_conn() -> Connection<Clock, Client<ShimRng>> {
+  Connection::new(
+    &Negotiated::none(),
+    ConnectionConfig::new(),
+    Client::new(ShimRng(3)),
+    Clock(0),
+  )
+}
+
+no_panic_shim! {
+  /// Shim over [`Connection::prepare_binary`] — the whole-message no-copy send,
+  /// answering the header's LENGTH so the body cannot fold into the text shim.
+  fn shim_prepare_binary(conn: &mut Connection<Clock, Client<ShimRng>>, payload: &mut [u8]) -> usize {
+    match conn.prepare_binary(payload) {
+      Ok(header) => header.as_slice().len(),
+      Err(_) => 0,
+    }
+  }
+}
+
+#[test]
+fn prepare_binary_is_panic_free() {
+  let mut conn = client_conn();
+  // Short-length arm: a 19-byte payload is 2 header bytes plus the 4-byte mask
+  // key. The payload is masked IN PLACE, so the opaque `&mut` is also what
+  // keeps the call from being deleted.
+  let mut short = *b"the quick brown fox";
+  assert_eq!(
+    shim_prepare_binary(black_box(&mut conn), black_box(&mut short[..])),
+    6
+  );
+  // Empty payload — the zero-length masking arm.
+  let mut empty: [u8; 0] = [];
+  assert_eq!(
+    shim_prepare_binary(black_box(&mut conn), black_box(&mut empty[..])),
+    6
+  );
+  // §5.2's 16-bit extended-length arm: 2 + 2 + 4.
+  let mut long = [0xA5u8; 300];
+  assert_eq!(
+    shim_prepare_binary(black_box(&mut conn), black_box(&mut long[..])),
+    8
+  );
+  // The refusal arm, reached through an opaque connection rather than a
+  // literal: after a close, every data send answers `Closing`.
+  conn
+    .close(websocket_proto::frame::CloseCode::Normal, "")
+    .expect("close an open connection");
+  assert_eq!(
+    shim_prepare_binary(black_box(&mut conn), black_box(&mut short[..])),
+    0
+  );
+}
+
+no_panic_shim! {
+  /// Shim over [`Connection::prepare_text`] — the same send with RFC 6455
+  /// §8.1's UTF-8 gate in front of it, answering a verdict rather than a length.
+  fn shim_prepare_text(conn: &mut Connection<Clock, Client<ShimRng>>, payload: &mut [u8]) -> bool {
+    conn.prepare_text(payload).is_ok()
+  }
+}
+
+#[test]
+fn prepare_text_is_panic_free() {
+  let mut conn = client_conn();
+  // Multibyte, so the validator walks continuation bytes rather than ASCII.
+  let mut multibyte = "héllo wörld".as_bytes().to_vec();
+  assert!(shim_prepare_text(
+    black_box(&mut conn),
+    black_box(&mut multibyte[..])
+  ));
+  let mut empty: [u8; 0] = [];
+  assert!(shim_prepare_text(
+    black_box(&mut conn),
+    black_box(&mut empty[..])
+  ));
+  // Invalid UTF-8 → refused, never a panic, and the buffer is left alone.
+  let mut invalid = [0xFFu8, 0xFE];
+  assert!(!shim_prepare_text(
+    black_box(&mut conn),
+    black_box(&mut invalid[..])
+  ));
+  assert_eq!(invalid, [0xFF, 0xFE]);
+  // A payload ending mid-codepoint: valid as a prefix, refused as a whole
+  // message (§5.6 lets a FRAGMENT split a character; a `fin` frame may not).
+  let mut truncated = [0xE2u8, 0x82];
+  assert!(!shim_prepare_text(
+    black_box(&mut conn),
+    black_box(&mut truncated[..])
+  ));
+  // The extended-length arm on the text path too.
+  let mut long = [b'x'; 300];
+  assert!(shim_prepare_text(
+    black_box(&mut conn),
+    black_box(&mut long[..])
   ));
 }
 

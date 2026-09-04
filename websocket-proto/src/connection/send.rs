@@ -278,6 +278,23 @@ where
   /// rules.
   ///
   /// [`encode_fragment`]: Connection::encode_fragment
+  // `#[inline]` here is load-bearing for `tests/no_panic.rs`, not a codegen
+  // guess. This crate's `no-panic` step runs WITHOUT fat LTO on purpose (see
+  // that file's LTO section and the `no-panic` job): its shims wrap leaves that
+  // inline into the shim under the default profile, and the missing LTO is what
+  // the lie-check's reason-grep stands on. The `prepare_*` shims wrap a
+  // GENERIC method whose tree spans several functions, and without this
+  // annotation the release link reds with `ERROR[no-panic]: detected panic in
+  // function `shim_prepare_text`` and the same for `shim_prepare_binary` —
+  // core's panic paths are still separate codegen units. MEASURED, by bisecting
+  // the set: `plan_data_send` alone still reds both shims; `prepare_fragment` +
+  // `plan_data_send` links clean; so those two are the minimum and the two
+  // one-line forwarders below carry it as well, because a proof that depends on
+  // the optimizer's CGU placement for a one-liner is a proof on a knife edge.
+  // (`CARGO_PROFILE_RELEASE_LTO=fat` also links clean, which is how the failure
+  // was identified as cross-CGU opacity rather than a real panic edge — but
+  // moving this crate's step to fat LTO is exactly what its comments forbid.)
+  #[inline]
   pub fn prepare_fragment(
     &mut self,
     kind: FragmentKind,
@@ -315,6 +332,50 @@ where
       buf,
       len: u8::try_from(len).unwrap_or(0),
     })
+  }
+
+  /// A whole unfragmented **binary** message with no payload copy: the
+  /// zero-copy twin of [`encode_binary`](Connection::encode_binary).
+  ///
+  /// This is the path a vectored driver wants. `encode_binary` copies the
+  /// payload into `out` behind the header; this masks `payload` **in place**
+  /// (clients; servers leave it untouched) and hands back the header for the
+  /// driver to write first — `writev([header.as_slice(), payload])`, or an
+  /// `io_uring` `IORING_OP_WRITEV` over the same two iovecs. For a 64 KiB
+  /// message that is 64 KiB of `memcpy` per send that does not happen.
+  ///
+  /// It is exactly `prepare_fragment(FragmentKind::BinaryStart, true, payload)`
+  /// and exists because that spelling reads like fragmentation when what it
+  /// says is "one whole message". The lifecycle and sequencing rules are
+  /// [`prepare_fragment`](Connection::prepare_fragment)'s, unchanged: a whole
+  /// message is a `*Start` that is also `fin`, so it requires no message in
+  /// progress and leaves none.
+  ///
+  /// Rejection leaves `payload` byte-identical and the fragmentation state
+  /// unchanged — everything fallible is checked before a byte is masked — so
+  /// the same buffer can be retried.
+  #[inline]
+  pub fn prepare_binary(&mut self, payload: &mut [u8]) -> Result<EncodedHeader, EncodeError> {
+    self.prepare_fragment(FragmentKind::BinaryStart, true, payload)
+  }
+
+  /// A whole unfragmented **text** message with no payload copy: the zero-copy
+  /// twin of [`encode_text`](Connection::encode_text). See
+  /// [`prepare_binary`](Connection::prepare_binary) for what "no copy" buys and
+  /// how the header is written.
+  ///
+  /// **The payload is `&mut [u8]`, not `&str`**, and the difference is forced
+  /// rather than chosen: masking rewrites the bytes in place, and a masked
+  /// UTF-8 string is not UTF-8 — writing those bytes through a `&mut str` would
+  /// break the type's invariant, which this crate cannot do at all
+  /// (`forbid(unsafe_code)`) and should not do in any case. Validity is checked
+  /// instead: the bytes must be valid UTF-8 (RFC 6455 §8.1) and the message
+  /// must end on a character boundary, both BEFORE anything is masked, so a
+  /// rejected send leaves the buffer byte-identical for a retry. Pass
+  /// `some_string.as_bytes()` through a mutable buffer you own.
+  #[inline]
+  pub fn prepare_text(&mut self, payload: &mut [u8]) -> Result<EncodedHeader, EncodeError> {
+    self.prepare_fragment(FragmentKind::TextStart, true, payload)
   }
 
   /// Encodes a ping with an application payload (≤ 125 bytes).
@@ -469,6 +530,7 @@ where
   /// §5.6 allows a single fragment to split a codepoint, so a non-`fin`
   /// fragment may end mid-character; only a `fin` fragment must land on a
   /// character boundary.
+  #[inline]
   fn plan_data_send(
     &self,
     opcode: Opcode,
@@ -1434,6 +1496,75 @@ mod tests {
     conn
       .prepare_fragment(FragmentKind::Continue, true, &mut p)
       .unwrap();
+  }
+
+  /// The two whole-message aliases, checked against the copying encoders they
+  /// are the no-copy twin of: the same bytes on the wire, and the same
+  /// fragmentation state left behind.
+  ///
+  /// The comparison is the assertion. `prepare_binary` reading like the main
+  /// path is the whole reason it exists, so what has to hold is that it IS the
+  /// main path — a driver that switches `encode_binary` for it must not have
+  /// changed what the peer receives.
+  #[test]
+  fn prepare_binary_and_text_are_the_copying_encoders_without_the_copy() {
+    for text in [false, true] {
+      let body: &[u8] = if text { b"Hello" } else { &[0x00, 0xFF, 0x7F] };
+
+      // The copying encoder, into its own buffer.
+      let mut copying = client();
+      let mut out = [0u8; 32];
+      let n = if text {
+        copying.encode_text("Hello", &mut out).unwrap()
+      } else {
+        copying.encode_binary(body, &mut out).unwrap()
+      };
+      let copied = out[..n].to_vec();
+
+      // The no-copy twin, from an identically-seeded client so the mask keys
+      // match frame for frame.
+      let mut preparing = client();
+      let mut payload = body.to_vec();
+      let header = if text {
+        preparing.prepare_text(&mut payload).unwrap()
+      } else {
+        preparing.prepare_binary(&mut payload).unwrap()
+      };
+      let mut vectored = header.as_slice().to_vec();
+      vectored.extend_from_slice(&payload);
+
+      assert_eq!(vectored, copied, "text={text}");
+
+      // Both left the connection between messages, so a second whole message
+      // is accepted by either.
+      preparing.encode_binary(b"next", &mut out).unwrap();
+      copying.encode_binary(b"next", &mut out).unwrap();
+    }
+  }
+
+  /// `prepare_text` is `encode_text`'s §8.1 gate too, and it refuses BEFORE it
+  /// masks: the rejected buffer is byte-identical, so the caller may fix the
+  /// bytes and retry the same allocation. That ordering is what makes the
+  /// no-copy path safe to offer as the default — a driver that masked first
+  /// would hand back a buffer it had already scrambled.
+  #[test]
+  fn prepare_text_refuses_invalid_utf8_without_touching_the_buffer() {
+    let mut conn = client();
+    let mut payload = [0xFFu8, 0xFE];
+    assert!(matches!(
+      conn.prepare_text(&mut payload),
+      Err(EncodeError::InvalidUtf8)
+    ));
+    assert_eq!(&payload, &[0xFF, 0xFE], "a refused send masks nothing");
+
+    // Binary takes the same bytes, since §8.1 governs text alone.
+    conn
+      .prepare_binary(&mut payload)
+      .expect("binary accepts arbitrary bytes");
+
+    // And the connection is still usable for a text message afterwards.
+    let mut good = *b"ok";
+    conn.prepare_text(&mut good).expect("text after a refusal");
   }
 
   /// RFC 6455 §5.6: a fragment may split a codepoint — only the assembled
