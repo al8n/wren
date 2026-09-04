@@ -577,6 +577,7 @@ http_semantics::negotiation::Preference::is_wildcard
 http_semantics::negotiation::Preference::name
 http_semantics::negotiation::Preference::weight
 http_semantics::negotiation::WILDCARD
+http_semantics::negotiation::accept_charset
 http_semantics::negotiation::accept_encoding
 http_semantics::negotiation::accept_language
 http_semantics::negotiation::is_language_range

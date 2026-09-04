@@ -207,7 +207,7 @@ use http_semantics::{
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
   grammar::{ParamSyntax, ParamValue, parameterised_list},
   media::{media_type, weight_for},
-  negotiation::{accept_encoding, accept_language},
+  negotiation::{accept_charset, accept_encoding, accept_language},
   range::{ContentRange, RangesSpecifier, Resolved},
   validator::{EntityTag, TagList},
 };
@@ -1862,6 +1862,60 @@ fn accept_language_is_panic_free() {
   assert_eq!(shim_accept_language(black_box(&[b"".as_slice()])), 0);
   assert_eq!(
     shim_accept_language(black_box(&[[0x65u8, 0x6e, 0x2d, 0xff].as_slice()])),
+    0
+  );
+}
+
+no_panic_shim! {
+  /// Shim over `negotiation::accept_charset` — RFC 9110 §12.5.2's
+  /// `Accept-Charset = #( ( token / "*" ) [ weight ] )`.
+  ///
+  /// It reaches the same enum arm `shim_accept_encoding` does, because the two
+  /// fields' elements derive the same strings, and it is shimmed anyway: what
+  /// this covers is the ENTRY POINT, and an entry point with no shim is an
+  /// unproven leaf whatever it forwards to today.
+  ///
+  /// `cloned()` for the third adapter type, so this shim's instantiation of the
+  /// walk is its own — see `shim_weight_for` for the measurement behind one
+  /// adapter per shim. Between the three, `Copied`, `Map` and `Cloned` are all
+  /// covered.
+  ///
+  /// Returns what it read, so a call whose result is dead cannot take the
+  /// shim's body with it.
+  fn shim_accept_charset(lines: &[&[u8]]) -> usize {
+    let mut seen = 0usize;
+    for item in accept_charset(lines.iter().cloned()) {
+      let Ok(preference) = item else { break };
+      seen = seen.wrapping_add(preference.name().map_or(0, str::len));
+      seen = seen.wrapping_add(usize::from(preference.weight().thousandths()));
+    }
+    seen
+  }
+}
+
+#[test]
+fn accept_charset_is_panic_free() {
+  // RFC 9110 §12.5.2's own example, and the wildcard that section gives a
+  // meaning of its own.
+  assert_eq!(
+    shim_accept_charset(black_box(&[b"iso-8859-5, unicode-1-1;q=0.8".as_slice()])),
+    1821
+  );
+  assert_eq!(
+    shim_accept_charset(black_box(&[b"*;q=0.5".as_slice()])),
+    500
+  );
+  // The two characters §8.3.2's Note names, which `token` does not hold, and
+  // the weight faults behind a name it does.
+  assert_eq!(shim_accept_charset(black_box(&[b"a{b}".as_slice()])), 0);
+  assert_eq!(
+    shim_accept_charset(black_box(&[b"utf-8;q=1.5".as_slice()])),
+    0
+  );
+  assert_eq!(shim_accept_charset(black_box(&[])), 0);
+  assert_eq!(shim_accept_charset(black_box(&[b"".as_slice()])), 0);
+  assert_eq!(
+    shim_accept_charset(black_box(&[[0xffu8, 0x2c, 0x3b].as_slice()])),
     0
   );
 }
