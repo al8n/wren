@@ -1,5 +1,61 @@
 # UNRELEASED
 
+## `xtask` — two gates disagreed about what a citation is, and four correct quotations sat in the backlog for it
+
+`doc-check` requires a comment quoting an RFC sentence with an inline reference
+in it to escape the brackets — rustdoc reads a bare `[RFC6455]` as an intra-doc
+link and fails the build under `-D rustdoc::broken_intra_doc_links`. The spec
+being quoted writes the bare form. `quote-check` then had to agree that those
+are the same mark, and it did not.
+
+### Fixed
+
+- **`strip_bracket_insertions` now takes the escape's backslash with the
+  bracket.** That function removes a `[bracketed]` span and the space in front
+  of it; the escape puts a `\` between the space and the `[`, so the
+  space-eating loop stopped at the backslash and left a space the spec's side
+  had already dropped. `squeeze` then deleted the backslash and collapsed
+  whitespace, which HID the difference whenever a space followed the closing
+  bracket and EXPOSED it whenever anything else did.
+
+  **Measured with a probe carrying both positions, on two sentences of RFC 9110
+  §12.5.4, before the fix.** A citation mid-sentence — `Section 3 of` the
+  escaped reference `defines several matching schemes.` — was reported
+  verbatim. The same citation at the end of a sentence — `found in Section 2.3
+  of` the escaped reference, then a full stop — failed, printing a comment side
+  ending `Section 2.3 of .` against a spec side ending `Section 2.3 of.` One
+  space, in one position. A rule that holds for a citation in the middle of a
+  sentence and breaks for the same citation at the end of one is worse than
+  either answer, because the author who meets it reads the failure as being
+  about their words.
+
+  `an_escaped_bracket_is_the_same_mark_as_a_bare_one` drives both positions and
+  pins the literal normalised form, so the test cannot pass by comparing two
+  identically-wrong sides. The ABNF path is untouched: `[ … ]` is RFC 5234
+  syntax there and stays.
+
+### What the fix found
+
+Four quotations of RFC 8441 §5 in `websocket-proto` — its sentence about the
+`Origin`, `Sec-WebSocket-Version`, `Sec-WebSocket-Protocol` and
+`Sec-WebSocket-Extensions` fields, which carries two bracketed references and
+ends one of them with a full stop — were sitting in the untriaged backlog
+because of exactly this. One of them is introduced with the word *verbatim*: the
+author believed it was, and the gate could not confirm it. All four now grade
+verbatim against `.rfc-cache/rfc8441.txt:245`.
+
+`UNTRIAGED` is lowered accordingly, which is what that table asks for when
+triage happens: `websocket-proto/src/handshake/connect.rs` from 4 to 1 and
+`websocket-proto/src/handshake/fields.rs` from 5 to 4. The workspace backlog
+goes from 91 spans to 87, and the one span left in `connect.rs` is the author's
+own paraphrase in quotation marks, which is correctly still untriaged.
+
+### Changed
+
+- `http-semantics`'s `accept_charset` carries RFC 9110 §8.3.2's Note in full
+  again. It had been shortened past the bracket to get around this defect, which
+  is the local move that leaves the next author to rediscover it.
+
 ## `http-semantics` — `Vary` is a different shape, and its proxy MUST NOT is stated rather than enforced
 
 RFC 9110 §12.5.5 shares §12.5's subject and none of its machinery.

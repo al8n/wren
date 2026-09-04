@@ -541,13 +541,14 @@ where
 /// # The element is `token` — the RFC spells no `charset` rule
 ///
 /// RFC 9110 §12.5.2's ABNF writes `( token / "*" )` and not a `charset`
-/// production, and §8.3.2 defines charset names in prose instead — in theory
-/// out of RFC 2978 §2.3's `mime-charset` rule, of which §8.3.2's Note says:
-/// "That rule allows two characters that are not included in "token" ("{" and
-/// "}"), but no charset name registered at the time of this writing includes
-/// braces". This reader implements the rule the FIELD spells — §5.6.2's
-/// `token` — so `a{b}` is refused here, which is what §12.5.2's own grammar
-/// says of it whatever a registry might one day hold.
+/// production, and §8.3.2 defines charset names in prose instead. Its Note
+/// says where the difference falls: "In theory, charset names are defined by
+/// the "mime-charset" ABNF rule defined in Section 2.3 of \[RFC2978\] (as
+/// corrected in \[Err1912\]). That rule allows two characters that are not
+/// included in "token" ("{" and "}"), but no charset name registered at the
+/// time of this writing includes braces". This reader implements the rule the
+/// FIELD spells — §5.6.2's `token` — so `a{b}` is refused here, which is what
+/// §12.5.2's own grammar says of it whatever a registry might one day hold.
 ///
 /// # Errors
 ///

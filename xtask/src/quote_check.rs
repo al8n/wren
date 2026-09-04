@@ -571,8 +571,8 @@ const UNTRIAGED: &[(&str, usize)] = &[
   ("http1-proto/tests/smuggling.rs", 2),
   ("http3-proto/README.md", 1),
   ("http3-proto/src/connection/mod.rs", 2),
-  ("websocket-proto/src/handshake/connect.rs", 4),
-  ("websocket-proto/src/handshake/fields.rs", 5),
+  ("websocket-proto/src/handshake/connect.rs", 1),
+  ("websocket-proto/src/handshake/fields.rs", 4),
   ("websocket-proto/src/handshake/h1/client.rs", 1),
   ("websocket-proto/src/handshake/h1/server.rs", 6),
   ("websocket-proto/src/negotiation.rs", 3),
@@ -3044,9 +3044,9 @@ fn squeeze(text: &str) -> String {
   out
 }
 
-/// Removes every `[bracketed]` span, and the space before it — on the
-/// QUOTATION path only ([`normalise`]), never on the ABNF one
-/// ([`normalise_production`]).
+/// Removes every `[bracketed]` span, and the space before it — and a `\[`
+/// escape's backslash with it — on the QUOTATION path only ([`normalise`]),
+/// never on the ABNF one ([`normalise_production`]).
 ///
 /// That split is not a refinement, it is the fix for a defect: `[ … ]` means
 /// opposite things on the two paths. Here it is an editorial mark, described
@@ -3073,6 +3073,45 @@ fn squeeze(text: &str) -> String {
 /// over a comment's, so a bracket either side chose to insert is gone from
 /// both before anything else is compared.
 ///
+/// # The `\[` escape rustdoc requires, and why this reads it
+///
+/// A `[RFC4647]` written bare in a doc comment is an intra-doc LINK to
+/// rustdoc, and `doc-check`'s [`intra_doc_links`](crate::doc_check) fails it
+/// under `-D rustdoc::broken_intra_doc_links`, and its own message says to
+/// escape them as `\[` and `\]` where the text is a citation rather than a
+/// link. So a comment quoting an RFC sentence that carries an inline
+/// reference has to write `\[RFC4647\]`, and the spec it is quoting writes
+/// `[RFC4647]`. The two gates then have to agree that those are the same mark,
+/// and this is where that agreement is implemented.
+///
+/// **Popping the backslash is the whole of it, and leaving it out failed in
+/// exactly one position.** The escape puts a `\` between the space and the
+/// `[`, so the space-eating loop below sees a backslash, stops, and leaves a
+/// space the spec's side has already dropped. [`squeeze`] then removes the
+/// backslash and collapses whitespace, which HIDES the difference whenever a
+/// space follows the closing bracket — the comment's stray space merges with
+/// the following one — and EXPOSES it whenever anything else does.
+///
+/// Measured with the two halves side by side, before this function popped the
+/// backslash, on RFC 9110 §12.5.4's own sentences. Each is kept on ONE line
+/// below, because a code span that wraps is masked by [`mask_paragraph`] and
+/// leaks under a per-line unit — the disagreement
+/// `the_two_masking_units_agree_on_every_graded_span_in_this_workspace` exists
+/// to refuse. Both are data this function is measured on rather than
+/// quotations making a claim, which is why they are spans and not prose.
+///
+/// - `"For matching, Section 3 of \[RFC4647\] defines several matching schemes."`
+///   — a space follows the close, and the run reported it verbatim.
+/// - `"Additional discussion of language priority lists can be found in Section 2.3 of \[RFC4647\]."`
+///   — a full stop follows the close, and the run failed it, printing a comment
+///   side ending `Section 2.3 of .` against a spec side ending `Section 2.3 of.`
+///
+/// One space, in one position, on two sentences of one section. A rule that
+/// holds for a citation mid-sentence and breaks for the same citation at the
+/// end of one is worse than either answer, because the author who meets it
+/// reads the failure as being about their WORDS. `an_escaped_bracket_is_the_same_mark_as_a_bare_one`
+/// is the test, and it drives both positions.
+///
 /// What this does NOT fix: a bracket that SUBSTITUTES words the RFC has at
 /// that exact point — `consider [it]` standing in for the RFC's own
 /// `consider that data` — still fails, because the substituted words are, by
@@ -3093,6 +3132,12 @@ fn strip_bracket_insertions(text: &str) -> String {
       break;
     };
     out.push_str(&rest[..open]);
+    // The `\[` rustdoc requires of a citation, taken before the space it
+    // stands between — otherwise the space survives here and is dropped from
+    // the spec's side, and the section above measures where that shows.
+    if out.ends_with('\\') {
+      out.pop();
+    }
     while out.ends_with(' ') || out.ends_with('\t') {
       out.pop();
     }
@@ -4129,6 +4174,39 @@ mod tests {
       "a corruption INSIDE the optional group is what the old rule threw away"
     );
     assert_eq!(checked, 1);
+  }
+
+  // A citation a comment MUST escape, because rustdoc reads a bare one as a
+  // link, normalises to what the spec's own bare one does — at both positions,
+  // since only one of them ever failed. See `strip_bracket_insertions` for the
+  // measurement that says which.
+  #[test]
+  fn an_escaped_bracket_is_the_same_mark_as_a_bare_one() {
+    // A space after the close: this position passed even before the fix,
+    // because `squeeze` merged the stray space into the following one.
+    assert_eq!(
+      super::normalise(r"Section 3 of \[RFC4647\] defines several"),
+      super::normalise("Section 3 of [RFC4647] defines several")
+    );
+    // A full stop after the close: this is the position that failed, and the
+    // literal expectation is spelled out so the test cannot pass by comparing
+    // two identically-wrong sides.
+    assert_eq!(
+      super::normalise(r"found in Section 2.3 of \[RFC4647\]."),
+      "found in Section 2.3 of."
+    );
+    assert_eq!(
+      super::normalise("found in Section 2.3 of [RFC4647]."),
+      "found in Section 2.3 of."
+    );
+    // And the ABNF path still keeps every bracket, escaped or not: `[ … ]` is
+    // RFC 5234 syntax there. The backslash itself goes on BOTH paths, because
+    // `squeeze` drops it wherever it stands; what parts the two paths is the
+    // bracket, which is all this fix moves.
+    assert_eq!(
+      super::normalise_production(r"language-range = \[RFC4647\]"),
+      "language-range = [RFC4647]"
+    );
   }
 
   // The quotation path's bracket rule is unchanged, and must stay so: the
