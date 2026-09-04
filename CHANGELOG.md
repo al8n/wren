@@ -1,5 +1,37 @@
 # UNRELEASED
 
+## `http-semantics` — two shims with one body are one symbol, and one of the two proved nothing
+
+`shim_accept_charset` and `shim_accept_encoding` had identical bodies. The two
+entry points are one walk at one element rule — which is a fact about the
+grammar and is pinned by a test — and `cloned()` and `copied()` over a `&&[u8]`
+lower to the same code, so after optimization the two shims WERE the same
+function and the linker folded them. One symbol survived for two shims, and
+`shim_accept_encoding`'s `no-panic` guard was never evaluated: its proof was
+empty while its own step reported `ok`.
+
+### Fixed
+
+- `shim_accept_charset` folds `is_wildcard` into its answer, which makes it a
+  different function from `shim_accept_encoding` and also drives an accessor no
+  other shim reaches. `shim-check`'s artifact half now reports
+  `http-semantics 21/21`; before it reported `20/21` and named the missing one.
+
+### How it was missed, which is the part worth writing down
+
+`shim-check` prints two lines. The first is the SOURCE half — how many shims are
+declared, how many call sites, how many arguments through `black_box` — and it
+was green throughout. The second is the ARTIFACT half, which asks the linker
+which shims are actually defined in the release test binary, and it was red from
+the commit that added the second shim. Three commit messages reported "all
+instantiated" on the strength of the first line alone, because the runs were
+piped through `head -1` and the exit code went with the pipe rather than with
+the command.
+
+That check exists precisely because identical code folding and a deleted call
+are the same silence in a symbol table. It caught this. What did not catch it
+was reading its output.
+
 ## `http-semantics` — the roles this crate serves, as a scope rule and not a note
 
 al8n/wren#70 records two items resting on the ABSENCE of a scope rule: neither
