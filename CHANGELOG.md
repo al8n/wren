@@ -1,5 +1,33 @@
 # UNRELEASED
 
+## `http-semantics` — the export that was going to unblock three readers was not one
+
+al8n/wren#70's Phase 2 says one line unblocks three of the four fields it adds:
+`media::parse_qvalue` is `pub(crate)`, and publishing it turns three "cannot"
+into three "inconvenient". Measured before writing any of them, both halves of
+that sentence are wrong.
+
+**It is not one line, and it is not a line at all.** `pub(crate)` is crate-wide.
+The three readers land in this crate, so they call the function with no edit to
+its visibility — there was never anything to unblock. What a `pub` would change
+is what a caller OUTSIDE the crate can reach, which is a different question
+that no reader in Phase 2 asks.
+
+**And it is the wrong shape for the question it was answering.** `Weight` is
+already `pub`; what a caller wants is the weight a member CARRIES, which
+`MediaRange::weight` hands over off a member this crate has already walked. A
+public `qvalue` reader beside it is a standing invitation to read the same bytes
+a second time — the thing that accessor exists to remove — and this crate has
+already published this function once, for `http1-proto`'s panic shim and no
+other caller, and taken it back.
+
+### Changed
+
+- `media::parse_qvalue` keeps `pub(crate)`, and its doc now carries the ruling:
+  the four RFC 9110 elements that end in `[ weight ]`, why a reader in this
+  crate needs no export, and why the `TE` reader §10.1.4's `t-codings` implies
+  is in the same position and gets the same answer.
+
 ## `xtask` — a code span that wrapped, a citation that wrapped, and a block whose marks do not pair
 
 Three ways a quotation left `quote-check` without being graded, counted or

@@ -1146,6 +1146,38 @@ impl Weight {
 /// field it walked itself is reading one member of a list this module already
 /// walks. The link-time panic proof reaches it through
 /// `__no_panic_internals`, which is what keeps it from having to be `pub`.
+///
+/// # A second field that reads a weight does not make this `pub`
+///
+/// RFC 9110 §12.4.2's `weight` hangs off more elements than `Accept`'s. §12.5.2
+/// writes `Accept-Charset = #( ( token / "*" ) [ weight ] )`, §12.5.3 writes
+/// `Accept-Encoding  = #( codings [ weight ] )`, §12.5.4 writes
+/// `Accept-Language = #( language-range [ weight ] )`, and §10.1.4's
+/// `t-codings = "trailers" / ( transfer-coding [ weight ] )` puts one on `TE`.
+/// Every one of those readers needs a `qvalue` read. None of them needs this
+/// function published, and the two reasons are worth standing where the
+/// visibility is rather than in whatever issue proposed the export.
+///
+/// - **`pub(crate)` already reaches a reader in this crate.** Visibility is
+///   crate-wide, so a sibling module calls this with no edit here at all.
+///   There is no one-line export that unblocks such a reader, because there is
+///   nothing blocking it; a `pub` would be a change made for callers outside
+///   the crate, and the paragraph below is about those.
+/// - **The weight belongs behind the reader's own accessor**, which is what
+///   [`Weight`] being `pub` already buys. A caller wants the weight a member
+///   CARRIES, and [`MediaRange::weight`] hands that over off a member this
+///   crate has already walked. Publishing a bare `qvalue` reader beside it
+///   would put back in reach the second reading of the same bytes that the
+///   accessor exists to remove — a caller re-finding the `q` in a member it was
+///   handed.
+///
+/// The one caller a `pub` here would serve is another CRATE, and this crate has
+/// been in that position and left it: while the panic shim lived in
+/// `http1-proto`'s test this function was `pub` for no caller but that test,
+/// and `tests/no_panic.rs` records the move that took it back. A field's reader
+/// belongs beside the field it reads, so a `TE` reader wanting §10.1.4's
+/// `[ weight ]` is in the same position as these three and gets the same
+/// answer.
 pub(crate) fn parse_qvalue(v: &[u8]) -> Option<Weight> {
   let (first, rest) = v.split_first()?;
   let one = match *first {
