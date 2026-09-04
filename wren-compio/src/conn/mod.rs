@@ -582,7 +582,19 @@ fn close_flush_timed_out<Ro: role::Role, S: Duplex>(
     // The echo never reached the wire: a staged peer outcome must not
     // surface as a clean close.
     guard.staged_close = None;
-    if let Some(closed) = guard.conn.handle_timeout(Instant::now()) {
+    // `handle_timeout` refuses an instant earlier than one the connection has
+    // already been given. `std::time::Instant` is monotonic, so that cannot
+    // happen here — it is spelled out rather than unwrapped because this driver
+    // must not panic on a clock it does not own, and a refusal means exactly
+    // what `None` means below: no protocol verdict.
+    let verdict = match guard.conn.handle_timeout(Instant::now()) {
+      Ok(verdict) => verdict,
+      Err(e) => {
+        warn!(error = %e, "clock went backwards settling the flush timeout");
+        None
+      }
+    };
+    if let Some(closed) = verdict {
       guard.closed = Some(closed);
       None
     } else {
@@ -668,11 +680,18 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       // messages cannot starve the close deadline or the keepalive.
       {
         let now = Instant::now();
-        if effective_deadline(&guard).is_some_and(|at| at <= now)
-          && let Some(closed) = guard.conn.handle_timeout(now)
-        {
-          debug!(clean = closed.clean(), "close deadline elapsed");
-          guard.closed = Some(closed);
+        if effective_deadline(&guard).is_some_and(|at| at <= now) {
+          // The refusal arm is unreachable with a monotonic `Instant::now()`;
+          // see `close_flush_timed_out` for why it is spelled rather than
+          // unwrapped.
+          match guard.conn.handle_timeout(now) {
+            Ok(Some(closed)) => {
+              debug!(clean = closed.clean(), "close deadline elapsed");
+              guard.closed = Some(closed);
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "clock went backwards settling protocol timers"),
+          }
         }
       }
     }

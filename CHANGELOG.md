@@ -865,6 +865,85 @@ five times on CI (al8n/wren#87).
   — moving this crate's step to fat LTO is what its own comments forbid, so the
   annotation is the fix and the profile is unchanged.
 
+- **A `now` that goes backwards is refused, not tolerated.** `handle`,
+  `poll_transmit` and `handle_timeout` compare deadlines by `Ord`, and a clock
+  that rewound was silently absorbed: deadlines fired late and nothing said so.
+  Each now compares `now` against the latest instant that connection has been
+  given and refuses a strictly earlier one —
+  `HandleError::ClockWentBackwards`, `EncodeError::ClockWentBackwards` and the
+  new `TimeoutError::ClockWentBackwards`. **This is a behavioural change**: a
+  call that used to succeed quietly can now fail.
+
+  An EQUAL instant is accepted, because a driver that reads its clock once per
+  wakeup and fans it across a batch is the shape this crate is written for. The
+  refusal touches nothing — the comparison runs before any store, so `data` is
+  unread, nothing is written to `out`, no lifecycle moves, and the call is
+  retryable with a correct instant. And it RETURNS: a rewound clock is a bug in
+  the caller's timekeeping, so whether it kills the process, drops the
+  connection or is logged and retried is the driver's decision, which is the
+  layering `deny(clippy::panic)` and the link proof already make structural.
+  `poll_timeout()` takes no `now` and is unchanged.
+
+  The recorded instant is an `I`, not an `Option<I>`: `Connection::new` already
+  takes a `now`, so there is no "no clock yet" state to encode and no first call
+  that skips the check — and an `Option` would cost eight more bytes on every
+  connection rather than eight. Size **408 → 416** bare, **440 → 448** heap,
+  **464 → 472** with `deflate`, and the `const` budget moved with it. The budget
+  caught the growth rather than a reviewer: adding the field reddened
+  `cargo check` with `error[E0080]: evaluation panicked` before a test existed.
+
+  `handle_timeout` is now link-checked in `tests/no_panic.rs` — it is the
+  shallowest of the three entry points and reaches the same comparison, so the
+  new leaf is covered by `no-panic` and not only by the lint wall. All eight of
+  the crate's shims are defined at distinct addresses (checked against the
+  binary's symbol table, not assumed).
+
+  **One existing test passed a smaller `now` and it was not deliberate.**
+  `keepalive_pings_on_inbound_silence` ticked `handle_timeout(4_999_999)` and
+  then drained with `poll_transmit(TestInstant(0))`; the `0` was incidental —
+  the line asserts that nothing is queued yet, which no instant changes — so it
+  is spelled at `4_999_999` now and says the same thing. Nothing else in the
+  workspace rewound. `wren-compio`'s two `handle_timeout` call sites use
+  `std::time::Instant::now()`, where the refusal is unreachable; both spell the
+  arm out and `warn!` rather than unwrapping, because a driver must not panic on
+  a clock it does not own.
+
+- **Feature `assert-contracts`: caller-contract violations panic; protocol
+  errors never do.** Off by default, so the crate's panic-freedom proof is
+  exactly what it was. On, a caller breaking this crate's API stops the process
+  instead of receiving an `Err` — the TigerBeetle stance that a program which
+  has already violated its own invariants should not continue on state nobody
+  reasoned about, made opt-in.
+
+  The line that matters is which errors are eligible. A **contract** error is
+  the caller's bug — a `now` that went backwards, and others as the audit
+  reaches them. A **protocol** error is anything a peer's bytes can cause: a
+  malformed header, an unmasked client frame, invalid UTF-8, an oversize
+  payload. Those never panic under any feature, because a peer-triggerable
+  panic is a denial-of-service entrance — one crafted frame and the process is
+  gone. The rule is enforced by WHICH ERRORS REACH `contract::contract_violation`
+  rather than by a comment saying so, and a protocol error routed through it
+  acquires a panic in a diff a reviewer can see. Exactly one error class is
+  routed there in this change: the clock-backwards refusal. Nothing existing was
+  reclassified.
+
+  The lint wall is left standing rather than relaxed: `deny(clippy::panic)` still
+  covers the crate with the feature on, and one
+  `#[cfg_attr(feature = "assert-contracts", allow(clippy::panic))]` on the helper
+  is the only place in this crate a panic can be written at all. A stray
+  `panic!` anywhere else still reds clippy under `--all-features`.
+
+  The feature is for a **final binary**, not a library: cargo unifies features
+  across the build graph, so a library enabling it decides the question for
+  every dependent, including ones that chose a returned `Err` deliberately.
+
+  The two returned-`Err` clock tests are gated OFF under the feature — there is
+  no `Err` to inspect and no surviving state to compare when the process is
+  going down — and four mirrors run in their place: one `#[should_panic]` per
+  entry point, matching the CONTRACT's own words rather than "panicked" so a
+  panic from anywhere else does not pass for it, plus one asserting that an
+  EQUAL instant still does not panic. 243 tests without the feature, 245 with.
+
 ### What was NOT consolidated, and the sequence that decides it
 
 - **`RecvState::control_buf` — the inbound accumulator — stays its own buffer.**
@@ -913,9 +992,37 @@ five times on CI (al8n/wren#87).
   send it with `encode_pong`. Changing when pongs drain after a close is a wire
   decision that deserves its own review.
 
-## CI — two gates the workspace claimed and no job ran
+## CI — three gates the workspace claimed and no job ran
 
 ### Added
+
+- **A must-fail control for `assert-contracts`.** A feature that turns on
+  panics and has never been observed to produce one is a feature nothing
+  checks: it could be misspelled in `Cargo.toml`, `cfg`'d out, or routed past
+  by a later refactor, and every job would stay green while the crate answered
+  `Err` exactly as before. So the `no-panic` job now builds
+  `--features assert-contracts,test-no-panic` in release and requires it to FAIL
+  to link — and to fail naming the shim that reaches
+  `contract::contract_violation`, not merely to fail. Measured:
+  `ERROR[no-panic]: detected panic in function `shim_handle_timeout``, and only
+  that shim. The step's own inversion was measured too: pointed at a build that
+  links, it exits 1 on its `::error::`.
+
+  `shim_handle_timeout` is the subject because `handle_timeout` is the
+  shallowest of the three `now`-taking entry points and the only one this crate
+  link-checks. Naming the shim rather than accepting any failure is the
+  lie-check's discipline: "it did not build" is satisfied by a typo or an
+  unrelated breakage, which would turn the step green while proving nothing.
+  The default proof is untouched — the step above it still runs
+  `--features test-no-panic` with no `assert-contracts`, still links clean at 9
+  tests, and `shim-check` reads that same binary.
+
+  The `clippy` job also runs the crate once at
+  `--no-default-features --features assert-contracts`, which is a different
+  question from the `--all-features` run above it: the bare `no_std` tier with
+  the feature, where the wall and the single `allow` have to agree without an
+  allocator in scope. The wall is deliberately not relaxed by the feature, so a
+  stray `panic!` anywhere else still reds there.
 
 - **`cargo check -p websocket-proto --no-default-features --target
   thumbv6m-none-eabi`.** The `no-std` job checked websocket-proto on

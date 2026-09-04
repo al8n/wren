@@ -96,6 +96,10 @@ pub mod error;
 
 pub use error::BufferTooSmallDetail;
 
+/// Caller-contract violations, and the one place the crate decides whether
+/// they return or panic (`assert-contracts`).
+mod contract;
+
 mod base64;
 
 mod utf8;

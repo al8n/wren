@@ -479,6 +479,70 @@ fn prepare_text_is_panic_free() {
   ));
 }
 
+// ── the timer tick, and the monotonicity check inside it ─────────────────────
+//
+// `Connection::accept_now` is the new leaf: one `Ord` comparison and a store,
+// reached from all three `now`-taking entry points. `handle_timeout` is the
+// shallowest of the three by a wide margin — its whole tree is that comparison,
+// two `matches!` on the lifecycle, two `Option` compares and one
+// `checked_add_duration` — so it is the one that can be link-checked, and
+// checking it compiles the leaf. `handle` and `poll_transmit` reach the same
+// leaf and are exercised by the smoke below, which is not link-checked for the
+// reasons `handle_step` gives.
+//
+// Its body is a `match` over `Result<Option<Closed>, _>` answering a `u8`,
+// which no other shim in this file spells — the folding hazard the `prepare_*`
+// pair carries does not arise.
+
+no_panic_shim! {
+  /// Shim over [`Connection::handle_timeout`] — the timer tick, and with it the
+  /// monotonicity comparison every `now`-taking entry point runs.
+  fn shim_handle_timeout(conn: &mut Connection<Clock, Server>, now: u64) -> u8 {
+    match conn.handle_timeout(Clock(now)) {
+      Ok(Some(_)) => 2,
+      Ok(None) => 1,
+      Err(_) => 0,
+    }
+  }
+}
+
+#[test]
+fn handle_timeout_is_panic_free() {
+  use core::time::Duration;
+  let mut conn: Connection<Clock, Server> = Connection::new(
+    &Negotiated::none(),
+    ConnectionConfig::new().with_keepalive(Some(Duration::from_secs(5))),
+    Server::new(),
+    Clock(0),
+  );
+  // Nothing due yet.
+  assert_eq!(
+    shim_handle_timeout(black_box(&mut conn), black_box(1)),
+    1,
+    "not due"
+  );
+  // The keepalive fires and re-arms: `checked_add_duration` on a live counter.
+  assert_eq!(
+    shim_handle_timeout(black_box(&mut conn), black_box(5_000_000_000)),
+    1,
+    "keepalive queued"
+  );
+  // The re-arm arm where the addition OVERFLOWS — `checked_add_duration`
+  // answers `None` rather than panicking, which is the contract `time.rs`
+  // states and the one this crate's arithmetic lint wall relies on.
+  assert_eq!(
+    shim_handle_timeout(black_box(&mut conn), black_box(u64::MAX)),
+    1,
+    "overflowing re-arm"
+  );
+  // The refusal arm: an instant earlier than one already seen.
+  assert_eq!(
+    shim_handle_timeout(black_box(&mut conn), black_box(0)),
+    0,
+    "clock went backwards"
+  );
+}
+
 // ── connection handle + drain (server role, no deflate) ──────────────────────
 
 /// Newtype clock so the connection under test is a concrete, fully

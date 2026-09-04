@@ -49,6 +49,11 @@ pub enum EncodeError {
   #[error("close reason too long")]
   ReasonTooLong,
 
+  /// `now` is earlier than an instant this connection has already been given.
+  /// See [`Connection::poll_transmit`].
+  #[error("`now` is earlier than an instant this connection has already been given")]
+  ClockWentBackwards,
+
   /// Compressed send was requested but permessage-deflate was not negotiated,
   /// or the outbound window-bits negotiated below 15 (miniz_oxide cannot bound
   /// its 32 KiB compression window to fewer bits — RFC-legal to send plain
@@ -426,6 +431,11 @@ where
   /// into `out`. Returns the byte count, or `None` when nothing is pending.
   /// Arms `close_deadline` at the moment the close frame actually drains.
   ///
+  /// Answers [`EncodeError::ClockWentBackwards`] when `now` is EARLIER than an
+  /// instant already handed to this connection; an equal instant is fine, and
+  /// the refusal writes nothing and dequeues nothing. The rule, and why it
+  /// returns rather than panics, is on [`crate::time::Instant`].
+  ///
   /// Once the close drains, this answers `None` for the life of the connection.
   /// That is THIS crate's rule and not RFC 6455 §5.5.1's, which forbids only
   /// further *data* frames after a Close ("The application MUST NOT send any
@@ -438,6 +448,14 @@ where
   /// peer. After a caller's own [`close`](Connection::close) it is neither —
   /// see that method.
   pub fn poll_transmit(&mut self, now: I, out: &mut [u8]) -> Result<Option<usize>, EncodeError> {
+    // Before anything is written or dequeued, so a refusal leaves the queue and
+    // the lifecycle exactly as they were and the call is retryable.
+    if !self.accept_now(now) {
+      return Err(crate::contract::contract_violation(
+        EncodeError::ClockWentBackwards,
+        crate::contract::CLOCK_IS_MONOTONIC,
+      ));
+    }
     // Close first, and then nothing: see the note above for which rule that is.
     if !self.send.close_sent {
       if let Some(pending) = self.send.pending

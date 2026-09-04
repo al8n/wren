@@ -134,7 +134,24 @@ pub struct Connection<I, Ro> {
   pub(crate) close_deadline: Option<I>,
   /// Next instant at which a keepalive ping should be sent.
   pub(crate) next_keepalive: Option<I>,
+  /// The latest instant any of the three `now`-taking entry points has been
+  /// given. See [`Connection::accept_now`] for what it is compared against and
+  /// why it is an `I` rather than an `Option<I>`.
+  pub(crate) last_now: I,
   pub(crate) _clock: core::marker::PhantomData<I>,
+}
+
+/// What [`Connection::handle_timeout`] refuses.
+///
+/// It had no error type before the monotonicity check: every other outcome of
+/// a timeout tick is an ordinary `Option<Closed>`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TimeoutError {
+  /// `now` is earlier than an instant this connection has already been given.
+  /// See [`Connection::handle_timeout`].
+  #[error("`now` is earlier than an instant this connection has already been given")]
+  ClockWentBackwards,
 }
 
 /// The clock the budget below is taken over: a `u64` nanosecond counter, which
@@ -187,11 +204,11 @@ impl Instant for Nanos {
 /// `core::mem::size_of::<Connection<Nanos, Server>>()`:
 ///
 /// ```text
-/// cargo run --quiet --no-default-features          # 536 at e42b30d → 408
-/// cargo run --quiet --features std                 # 568 at e42b30d → 440
-/// cargo run --quiet --features alloc               # 568 at e42b30d → 440
-/// cargo run --quiet --features no-atomic           # 568 at e42b30d → 440
-/// cargo run --quiet --features alloc,deflate       # 592 at e42b30d → 464
+/// cargo run --quiet --no-default-features          # 536 at e42b30d → 408 → 416
+/// cargo run --quiet --features std                 # 568 at e42b30d → 440 → 448
+/// cargo run --quiet --features alloc               # 568 at e42b30d → 440 → 448
+/// cargo run --quiet --features no-atomic           # 568 at e42b30d → 440 → 448
+/// cargo run --quiet --features alloc,deflate       # 592 at e42b30d → 464 → 472
 /// ```
 ///
 /// The second column is after the three inline 125-byte control buffers became
@@ -200,6 +217,13 @@ impl Instant for Nanos {
 /// inbound accumulator (`RecvState::control_buf`) is deliberately still its own
 /// buffer — see [`PendingKind`](send::PendingKind) for what sharing it with the
 /// outbound slot would break.
+///
+/// The third is `last_now`, the eight bytes the monotonicity check costs — an
+/// `I` rather than an `Option<I>` precisely so it is eight and not sixteen (see
+/// [`accept_now`](Connection::accept_now)). The budget caught that growth
+/// rather than a reviewer: adding the field reddened `cargo check` with
+/// `error[E0080]: evaluation panicked` before a test was written, which is the
+/// gate working.
 ///
 /// The three tiers are three numbers because they are three structs: the heap
 /// tiers add `RecvState::pong_overflow` (a `VecDeque`, 32 bytes), and `deflate`
@@ -213,16 +237,16 @@ impl Instant for Nanos {
   feature = "no-atomic",
   feature = "deflate"
 )))]
-const CONNECTION_SIZE_BUDGET: usize = 408;
+const CONNECTION_SIZE_BUDGET: usize = 416;
 
 #[cfg(all(
   not(feature = "deflate"),
   any(feature = "alloc", feature = "std", feature = "no-atomic")
 ))]
-const CONNECTION_SIZE_BUDGET: usize = 440;
+const CONNECTION_SIZE_BUDGET: usize = 448;
 
 #[cfg(feature = "deflate")]
-const CONNECTION_SIZE_BUDGET: usize = 464;
+const CONNECTION_SIZE_BUDGET: usize = 472;
 
 const _: () =
   assert!(core::mem::size_of::<Connection<Nanos, role::Server>>() <= CONNECTION_SIZE_BUDGET);
@@ -261,6 +285,7 @@ where
       lifecycle: Lifecycle::Open,
       close_deadline: None,
       next_keepalive,
+      last_now: now,
       _clock: core::marker::PhantomData,
     }
   }
@@ -294,10 +319,68 @@ where
     }
   }
 
-  /// Advances the timer state to `now`. Returns `Some(Closed)` when the
-  /// close-handshake timeout fires; returns `None` when a keepalive ping is
-  /// queued (drain [`poll_transmit`](Connection::poll_transmit)).
-  pub fn handle_timeout(&mut self, now: I) -> Option<Closed> {
+  /// Accepts `now` as this connection's current instant, recording it, or
+  /// answers `false` because it is EARLIER than one already seen.
+  ///
+  /// This is the crate's whole monotonicity check, in one place, and three
+  /// things about it are deliberate.
+  ///
+  /// **Equal is accepted.** Only a strictly earlier instant is refused. A
+  /// driver that reads its clock once per wakeup and hands the same instant to
+  /// `handle`, `poll_transmit` and `handle_timeout` in one batch is the shape
+  /// this crate is written for, and every call in that batch must succeed.
+  ///
+  /// **It RETURNS by default, and the decision is one flag rather than three
+  /// call sites.** All three refusals go through
+  /// [`contract_violation`](crate::contract::contract_violation), which hands
+  /// the error back — or, under the `assert-contracts` feature, panics naming
+  /// this contract. A clock that goes backwards is a bug in the caller's
+  /// timekeeping, and whether that should kill the process or be logged and
+  /// retried is the driver's; the crate's job is to make the fact reachable
+  /// instead of absorbing it, which is what it did before this check —
+  /// `handle(now)` with a rewound `now` simply made deadlines fire late and
+  /// said nothing. Note the asymmetry that module is built on: a caller's bug
+  /// may panic under a flag; a PEER's bytes never may, on any flag.
+  ///
+  /// **The stored instant is an `I`, not an `Option<I>`.** There is no "no
+  /// clock yet" state to represent: [`Connection::new`] already takes a `now`
+  /// and seeds this from it, so the first call after construction compares
+  /// against a real instant. An `Option` would encode a case that cannot occur
+  /// and cost eight more bytes on every connection — on a crate whose size is a
+  /// `const` assertion, that is not free.
+  ///
+  /// Refusal touches nothing: the comparison runs before the store, so a
+  /// refused call leaves the connection byte-identical and is retryable with a
+  /// correct instant.
+  fn accept_now(&mut self, now: I) -> bool {
+    if now < self.last_now {
+      return false;
+    }
+    self.last_now = now;
+    true
+  }
+
+  /// Advances the timer state to `now`. Returns `Ok(Some(Closed))` when the
+  /// close-handshake timeout fires; `Ok(None)` when nothing fired or a
+  /// keepalive ping was queued (drain
+  /// [`poll_transmit`](Connection::poll_transmit)).
+  ///
+  /// # Errors
+  ///
+  /// [`TimeoutError::ClockWentBackwards`] when `now` is EARLIER than an instant
+  /// already handed to this connection through this method,
+  /// [`handle`](Connection::handle) or
+  /// [`poll_transmit`](Connection::poll_transmit). An equal instant is fine.
+  /// The refusal leaves the connection untouched, so the call can be retried
+  /// with a correct instant. The rule, and why it returns rather than panics,
+  /// is on [`crate::time::Instant`].
+  pub fn handle_timeout(&mut self, now: I) -> Result<Option<Closed>, TimeoutError> {
+    if !self.accept_now(now) {
+      return Err(crate::contract::contract_violation(
+        TimeoutError::ClockWentBackwards,
+        crate::contract::CLOCK_IS_MONOTONIC,
+      ));
+    }
     // Close deadline check (only in CloseSent).
     if matches!(self.lifecycle, Lifecycle::CloseSent)
       && let Some(deadline) = self.close_deadline
@@ -308,7 +391,7 @@ where
         .send
         .queued_code
         .unwrap_or(crate::frame::CloseCode::Normal);
-      return Some(Closed::new(code, false));
+      return Ok(Some(Closed::new(code, false)));
     }
     // Keepalive check (only in Open).
     if matches!(self.lifecycle, Lifecycle::Open)
@@ -321,7 +404,7 @@ where
         self.next_keepalive = now.checked_add_duration(interval);
       }
     }
-    None
+    Ok(None)
   }
 }
 
@@ -483,16 +566,31 @@ pub(crate) mod tests {
     // Armed from construction.
     assert_eq!(conn.poll_timeout(), Some(TestInstant(5_000_000)));
     // Not yet due: nothing happens.
-    assert!(conn.handle_timeout(TestInstant(4_999_999)).is_none());
-    let mut out = [0u8; 16];
     assert!(
       conn
-        .poll_transmit(TestInstant(0), &mut out)
+        .handle_timeout(TestInstant(4_999_999))
+        .expect("a monotonic instant")
+        .is_none()
+    );
+    let mut out = [0u8; 16];
+    // This drain used to be spelled `TestInstant(0)` — a REWIND, since the tick
+    // above already handed the connection 4_999_999. It was incidental rather
+    // than deliberate: what the line asserts is that nothing is queued yet, and
+    // no instant it could be given changes that. Spelled at the same instant the
+    // tick used, it says the same thing and keeps the clock monotone.
+    assert!(
+      conn
+        .poll_transmit(TestInstant(4_999_999), &mut out)
         .unwrap()
         .is_none()
     );
     // Due: queues an empty ping and re-arms.
-    assert!(conn.handle_timeout(TestInstant(5_000_000)).is_none());
+    assert!(
+      conn
+        .handle_timeout(TestInstant(5_000_000))
+        .expect("a monotonic instant")
+        .is_none()
+    );
     let n = conn
       .poll_transmit(TestInstant(5_000_000), &mut out)
       .unwrap()
@@ -507,6 +605,168 @@ pub(crate) mod tests {
       while ev.next().is_some() {}
     }
     assert_eq!(conn.poll_timeout(), Some(TestInstant(12_000_000)));
+  }
+
+  /// The monotonicity contract, at all three entry points that take a `now`.
+  ///
+  /// The state comparison is a `Debug` render taken before and after, which is
+  /// the cheapest thing that is actually BYTE-identical rather than
+  /// spot-checked: it covers the lifecycle, both deadlines, the outbound
+  /// control slot, the frame and message cursors and the recorded instant at
+  /// once, so a refusal that quietly advanced any one of them reds here. A
+  /// handful of `assert_eq!`s on the fields somebody thought to name would not.
+  #[cfg(not(feature = "assert-contracts"))]
+  #[test]
+  fn a_rewound_now_is_refused_everywhere_and_changes_nothing() {
+    use super::{EncodeError, HandleError, TimeoutError};
+    use crate::frame::Opcode;
+
+    let mut conn: Connection<TestInstant, Server> = Connection::new(
+      &Negotiated::none(),
+      ConnectionConfig::default(),
+      Server::new(),
+      TestInstant(1_000),
+    );
+
+    // Give it state worth leaving alone: a received ping owes a pong, which
+    // sits in the outbound control slot.
+    let mut ping = masked_frame(Opcode::Ping, true, b"abc");
+    {
+      let mut ev = conn.handle(TestInstant(2_000), &mut ping).expect("forward");
+      while ev.next().is_some() {}
+    }
+
+    let snapshot = format!("{conn:?}");
+    let mut out = [0u8; 32];
+    let mut more = masked_frame(Opcode::Ping, true, b"xyz");
+    let more_before = more.clone();
+
+    // `handle`: refused, and `data` is not read.
+    assert!(matches!(
+      conn.handle(TestInstant(1_999), &mut more),
+      Err(HandleError::ClockWentBackwards)
+    ));
+    assert_eq!(more, more_before, "a refused handle unmasks nothing");
+    assert_eq!(format!("{conn:?}"), snapshot);
+
+    // `poll_transmit`: refused, and nothing is written or dequeued — the pong
+    // is still owed.
+    assert!(matches!(
+      conn.poll_transmit(TestInstant(1_999), &mut out),
+      Err(EncodeError::ClockWentBackwards)
+    ));
+    assert_eq!(out, [0u8; 32], "a refused drain writes nothing");
+    assert_eq!(format!("{conn:?}"), snapshot);
+
+    // `handle_timeout`: refused, no timer moves.
+    assert!(matches!(
+      conn.handle_timeout(TestInstant(1_999)),
+      Err(TimeoutError::ClockWentBackwards)
+    ));
+    assert_eq!(format!("{conn:?}"), snapshot);
+
+    // EQUAL is accepted at all three, which is the shape a driver that reads
+    // its clock once per wakeup and fans it across a batch depends on.
+    assert!(conn.handle_timeout(TestInstant(2_000)).is_ok());
+    {
+      let mut ev = conn
+        .handle(TestInstant(2_000), &mut more)
+        .expect("an equal instant is not a rewind");
+      while ev.next().is_some() {}
+    }
+    let n = conn
+      .poll_transmit(TestInstant(2_000), &mut out)
+      .expect("an equal instant is not a rewind")
+      .expect("the pong the refused drain left owed");
+    assert_eq!(out[0], 0x8A, "and it is still a pong");
+    let _ = n;
+  }
+
+  /// The instant [`Connection::new`] was given is the first floor: the very
+  /// first `now`-taking call is compared against it. That is why the recorded
+  /// instant is an `I` rather than an `Option<I>` — there is no "no clock yet"
+  /// state, so there is no first call that skips the check.
+  #[cfg(not(feature = "assert-contracts"))]
+  #[test]
+  fn the_constructing_instant_is_the_first_floor() {
+    use super::EncodeError;
+
+    let mut conn: Connection<TestInstant, Server> = Connection::new(
+      &Negotiated::none(),
+      ConnectionConfig::default(),
+      Server::new(),
+      TestInstant(5_000),
+    );
+    let mut out = [0u8; 8];
+    assert!(matches!(
+      conn.poll_transmit(TestInstant(4_999), &mut out),
+      Err(EncodeError::ClockWentBackwards)
+    ));
+    // At it, and past it.
+    assert!(conn.poll_transmit(TestInstant(5_000), &mut out).is_ok());
+    assert!(conn.handle_timeout(TestInstant(9_999)).is_ok());
+  }
+
+  /// The same contract under `assert-contracts`, at each of the three entry
+  /// points, one panic per test because a `should_panic` test can only witness
+  /// the first.
+  ///
+  /// These are the mirrors of the two tests above, which are gated OFF under
+  /// the feature: with it on there is no returned `Err` to inspect and no
+  /// surviving state to compare, because the process is going down. Splitting
+  /// them is what lets `cargo test --all-features` and `cargo hack
+  /// --each-feature` run a crate whose behaviour the flag genuinely changes.
+  ///
+  /// `expected` matches the CONTRACT's own words rather than "panicked", so a
+  /// panic that arrived from somewhere else — a bounds check, an unwrap in a
+  /// helper — does not pass for this one.
+  #[cfg(feature = "assert-contracts")]
+  mod assert_contracts {
+    use super::*;
+    use crate::frame::Opcode;
+
+    fn at(now: u64) -> Connection<TestInstant, Server> {
+      Connection::new(
+        &Negotiated::none(),
+        ConnectionConfig::default(),
+        Server::new(),
+        TestInstant(now),
+      )
+    }
+
+    #[test]
+    #[should_panic(expected = "`now` must not go backwards")]
+    fn handle_panics_on_a_rewound_now() {
+      let mut conn = at(1_000);
+      let mut frame = masked_frame(Opcode::Ping, true, b"x");
+      let _ = conn.handle(TestInstant(999), &mut frame);
+    }
+
+    #[test]
+    #[should_panic(expected = "`now` must not go backwards")]
+    fn poll_transmit_panics_on_a_rewound_now() {
+      let mut conn = at(1_000);
+      let mut out = [0u8; 16];
+      let _ = conn.poll_transmit(TestInstant(999), &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "`now` must not go backwards")]
+    fn handle_timeout_panics_on_a_rewound_now() {
+      let mut conn = at(1_000);
+      let _ = conn.handle_timeout(TestInstant(999));
+    }
+
+    /// And the feature does NOT turn every refusal into a panic: an equal
+    /// instant is still accepted, so a driver batching one clock read across
+    /// several calls does not trip it.
+    #[test]
+    fn an_equal_now_still_does_not_panic() {
+      let mut conn = at(1_000);
+      let mut out = [0u8; 16];
+      assert!(conn.handle_timeout(TestInstant(1_000)).is_ok());
+      assert!(conn.poll_transmit(TestInstant(1_000), &mut out).is_ok());
+    }
   }
 
   #[test]
@@ -542,7 +802,10 @@ pub(crate) mod tests {
     assert_eq!(conn2.poll_timeout(), Some(TestInstant(4_000_000)));
 
     // Peer never answers: terminal, unclean, our code.
-    let closed = conn.handle_timeout(TestInstant(4_000_000)).unwrap();
+    let closed = conn
+      .handle_timeout(TestInstant(4_000_000))
+      .expect("a monotonic instant")
+      .expect("the close deadline fires");
     assert_eq!(closed.code(), crate::frame::CloseCode::GoingAway);
     assert!(!closed.clean());
     assert!(conn.is_terminal());

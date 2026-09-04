@@ -36,6 +36,11 @@ pub enum HandleError {
   /// The connection is terminal; feeding more input is a caller bug.
   #[error("connection is terminal")]
   Terminal,
+
+  /// `now` is earlier than an instant this connection has already been given.
+  /// See [`Connection::handle`].
+  #[error("`now` is earlier than an instant this connection has already been given")]
+  ClockWentBackwards,
 }
 
 /// Where the receive machine is within the byte stream.
@@ -382,6 +387,17 @@ where
     now: I,
     data: &'a mut [u8],
   ) -> Result<Events<'a, 'c, I, Ro>, HandleError> {
+    // The clock check comes FIRST, before the state-dependent refusal below,
+    // because it is a statement about this call's ARGUMENT rather than about
+    // the connection: a driver validating its own timekeeping gets the same
+    // answer whether or not the connection has since gone terminal. It touches
+    // nothing on refusal, so `data` is unread and the cursor is never built.
+    if !self.accept_now(now) {
+      return Err(crate::contract::contract_violation(
+        HandleError::ClockWentBackwards,
+        crate::contract::CLOCK_IS_MONOTONIC,
+      ));
+    }
     if self.is_terminal() {
       return Err(HandleError::Terminal);
     }

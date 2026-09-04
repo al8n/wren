@@ -57,6 +57,16 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-features --tests --examples -- -D warnings
+      # `assert-contracts` on its own, because `--all-features` above is not the
+      # same question. That run has `std`; this one is the bare `no_std` tier
+      # with the feature, which is where the crate's `deny(clippy::panic)` wall
+      # and the single `allow` on `contract::contract_violation` have to agree
+      # without an allocator in scope. The wall is deliberately NOT relaxed by
+      # the feature — that one `allow` is the only place a panic may be written
+      # even with it on — so a stray `panic!` added anywhere else still reds
+      # here rather than being waved through by the flag that made panicking
+      # legal in one function.
+      - run: cargo clippy -p websocket-proto --no-default-features --features assert-contracts --all-targets -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features alloc -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features deflate -- -D warnings
@@ -608,3 +618,39 @@ jobs:
           lie_check http3-proto
           lie_check http1-proto CARGO_PROFILE_RELEASE_LTO=fat
           lie_check http-semantics CARGO_PROFILE_RELEASE_LTO=fat
+      # MUST-FAIL, and the same argument one flag over. `assert-contracts` turns
+      # CALLER-CONTRACT violations into panics — a `now` that went backwards is
+      # the one error routed there so far — so with it on, the link proof has to
+      # go RED, and red naming the shim that reaches
+      # `contract::contract_violation`. A feature that turns on panics and has
+      # never been observed to produce one is a feature nothing checks: it could
+      # be misspelled in `Cargo.toml`, `cfg`'d out, or routed past by a later
+      # refactor, and every job here would stay green while the crate answered
+      # `Err` exactly as before. This step is what disagrees.
+      #
+      # `shim_handle_timeout` is the subject because `handle_timeout` is the
+      # shallowest of the three `now`-taking entry points and the only one this
+      # crate link-checks (`handle` and `poll_transmit` reach the same
+      # comparison; see the module doc in `tests/no_panic.rs` for why their call
+      # trees are held by the lint wall instead). Naming the SHIM rather than
+      # grepping for any failure is the same discipline as the lie-check above:
+      # "it did not build" is satisfied by a typo or an unrelated breakage,
+      # which would turn this step green while proving nothing.
+      #
+      # The default proof is untouched by this: the step above still runs
+      # `--features test-no-panic` with no `assert-contracts` and still links
+      # clean, and `shim-check` reads that same binary.
+      - name: assert-contracts turns the clock refusal into a real panic (MUST FAIL)
+        run: |
+          log="$(mktemp)"
+          ! cargo test -p websocket-proto --release \
+            --features assert-contracts,test-no-panic --test no_panic >"$log" 2>&1 || {
+            echo "::error::websocket-proto linked WITH assert-contracts — the feature panics nowhere"
+            exit 1
+          }
+          grep -q 'ERROR\[no-panic\]: detected panic in function `shim_handle_timeout`' "$log" || {
+            echo "::error::the assert-contracts build failed, but not with no-panic's link error naming shim_handle_timeout"
+            cat "$log"
+            exit 1
+          }
+          echo "assert-contracts: the contract panic reached the linker, naming shim_handle_timeout"

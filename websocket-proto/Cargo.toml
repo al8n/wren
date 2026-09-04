@@ -44,6 +44,22 @@ no-atomic = [
   "http1-proto/no-atomic",
   "http-semantics/no-atomic",
 ]
+# Turn CALLER-CONTRACT violations into panics instead of returned errors: a
+# `now` that went backwards, and (as the audit reaches them) other ways a caller
+# can break this API. The TigerBeetle stance — a program that has already
+# violated its own invariants should stop rather than continue on state nobody
+# reasoned about — made opt-in so the crate's DEFAULT panic-freedom proof
+# (`tests/no_panic.rs`, `xtask shim-check`) is untouched.
+#
+# PROTOCOL errors never panic under this or any feature. Anything a peer's bytes
+# can cause — a malformed header, an unmasked client frame, invalid UTF-8, an
+# oversize payload — stays an `Err`, because a peer-triggerable panic is a
+# denial-of-service entrance. See `src/contract.rs`.
+#
+# For a FINAL BINARY, not a library: cargo unifies features across the build
+# graph, so a library enabling this decides the question for every dependent,
+# including ones that chose a returned `Err` deliberately.
+assert-contracts = []
 # Internal: exposes `pub(crate)` hot paths so `tests/no_panic.rs` can wrap them
 # in `#[no_panic]` shims. Implies `std` (the test driver is std-only). Not for
 # downstream use — the re-exports are doc-hidden and unstable.
