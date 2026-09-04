@@ -662,9 +662,11 @@ impl Acceptability {
 /// - **Derived.** A zero anywhere among the entries naming a coding excludes
 ///   it, which is rule 3's "unless it is accompanied by a qvalue of 0" read
 ///   plainly, and holds whichever end of the field a recipient reads from.
-/// - **Chosen.** Where no entry is zero, the LAST in wire order gives the
-///   weight. Nothing in RFC 9110 picks between that, the first, and the
-///   largest.
+/// - **Chosen.** Where no entry is zero, the FIRST in field order gives the
+///   weight. Nothing in RFC 9110 picks between that, the last, and the largest;
+///   what picks it is that [`weight_for`](crate::media::weight_for) already
+///   resolves the same open tie the same way for `Accept`, and one crate may
+///   not answer one unsettled question two ways.
 ///
 /// The chosen half is pinned by
 /// `a_repeated_entry_is_undecided_and_this_is_the_reading_taken`, which asserts
@@ -742,10 +744,35 @@ where
 
 /// Folds a second entry naming one coding onto the first.
 ///
-/// Two rules in four lines, and they do not have the same standing —
+/// Two rules, and they do not have the same standing —
 /// [`encoding_acceptability`]'s own doc splits them, and this is the name that
 /// stopped asserting the second was settled. A zero absorbs, which rule 3's
-/// words give; otherwise the last in wire order wins, which nothing gives.
+/// words give; otherwise the FIRST in field order wins, which RFC 9110 does not
+/// give and this crate had already settled elsewhere.
+///
+/// # `media` decided the undecided half first, and this follows it
+///
+/// The search below establishes that RFC 9110 leaves the tie open. It does not
+/// license each reader in this crate to break it its own way, and one reader
+/// had already broken it: [`weight_for`](crate::media::weight_for) resolves a
+/// media range the field names twice by FIELD ORDER, first standing, and its
+/// own comment rejects the alternative in writing: relaxing its `<` to `<=` is
+/// recorded there as what would send every tie to the last range instead of the
+/// first. §12.5.1 gets the same silence that §12.5.3 does, so a second reader
+/// picking
+/// the other end would make one crate answer one unsettled question two ways.
+/// Measured before this was aligned:
+/// `weight_for(text/plain, ["text/plain;q=0.25, text/plain;q=0.75"])` is 250 and
+/// `encoding_acceptability(Some(b"gzip"), ["gzip;q=0.25, gzip;q=0.75"])` was
+/// 750.
+///
+/// **The derived half stays, and the difference it makes is licensed by the
+/// sections rather than chosen.** `weight_for` absorbs no zero — measured,
+/// `weight_for(text/plain, ["text/plain;q=1, text/plain;q=0"])` is 1000 — and
+/// it should not: §12.5.1 has no counterpart to §12.5.3 rule 3's "unless it is
+/// accompanied by a qvalue of 0", which is the sentence this reader has and
+/// that one does not. So the two agree wherever the RFC is silent and part only
+/// where it speaks to one of them.
 ///
 /// # Where the rule that would settle this was looked for, and is not
 ///
@@ -778,8 +805,14 @@ where
 /// in the sections above or elsewhere in RFC 9110.
 fn fold_repeated_entry(seen: Option<Weight>, found: Weight) -> Weight {
   match seen {
+    // Derived, from rule 3: a zero already seen absorbs what follows it, and a
+    // zero that arrives absorbs what stood. Order-independent, which is what
+    // makes it the derived half rather than a second choice.
     Some(previous) if previous == Weight::ZERO => previous,
-    _ => found,
+    _ if found == Weight::ZERO => found,
+    // Chosen, following `media`: the first entry stands.
+    Some(previous) => previous,
+    None => found,
   }
 }
 
