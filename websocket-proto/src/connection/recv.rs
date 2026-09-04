@@ -89,9 +89,11 @@ pub(crate) struct RecvState {
   pub(crate) text_carry: ([u8; 4], u8),
   /// Additional pongs owed when several pings arrive before `poll_transmit`
   /// drains the first. The FIRST echo does not live here — it goes in the
-  /// single outbound control slot,
-  /// [`SendState::pending`](super::send::SendState::pending), which it shares
-  /// with a queued close. RFC 6455 §5.5.3 permits answering only the most
+  /// outbound pong slot,
+  /// [`SendState::pending_pong`](super::send::SendState::pending_pong), which
+  /// is its own buffer beside the queued close rather than shared with it (see
+  /// [`SendState`](super::send::SendState) for why one slot could not serve
+  /// both). RFC 6455 §5.5.3 permits answering only the most
   /// recent ping, so on the bare (`no_alloc`) tier that one slot is the whole
   /// story and later pings coalesce into it; where a heap is available we echo
   /// every ping (Autobahn §2.10) up to [`MAX_PENDING_PONGS`] — past that, the
@@ -1067,19 +1069,15 @@ where
   /// conformant. On the bare tier there is no queue and the slot simply
   /// coalesces to the most recent ping, by the same clause.
   ///
-  /// A slot holding a CLOSE takes neither, and this function does not say so:
-  /// the overflow branch below asks only whether a PONG is already queued, and
-  /// everything else goes to `offer_pong`, which owns the refusal as the single
-  /// writer of a pong into that slot. Written the other way — a `Close` arm
-  /// here AND a refusal there — the rule has two entrances, and deleting either
-  /// copy leaves every test green; that is measured rather than argued, and it
-  /// is why this reads as one branch and a fallthrough.
+  /// A queued CLOSE is not consulted at all. It is a different frame in a
+  /// different slot, and §5.5.2 (line 2042 of `.rfc-cache/rfc6455.txt`) keeps
+  /// the Pong owed until this endpoint has RECEIVED a Close — which one it SENT
+  /// is not. `poll_transmit` gates the pong on the terminal lifecycle, which is
+  /// §5.5.2's own condition, and that gate is the only place the question is
+  /// asked.
   fn queue_pong(&mut self, payload: [u8; MAX_CONTROL_PAYLOAD], len: u8) {
     #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
-    if matches!(
-      self.conn.send.pending_kind(),
-      Some(super::send::PendingKind::Pong)
-    ) {
+    if self.conn.send.pending_pong.is_some() {
       if self.conn.recv.pong_overflow.len() >= MAX_PENDING_PONGS {
         self.conn.recv.pong_overflow.pop_front();
       }

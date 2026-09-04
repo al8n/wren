@@ -204,26 +204,45 @@ impl Instant for Nanos {
 /// `core::mem::size_of::<Connection<Nanos, Server>>()`:
 ///
 /// ```text
-/// cargo run --quiet --no-default-features          # 536 at e42b30d → 408 → 416
-/// cargo run --quiet --features std                 # 568 at e42b30d → 440 → 448
-/// cargo run --quiet --features alloc               # 568 at e42b30d → 440 → 448
-/// cargo run --quiet --features no-atomic           # 568 at e42b30d → 440 → 448
-/// cargo run --quiet --features alloc,deflate       # 592 at e42b30d → 464 → 472
+/// cargo run --quiet --no-default-features          # 536 at e42b30d → 544
+/// cargo run --quiet --features std                 # 568 at e42b30d → 576
+/// cargo run --quiet --features alloc               # 568 at e42b30d → 576
+/// cargo run --quiet --features no-atomic           # 568 at e42b30d → 576
+/// cargo run --quiet --features alloc,deflate       # 592 at e42b30d → 592
 /// ```
 ///
-/// The second column is after the three inline 125-byte control buffers became
-/// two: `SendState`'s close slot and `RecvState`'s pong slot are one tagged
-/// [`PendingControl`](send::PendingControl), 128 bytes off every tier. The
-/// inbound accumulator (`RecvState::control_buf`) is deliberately still its own
-/// buffer — see [`PendingKind`](send::PendingKind) for what sharing it with the
-/// outbound slot would break.
+/// **Net +8 bytes**, and every one of them is `last_now` — the monotonicity
+/// check's stored instant, an `I` rather than an `Option<I>` precisely so it is
+/// eight and not sixteen (see [`accept_now`](Connection::accept_now)). With
+/// `deflate` even that lands in existing padding and the number does not move.
 ///
-/// The third is `last_now`, the eight bytes the monotonicity check costs — an
-/// `I` rather than an `Option<I>` precisely so it is eight and not sixteen (see
-/// [`accept_now`](Connection::accept_now)). The budget caught that growth
-/// rather than a reviewer: adding the field reddened `cargo check` with
-/// `error[E0080]: evaluation panicked` before a test was written, which is the
-/// gate working.
+/// A middle revision of this branch was 128 bytes smaller, by merging
+/// `SendState`'s close slot and `RecvState`'s pong slot into one tagged slot.
+/// **That merge was a conformance defect and is reverted**: RFC 6455 §5.5.2
+/// (line 2042 of `.rfc-cache/rfc6455.txt`) owes a Pong until a Close is
+/// RECEIVED, so the machine has to hold a queued close and an owed pong at the
+/// same time, and one slot cannot. The two buffers are back where `e42b30d` had
+/// them. A smaller `Connection` does not license a nonconformance — the
+/// derivation is on [`poll_transmit`](Connection::poll_transmit).
+///
+/// The budget caught the `last_now` growth rather than a reviewer: adding the
+/// field reddened `cargo check` with `error[E0080]: evaluation panicked` before
+/// a test was written, which is the gate working.
+///
+/// # What this bound does NOT say
+///
+/// It is taken at ONE instantiation: `Connection<Nanos, Server>` — an 8-byte
+/// `Copy + Ord` clock and a zero-sized role. It is **not** a bound on
+/// `Connection<I, Ro>` for a caller's own `I` and `Ro`, and it cannot be: the
+/// struct holds three `I`-shaped fields (`close_deadline` and `next_keepalive`
+/// as `Option<I>`, `last_now` as `I`) plus the role by value, so a caller
+/// substituting a wider instant or a `Client<R>` whose `R` carries an RNG pays
+/// for them on top and this assertion says nothing about it.
+///
+/// MEASURED rather than reasoned, because the reasoning was wrong the first
+/// time: with a 16-byte clock newtype the bare tier is **568**, not the 448 a
+/// field-by-field count predicted. The two `Option<I>` and the `I` grow by 8
+/// each, and none of the 24 lands in padding.
 ///
 /// The three tiers are three numbers because they are three structs: the heap
 /// tiers add `RecvState::pong_overflow` (a `VecDeque`, 32 bytes), and `deflate`
@@ -237,16 +256,16 @@ impl Instant for Nanos {
   feature = "no-atomic",
   feature = "deflate"
 )))]
-const CONNECTION_SIZE_BUDGET: usize = 416;
+const CONNECTION_SIZE_BUDGET: usize = 544;
 
 #[cfg(all(
   not(feature = "deflate"),
   any(feature = "alloc", feature = "std", feature = "no-atomic")
 ))]
-const CONNECTION_SIZE_BUDGET: usize = 448;
+const CONNECTION_SIZE_BUDGET: usize = 576;
 
 #[cfg(feature = "deflate")]
-const CONNECTION_SIZE_BUDGET: usize = 472;
+const CONNECTION_SIZE_BUDGET: usize = 592;
 
 const _: () =
   assert!(core::mem::size_of::<Connection<Nanos, role::Server>>() <= CONNECTION_SIZE_BUDGET);

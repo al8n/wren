@@ -36,7 +36,293 @@ changes turn properties this crate already had into properties something checks.
   (the `pong_overflow` `VecDeque`), 592 with `deflate` (the two boxed codec
   handles and the negotiated parameters). The bound was measured to bite: set to
   535, the bare tier fails `cargo check` with
-  `error[E0080]: evaluation panicked`.
+  `error[E0080]: evaluation panicked`. The numbers this release ships at are
+  **544 / 576 / 592** — the `+8` is `last_now`, below.
+
+  **What the bound does not say**, stated where it is asserted: it is taken at
+  one instantiation, `Connection<Nanos, Server>` — an 8-byte `Copy + Ord` clock
+  and a zero-sized role. A caller's own `I` and `Ro` are not bounded by it. The
+  struct holds three `I`-shaped fields, and with a 16-byte clock the bare tier
+  measures **568** rather than the 448 a field-by-field count predicted — which
+  is why that figure is measured in the doc rather than reasoned.
+
+### Changed
+
+- **A Pong owed when this endpoint has sent — but not received — a Close is now
+  sent.** Two defects, one clause. RFC 6455 §5.5.2 (line 2042 of
+  `.rfc-cache/rfc6455.txt`) makes a Pong a MUST "unless it already received a
+  Close frame", and a Close this endpoint SENT is not one it received. §5.5.3
+  (line 2064) licenses answering only the most recently processed Ping; it
+  licenses answering none.
+
+  * `poll_transmit` answered `None` for the life of the connection once the
+    close drained, so a Ping arriving while we awaited the peer's Close got
+    nothing.
+  * And `encode_control` refused every non-`Open` lifecycle, so the workaround
+    this crate's own docs pointed a caller at — answer it yourself with
+    `encode_pong` — returned `EncodeError::Closing`. The documented escape hatch
+    was shut.
+
+  Both are fixed. Control frames are now refused only once the connection is
+  **terminal**, which is §5.5.2's own condition; §5.5.1 (line 2002) bans further
+  *data* frames after a Close, not control frames, and data sends still stop at
+  `close()` exactly as before.
+
+  **The order is derived, not inherited: an owed pong precedes a queued close.**
+  Neither clause forbids the other order, so the choice is argued. §5.5.2 (line
+  2043) is the spec's only ordering pressure — "It SHOULD respond with Pong
+  frame as soon as is practical" — and when the Ping arrived our Close was
+  queued but not yet on the wire, so the earliest practical frame is the next
+  one written. §5.5.1 (lines 2023–2026) is what gives that teeth: once the peer
+  has our Close and answers it, "an endpoint considers the WebSocket connection
+  closed and MUST close the underlying TCP connection. The server MUST close the
+  underlying TCP connection immediately" — a pong written behind our Close is
+  racing a socket the peer may already have shut.
+
+  **This is a behavioural change on the wire.** Two regressions pin it:
+  `Ping → close() → Ping → drain` emits both pongs in arrival order and then the
+  close (both, because a heap is available — Autobahn §2.10's rule; the bare tier
+  coalesces to the most recent by §5.5.3), and `close() → drain → Ping → drain`
+  emits the late pong after the close and accepts `encode_pong` by hand. A third
+  pins the boundary: once the peer's Close ARRIVES, §5.5.2's exemption applies,
+  the echo is all that drains, and `encode_pong` is refused.
+
+- **The one-slot consolidation is reverted, and the size claim with it.** An
+  earlier revision of this branch merged `SendState::pending_close` and
+  `RecvState::pending_pong` into one tagged slot, on the reasoning that a queued
+  close drained first and `poll_transmit` answered `None` afterwards, so an owed
+  pong could never reach the wire anyway. That reasoning described the code and
+  not the RFC — and by codifying it, the merge left nowhere to hold a Pong the
+  spec requires. The two buffers are back where `e42b30d` had them, both in
+  `SendState`, and neither erases the other in either order.
+
+  So the **−128 bytes is given back**: 536 → **544** bare, 568 → **576** with
+  `std` / `alloc` / `no-atomic`, 592 → **592** with `deflate` (where the growth
+  lands in existing padding). The branch's whole net size effect is the `+8` of
+  `last_now`. **A smaller `Connection` does not license a nonconformance.**
+
+  A ping flood cannot starve the close: within one drain loop no `handle` runs,
+  so what precedes it is the one owed pong plus at most `MAX_PENDING_PONGS`
+  behind it on the heap tiers, and exactly one on the bare tier.
+
+- **`prepare_binary` / `prepare_text`: the zero-copy send is now the obvious
+  one.** A whole message with no payload copy was spelled
+  `prepare_fragment(FragmentKind::BinaryStart, true, payload)` — correct, and
+  reading like fragmentation — while `encode_binary`, which COPIES the payload
+  into the output buffer, read like the main path. The two new methods are thin
+  aliases with the same lifecycle and sequencing rules, documented as the path a
+  `writev` / `IORING_OP_WRITEV` driver takes: the header comes back as an
+  `EncodedHeader`, the payload is masked in place, and for a 64 KiB message that
+  is 64 KiB of `memcpy` per send that does not happen.
+
+  `prepare_text` takes `&mut [u8]` rather than `encode_text`'s `&str`, and the
+  difference is forced: masking rewrites the bytes, and a masked UTF-8 string is
+  not UTF-8, so writing through a `&mut str` would break that type's invariant —
+  which a `forbid(unsafe_code)` crate cannot do at all. RFC 6455 §8.1 validity
+  is checked instead, before anything is masked, so a rejected send leaves the
+  buffer byte-identical for a retry.
+
+  Both are link-checked in `tests/no_panic.rs` over the CLIENT role, which is
+  the one whose `prepare_*` writes to the payload. Their bodies answer different
+  types over different opcodes so identical code folding cannot satisfy two
+  declared shims with one body — a sibling branch found the linker doing exactly
+  that, leaving one proof empty while `shim-check` read green. Verified from the
+  symbol table rather than argued: `shim_prepare_text` and `shim_prepare_binary`
+  are defined at distinct addresses (`0x…0ed0` and `0x…1100`), and no two of the
+  crate's seven shims share one.
+
+  `prepare_fragment` and `plan_data_send` (and the two new forwarders) gained
+  `#[inline]`, and that is load-bearing rather than a codegen guess: this crate's
+  `no-panic` step runs WITHOUT fat LTO on purpose, and without the annotation
+  the release link reds with `ERROR[no-panic]: detected panic in function
+  `shim_prepare_text`` and the same for `shim_prepare_binary`. Bisected:
+  `plan_data_send` alone still reds both, `prepare_fragment` + `plan_data_send`
+  links clean. `CARGO_PROFILE_RELEASE_LTO=fat` also links clean, which is how
+  the failure was identified as cross-CGU opacity rather than a real panic edge
+  — moving this crate's step to fat LTO is what its own comments forbid, so the
+  annotation is the fix and the profile is unchanged.
+
+- **A `now` that goes backwards is refused, not tolerated.** `handle`,
+  `poll_transmit` and `handle_timeout` compare deadlines by `Ord`, and a clock
+  that rewound was silently absorbed: deadlines fired late and nothing said so.
+  Each now compares `now` against the latest instant that connection has been
+  given and refuses a strictly earlier one —
+  `HandleError::ClockWentBackwards`, `EncodeError::ClockWentBackwards` and the
+  new `TimeoutError::ClockWentBackwards`. **This is a behavioural change**: a
+  call that used to succeed quietly can now fail.
+
+  An EQUAL instant is accepted, because a driver that reads its clock once per
+  wakeup and fans it across a batch is the shape this crate is written for. The
+  refusal touches nothing — the comparison runs before any store, so `data` is
+  unread, nothing is written to `out`, no lifecycle moves, and the call is
+  retryable with a correct instant. And it RETURNS: a rewound clock is a bug in
+  the caller's timekeeping, so whether it kills the process, drops the
+  connection or is logged and retried is the driver's decision, which is the
+  layering `deny(clippy::panic)` and the link proof already make structural.
+  `poll_timeout()` takes no `now` and is unchanged.
+
+  The recorded instant is an `I`, not an `Option<I>`: `Connection::new` already
+  takes a `now`, so there is no "no clock yet" state to encode and no first call
+  that skips the check — and an `Option` would cost eight more bytes on every
+  connection rather than eight. Size **408 → 416** bare, **440 → 448** heap,
+  **464 → 472** with `deflate`, and the `const` budget moved with it. The budget
+  caught the growth rather than a reviewer: adding the field reddened
+  `cargo check` with `error[E0080]: evaluation panicked` before a test existed.
+
+  `handle_timeout` is now link-checked in `tests/no_panic.rs` — it is the
+  shallowest of the three entry points and reaches the same comparison, so the
+  new leaf is covered by `no-panic` and not only by the lint wall. All eight of
+  the crate's shims are defined at distinct addresses (checked against the
+  binary's symbol table, not assumed).
+
+  **One existing test passed a smaller `now` and it was not deliberate.**
+  `keepalive_pings_on_inbound_silence` ticked `handle_timeout(4_999_999)` and
+  then drained with `poll_transmit(TestInstant(0))`; the `0` was incidental —
+  the line asserts that nothing is queued yet, which no instant changes — so it
+  is spelled at `4_999_999` now and says the same thing. Nothing else in the
+  workspace rewound. `wren-compio`'s two `handle_timeout` call sites use
+  `std::time::Instant::now()`, where the refusal is unreachable; both spell the
+  arm out and `warn!` rather than unwrapping, because a driver must not panic on
+  a clock it does not own.
+
+- **Feature `assert-contracts`: caller-contract violations panic; protocol
+  errors never do.** Off by default, so the crate's panic-freedom proof is
+  exactly what it was. On, a caller breaking this crate's API stops the process
+  instead of receiving an `Err` — the TigerBeetle stance that a program which
+  has already violated its own invariants should not continue on state nobody
+  reasoned about, made opt-in.
+
+  The line that matters is which errors are eligible. A **contract** error is
+  the caller's bug — a `now` that went backwards, and others as the audit
+  reaches them. A **protocol** error is anything a peer's bytes can cause: a
+  malformed header, an unmasked client frame, invalid UTF-8, an oversize
+  payload. Those never panic under any feature, because a peer-triggerable
+  panic is a denial-of-service entrance — one crafted frame and the process is
+  gone. The rule is enforced by WHICH ERRORS REACH `contract::contract_violation`
+  rather than by a comment saying so, and a protocol error routed through it
+  acquires a panic in a diff a reviewer can see. Exactly one error class is
+  routed there in this change: the clock-backwards refusal. Nothing existing was
+  reclassified.
+
+  The lint wall is left standing rather than relaxed: `deny(clippy::panic)` still
+  covers the crate with the feature on, and one
+  `#[cfg_attr(feature = "assert-contracts", allow(clippy::panic))]` on the helper
+  is the only place in this crate a panic can be written at all. A stray
+  `panic!` anywhere else still reds clippy under `--all-features`.
+
+  The feature is for a **final binary**, not a library: cargo unifies features
+  across the build graph, so a library enabling it decides the question for
+  every dependent, including ones that chose a returned `Err` deliberately.
+
+  The two returned-`Err` clock tests are gated OFF under the feature — there is
+  no `Err` to inspect and no surviving state to compare when the process is
+  going down — and four mirrors run in their place: one `#[should_panic]` per
+  entry point, matching the CONTRACT's own words rather than "panicked" so a
+  panic from anywhere else does not pass for it, plus one asserting that an
+  EQUAL instant still does not panic. 243 tests without the feature, 245 with.
+
+### What was NOT consolidated, and the sequence that decides it
+
+- **`RecvState::control_buf` — the inbound accumulator — stays its own buffer.**
+  Sharing it with the outbound slot is tempting because a pong's payload *is*
+  the ping's accumulated payload, so the echo could be a tag flip rather than a
+  copy. It is not sound, and one sequence settles it: a ping completes (its echo
+  owed, payload in the shared buffer), then the peer sends an unsolicited **Pong**
+  — or the first bytes of any control frame, since RFC 6455 §5.5 lets a control
+  payload split across reads. Those bytes accumulate over the echo we still owe,
+  and `poll_transmit` then puts a frame on the wire whose body is neither ping's.
+  RFC 6455 §5.5.3 (line 2060 of `.rfc-cache/rfc6455.txt`): "A Pong frame sent in
+  response to a Ping frame must have identical 'Application data' as found in
+  the message body of the Ping frame being replied to."
+
+  §5.5.3's most-recent-ping licence (line 2064) does not cover it. It permits
+  answering "only the most recently processed Ping frame" — a *processed* one. A
+  half-received ping has not been processed, and an inbound Pong or Close is not
+  a ping at all, so dropping the owed echo when one of those arrives is a §5.5.2
+  MUST left unanswered with nothing licensing it. Dropping the echo at the first
+  accumulated byte and keeping it are both wrong; keeping the buffer is right.
+
+  The inbound **close** case that motivated the question is in fact the benign
+  one — a received close makes the connection terminal and only the close echo
+  drains — which is exactly why it is not the sequence to reason from.
+
+## CI — three gates the workspace claimed and no job ran
+
+### Added
+
+- **A must-fail control for `assert-contracts`.** A feature that turns on
+  panics and has never been observed to produce one is a feature nothing
+  checks: it could be misspelled in `Cargo.toml`, `cfg`'d out, or routed past
+  by a later refactor, and every job would stay green while the crate answered
+  `Err` exactly as before. So the `no-panic` job now builds
+  `--features assert-contracts,test-no-panic` in release and requires it to FAIL
+  to link — and to fail naming the shim that reaches
+  `contract::contract_violation`, not merely to fail. Measured:
+  `ERROR[no-panic]: detected panic in function `shim_handle_timeout``, and only
+  that shim. The step's own inversion was measured too: pointed at a build that
+  links, it exits 1 on its `::error::`.
+
+  `shim_handle_timeout` is the subject because `handle_timeout` is the
+  shallowest of the three `now`-taking entry points and the only one this crate
+  link-checks. Naming the shim rather than accepting any failure is the
+  lie-check's discipline: "it did not build" is satisfied by a typo or an
+  unrelated breakage, which would turn the step green while proving nothing.
+  The default proof is untouched — the step above it still runs
+  `--features test-no-panic` with no `assert-contracts`, still links clean at 9
+  tests, and `shim-check` reads that same binary.
+
+  The `clippy` job also runs the crate once at
+  `--no-default-features --features assert-contracts`, which is a different
+  question from the `--all-features` run above it: the bare `no_std` tier with
+  the feature, where the wall and the single `allow` have to agree without an
+  allocator in scope. The wall is deliberately not relaxed by the feature, so a
+  stray `panic!` anywhere else still reds there.
+
+- **`cargo check -p websocket-proto --no-default-features --target
+  thumbv6m-none-eabi`.** The `no-std` job checked websocket-proto on
+  `thumbv6m-none-eabi` only with `--features no-atomic`, and `no-atomic` links
+  `alloc` (`lib.rs`'s `extern crate alloc as std`) — so that is the HEAP tier on
+  a CAS-less core, not the no-alloc one. The bare tier's only check anywhere was
+  clippy on the host. The `http-semantics` pair a few lines below has done both
+  tiers for a while; this is that shape applied to the crate.
+
+  It PASSES today (37 s, measured at `e42b30d`), so it is proof rather than a
+  repair — and it was measured to be able to FAIL, by the case that makes the
+  cross-compile worth its half-minute rather than by any compile error at all.
+  A `core::sync::atomic::AtomicUsize::fetch_add` added under
+  `cfg(not(feature = "std"))` leaves the HOST bare check at exit 0 with zero
+  errors, and reds the new line with `error[E0599]: no method named `fetch_add`
+  found for reference `&Atomic<usize>``. Cortex-M0+ has atomic load/store and no
+  CAS; the host has both, and no other step in this workspace can see the
+  difference. (The plainer demonstration also holds: a `std::string::String`
+  under the same gate reds the line with `E0433: cannot find module or crate
+  `std``.)
+
+- **`handshake-corpus` now has a step, and it is not the obvious one.**
+  `handshake-corpus` is a workspace member (`Cargo.toml` line 2) that no
+  workflow ran — its only mention across `.github/` was `loc.yml:49` calling it
+  dev-only. The obvious repair, `cargo test -p handshake-corpus` beside
+  `-p auth-corpus` and `-p coding-corpus`, would be DECORATION, and the count is
+  what says so: the crate is a binary with no `#[test]` anywhere and no `tests/`
+  directory, so that command reports `running 0 tests` / `0 passed` and exits 0
+  forever. Measured; the line was not added.
+
+  What it has instead is a `main` that GENERATES the corpus, and nothing ran
+  that either. `clippy --workspace` compiles it, which catches a type error and
+  nothing more; `xtask handshake-diff` is the instrument that reads it and needs
+  TWO revisions, so like `auth-diff` it cannot run on a commit. Between those
+  sits every failure of the generator itself — a case builder that panics, a
+  sweep that silently stops emitting — and neither job could see it.
+
+  So the step runs it and requires records: exit 0 and 2004 records at this
+  commit. `--features deflate` is load-bearing rather than tidy — without it
+  `main` is one `eprintln!` and `exit(2)`, measured, which would red the step
+  for the wrong reason. The floor is `> 0` and not a pinned total on purpose:
+  the corpus is MEANT to move between revisions, that movement is what
+  `handshake-diff` reads, and a step pinning the count would fight the
+  instrument. Both of the step's failure modes were measured — the missing
+  feature exits 2, an empty corpus exits 1 on the floor.
+
 ## `http-semantics` — RFC 9110 §12.5's other four fields, over an element that carries no parameters
 
 `Accept` and its ranking shipped in this crate; §12.5's other four fields had no
@@ -782,292 +1068,6 @@ five times on CI (al8n/wren#87).
   measurement recorded here was made against `quote-check` alone, which is
   exactly the failure this branch exists to stop — a gate reporting green
   because the wrong question was asked of it.
-
-### Changed
-
-- **Three inline 125-byte control buffers are two: the outbound close slot and
-  the outbound pong slot are one tagged slot.** `SendState::pending_close` and
-  `RecvState::pending_pong` were two `Option<([u8; 125], u8)>` — 254 bytes per
-  connection, empty almost always — that could never both reach the wire.
-  `poll_transmit` drains a queued close FIRST and then answers `None` for the
-  life of the connection, so a pong pending when a close is queued was already
-  unreachable and a pong owed after one was queued was never going to drain
-  either. They are now one `Option<PendingControl>` carrying a `PendingKind`
-  tag: 127 bytes, storing exactly what the two could ever transmit.
-
-  Measured: **536 → 408** bytes bare, **568 → 440** with `std` / `alloc` /
-  `no-atomic`, **592 → 464** with `deflate` — 128 off every tier, and the `const`
-  budget above moved to the new measurements. At 100 000 connections per core
-  that is 12.8 MB of empty scratch a thread-per-core slab no longer reserves.
-
-  Wire behaviour is unchanged, which is the whole argument for the change: every
-  frame the old two slots could emit, the one slot emits, in the same order. The
-  Autobahn §2.10 tests (`ping_flood_in_one_batch_pongs_every_ping_in_order`,
-  `ping_flood_beyond_the_cap_sheds_oldest_and_stays_bounded`) and
-  `pong_overflow`'s capped-shed semantics are untouched; the crate's suite went
-  from 255 to 257 tests, the two additions being the ones below.
-
-- **The slot's priority direction now has a subject.** Two fields could not
-  overwrite each other, so nothing had to say which wins; one slot has to, and a
-  pong that took it from a queued close would DELETE a frame the peer is waiting
-  on. The refusal lives in `SendState::offer_pong`, the single writer of a pong
-  into that slot, and
-  `a_pong_owed_after_a_queued_close_does_not_displace_it` asserts it from
-  outside: queue a close, land a ping behind it, and the frame that drains is
-  0x88 with our code and reason.
-
-  The first version of that test was VACUOUS and was measured to be: the recv
-  path carried a second copy of the same rule (`Some(Close) => return`), so
-  deleting the guard in `offer_pong` left every test green. One rule, one
-  entrance — the recv path now asks only whether a pong is already queued and
-  falls through — and deleting the guard reds 2 tests.
-
-  `queue_close`'s "the first queued close wins" had the same shape and no
-  reachable sequence at all: every `Connection` path into it is already guarded
-  elsewhere. `the_close_slot_takes_a_pong_s_place_and_then_keeps_its_own`
-  asserts it on `SendState` directly, which is where it is reachable; deleting
-  the guard reds 1 test.
-
-- **`prepare_binary` / `prepare_text`: the zero-copy send is now the obvious
-  one.** A whole message with no payload copy was spelled
-  `prepare_fragment(FragmentKind::BinaryStart, true, payload)` — correct, and
-  reading like fragmentation — while `encode_binary`, which COPIES the payload
-  into the output buffer, read like the main path. The two new methods are thin
-  aliases with the same lifecycle and sequencing rules, documented as the path a
-  `writev` / `IORING_OP_WRITEV` driver takes: the header comes back as an
-  `EncodedHeader`, the payload is masked in place, and for a 64 KiB message that
-  is 64 KiB of `memcpy` per send that does not happen.
-
-  `prepare_text` takes `&mut [u8]` rather than `encode_text`'s `&str`, and the
-  difference is forced: masking rewrites the bytes, and a masked UTF-8 string is
-  not UTF-8, so writing through a `&mut str` would break that type's invariant —
-  which a `forbid(unsafe_code)` crate cannot do at all. RFC 6455 §8.1 validity
-  is checked instead, before anything is masked, so a rejected send leaves the
-  buffer byte-identical for a retry.
-
-  Both are link-checked in `tests/no_panic.rs` over the CLIENT role, which is
-  the one whose `prepare_*` writes to the payload. Their bodies answer different
-  types over different opcodes so identical code folding cannot satisfy two
-  declared shims with one body — a sibling branch found the linker doing exactly
-  that, leaving one proof empty while `shim-check` read green. Verified from the
-  symbol table rather than argued: `shim_prepare_text` and `shim_prepare_binary`
-  are defined at distinct addresses (`0x…0ed0` and `0x…1100`), and no two of the
-  crate's seven shims share one.
-
-  `prepare_fragment` and `plan_data_send` (and the two new forwarders) gained
-  `#[inline]`, and that is load-bearing rather than a codegen guess: this crate's
-  `no-panic` step runs WITHOUT fat LTO on purpose, and without the annotation
-  the release link reds with `ERROR[no-panic]: detected panic in function
-  `shim_prepare_text`` and the same for `shim_prepare_binary`. Bisected:
-  `plan_data_send` alone still reds both, `prepare_fragment` + `plan_data_send`
-  links clean. `CARGO_PROFILE_RELEASE_LTO=fat` also links clean, which is how
-  the failure was identified as cross-CGU opacity rather than a real panic edge
-  — moving this crate's step to fat LTO is what its own comments forbid, so the
-  annotation is the fix and the profile is unchanged.
-
-- **A `now` that goes backwards is refused, not tolerated.** `handle`,
-  `poll_transmit` and `handle_timeout` compare deadlines by `Ord`, and a clock
-  that rewound was silently absorbed: deadlines fired late and nothing said so.
-  Each now compares `now` against the latest instant that connection has been
-  given and refuses a strictly earlier one —
-  `HandleError::ClockWentBackwards`, `EncodeError::ClockWentBackwards` and the
-  new `TimeoutError::ClockWentBackwards`. **This is a behavioural change**: a
-  call that used to succeed quietly can now fail.
-
-  An EQUAL instant is accepted, because a driver that reads its clock once per
-  wakeup and fans it across a batch is the shape this crate is written for. The
-  refusal touches nothing — the comparison runs before any store, so `data` is
-  unread, nothing is written to `out`, no lifecycle moves, and the call is
-  retryable with a correct instant. And it RETURNS: a rewound clock is a bug in
-  the caller's timekeeping, so whether it kills the process, drops the
-  connection or is logged and retried is the driver's decision, which is the
-  layering `deny(clippy::panic)` and the link proof already make structural.
-  `poll_timeout()` takes no `now` and is unchanged.
-
-  The recorded instant is an `I`, not an `Option<I>`: `Connection::new` already
-  takes a `now`, so there is no "no clock yet" state to encode and no first call
-  that skips the check — and an `Option` would cost eight more bytes on every
-  connection rather than eight. Size **408 → 416** bare, **440 → 448** heap,
-  **464 → 472** with `deflate`, and the `const` budget moved with it. The budget
-  caught the growth rather than a reviewer: adding the field reddened
-  `cargo check` with `error[E0080]: evaluation panicked` before a test existed.
-
-  `handle_timeout` is now link-checked in `tests/no_panic.rs` — it is the
-  shallowest of the three entry points and reaches the same comparison, so the
-  new leaf is covered by `no-panic` and not only by the lint wall. All eight of
-  the crate's shims are defined at distinct addresses (checked against the
-  binary's symbol table, not assumed).
-
-  **One existing test passed a smaller `now` and it was not deliberate.**
-  `keepalive_pings_on_inbound_silence` ticked `handle_timeout(4_999_999)` and
-  then drained with `poll_transmit(TestInstant(0))`; the `0` was incidental —
-  the line asserts that nothing is queued yet, which no instant changes — so it
-  is spelled at `4_999_999` now and says the same thing. Nothing else in the
-  workspace rewound. `wren-compio`'s two `handle_timeout` call sites use
-  `std::time::Instant::now()`, where the refusal is unreachable; both spell the
-  arm out and `warn!` rather than unwrapping, because a driver must not panic on
-  a clock it does not own.
-
-- **Feature `assert-contracts`: caller-contract violations panic; protocol
-  errors never do.** Off by default, so the crate's panic-freedom proof is
-  exactly what it was. On, a caller breaking this crate's API stops the process
-  instead of receiving an `Err` — the TigerBeetle stance that a program which
-  has already violated its own invariants should not continue on state nobody
-  reasoned about, made opt-in.
-
-  The line that matters is which errors are eligible. A **contract** error is
-  the caller's bug — a `now` that went backwards, and others as the audit
-  reaches them. A **protocol** error is anything a peer's bytes can cause: a
-  malformed header, an unmasked client frame, invalid UTF-8, an oversize
-  payload. Those never panic under any feature, because a peer-triggerable
-  panic is a denial-of-service entrance — one crafted frame and the process is
-  gone. The rule is enforced by WHICH ERRORS REACH `contract::contract_violation`
-  rather than by a comment saying so, and a protocol error routed through it
-  acquires a panic in a diff a reviewer can see. Exactly one error class is
-  routed there in this change: the clock-backwards refusal. Nothing existing was
-  reclassified.
-
-  The lint wall is left standing rather than relaxed: `deny(clippy::panic)` still
-  covers the crate with the feature on, and one
-  `#[cfg_attr(feature = "assert-contracts", allow(clippy::panic))]` on the helper
-  is the only place in this crate a panic can be written at all. A stray
-  `panic!` anywhere else still reds clippy under `--all-features`.
-
-  The feature is for a **final binary**, not a library: cargo unifies features
-  across the build graph, so a library enabling it decides the question for
-  every dependent, including ones that chose a returned `Err` deliberately.
-
-  The two returned-`Err` clock tests are gated OFF under the feature — there is
-  no `Err` to inspect and no surviving state to compare when the process is
-  going down — and four mirrors run in their place: one `#[should_panic]` per
-  entry point, matching the CONTRACT's own words rather than "panicked" so a
-  panic from anywhere else does not pass for it, plus one asserting that an
-  EQUAL instant still does not panic. 243 tests without the feature, 245 with.
-
-### What was NOT consolidated, and the sequence that decides it
-
-- **`RecvState::control_buf` — the inbound accumulator — stays its own buffer.**
-  Sharing it with the outbound slot is tempting because a pong's payload *is*
-  the ping's accumulated payload, so the echo could be a tag flip rather than a
-  copy. It is not sound, and one sequence settles it: a ping completes (its echo
-  owed, payload in the shared buffer), then the peer sends an unsolicited **Pong**
-  — or the first bytes of any control frame, since RFC 6455 §5.5 lets a control
-  payload split across reads. Those bytes accumulate over the echo we still owe,
-  and `poll_transmit` then puts a frame on the wire whose body is neither ping's.
-  RFC 6455 §5.5.3 (line 2060 of `.rfc-cache/rfc6455.txt`): "A Pong frame sent in
-  response to a Ping frame must have identical 'Application data' as found in
-  the message body of the Ping frame being replied to."
-
-  §5.5.3's most-recent-ping licence (line 2064) does not cover it. It permits
-  answering "only the most recently processed Ping frame" — a *processed* one. A
-  half-received ping has not been processed, and an inbound Pong or Close is not
-  a ping at all, so dropping the owed echo when one of those arrives is a §5.5.2
-  MUST left unanswered with nothing licensing it. Dropping the echo at the first
-  accumulated byte and keeping it are both wrong; keeping the buffer is right.
-
-  The inbound **close** case that motivated the question is in fact the benign
-  one — a received close makes the connection terminal and only the close echo
-  drains — which is exactly why it is not the sequence to reason from.
-
-### Concern recorded rather than fixed
-
-- **After a caller's own `close()`, a pong owed under §5.5.2 is not sent, and
-  RFC 6455 does not license that.** The rule `poll_transmit` used to state as
-  `once it goes out, nothing else ever follows (§5.5.1)` is not §5.5.1's: line 2002 of
-  `.rfc-cache/rfc6455.txt` reads "The application MUST NOT send any more **data**
-  frames after sending a Close frame", and a Pong is not a data frame. §5.5.2
-  (line 2042) is unconditional — "Upon receipt of a Ping frame, an endpoint MUST
-  send a Pong frame in response, unless it already received a Close frame" — and
-  its exemption is keyed on having RECEIVED a Close, which an endpoint that
-  called `close()` has not.
-
-  The protocol's own closes are covered: an echo answers a Close we received, so
-  §5.5.2 exempts it outright, and a failure close is §7.1.7's (line 2399: the
-  endpoint "MUST NOT continue to attempt to process data … after being
-  instructed to _Fail the WebSocket Connection_"). The caller-initiated case is
-  neither, and it is **pre-existing** — the old two-slot code stored that pong
-  and never transmitted it. This change makes the drop structural instead of
-  incidental, and documents it on `Connection::close` with the payload still
-  reaching the caller as a `Ping` event, so a driver that wants the echo can
-  send it with `encode_pong`. Changing when pongs drain after a close is a wire
-  decision that deserves its own review.
-
-## CI — three gates the workspace claimed and no job ran
-
-### Added
-
-- **A must-fail control for `assert-contracts`.** A feature that turns on
-  panics and has never been observed to produce one is a feature nothing
-  checks: it could be misspelled in `Cargo.toml`, `cfg`'d out, or routed past
-  by a later refactor, and every job would stay green while the crate answered
-  `Err` exactly as before. So the `no-panic` job now builds
-  `--features assert-contracts,test-no-panic` in release and requires it to FAIL
-  to link — and to fail naming the shim that reaches
-  `contract::contract_violation`, not merely to fail. Measured:
-  `ERROR[no-panic]: detected panic in function `shim_handle_timeout``, and only
-  that shim. The step's own inversion was measured too: pointed at a build that
-  links, it exits 1 on its `::error::`.
-
-  `shim_handle_timeout` is the subject because `handle_timeout` is the
-  shallowest of the three `now`-taking entry points and the only one this crate
-  link-checks. Naming the shim rather than accepting any failure is the
-  lie-check's discipline: "it did not build" is satisfied by a typo or an
-  unrelated breakage, which would turn the step green while proving nothing.
-  The default proof is untouched — the step above it still runs
-  `--features test-no-panic` with no `assert-contracts`, still links clean at 9
-  tests, and `shim-check` reads that same binary.
-
-  The `clippy` job also runs the crate once at
-  `--no-default-features --features assert-contracts`, which is a different
-  question from the `--all-features` run above it: the bare `no_std` tier with
-  the feature, where the wall and the single `allow` have to agree without an
-  allocator in scope. The wall is deliberately not relaxed by the feature, so a
-  stray `panic!` anywhere else still reds there.
-
-- **`cargo check -p websocket-proto --no-default-features --target
-  thumbv6m-none-eabi`.** The `no-std` job checked websocket-proto on
-  `thumbv6m-none-eabi` only with `--features no-atomic`, and `no-atomic` links
-  `alloc` (`lib.rs`'s `extern crate alloc as std`) — so that is the HEAP tier on
-  a CAS-less core, not the no-alloc one. The bare tier's only check anywhere was
-  clippy on the host. The `http-semantics` pair a few lines below has done both
-  tiers for a while; this is that shape applied to the crate.
-
-  It PASSES today (37 s, measured at `e42b30d`), so it is proof rather than a
-  repair — and it was measured to be able to FAIL, by the case that makes the
-  cross-compile worth its half-minute rather than by any compile error at all.
-  A `core::sync::atomic::AtomicUsize::fetch_add` added under
-  `cfg(not(feature = "std"))` leaves the HOST bare check at exit 0 with zero
-  errors, and reds the new line with `error[E0599]: no method named `fetch_add`
-  found for reference `&Atomic<usize>``. Cortex-M0+ has atomic load/store and no
-  CAS; the host has both, and no other step in this workspace can see the
-  difference. (The plainer demonstration also holds: a `std::string::String`
-  under the same gate reds the line with `E0433: cannot find module or crate
-  `std``.)
-
-- **`handshake-corpus` now has a step, and it is not the obvious one.**
-  `handshake-corpus` is a workspace member (`Cargo.toml` line 2) that no
-  workflow ran — its only mention across `.github/` was `loc.yml:49` calling it
-  dev-only. The obvious repair, `cargo test -p handshake-corpus` beside
-  `-p auth-corpus` and `-p coding-corpus`, would be DECORATION, and the count is
-  what says so: the crate is a binary with no `#[test]` anywhere and no `tests/`
-  directory, so that command reports `running 0 tests` / `0 passed` and exits 0
-  forever. Measured; the line was not added.
-
-  What it has instead is a `main` that GENERATES the corpus, and nothing ran
-  that either. `clippy --workspace` compiles it, which catches a type error and
-  nothing more; `xtask handshake-diff` is the instrument that reads it and needs
-  TWO revisions, so like `auth-diff` it cannot run on a commit. Between those
-  sits every failure of the generator itself — a case builder that panics, a
-  sweep that silently stops emitting — and neither job could see it.
-
-  So the step runs it and requires records: exit 0 and 2004 records at this
-  commit. `--features deflate` is load-bearing rather than tidy — without it
-  `main` is one `eprintln!` and `exit(2)`, measured, which would red the step
-  for the wrong reason. The floor is `> 0` and not a pinned total on purpose:
-  the corpus is MEANT to move between revisions, that movement is what
-  `handshake-diff` reads, and a step pinning the count would fight the
-  instrument. Both of the step's failure modes were measured — the missing
-  feature exits 2, an empty corpus exits 1 on the floor.
 
 ## `http-semantics` — the auth recovery invented a challenge out of a parameter's own data
 
