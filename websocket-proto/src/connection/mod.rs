@@ -182,17 +182,24 @@ impl Instant for Nanos {
 /// Widening it is therefore a deliberate edit with a new measurement beside it,
 /// which is the review this number should get.
 ///
-/// Measured 2026-09-04 at `e42b30d` on aarch64-apple-darwin (64-bit `usize`),
-/// with a probe binary outside the workspace that depends on this crate by path
-/// and prints `core::mem::size_of::<Connection<Nanos, Server>>()`:
+/// Measured 2026-09-04 on aarch64-apple-darwin (64-bit `usize`), with a probe
+/// binary outside the workspace that depends on this crate by path and prints
+/// `core::mem::size_of::<Connection<Nanos, Server>>()`:
 ///
 /// ```text
-/// cargo run --quiet --no-default-features          # 536
-/// cargo run --quiet --features std                 # 568
-/// cargo run --quiet --features alloc               # 568
-/// cargo run --quiet --features no-atomic           # 568
-/// cargo run --quiet --features alloc,deflate       # 592
+/// cargo run --quiet --no-default-features          # 536 at e42b30d → 408
+/// cargo run --quiet --features std                 # 568 at e42b30d → 440
+/// cargo run --quiet --features alloc               # 568 at e42b30d → 440
+/// cargo run --quiet --features no-atomic           # 568 at e42b30d → 440
+/// cargo run --quiet --features alloc,deflate       # 592 at e42b30d → 464
 /// ```
+///
+/// The second column is after the three inline 125-byte control buffers became
+/// two: `SendState`'s close slot and `RecvState`'s pong slot are one tagged
+/// [`PendingControl`](send::PendingControl), 128 bytes off every tier. The
+/// inbound accumulator (`RecvState::control_buf`) is deliberately still its own
+/// buffer — see [`PendingKind`](send::PendingKind) for what sharing it with the
+/// outbound slot would break.
 ///
 /// The three tiers are three numbers because they are three structs: the heap
 /// tiers add `RecvState::pong_overflow` (a `VecDeque`, 32 bytes), and `deflate`
@@ -206,16 +213,16 @@ impl Instant for Nanos {
   feature = "no-atomic",
   feature = "deflate"
 )))]
-const CONNECTION_SIZE_BUDGET: usize = 536;
+const CONNECTION_SIZE_BUDGET: usize = 408;
 
 #[cfg(all(
   not(feature = "deflate"),
   any(feature = "alloc", feature = "std", feature = "no-atomic")
 ))]
-const CONNECTION_SIZE_BUDGET: usize = 568;
+const CONNECTION_SIZE_BUDGET: usize = 440;
 
 #[cfg(feature = "deflate")]
-const CONNECTION_SIZE_BUDGET: usize = 592;
+const CONNECTION_SIZE_BUDGET: usize = 464;
 
 const _: () =
   assert!(core::mem::size_of::<Connection<Nanos, role::Server>>() <= CONNECTION_SIZE_BUDGET);

@@ -76,11 +76,43 @@ pub(crate) enum SendMessageState {
   InBinary,
 }
 
+/// Which frame the single outbound control slot ([`SendState::pending`]) holds.
+///
+/// The tag is what lets one buffer stand for two, and the reason is a property
+/// of [`Connection::poll_transmit`] rather than of the RFC: a queued close is
+/// drained FIRST and sets `close_sent`, after which `poll_transmit` answers
+/// `None` for the life of the connection. So a pong that is pending when a
+/// close is queued was already never going to reach the wire, and a pong owed
+/// after one is queued was never going to either. One tagged slot stores
+/// exactly what two untagged slots could ever transmit — 127 bytes instead of
+/// 254, per connection, empty almost always.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum PendingKind {
+  /// A close frame: the last frame this side puts on the wire.
+  Close,
+  /// A pong echoing a received ping (RFC 6455 §5.5.2).
+  Pong,
+}
+
+/// The one protocol-generated control frame awaiting
+/// [`Connection::poll_transmit`], and which kind it is.
+///
+/// Application-sent control frames do not come through here at all —
+/// `encode_ping` / `encode_pong` serialize straight into the caller's buffer.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct PendingControl {
+  pub(crate) kind: PendingKind,
+  pub(crate) payload: [u8; MAX_CONTROL_PAYLOAD],
+  pub(crate) len: u8,
+}
+
 #[derive(Debug)]
 pub(crate) struct SendState {
   pub(crate) message: SendMessageState,
-  /// Close frame queued by the protocol or the application.
-  pub(crate) pending_close: Option<([u8; MAX_CONTROL_PAYLOAD], u8)>,
+  /// The single outbound control slot — a close queued by the protocol or the
+  /// application, or a pong owed for a received ping. See [`PendingKind`] for
+  /// why one slot is enough for both.
+  pub(crate) pending: Option<PendingControl>,
   pub(crate) close_sent: bool,
   /// The close code from the first `queue_close` call (for `handle_timeout`).
   pub(crate) queued_code: Option<CloseCode>,
@@ -96,7 +128,7 @@ impl SendState {
   pub(crate) fn new() -> Self {
     Self {
       message: SendMessageState::Idle,
-      pending_close: None,
+      pending: None,
       close_sent: false,
       queued_code: None,
       pending_ping: false,
@@ -108,17 +140,59 @@ impl SendState {
   /// Queues a close frame payload (best effort; oversized reasons are
   /// truncated at a char boundary by the caller before queueing). The first
   /// queued close wins — a later one (e.g. an echo after we already sent our
-  /// own close) is dropped.
+  /// own close) is dropped. A pong holding the slot IS displaced: see
+  /// [`PendingKind`].
   pub(crate) fn queue_close(&mut self, code: CloseCode, reason: &str) {
-    let mut buf = [0u8; MAX_CONTROL_PAYLOAD];
-    let len = match encode_close_payload(code, reason, &mut buf) {
-      Ok(n) => n,
-      Err(_) => encode_close_payload(code, "", &mut buf).unwrap_or_default(),
-    };
-    if self.pending_close.is_none() {
-      self.pending_close = Some((buf, u8::try_from(len).unwrap_or(0)));
-      self.queued_code = Some(code);
+    if matches!(self.pending_kind(), Some(PendingKind::Close)) {
+      return;
     }
+    let mut payload = [0u8; MAX_CONTROL_PAYLOAD];
+    let len = match encode_close_payload(code, reason, &mut payload) {
+      Ok(n) => n,
+      Err(_) => encode_close_payload(code, "", &mut payload).unwrap_or_default(),
+    };
+    self.pending = Some(PendingControl {
+      kind: PendingKind::Close,
+      payload,
+      len: u8::try_from(len).unwrap_or(0),
+    });
+    self.queued_code = Some(code);
+  }
+
+  /// Replaces whatever the slot holds — including an EARLIER close — with this
+  /// failure close. The receive path's `fail` is the only caller: the failure
+  /// code is what must reach the wire, or a peer would see the benign close of
+  /// a connection we are failing.
+  pub(crate) fn force_close(&mut self, code: CloseCode) {
+    self.pending = None;
+    self.queued_code = None;
+    self.queue_close(code, "");
+  }
+
+  /// What the outbound control slot holds, if anything.
+  pub(crate) const fn pending_kind(&self) -> Option<PendingKind> {
+    match self.pending {
+      Some(PendingControl { kind, .. }) => Some(kind),
+      None => None,
+    }
+  }
+
+  /// Offers a pong echo to the outbound slot; a pong already there is replaced.
+  ///
+  /// A queued CLOSE is never displaced, and the refusal lives HERE, in the only
+  /// writer that can put a pong in the slot, rather than at the call site — a
+  /// second caller inherits it instead of having to remember it. Displacing a
+  /// close would delete a frame the peer is waiting for; queueing behind one
+  /// would store bytes `poll_transmit` can no longer reach.
+  pub(crate) fn offer_pong(&mut self, payload: [u8; MAX_CONTROL_PAYLOAD], len: u8) {
+    if matches!(self.pending_kind(), Some(PendingKind::Close)) {
+      return;
+    }
+    self.pending = Some(PendingControl {
+      kind: PendingKind::Pong,
+      payload,
+      len,
+    });
   }
 }
 
@@ -257,6 +331,21 @@ where
   /// close frame for [`poll_transmit`](Connection::poll_transmit) and stops
   /// further data sends. The reason is capped at 123 bytes (truncate at a
   /// char boundary before calling, or it is rejected).
+  ///
+  /// **The queued close is the last frame this side sends.** A pong owed for a
+  /// Ping received between this call and the peer's close echo is therefore not
+  /// sent, and RFC 6455 does not license that: §5.5.1 forbids only further
+  /// *data* frames after a Close, and §5.5.2's exemption from the Pong — "unless
+  /// it already received a Close frame" — is keyed on having RECEIVED one,
+  /// which this endpoint has not. It is a deliberate simplification of this
+  /// crate's, recorded here so a driver that needs the pong knows to send it
+  /// itself with [`encode_pong`](Connection::encode_pong) — the connection
+  /// still surfaces the [`Ping`](crate::connection::Event::Ping) event, so the
+  /// payload §5.5.3 requires the echo to carry is in the caller's hands.
+  ///
+  /// The protocol's OWN closes are not in this position: an echo answers a
+  /// Close we received (§5.5.2 exempts it outright) and a failure close is
+  /// §7.1.7's, which ends the connection rather than continuing it.
   pub fn close(&mut self, code: CloseCode, reason: &str) -> Result<(), EncodeError> {
     if !matches!(self.lifecycle, Lifecycle::Open) {
       return Err(EncodeError::Closing);
@@ -275,20 +364,34 @@ where
   /// Drains one queued protocol frame (close → pong echo → keepalive ping)
   /// into `out`. Returns the byte count, or `None` when nothing is pending.
   /// Arms `close_deadline` at the moment the close frame actually drains.
+  ///
+  /// Once the close drains, this answers `None` for the life of the connection.
+  /// That is THIS crate's rule and not RFC 6455 §5.5.1's, which forbids only
+  /// further *data* frames after a Close ("The application MUST NOT send any
+  /// more data frames after sending a Close frame"). On the two paths the
+  /// protocol itself queues a close it is also the RFC's: an echo answers a
+  /// Close we RECEIVED, and §5.5.2 exempts an endpoint that "already received a
+  /// Close frame" from the Pong it would otherwise owe; a failure close is
+  /// §7.1.7's, after which the endpoint proceeds to _Close the WebSocket
+  /// Connection_ and "MUST NOT continue to attempt to process data" from the
+  /// peer. After a caller's own [`close`](Connection::close) it is neither —
+  /// see that method.
   pub fn poll_transmit(&mut self, now: I, out: &mut [u8]) -> Result<Option<usize>, EncodeError> {
-    // Close first: once it goes out, nothing else ever follows (§5.5.1).
+    // Close first, and then nothing: see the note above for which rule that is.
     if !self.send.close_sent {
-      if let Some((payload, len)) = self.send.pending_close {
-        let len = usize::from(len);
+      if let Some(pending) = self.send.pending
+        && matches!(pending.kind, PendingKind::Close)
+      {
+        let len = usize::from(pending.len);
         let n = self.write_frame(
           Opcode::Close,
           true,
           false,
-          payload.get(..len).unwrap_or(&[]),
+          pending.payload.get(..len).unwrap_or(&[]),
           out,
         )?;
         self.send.close_sent = true;
-        self.send.pending_close = None;
+        self.send.pending = None;
         // Arm the close deadline NOW (at drain time, not at close() time).
         self.close_deadline = now.checked_add_duration(self.config.close_timeout);
         return Ok(Some(n));
@@ -296,24 +399,37 @@ where
     } else {
       return Ok(None);
     }
-    if let Some((payload, len)) = self.recv.pending_pong {
-      let len = usize::from(len);
+    // The slot's other tenant. Matched on the tag rather than inferred from the
+    // arm above having returned: one entrance, one condition, stated.
+    if let Some(pending) = self.send.pending
+      && matches!(pending.kind, PendingKind::Pong)
+    {
+      let len = usize::from(pending.len);
       let n = self.write_frame(
         Opcode::Pong,
         true,
         false,
-        payload.get(..len).unwrap_or(&[]),
+        pending.payload.get(..len).unwrap_or(&[]),
         out,
       )?;
       // Refill the slot from the overflow queue so the next `poll_transmit`
       // emits the following pong (every ping answered where a heap exists).
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       {
-        self.recv.pending_pong = self.recv.pong_overflow.pop_front();
+        self.send.pending =
+          self
+            .recv
+            .pong_overflow
+            .pop_front()
+            .map(|(payload, len)| PendingControl {
+              kind: PendingKind::Pong,
+              payload,
+              len,
+            });
       }
       #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
       {
-        self.recv.pending_pong = None;
+        self.send.pending = None;
       }
       return Ok(Some(n));
     }
@@ -1521,6 +1637,116 @@ mod tests {
     assert_eq!(out[0], 0x88);
     let _ = n;
     // Nothing after a sent close — the pending pong is dropped.
+    assert!(
+      conn
+        .poll_transmit(TestInstant(0), &mut out)
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  /// `SendState`'s slot rules, asserted on the state directly rather than
+  /// through a `Connection`, because one of them has no reachable sequence.
+  ///
+  /// "The first queued close wins" is guarded in `queue_close`, and every path
+  /// that reaches it is ALREADY guarded elsewhere: `Connection::close` refuses
+  /// unless the lifecycle is `Open`, the peer-close echo is behind
+  /// `if !matches!(lifecycle, CloseSent)`, and `fail` goes through
+  /// `force_close`, which clears the slot first. Deleting the guard therefore
+  /// reds nothing at the `Connection` level — measured, not assumed — and an
+  /// unreachable guard with no subject is one a later caller can walk past
+  /// without a single test disagreeing. Naming it here is what keeps the rule
+  /// stated: a fourth writer that queues a second close must not silently
+  /// replace the first, because `queued_code` is what `handle_timeout` reports
+  /// and the payload is what the peer reads.
+  #[test]
+  fn the_close_slot_takes_a_pong_s_place_and_then_keeps_its_own() {
+    let mut send = SendState::new();
+
+    // A pong owed, then a close: the close TAKES the slot. This is the
+    // displacement the single-slot design turns on — the pong was already
+    // unreachable, since `poll_transmit` answers `None` after a close drains.
+    send.offer_pong([b'p'; MAX_CONTROL_PAYLOAD], 1);
+    assert_eq!(send.pending_kind(), Some(PendingKind::Pong));
+    send.queue_close(CloseCode::GoingAway, "first");
+    assert_eq!(send.pending_kind(), Some(PendingKind::Close));
+    assert_eq!(send.queued_code, Some(CloseCode::GoingAway));
+    let first = send.pending.expect("a close is queued");
+    assert_eq!(&first.payload[..usize::from(first.len)], b"\x03\xE9first");
+
+    // A SECOND close does not replace it — neither its code nor its payload.
+    send.queue_close(CloseCode::PolicyViolation, "second");
+    assert_eq!(send.queued_code, Some(CloseCode::GoingAway));
+    let still = send.pending.expect("the first close is still queued");
+    assert_eq!(&still.payload[..usize::from(still.len)], b"\x03\xE9first");
+
+    // Nor does a pong owed afterwards.
+    send.offer_pong([b'q'; MAX_CONTROL_PAYLOAD], 1);
+    assert_eq!(send.pending_kind(), Some(PendingKind::Close));
+    let after = send.pending.expect("the first close is still queued");
+    assert_eq!(&after.payload[..usize::from(after.len)], b"\x03\xE9first");
+
+    // `force_close` is the one door that DOES replace a queued close: the
+    // failure code is what has to reach the wire.
+    send.force_close(CloseCode::ProtocolError);
+    assert_eq!(send.queued_code, Some(CloseCode::ProtocolError));
+    let failed = send.pending.expect("the failure close is queued");
+    assert_eq!(&failed.payload[..usize::from(failed.len)], b"\x03\xEA");
+  }
+
+  /// The direction the shared outbound slot resolves in, pinned from the
+  /// outside. `pending_close` and `pending_pong` used to be two fields, so
+  /// neither could overwrite the other and nothing had to say which wins; they
+  /// are one tagged slot now, and a pong that took it from a queued close would
+  /// DELETE a close frame the peer is waiting on — a wedged handshake, not a
+  /// dropped echo. The refusal lives in `SendState::offer_pong`; this is the
+  /// assertion that names the frame it protects.
+  ///
+  /// Note what makes this test's subject its own: the sibling above drains a
+  /// close that was queued while a pong was already pending, which the OLD
+  /// two-field code also answered `Some(close)` then `None` to. This one queues
+  /// the close FIRST and lands the ping after it, which is the sequence only
+  /// the tag decides.
+  #[test]
+  fn a_pong_owed_after_a_queued_close_does_not_displace_it() {
+    use crate::frame::{Opcode, mask as apply_mask};
+    let mut conn = server();
+    conn
+      .close(CloseCode::GoingAway, "bye")
+      .expect("close on an open connection");
+
+    // A ping arriving AFTER our close is queued but BEFORE it drains.
+    let key = [4, 4, 4, 4];
+    let h = FrameHeader::new(Opcode::Ping, 1).with_mask(Some(key));
+    let mut bytes = vec![0u8; h.header_len() + 1];
+    let n = h.encode(&mut bytes).unwrap();
+    bytes[n] = b'q';
+    apply_mask(&mut bytes[n..], key, 0);
+    {
+      let mut events = conn.handle(TestInstant(0), &mut bytes).unwrap();
+      // The Ping event is still surfaced: the caller can answer it itself.
+      assert!(matches!(
+        events.next(),
+        Some(crate::connection::Event::Ping(_))
+      ));
+      assert!(events.next().is_none());
+    }
+
+    // The CLOSE drains, carrying OUR code and reason — not a pong.
+    let mut out = [0u8; 64];
+    let n = conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("the queued close must still be there");
+    assert_eq!(out[0], 0x88, "opcode must be Close, not Pong (0x8A)");
+    let decoded = match FrameHeader::decode(&out[..n]).unwrap() {
+      Decoded::Complete(d) => d,
+      _ => panic!("incomplete close frame"),
+    };
+    let body = &out[decoded.consumed()..n];
+    assert_eq!(&body[..2], &[0x03, 0xE9], "close code 1001 (GoingAway)");
+    assert_eq!(&body[2..], b"bye");
+    // And nothing behind it.
     assert!(
       conn
         .poll_transmit(TestInstant(0), &mut out)

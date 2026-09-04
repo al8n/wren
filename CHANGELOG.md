@@ -783,6 +783,99 @@ five times on CI (al8n/wren#87).
   exactly the failure this branch exists to stop — a gate reporting green
   because the wrong question was asked of it.
 
+### Changed
+
+- **Three inline 125-byte control buffers are two: the outbound close slot and
+  the outbound pong slot are one tagged slot.** `SendState::pending_close` and
+  `RecvState::pending_pong` were two `Option<([u8; 125], u8)>` — 254 bytes per
+  connection, empty almost always — that could never both reach the wire.
+  `poll_transmit` drains a queued close FIRST and then answers `None` for the
+  life of the connection, so a pong pending when a close is queued was already
+  unreachable and a pong owed after one was queued was never going to drain
+  either. They are now one `Option<PendingControl>` carrying a `PendingKind`
+  tag: 127 bytes, storing exactly what the two could ever transmit.
+
+  Measured: **536 → 408** bytes bare, **568 → 440** with `std` / `alloc` /
+  `no-atomic`, **592 → 464** with `deflate` — 128 off every tier, and the `const`
+  budget above moved to the new measurements. At 100 000 connections per core
+  that is 12.8 MB of empty scratch a thread-per-core slab no longer reserves.
+
+  Wire behaviour is unchanged, which is the whole argument for the change: every
+  frame the old two slots could emit, the one slot emits, in the same order. The
+  Autobahn §2.10 tests (`ping_flood_in_one_batch_pongs_every_ping_in_order`,
+  `ping_flood_beyond_the_cap_sheds_oldest_and_stays_bounded`) and
+  `pong_overflow`'s capped-shed semantics are untouched; the crate's suite went
+  from 255 to 257 tests, the two additions being the ones below.
+
+- **The slot's priority direction now has a subject.** Two fields could not
+  overwrite each other, so nothing had to say which wins; one slot has to, and a
+  pong that took it from a queued close would DELETE a frame the peer is waiting
+  on. The refusal lives in `SendState::offer_pong`, the single writer of a pong
+  into that slot, and
+  `a_pong_owed_after_a_queued_close_does_not_displace_it` asserts it from
+  outside: queue a close, land a ping behind it, and the frame that drains is
+  0x88 with our code and reason.
+
+  The first version of that test was VACUOUS and was measured to be: the recv
+  path carried a second copy of the same rule (`Some(Close) => return`), so
+  deleting the guard in `offer_pong` left every test green. One rule, one
+  entrance — the recv path now asks only whether a pong is already queued and
+  falls through — and deleting the guard reds 2 tests.
+
+  `queue_close`'s "the first queued close wins" had the same shape and no
+  reachable sequence at all: every `Connection` path into it is already guarded
+  elsewhere. `the_close_slot_takes_a_pong_s_place_and_then_keeps_its_own`
+  asserts it on `SendState` directly, which is where it is reachable; deleting
+  the guard reds 1 test.
+
+### What was NOT consolidated, and the sequence that decides it
+
+- **`RecvState::control_buf` — the inbound accumulator — stays its own buffer.**
+  Sharing it with the outbound slot is tempting because a pong's payload *is*
+  the ping's accumulated payload, so the echo could be a tag flip rather than a
+  copy. It is not sound, and one sequence settles it: a ping completes (its echo
+  owed, payload in the shared buffer), then the peer sends an unsolicited **Pong**
+  — or the first bytes of any control frame, since RFC 6455 §5.5 lets a control
+  payload split across reads. Those bytes accumulate over the echo we still owe,
+  and `poll_transmit` then puts a frame on the wire whose body is neither ping's.
+  RFC 6455 §5.5.3 (line 2060 of `.rfc-cache/rfc6455.txt`): "A Pong frame sent in
+  response to a Ping frame must have identical 'Application data' as found in
+  the message body of the Ping frame being replied to."
+
+  §5.5.3's most-recent-ping licence (line 2064) does not cover it. It permits
+  answering "only the most recently processed Ping frame" — a *processed* one. A
+  half-received ping has not been processed, and an inbound Pong or Close is not
+  a ping at all, so dropping the owed echo when one of those arrives is a §5.5.2
+  MUST left unanswered with nothing licensing it. Dropping the echo at the first
+  accumulated byte and keeping it are both wrong; keeping the buffer is right.
+
+  The inbound **close** case that motivated the question is in fact the benign
+  one — a received close makes the connection terminal and only the close echo
+  drains — which is exactly why it is not the sequence to reason from.
+
+### Concern recorded rather than fixed
+
+- **After a caller's own `close()`, a pong owed under §5.5.2 is not sent, and
+  RFC 6455 does not license that.** The rule `poll_transmit` used to state as
+  `once it goes out, nothing else ever follows (§5.5.1)` is not §5.5.1's: line 2002 of
+  `.rfc-cache/rfc6455.txt` reads "The application MUST NOT send any more **data**
+  frames after sending a Close frame", and a Pong is not a data frame. §5.5.2
+  (line 2042) is unconditional — "Upon receipt of a Ping frame, an endpoint MUST
+  send a Pong frame in response, unless it already received a Close frame" — and
+  its exemption is keyed on having RECEIVED a Close, which an endpoint that
+  called `close()` has not.
+
+  The protocol's own closes are covered: an echo answers a Close we received, so
+  §5.5.2 exempts it outright, and a failure close is §7.1.7's (line 2399: the
+  endpoint "MUST NOT continue to attempt to process data … after being
+  instructed to _Fail the WebSocket Connection_"). The caller-initiated case is
+  neither, and it is **pre-existing** — the old two-slot code stored that pong
+  and never transmitted it. This change makes the drop structural instead of
+  incidental, and documents it on `Connection::close` with the payload still
+  reaching the caller as a `Ping` event, so a driver that wants the echo can
+  send it with `encode_pong`. Changing when pongs drain after a close is a wire
+  decision that deserves its own review.
+
 ## `http-semantics` — the auth recovery invented a challenge out of a parameter's own data
 
 `challenges()` could hand a caller a challenge no origin server sent, built out
