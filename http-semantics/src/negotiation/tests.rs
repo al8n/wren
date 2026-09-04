@@ -820,25 +820,77 @@ fn the_sections_own_example_answers_every_way_round() {
 }
 
 #[test]
-fn a_repeated_entry_is_resolved_the_way_the_doc_says() {
-  // RFC 9110 settles no rule for a repeat. A zero anywhere excludes, which is
-  // rule 3's own wording read plainly and does not depend on the order the
-  // field is read in; otherwise the last in wire order gives the weight.
-  assert_eq!(
-    acceptability(Some(b"gzip"), &[b"gzip;q=1, gzip;q=0"]),
-    (false, Some(0))
-  );
-  assert_eq!(
-    acceptability(Some(b"gzip"), &[b"gzip;q=0, gzip;q=1"]),
-    (false, Some(0))
-  );
-  assert_eq!(
-    acceptability(Some(b"gzip"), &[b"gzip;q=0.5, gzip;q=1"]),
-    (true, Some(1000))
-  );
+fn a_repeated_entry_is_undecided_and_this_is_the_reading_taken() {
+  // RFC 9110 does not settle what a field naming one coding twice with two
+  // different weights means. `fold_repeated_entry` records where the rule that
+  // would settle it was looked for — §12.4.2, §12.5.1's ordering sentence,
+  // §5.6.1 and §5.6.1.2, §5.3 and §8.6 — and it is in none of them. This test
+  // is what makes the resulting choice a decision the next reader MEETS rather
+  // than a behaviour they infer.
+
+  // The half that IS derived, from rule 3's "unless it is accompanied by a
+  // qvalue of 0": a zero anywhere excludes. Asserted BOTH ways round, because
+  // what makes it derived rather than chosen is that no reading of the repeat
+  // can move it — two recipients reading the same field from opposite ends
+  // agree here whatever rule each took.
+  for field in [
+    b"gzip;q=1, gzip;q=0".as_slice(),
+    b"gzip;q=0, gzip;q=1",
+    b"gzip;q=0, gzip;q=0.5, gzip;q=1",
+  ] {
+    assert_eq!(
+      acceptability(Some(b"gzip"), &[field]),
+      (false, Some(0)),
+      "{field:?}"
+    );
+  }
   assert_eq!(
     acceptability(Some(b"br"), &[b"*;q=1, *;q=0"]),
     (false, Some(0))
+  );
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"*;q=0, *;q=1"]),
+    (false, Some(0))
+  );
+
+  // The half that is CHOSEN. Nothing in RFC 9110 picks between the last entry,
+  // the first, and the largest, so the pair below is asserted both ways round —
+  // one of them alone would be satisfied by a "largest wins" reading too, and
+  // the mirror is what excludes it. A future reading that takes the first entry
+  // reds on the first assertion; one that takes the largest reds on the second.
+  //
+  // What would settle it: a sentence saying which entry a recipient reads when
+  // a field names one value more than once with different weights. There is
+  // none. If one is ever added, this test is what has to be re-argued rather
+  // than merely re-blessed.
+  //
+  // Both claims above are measured, not predicted. Replacing
+  // `fold_repeated_entry`'s body with `seen.unwrap_or(found)` — first in wire
+  // order — reds this test, and replacing it with a zero-absorbing
+  // largest-wins reds it on the mirror assertion below, naming that message.
+  // Run as `cargo test -p http-semantics --lib
+  // negotiation::tests::a_repeated_entry`, once per mutation, with the file
+  // restored from a copy afterwards.
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip;q=0.25, gzip;q=0.75"]),
+    (true, Some(750)),
+    "last in wire order; the first-in-wire-order reading answers 250 here"
+  );
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip;q=0.75, gzip;q=0.25"]),
+    (true, Some(250)),
+    "and the mirror: a largest-wins reading answers 750 here, and this pins the \
+     ORDER rather than a value that happens to be the larger of the two"
+  );
+  // The same undecidedness reaches the wildcard entry, and takes the same
+  // reading there, since one fold serves both.
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"*;q=0.25, *;q=0.75"]),
+    (true, Some(750))
+  );
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"*;q=0.75, *;q=0.25"]),
+    (true, Some(250))
   );
 }
 
