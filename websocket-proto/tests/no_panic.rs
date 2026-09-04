@@ -493,6 +493,15 @@ fn prepare_text_is_panic_free() {
 // Its body is a `match` over `Result<Option<Closed>, _>` answering a `u8`,
 // which no other shim in this file spells — the folding hazard the `prepare_*`
 // pair carries does not arise.
+//
+// THIS SHIM IS ALSO THE `assert-contracts` CONTROL, and it needs no gate to be
+// one. Without that feature its body is panic-free and the proof passes; with
+// it, the clock refusal inside `handle_timeout` becomes a reachable `panic!`
+// and the release link MUST fail naming `shim_handle_timeout` — which is what
+// the `no-panic` job's must-fail step greps for. That is the `shim_lie` pattern
+// with the gate supplied by the feature under test instead of by a `cfg`, which
+// is what `shim-check` requires: it rejects any gated shim but the one
+// `shim_lie`, so a second gated control shim is not available here.
 
 no_panic_shim! {
   /// Shim over [`Connection::handle_timeout`] — the timer tick, and with it the
@@ -536,6 +545,21 @@ fn handle_timeout_is_panic_free() {
     "overflowing re-arm"
   );
   // The refusal arm: an instant earlier than one already seen.
+  //
+  // NOT run under `assert-contracts`, and that is the point of the gate rather
+  // than an omission. With that feature the refusal PANICS by design — it is the
+  // one error class routed through `contract::contract_violation` — so driving
+  // it here would abort `cargo test -p websocket-proto --all-features`, which is
+  // a CI step. Measured: it did, before this gate. The feature-on behaviour has
+  // its own coverage, deliberately kept OUT of this file and away from the
+  // proof: `connection::tests::assert_contracts` asserts the panic at all three
+  // entry points with `#[should_panic]` matching the contract's own words.
+  //
+  // The SHIM itself stays ungated, and must: `xtask shim-check` fails any shim
+  // carrying a `cfg` except the single `shim_lie` control, because a shim the
+  // proof build does not contain is a shim nothing proves. Gating only the call
+  // site keeps the shim in every build and keeps `--all-features` coherent.
+  #[cfg(not(feature = "assert-contracts"))]
   assert_eq!(
     shim_handle_timeout(black_box(&mut conn), black_box(0)),
     0,

@@ -219,7 +219,109 @@ changes turn properties this crate already had into properties something checks.
   going down — and four mirrors run in their place: one `#[should_panic]` per
   entry point, matching the CONTRACT's own words rather than "panicked" so a
   panic from anywhere else does not pass for it, plus one asserting that an
-  EQUAL instant still does not panic. 243 tests without the feature, 245 with.
+  EQUAL instant still does not panic. 245 tests without the feature, 247 with.
+
+- **`cargo test -p websocket-proto --all-features` was broken by the
+  `assert-contracts` feature, and is fixed.** That is a CI step. With
+  `test-no-panic` and `assert-contracts` both on, `handle_timeout_is_panic_free`
+  drove `last_now` to `u64::MAX` and then passed zero — the exact condition the
+  feature turns into a panic — so the test aborted. Measured: exit 101.
+
+  Only the REWINDING CALL SITE is gated out under the feature, not the shim.
+  `xtask shim-check` fails any shim carrying a `cfg` except the single
+  `shim_lie` control ("a shim the proof build does not contain is a shim nothing
+  proves"), so a gated `shim_handle_timeout` — or a second gated control shim —
+  would red that gate instead. Gating the call keeps the shim in every build and
+  makes `--all-features` coherent.
+
+  `shim_handle_timeout` remains the must-fail control's subject, and needs no
+  `cfg` to be one: without the feature its body is panic-free and the proof
+  passes; with it the clock refusal becomes a reachable `panic!` and the release
+  link fails naming it. That is the `shim_lie` pattern with the gate supplied by
+  the feature under test. The feature-on behaviour keeps its own coverage in
+  `connection::tests::assert_contracts`, deliberately outside the proof file.
+  The comment claiming `--all-features` stayed viable is corrected.
+
+- **The panic wall's claim is narrowed to what it enforces, and the gap is a
+  number.** `contract.rs` said the one `allow` on `contract_violation` was the
+  only place a panic could be written in this crate. That is stronger than the
+  lints deliver: `clippy::panic` catches the `panic!` macro, and
+  `clippy::panic_in_result_fn` catches assertions only inside functions that
+  return `Result` and does not inspect their callees — so an `assert!` in a
+  non-`Result` helper on a peer-byte path is denied by nothing.
+
+  Checked against this toolchain rather than assumed. Of the lints that could
+  cover assertion macros, `clippy::{unreachable, todo, unimplemented,
+  indexing_slicing, arithmetic_side_effects}` were ALREADY in the wall; the only
+  one missing was `clippy::assertions_on_constants`, which is now denied and
+  found nothing. `clippy-driver -W help` on 1.91 lists no lint that denies a
+  bare `assert!` outside a `Result`-returning function, which is why the claim
+  is narrowed rather than the wall widened.
+
+  What covers callees is the link-time proof, and only for the shimmed entry
+  points — `FrameHeader::{decode, encode}`, `mask`, `Utf8Validator::feed`, the
+  internal base64 encoder, and `Connection::{prepare_binary, prepare_text,
+  handle_timeout}`. Counted so the next batch has a target rather than an
+  intention: of the **46** public functions taking a `&[u8]` / `&mut [u8]` /
+  `&str`, **7** are shim-covered and **39** are not, headed by
+  `Connection::handle` and the whole `handshake::h1` surface. Widening the proof
+  is deliberately not this branch's work — `tests/no_panic.rs` records why the
+  connection tree does not inline into one shim.
+
+- **The panic taxonomy had two voices, and now has one.** `contract.rs` opened
+  by calling "feeding a terminal connection" a contract error while its own
+  audit, twenty lines later, correctly ruled `HandleError::Terminal` not
+  panic-eligible because peer Close timing induces it. The routing was safe;
+  the terminology would have misled the next person to route an error. The
+  opening now names the panic-eligible class as the **narrow** one —
+  non-peer-triggerable, in both value and state — rather than "caller misuse",
+  and says outright that a terminal connection is not in it.
+
+  The worked list is now a table, and it settles at **one** candidate:
+  `EncodeError::FragmentSequence`, because nothing on the wire chooses this
+  endpoint's outbound fragmentation order. `Terminal`, `Closing`,
+  `ControlTooLong`, `ReasonTooLong`, `InvalidCloseCode`, `InvalidUtf8` and
+  `BufferTooSmall` are each peer-inducible — by value or by timing — and none of
+  them may ever panic.
+
+- **The criterion for what may become a panic is corrected, and it was wrong in
+  the dangerous direction.** It is not "the caller broke the API" but **could
+  the value that triggers this refusal have come off the wire?** A caller is
+  entitled to relay peer data back into this API — echo a received close code,
+  answer a ping with the payload it carried — so a refusal keyed on such a value
+  is peer-triggerable no matter who typed the call.
+
+  Re-classified accordingly, and none of these may become panics:
+  `EncodeError::{ControlTooLong, ReasonTooLong, InvalidCloseCode}` each refuse a
+  VALUE a caller may be relaying; `HandleError::Terminal` and
+  `EncodeError::Closing` follow peer-driven state, since the peer's Close is
+  what makes a connection terminal and it can land between a caller's check and
+  its call. `EncodeError::FragmentSequence` is the one that clearly may: nothing
+  on the wire chooses this endpoint's outbound fragmentation order. The
+  criterion is written at the helper, where the next person to route an error
+  will read it.
+
+- **Every "returns rather than panics" now names the `assert-contracts`
+  exception.** `time.rs` said the backwards-clock refusal was "never panicked",
+  and under that feature it panics for exactly that condition — the two claims
+  shipped in the same release. Grepped for the phrasing and qualified each site:
+  the [`Instant`] trait doc, `Connection::handle_timeout`,
+  `Connection::poll_transmit` and the private `accept_now`.
+
+- **`poll_timeout` documents that its answer is a *when*, not a *what*.** The
+  deadline it returns can already be OLDER than the last instant the connection
+  was given — a keepalive armed at `t+5` is stale once a `poll_transmit(t+20)`
+  has gone by, because `last_now` advances on every entry point while the
+  deadline does not. Feeding that value straight back to `handle_timeout` is a
+  rewind, and the monotonicity check refuses it. Arrange the timer for it, then
+  call with a fresh reading of your clock.
+
+- **The size assertion states what it does not bound.** It is taken at one
+  instantiation, `Connection<Nanos, Server>` — an 8-byte `Copy + Ord` clock and
+  a zero-sized role. A caller's own `I` and `Ro` are not covered: the struct
+  holds three `I`-shaped fields plus the role by value. The doc gives that cost
+  as a MEASUREMENT rather than a field count, because the field count was wrong
+  — with a 16-byte clock the bare tier is **568**, not the 448 predicted.
 
 ### What was NOT consolidated, and the sequence that decides it
 

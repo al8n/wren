@@ -27,13 +27,22 @@ use core::time::Duration;
 /// instant is accepted, so a driver that reads its clock once per wakeup may
 /// hand the same one to every call in a batch.
 ///
-/// The refusal is returned, never panicked: a rewound clock is a bug in the
-/// caller's timekeeping, and whether it should kill the process, drop the
-/// connection or be logged and retried is the driver's decision. What the crate
-/// owes is that the fact is reachable — before the check, a rewound `now` was
-/// silently tolerated and deadlines simply fired late.
+/// The refusal is **returned** — a rewound clock is a bug in the caller's
+/// timekeeping, and whether it should kill the process, drop the connection or
+/// be logged and retried is the driver's decision. What the crate owes is that
+/// the fact is reachable; before the check, a rewound `now` was silently
+/// tolerated and deadlines simply fired late.
+///
+/// **Unless the `assert-contracts` feature is on**, in which case this exact
+/// condition panics instead of returning, by design: the refusal routes through
+/// `contract::contract_violation`, which is that feature's whole purpose. A
+/// binary that enables it has asked for the abort. Nothing a PEER's bytes can
+/// cause panics under any feature.
+///
 /// [`Connection::poll_timeout`](crate::Connection::poll_timeout) takes no `now`
-/// and is unaffected.
+/// and never refuses — but see its own docs before feeding its answer back in:
+/// the deadline it returns can be OLDER than the last instant this connection
+/// was given, and handing that value to `handle_timeout` is a rewind.
 ///
 /// All arithmetic is checked: implementations return `None` on overflow
 /// or when subtracting a later instant from an earlier one, rather than

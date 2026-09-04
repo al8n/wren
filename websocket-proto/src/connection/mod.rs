@@ -318,7 +318,19 @@ where
 
   /// Returns the next deadline the caller must arrange to fire
   /// [`handle_timeout`](Connection::handle_timeout) at. Returns `None` when
-  /// no timers are armed.
+  /// no timers are armed. It takes no `now`, so it never refuses.
+  ///
+  /// **The deadline it returns may be OLDER than the last instant this
+  /// connection was given**, and that is not a bug in either method: a deadline
+  /// is armed from the `now` of the call that armed it, while `last_now`
+  /// advances on every `handle` / `poll_transmit` / `handle_timeout`. A keepalive
+  /// armed at `t+5` is already stale once a `poll_transmit(t+20)` has gone by.
+  ///
+  /// So this value is a *when to wake up*, not a *what to pass*. Arrange the
+  /// timer for it, and then call `handle_timeout` with a **fresh** reading of
+  /// your clock. Handing this value straight back is a rewind, and
+  /// `handle_timeout` refuses it with
+  /// [`TimeoutError::ClockWentBackwards`].
   pub fn poll_timeout(&self) -> Option<I> {
     let keepalive = if matches!(self.lifecycle, Lifecycle::Open) {
       self.next_keepalive
@@ -349,8 +361,8 @@ where
   /// `handle`, `poll_transmit` and `handle_timeout` in one batch is the shape
   /// this crate is written for, and every call in that batch must succeed.
   ///
-  /// **It RETURNS by default, and the decision is one flag rather than three
-  /// call sites.** All three refusals go through
+  /// **It RETURNS by default — and panics under `assert-contracts` — with the
+  /// decision in one flag rather than three call sites.** All three refusals go through
   /// [`contract_violation`](crate::contract::contract_violation), which hands
   /// the error back — or, under the `assert-contracts` feature, panics naming
   /// this contract. A clock that goes backwards is a bug in the caller's
@@ -391,8 +403,14 @@ where
   /// [`handle`](Connection::handle) or
   /// [`poll_transmit`](Connection::poll_transmit). An equal instant is fine.
   /// The refusal leaves the connection untouched, so the call can be retried
-  /// with a correct instant. The rule, and why it returns rather than panics,
-  /// is on [`crate::time::Instant`].
+  /// with a correct instant. The rule — and the `assert-contracts` exception,
+  /// under which this refusal panics rather than returning — is on
+  /// [`crate::time::Instant`].
+  ///
+  /// Pass a FRESH `now`, not the deadline
+  /// [`poll_timeout`](Connection::poll_timeout) handed you: that deadline can
+  /// already be older than the last instant this connection was given, and
+  /// feeding it back is a rewind this method refuses.
   pub fn handle_timeout(&mut self, now: I) -> Result<Option<Closed>, TimeoutError> {
     if !self.accept_now(now) {
       return Err(crate::contract::contract_violation(
