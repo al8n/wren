@@ -557,3 +557,106 @@ fn charset_and_encoding_read_one_element_language() {
     }
   }
 }
+
+// ── RFC 9110 §12.5.5's Vary ──────────────────────────────────────────────────
+
+/// The `n`th `Vary` member, rendered so a test can compare it: `None` for the
+/// wildcard, `Some(name)` for a field name.
+fn vary_member_at<'a>(lines: &[&'a [u8]], n: usize) -> Option<Option<&'a str>> {
+  let item = vary(lines.iter().copied()).nth(n)?;
+  Some(match item.expect("well formed") {
+    VaryMember::Wildcard => None,
+    VaryMember::FieldName(name) => Some(name),
+  })
+}
+
+#[test]
+fn the_sections_own_vary_example_reads_as_it_reads() {
+  // RFC 9110 §12.5.5: "Vary: accept-encoding, accept-language".
+  let lines = [b"accept-encoding, accept-language".as_slice()];
+  assert_eq!(vary_member_at(&lines, 0), Some(Some("accept-encoding")));
+  assert_eq!(vary_member_at(&lines, 1), Some(Some("accept-language")));
+  assert_eq!(vary_member_at(&lines, 2), None);
+}
+
+#[test]
+fn the_wildcard_is_a_member_and_not_a_state_of_the_whole_value() {
+  // `Vary = #( "*" / field-name )` (RFC 9110 §12.5.5) puts the wildcard inside
+  // the list construct, and that section speaks of "A list containing the
+  // member "*"" — so a value may hold it beside field names.
+  let lines = [b"*, accept-encoding".as_slice()];
+  assert_eq!(vary_member_at(&lines, 0), Some(None));
+  assert_eq!(vary_member_at(&lines, 1), Some(Some("accept-encoding")));
+  assert_eq!(vary_member_at(&lines, 2), None);
+
+  let alone = [b"*".as_slice()];
+  assert_eq!(vary_member_at(&alone, 0), Some(None));
+  assert_eq!(vary_member_at(&alone, 1), None);
+}
+
+#[test]
+fn a_vary_member_carries_no_weight_grammar() {
+  // §12.5.5 brackets no `[ weight ]`, so a `;` opens nothing at all and
+  // `;` is no RFC 9110 §5.6.2 `tchar`. What `Accept-Encoding` reads as a weight
+  // is a malformed member here — which is the whole of why `Vary` is not the
+  // other walk.
+  for line in [b"accept-encoding;q=0.5".as_slice(), b"accept-encoding;"] {
+    assert_eq!(
+      vary([line]).next().expect("one").expect_err("malformed"),
+      VaryError::NotAFieldName,
+      "{line:?}"
+    );
+  }
+  let pref = accept_encoding([b"accept-encoding;q=0.5".as_slice()])
+    .next()
+    .expect("one")
+    .expect("well formed");
+  assert_eq!(pref.weight().thousandths(), 500);
+}
+
+#[test]
+fn a_vary_member_is_a_token_and_is_not_checked_against_a_registry() {
+  // `field-name     = token` (RFC 9110 §5.1), and §12.5.5: "Potential selecting
+  // header fields are not limited to fields defined by this specification."
+  for good in [b"X-Made-Up".as_slice(), b"a", b"*x", b"~!#$%&'^_`|"] {
+    assert!(
+      matches!(
+        vary([good]).next().expect("one").expect("well formed"),
+        VaryMember::FieldName(_)
+      ),
+      "{good:?}"
+    );
+  }
+  for bad in [b"accept encoding".as_slice(), b"accept:", b"\"accept\""] {
+    assert_eq!(
+      vary([bad]).next().expect("one").expect_err("malformed"),
+      VaryError::NotAFieldName,
+      "{bad:?}"
+    );
+  }
+}
+
+#[test]
+fn the_vary_walk_skips_empty_elements_latches_and_reads_lines_as_the_join() {
+  let mut walk = vary([b", accept ,, accept encoding, accept-language".as_slice()]);
+  assert!(matches!(
+    walk.next().expect("one").expect("ok"),
+    VaryMember::FieldName("accept")
+  ));
+  assert_eq!(
+    walk.next().expect("two").expect_err("malformed"),
+    VaryError::NotAFieldName
+  );
+  assert!(walk.next().is_none());
+  assert!(walk.next().is_none());
+
+  let split = [b"*".as_slice(), b"accept-encoding", b""];
+  let joined = [b"*,accept-encoding,".as_slice()];
+  for n in 0..3 {
+    assert_eq!(vary_member_at(&split, n), vary_member_at(&joined, n), "{n}");
+  }
+
+  let absent: [&[u8]; 0] = [];
+  assert!(vary(absent).next().is_none());
+  assert!(vary([b"".as_slice()]).next().is_none());
+}

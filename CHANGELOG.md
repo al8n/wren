@@ -1,5 +1,52 @@
 # UNRELEASED
 
+## `http-semantics` — `Vary` is a different shape, and its proxy MUST NOT is stated rather than enforced
+
+RFC 9110 §12.5.5 shares §12.5's subject and none of its machinery.
+`Vary = #( "*" / field-name )` brackets no `[ weight ]`, so there is nothing for
+§12.4.2 to rank, and its `"*"` is an alternative of the ELEMENT rather than a
+name the `token` alternative happens to also derive. It gets its own item type,
+its own error type and its own walk, and shares only §5.6.1's list split with
+the three ranked readers beside it.
+
+### Added
+
+- `negotiation::vary` — RFC 9110 §12.5.5's `Vary = #( "*" / field-name )` over
+  §5.1's `field-name     = token`. It takes a field's lines, yields one
+  `VaryMember` per element in wire order, and latches on the first fault.
+- `negotiation::VaryMember`, whose two variants are `Wildcard` and
+  `FieldName(&str)`; and `negotiation::VaryError`, whose one variant is
+  `NotAFieldName`. Both carry `#[non_exhaustive]` where a variant could be
+  added.
+
+### The §12.5.5 rule that is not enforced, and what enforcing it would take
+
+RFC 9110 §12.5.5: "A proxy MUST NOT generate "*" in a Vary field value." It is
+stated at `VaryMember::Wildcard` and nothing checks it, and both halves of that
+are deliberate.
+
+The rule binds a GENERATOR that is a proxy. This crate generates no `Vary` — it
+holds no encoder for the field — so there is no site the rule could be applied
+at, and adding one in order to have something to check would be inventing the
+machinery the rule governs rather than obeying it. Enforcement needs a `Vary`
+writer plus the knowledge that the caller is an intermediary, and the second is
+not a fact about any bytes this crate reads. Whether this workspace serves an
+intermediary at all is an open ruling in al8n/wren#70 — the same absence that
+leaves §7.6.2's `Max-Forwards` and §7.6.3's `Via` unfiled — so the rule is
+unenforced pending a decision recorded there rather than by oversight here.
+
+What a proxy that does generate a `Vary` needs in order to obey it is the fact
+the variant is: a caller re-emitting the members it read knows from the variant
+alone which one it may not write.
+
+### The wildcard is a member, not a state of the whole value
+
+§12.5.5 puts `"*"` inside the list construct and speaks of a list containing it,
+so `*, accept-encoding` is one list of two members and the wildcard is the
+first. A `Vary` reader that made the wildcard a property of the value would
+answer a different question, and would have nowhere to put the field names
+beside it.
+
 ## `http-semantics` — the rest of RFC 9110 §12.5, over an element that carries no parameters
 
 `Accept` and its ranking shipped in this crate; §12.5's other four fields had no

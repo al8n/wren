@@ -576,6 +576,11 @@ http_semantics::negotiation::Preference
 http_semantics::negotiation::Preference::is_wildcard
 http_semantics::negotiation::Preference::name
 http_semantics::negotiation::Preference::weight
+http_semantics::negotiation::VaryError
+http_semantics::negotiation::VaryError::NotAFieldName
+http_semantics::negotiation::VaryMember
+http_semantics::negotiation::VaryMember::FieldName
+http_semantics::negotiation::VaryMember::Wildcard
 http_semantics::negotiation::WILDCARD
 http_semantics::negotiation::accept_charset
 http_semantics::negotiation::accept_encoding
@@ -584,6 +589,8 @@ http_semantics::negotiation::is_language_range
 http_semantics::negotiation::preference_from
 http_semantics::negotiation::preferences
 http_semantics::negotiation::read_weight
+http_semantics::negotiation::vary
+http_semantics::negotiation::vary_member
 http_semantics::range
 http_semantics::range::RangeError
 http_semantics::range::RangeError::BufferTooSmall

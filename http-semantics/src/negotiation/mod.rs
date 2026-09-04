@@ -1,10 +1,10 @@
 //! The RFC 9110 §12.5 content negotiation fields whose element carries no
-//! parameters: §12.5.2's `Accept-Charset`, §12.5.3's `Accept-Encoding` and
-//! §12.5.4's `Accept-Language`.
+//! parameters: §12.5.2's `Accept-Charset`, §12.5.3's `Accept-Encoding`,
+//! §12.5.4's `Accept-Language` and §12.5.5's `Vary`.
 //!
-//! One walk serves them. Each is a §5.6.1 list of a bare name with RFC 9110
-//! §12.4.2's weight optionally hung off it, and the only thing that separates
-//! one from another is which names its element production admits:
+//! One walk serves the first three. Each is a §5.6.1 list of a bare name with
+//! RFC 9110 §12.4.2's weight optionally hung off it, and the only thing that
+//! separates one from another is which names its element production admits:
 //!
 //! ```text
 //! Accept-Charset = #( ( token / "*" ) [ weight ] )
@@ -15,6 +15,23 @@
 //! language-range  = <language-range, see [RFC4647], Section 2.1>
 //! weight = OWS ";" OWS "q=" qvalue
 //! ```
+//!
+//! [`vary`] is in this module and is NOT that walk, because §12.5.5 is not that
+//! shape:
+//!
+//! ```text
+//! Vary = #( "*" / field-name )
+//! field-name     = token
+//! ```
+//!
+//! It carries no `[ weight ]` bracket, so there is nothing for §12.4.2 to
+//! rank, and its `"*"` is an alternative of the ELEMENT rather than a name a
+//! `token` alternative happens to also derive. It shares the §5.6.1 list split
+//! with the three above and nothing else, and it answers in a type of its own
+//! rather than in a [`Preference`] whose weight would always be
+//! [`Weight::ONE`] and mean nothing. It is here because §12.5 is where its
+//! subject is: it names the request fields a response's content was selected
+//! from.
 //!
 //! §12.5.4's element is the one RFC 9110 does not spell. That `prose-val` sends
 //! a reader to RFC 4647 §2.1, whose rule is transcribed at
@@ -547,6 +564,142 @@ where
   I: IntoIterator<Item = &'a [u8]>,
 {
   preferences(lines, Element::Token)
+}
+
+/// One member of a `Vary` field: RFC 9110 §12.5.5's `"*" / field-name`.
+///
+/// Borrows the field lines it was parsed from.
+///
+/// # No `PartialEq`
+///
+/// For the reason [`Preference`] carries none, on RFC 9110 §5.1's sentence
+/// rather than §8.4.1's: "Field names are case-insensitive", so a derive would
+/// call `Accept-Encoding` and `accept-encoding` two members while they name one
+/// field. A caller compares with `str::eq_ignore_ascii_case`, or with
+/// [`eq_ignore_ascii`](crate::grammar::eq_ignore_ascii) against a name it
+/// knows.
+#[derive(Debug, Copy, Clone)]
+pub enum VaryMember<'a> {
+  /// The `"*"` alternative.
+  ///
+  /// RFC 9110 §12.5.5: "A list containing the member "*" signals that other
+  /// aspects of the request might have played a role in selecting the response
+  /// representation, possibly including aspects outside the message syntax
+  /// (e.g., the client's network address)." §12.4.3 puts it in one sentence:
+  /// "Within Vary, the wildcard value means that the variance is unlimited."
+  ///
+  /// It is a MEMBER and not a whole value, which is why it is a variant of an
+  /// item rather than a state of the walk: §12.5.5 writes
+  /// `Vary = #( "*" / field-name )`, so `*, accept-encoding` is one list of two
+  /// members and this is the first of them.
+  ///
+  /// # The §12.5.5 rule this crate does not enforce, and what would enforce it
+  ///
+  /// RFC 9110 §12.5.5: "A proxy MUST NOT generate "*" in a Vary field value."
+  /// It is STATED here and nothing checks it, and both halves of that are
+  /// deliberate.
+  ///
+  /// It binds a GENERATOR that is a proxy. This crate generates no `Vary` at
+  /// all — there is no encoder for this field here — so there is no site the
+  /// rule could be applied at, and adding one to have something to check would
+  /// be inventing the machinery the rule governs rather than obeying it. What
+  /// enforcement needs is a `Vary` writer plus the knowledge that the caller is
+  /// an intermediary, and the second of those is not a fact about any bytes
+  /// this crate reads.
+  ///
+  /// Whether this workspace serves an intermediary at all is an open ruling in
+  /// al8n/wren#70 — the same absence that leaves §7.6.2's `Max-Forwards` and
+  /// §7.6.3's `Via` unfiled — so the rule is unenforced pending a decision that
+  /// is recorded elsewhere rather than by oversight here.
+  ///
+  /// What a proxy that DOES generate a `Vary` needs in order to obey it is the
+  /// fact that this variant is: a caller re-emitting the members it read knows
+  /// from the variant alone which one it may not write.
+  Wildcard,
+  /// The `field-name` alternative — RFC 9110 §5.1's
+  /// `field-name     = token`.
+  ///
+  /// A member that is exactly `*` is [`Wildcard`](Self::Wildcard) and never
+  /// this, though `*` is a §5.6.2 `tchar` and so a `token` the second
+  /// alternative would also derive. §12.5.5 settles which reading applies: "A
+  /// Vary field value is either the wildcard member "*" or a list of request
+  /// field names, known as the selecting header fields, that might have had a
+  /// role in selecting the representation for this response."
+  ///
+  /// Not checked against any registry. RFC 9110 §12.5.5: "Potential selecting
+  /// header fields are not limited to fields defined by this specification."
+  FieldName(&'a str),
+}
+
+/// Why a [`vary`] walk stopped.
+///
+/// One variant, and no weight variants: RFC 9110 §12.5.5's
+/// `Vary = #( "*" / field-name )` brackets no `[ weight ]`, so
+/// [`NegotiationError`]'s other two conditions cannot arise here and a shared
+/// error type would give this walk's `Result` two states it can never hold.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum VaryError {
+  /// The member is neither `"*"` nor RFC 9110 §5.1's `field-name     = token`.
+  #[error("not a field name")]
+  NotAFieldName,
+}
+
+/// Walks a `Vary` field's members (RFC 9110 §12.5.5).
+///
+/// `Vary = #( "*" / field-name )`. Takes the field's LINES like the ranked
+/// readers above, and for the same reason: §5.2 may spread the list over
+/// several of them, and no member can hold the comma the join inserts.
+///
+/// RFC 9110 §12.5.5: "The "Vary" header field in a response describes what
+/// parts of a request message, aside from the method and target URI, might
+/// have influenced the origin server's process for selecting the content of
+/// this response."
+///
+/// # What this answers and what it does not
+///
+/// It answers which members the field named, in wire order, and which of them
+/// is §12.5.5's wildcard. It answers nothing about what a recipient should DO
+/// with them: §12.5.5's two purposes are a cache's rule, which RFC 9111 §4.1
+/// owns, and a user agent's, and both need state that is not in this field's
+/// bytes. The one consequence stated here rather than derived is
+/// [`VaryMember::Wildcard`]'s: "A recipient will not be able to determine
+/// whether this response is appropriate for a later request without forwarding
+/// the request to the origin server."
+///
+/// Like the ranked walks, this one latches: nothing is yielded after the first
+/// fault.
+///
+/// # Errors
+///
+/// Each item is [`VaryError::NotAFieldName`].
+pub fn vary<'a, I>(lines: I) -> impl Iterator<Item = Result<VaryMember<'a>, VaryError>>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  lines
+    .into_iter()
+    .flat_map(list_elements)
+    .map(vary_member)
+    .scan(false, |done, item| {
+      if *done {
+        return None;
+      }
+      *done = item.is_err();
+      Some(item)
+    })
+}
+
+/// Reads one already-delimited `Vary` element.
+fn vary_member(member: &[u8]) -> Result<VaryMember<'_>, VaryError> {
+  if member == WILDCARD {
+    return Ok(VaryMember::Wildcard);
+  }
+  if is_token(member) {
+    Ok(VaryMember::FieldName(ascii(member)))
+  } else {
+    Err(VaryError::NotAFieldName)
+  }
 }
 
 #[cfg(test)]
