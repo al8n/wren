@@ -45,12 +45,22 @@ pub(crate) fn duplex() -> (Pipe, Pipe) {
 /// bytes until the peer drains (0 = unbounded) — for write-backpressure
 /// tests.
 pub(crate) fn duplex_with_capacity(cap: usize) -> (Pipe, Pipe) {
+  duplex_with_capacities(cap, cap)
+}
+
+/// The same, with the two directions bounded INDEPENDENTLY: `a_writes` is what
+/// the first pipe may buffer before parking, `b_writes` what the second may.
+/// For a test that needs one direction wedged while the other stays wide — a
+/// peer that has stopped reading and is flooding.
+pub(crate) fn duplex_with_capacities(a_writes: usize, b_writes: usize) -> (Pipe, Pipe) {
+  // A pipe's writes land in the buffer its PEER reads, so the capacity that
+  // bounds `a` lives on the shared half `b` holds for reading.
   let a = Rc::new(Shared {
-    capacity: cap,
+    capacity: b_writes,
     ..Shared::default()
   });
   let b = Rc::new(Shared {
-    capacity: cap,
+    capacity: a_writes,
     ..Shared::default()
   });
   (
