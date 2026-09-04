@@ -208,10 +208,19 @@ impl Instant for Nanos {
 /// cargo run --quiet --features std                 # 568 at e42b30d → 576
 /// cargo run --quiet --features alloc               # 568 at e42b30d → 576
 /// cargo run --quiet --features no-atomic           # 568 at e42b30d → 576
-/// cargo run --quiet --features alloc,deflate       # 592 at e42b30d → 592
+/// cargo run --quiet --features alloc,deflate       # 592 at e42b30d → 600
 /// ```
 ///
-/// **Net +8 bytes**, and every one of them is `last_now` — the monotonicity
+/// The last column includes `SendState::pongs_before_close`, the `u8` that
+/// makes the two outbound slots drain in queue-time order. MEASURED, because
+/// the guess would have been wrong in both directions: it costs **nothing** on
+/// the bare and heap tiers, where it lands in existing padding, and **8 bytes**
+/// with `deflate`, where it does not.
+///
+/// **Net +8 bytes on the bare and heap tiers, +8 with `deflate`** — `last_now`
+/// on the first two, and `last_now` plus the queue-order byte on the third,
+/// where padding stops absorbing them. On the bare tier every one of them is
+/// `last_now` — the monotonicity
 /// check's stored instant, an `I` rather than an `Option<I>` precisely so it is
 /// eight and not sixteen (see [`accept_now`](Connection::accept_now)). With
 /// `deflate` even that lands in existing padding and the number does not move.
@@ -265,7 +274,7 @@ const CONNECTION_SIZE_BUDGET: usize = 544;
 const CONNECTION_SIZE_BUDGET: usize = 576;
 
 #[cfg(feature = "deflate")]
-const CONNECTION_SIZE_BUDGET: usize = 592;
+const CONNECTION_SIZE_BUDGET: usize = 600;
 
 const _: () =
   assert!(core::mem::size_of::<Connection<Nanos, role::Server>>() <= CONNECTION_SIZE_BUDGET);

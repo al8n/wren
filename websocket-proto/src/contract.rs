@@ -55,13 +55,16 @@
 //! | `EncodeError::CompressionUnavailable` (`deflate`) | no | whether permessage-deflate was negotiated is settled by BOTH peers at the handshake, so the refusal is keyed on peer-decided state |
 //! | the three `ClockWentBackwards` | **yes** | routed through this wall already |
 //!
-//! That split is enforced by WHICH ERRORS REACH [`contract_violation`] rather
+//! That split is enforced by WHICH ERRORS REACH
+//! [`contract_violation`](crate::contract::contract_violation) rather
 //! than by a comment that says so. A protocol error that starts routing through
 //! this function acquires a panic, and the diff that does it is the review.
 //!
 //! # The feature
 //!
-//! Off (the default), [`contract_violation`] hands the error straight back and
+//! Off (the default),
+//! [`contract_violation`](crate::contract::contract_violation) hands the error
+//! straight back and
 //! the crate's panic-freedom is exactly what `tests/no_panic.rs` proves it to
 //! be. On (`assert-contracts`), it panics naming the contract that was broken.
 //!

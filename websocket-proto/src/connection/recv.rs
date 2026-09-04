@@ -113,6 +113,20 @@ pub(crate) struct RecvState {
 }
 
 impl RecvState {
+  /// How many pong echoes are queued BEHIND the outbound slot. Zero on the bare
+  /// tier, which has no queue. `SendState::queue_close` needs it to size the
+  /// group of pongs that precede a close.
+  pub(crate) fn queued_pongs(&self) -> usize {
+    #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+    {
+      self.pong_overflow.len()
+    }
+    #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
+    {
+      0
+    }
+  }
+
   pub(crate) const fn new() -> Self {
     Self {
       frame: FrameState::Header {
@@ -1030,7 +1044,36 @@ where
         // none was received), unless we already sent our own close.
         let echo = if absent { CloseCode::Normal } else { code };
         if !matches!(self.conn.lifecycle, Lifecycle::CloseSent) {
-          self.conn.send.queue_close(echo, "");
+          let queued_behind = self.conn.recv.queued_pongs();
+          self.conn.send.queue_close(echo, "", queued_behind);
+        } else if self.conn.send.close_sent {
+          // Our close ALREADY LEFT, so both Close frames are now exchanged.
+          // §5.5.1 (line 2023 of `.rfc-cache/rfc6455.txt`): "After both sending
+          // and receiving a Close message, an endpoint considers the WebSocket
+          // connection closed and MUST close the underlying TCP connection."
+          // Nothing more may go out. The §5.5.2 Pong obligation was real when
+          // those Pings arrived, but it cannot be discharged on a connection
+          // the RFC says MUST now close — the MUST-close wins, and the echoes
+          // are dropped rather than written after the handshake completed.
+          self.conn.send.pending_pong = None;
+          #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+          self.conn.recv.pong_overflow.clear();
+          self.conn.send.pongs_before_close = 0;
+        } else {
+          // Our close is queued and has NOT gone out. Every pong still queued
+          // was owed for a Ping that arrived before this Close (one arriving
+          // after it is refused in `queue_pong`), and there is still a frame
+          // ahead of them to be written — so all of them can be discharged
+          // first. Promote the whole queue into the pre-close prefix; the drain
+          // then yields every pong and finally the close that ends the
+          // handshake. Bounded at `MAX_PENDING_PONGS + 1` pongs plus the close.
+          // This is the ONE site that raises the count, and it is the epoch
+          // boundary `poll_transmit`'s two-epoch bound states its second half
+          // from: `lifecycle` goes Terminal just below, so
+          // `queue_pong` refuses every later Ping and there is no third epoch.
+          let owed = usize::from(self.conn.send.pending_pong.is_some())
+            .saturating_add(self.conn.recv.queued_pongs());
+          self.conn.send.pongs_before_close = u8::try_from(owed).unwrap_or(u8::MAX);
         }
         // Peer echo clears the close deadline (handshake complete).
         self.conn.close_deadline = None;
@@ -1069,17 +1112,58 @@ where
   /// conformant. On the bare tier there is no queue and the slot simply
   /// coalesces to the most recent ping, by the same clause.
   ///
-  /// A queued CLOSE is not consulted at all. It is a different frame in a
-  /// different slot, and §5.5.2 (line 2042 of `.rfc-cache/rfc6455.txt`) keeps
-  /// the Pong owed until this endpoint has RECEIVED a Close — which one it SENT
-  /// is not. `poll_transmit` gates the pong on the terminal lifecycle, which is
-  /// §5.5.2's own condition, and that gate is the only place the question is
-  /// asked.
+  /// **The §5.5.2 question is settled HERE, where the Ping lands, not at drain
+  /// time.** Line 2042 of `.rfc-cache/rfc6455.txt` reads "Upon receipt of a Ping
+  /// frame, an endpoint MUST send a Pong frame in response, unless it already
+  /// received a Close frame" — the exemption is a property of the moment the
+  /// Ping ARRIVES. So a Ping that arrives after a Close was received owes
+  /// nothing and is dropped right here; and, the other half of the same
+  /// sentence, a pong owed BEFORE that Close arrived is **not** cancelled by it.
+  /// Nothing in §5.5.2 says a later Close discharges an obligation that already
+  /// existed, and an earlier revision of this crate read it that way and
+  /// silently dropped the echo.
+  ///
+  /// The terminal check covers the failure path too: §7.1.7 (line 2399) has an
+  /// endpoint instructed to _Fail the WebSocket Connection_ stop processing, and
+  /// `fail` additionally clears what was already owed.
+  ///
+  /// **It is the second half of a pair, and cannot fire today.** The first half
+  /// is [`Events::next`]'s opening `if self.conn.is_terminal() { return None; }`:
+  /// once a Close is parsed the cursor stops consuming, so a Ping later in the
+  /// same batch is never decoded and this function is never reached with a
+  /// terminal connection. `handle` refuses a subsequent call outright. Which
+  /// means deleting the check reds nothing that goes through `handle` — the
+  /// shape this crate has twice mistaken for coverage.
+  ///
+  /// So the pairing is pinned rather than asserted:
+  /// `tests::a_post_close_ping_owes_no_pong_even_past_the_cursor_short_circuit`
+  /// bypasses the short-circuit and drives this function directly, and
+  /// `tests::dropping_events_after_close_received_is_still_terminal` covers the
+  /// half that is live. Keep both: the short-circuit is about ignoring the rest
+  /// of the input (§1.4), this check is about §5.5.2's obligation, and a
+  /// refactor that separated them would otherwise reintroduce the defect
+  /// silently.
+  ///
+  /// A queued CLOSE is not consulted. It is a different frame in a different
+  /// slot; which of the two drains first is queue-time order, decided in
+  /// `poll_transmit`.
   fn queue_pong(&mut self, payload: [u8; MAX_CONTROL_PAYLOAD], len: u8) {
+    if self.conn.is_terminal() {
+      return;
+    }
     #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
     if self.conn.send.pending_pong.is_some() {
       if self.conn.recv.pong_overflow.len() >= MAX_PENDING_PONGS {
         self.conn.recv.pong_overflow.pop_front();
+        // The shed entry is drain position 1 — the slot is 0, the overflow
+        // front is 1. It lies inside the frozen pre-close prefix only when that
+        // prefix reaches past the slot, i.e. `>= 2`; at exactly 1 the prefix is
+        // the slot alone and what was shed was already behind the close. Unlike
+        // `offer_pong`'s position 0, `saturating_sub` alone would be wrong here,
+        // so the comparison is load-bearing rather than restated.
+        if self.conn.send.pongs_before_close >= 2 {
+          self.conn.send.pongs_before_close = self.conn.send.pongs_before_close.saturating_sub(1);
+        }
       }
       self.conn.recv.pong_overflow.push_back((payload, len));
       return;
@@ -1095,6 +1179,29 @@ where
     // ran but the driver has not drained yet — is superseded: the failure
     // code is what must reach the wire, or the peer would see a benign close
     // for a connection we are failing.
+    // §7.1.7 (line 2399): an endpoint instructed to _Fail the WebSocket
+    // Connection_ proceeds to close it and "MUST NOT continue to attempt to
+    // process data". So every owed pong goes, here at §7.1.7's own entrance,
+    // rather than being filtered out at drain time by a second rule.
+    // The count is "pre-close pongs currently queued", and a cleared queue has
+    // none — so it goes with them. F3's discard arm already does this; now every
+    // site that empties the queue does.
+    //
+    // MEASURED to be a no-op today, and kept anyway. On the `!close_sent` path
+    // below, `force_close` calls `queue_close(code, "", 0)` with the slot
+    // already emptied above, so the count is recomputed to 0 there. On the
+    // `close_sent` path nothing recomputes it — but a POSITIVE count with
+    // `close_sent` is unreachable: the close drains only once the prefix is
+    // exhausted or the slot is empty, and nothing empties the slot except
+    // draining. So neither branch can leave a stale number, and deleting this
+    // line reds no test. It stays because it makes the rule true AT the site
+    // that empties the queue rather than by two arguments about other sites,
+    // and because the second of those arguments is one line of `poll_transmit`
+    // away from being false.
+    self.conn.send.pending_pong = None;
+    #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+    self.conn.recv.pong_overflow.clear();
+    self.conn.send.pongs_before_close = 0;
     if !self.conn.send.close_sent {
       self.conn.send.force_close(code);
     }
@@ -1669,6 +1776,214 @@ mod tests {
       matches!(got.first(), Some(Ev::Start(..))),
       "next read must start a fresh message, got {got:?}"
     );
+  }
+
+  /// C2: failing the connection leaves no pong, and no count describing one.
+  ///
+  /// **This test pins the behaviour, not the new line.** `fail` clears the queue
+  /// — §7.1.7 (line 2399 of `.rfc-cache/rfc6455.txt`) has an endpoint told to
+  /// _Fail the WebSocket Connection_ stop processing — and the count reaching 0
+  /// is currently guaranteed twice over: `force_close` recomputes it through
+  /// `queue_close(code, "", 0)` on the `!close_sent` path, and on the
+  /// `close_sent` path no reachable sequence leaves it positive. Reverting the
+  /// explicit zeroing in `fail` therefore does NOT red this test — measured, not
+  /// assumed — so what it holds is the observable rule: a failed connection
+  /// drains its failure close first and owes nothing.
+  #[test]
+  fn failing_the_connection_clears_the_pre_close_count_with_the_pongs() {
+    let mut conn = server();
+
+    // One pong owed, then our own close: the prefix freezes at 1.
+    let mut ping = crate::connection::tests::masked_frame(Opcode::Ping, true, b"A");
+    {
+      let mut ev = conn.handle(TestInstant(0), &mut ping).unwrap();
+      while ev.next().is_some() {}
+    }
+    conn.close(CloseCode::GoingAway, "").unwrap();
+    assert_eq!(
+      conn.send.pongs_before_close, 1,
+      "the prefix froze at the slot"
+    );
+
+    // A reserved opcode fails the connection (§5.2), reaching `fail`.
+    let mut bad = frame(Opcode::Reserved(0xB), true, false, b"");
+    {
+      let mut ev = conn.handle(TestInstant(0), &mut bad).unwrap();
+      while ev.next().is_some() {}
+    }
+    assert!(conn.is_terminal());
+    assert_eq!(
+      conn.send.pongs_before_close, 0,
+      "a failed connection owes no pre-close pongs — held today by both \
+       `force_close`'s recompute and `fail`'s explicit zeroing"
+    );
+
+    // And the failure close drains first, with no pong ahead of it.
+    let mut out = [0u8; 32];
+    let n = conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("the failure close");
+    assert_eq!(out[0], 0x88, "poll 1 is the close, not a pong");
+    let _ = n;
+    assert!(
+      conn
+        .poll_transmit(TestInstant(0), &mut out)
+        .unwrap()
+        .is_none(),
+      "and nothing behind it"
+    );
+  }
+
+  /// F4: the public half of the post-Close-Ping rule — one batch carrying
+  /// `[Close, Ping]`.
+  ///
+  /// `Events::next` returns `None` once the connection is terminal, so the
+  /// trailing Ping is never decoded: it is not surfaced as an event and it owes
+  /// no Pong. RFC 6455 §5.5.2 (line 2042 of `.rfc-cache/rfc6455.txt`) is the
+  /// reason it owes nothing — "unless it already received a Close frame" — and
+  /// the short-circuit is the mechanism. The helper test above proves the
+  /// second-line guard; only this one protects the public behaviour, which a
+  /// refactor could change without touching that helper.
+  #[test]
+  fn a_ping_behind_a_close_in_one_batch_is_neither_surfaced_nor_answered() {
+    let mut conn = server();
+
+    let mut payload = [0u8; 8];
+    let pn = encode_close_payload(CloseCode::Normal, "", &mut payload).unwrap();
+    let mut bytes = crate::connection::tests::masked_frame(Opcode::Close, true, &payload[..pn]);
+    bytes.extend(crate::connection::tests::masked_frame(
+      Opcode::Ping,
+      true,
+      b"late",
+    ));
+
+    {
+      let mut ev = conn.handle(TestInstant(0), &mut bytes).unwrap();
+      assert!(matches!(ev.next(), Some(Event::CloseReceived(_))));
+      assert!(matches!(ev.next(), Some(Event::Closed(_))));
+      assert!(
+        ev.next().is_none(),
+        "the Ping behind the Close is never decoded: §5.5.2 line 2042 exempts a \
+         Ping that arrives after a Close was received, and `Events::next`'s \
+         terminal short-circuit is what stops it being surfaced"
+      );
+    }
+    assert!(conn.is_terminal());
+
+    let mut out = [0u8; 64];
+    let n = conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("the close echo");
+    assert_eq!(
+      &out[..n],
+      &[0x88, 0x02, 0x03, 0xE8],
+      "the echo, whole: FIN Close, len 2, code 1000"
+    );
+    assert!(
+      conn
+        .poll_transmit(TestInstant(0), &mut out)
+        .unwrap()
+        .is_none(),
+      "no Pong was queued for a Ping that arrived after the Close"
+    );
+    assert!(conn.send.pending_pong.is_none());
+  }
+
+  /// F2: shedding an entry that lies inside the frozen pre-close prefix must
+  /// shrink the prefix with it.
+  ///
+  /// At capacity the overflow queue evicts its front to make room. That entry
+  /// is drain position 1 and — with a full queue — inside the prefix, so if the
+  /// count does not shrink, the post-close pong pushed in its place inherits its
+  /// place AHEAD of the close. RFC 6455 §5.5.3 (line 2064 of
+  /// `.rfc-cache/rfc6455.txt`) permits dropping the older echo; it does not
+  /// permit the replacement to overtake the close.
+  ///
+  /// The prefix here is `1 + MAX_PENDING_PONGS` — the slot plus the queue — so
+  /// the close lands on poll `1 + MAX_PENDING_PONGS`, one earlier than the
+  /// number of pongs queued, because A2 was shed.
+  #[test]
+  fn a_shed_pre_close_pong_shrinks_the_frozen_prefix() {
+    use crate::frame::Decoded;
+    let mut conn = server();
+    let prefix = 1 + MAX_PENDING_PONGS;
+
+    for i in 1..=prefix {
+      let payload = format!("A{i}");
+      let mut f = crate::connection::tests::masked_frame(Opcode::Ping, true, payload.as_bytes());
+      let mut ev = conn.handle(TestInstant(0), &mut f).unwrap();
+      while ev.next().is_some() {}
+    }
+    conn.close(CloseCode::GoingAway, "").unwrap();
+
+    // The queue is full, so this evicts A2 — drain position 1.
+    let mut b = crate::connection::tests::masked_frame(Opcode::Ping, true, b"B");
+    {
+      let mut ev = conn.handle(TestInstant(0), &mut b).unwrap();
+      while ev.next().is_some() {}
+    }
+
+    let mut out = [0u8; 64];
+    let mut got: Vec<(u8, Vec<u8>)> = Vec::new();
+    while let Some(n) = conn.poll_transmit(TestInstant(0), &mut out).unwrap() {
+      let decoded = match FrameHeader::decode(&out[..n]).unwrap() {
+        Decoded::Complete(d) => d,
+        _ => panic!("incomplete frame"),
+      };
+      got.push((out[0], out[decoded.consumed()..n].to_vec()));
+    }
+
+    let mut expect: Vec<(u8, Vec<u8>)> = Vec::new();
+    expect.push((0x8A, b"A1".to_vec()));
+    for i in 3..=prefix {
+      expect.push((0x8A, format!("A{i}").into_bytes()));
+    }
+    expect.push((0x88, vec![0x03, 0xE9]));
+    expect.push((0x8A, b"B".to_vec()));
+    assert_eq!(
+      got,
+      expect,
+      "A2 was shed from inside the frozen prefix, so the prefix must shrink to \
+       {} and the close must land on poll {} — B is a POST-close pong and may \
+       not inherit A2's place ahead of it",
+      prefix - 1,
+      prefix
+    );
+  }
+
+  /// The pair of `Events::next`'s terminal short-circuit, driven past it.
+  ///
+  /// `queue_pong`'s own terminal refusal is unreachable through `handle`,
+  /// because the cursor stops consuming once a Close is parsed — so nothing
+  /// that goes through the public API can show the guard working, and deleting
+  /// it would red no test. This reaches the state a refactor of `next` could
+  /// reach — terminal, with a Ping still to decode — and shows the refusal.
+  ///
+  /// Its PARTNER is
+  /// `a_ping_behind_a_close_in_one_batch_is_neither_surfaced_nor_answered`,
+  /// which asserts the same outcome through the public API only. This one
+  /// proves the helper's guard; that one protects `Events::next`'s behaviour,
+  /// which a refactor could change while this test kept passing.
+  #[test]
+  fn a_post_close_ping_owes_no_pong_even_past_the_cursor_short_circuit() {
+    use crate::connection::Lifecycle;
+    let mut conn = server();
+    let mut ping = crate::connection::tests::masked_frame(Opcode::Ping, true, b"late");
+    let mut events = conn.handle(TestInstant(0), &mut ping).unwrap();
+
+    // The state `next` refuses to walk into: a Close has been received, and a
+    // Ping is still in the buffer. Set directly, because the short-circuit is
+    // exactly what stops the public API from producing it.
+    events.conn.lifecycle = Lifecycle::Terminal;
+    events.queue_pong([b'x'; MAX_CONTROL_PAYLOAD], 4);
+
+    assert!(
+      events.conn.send.pending_pong.is_none(),
+      "a Ping received after a Close owes nothing (§5.5.2, line 2043)"
+    );
+    assert_eq!(events.conn.recv.pong_overflow.len(), 0);
   }
 
   /// Regression: a consumer that handles `CloseReceived` and DROPS

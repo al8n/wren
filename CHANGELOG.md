@@ -68,24 +68,60 @@ changes turn properties this crate already had into properties something checks.
   *data* frames after a Close, not control frames, and data sends still stop at
   `close()` exactly as before.
 
-  **The order is derived, not inherited: an owed pong precedes a queued close.**
-  Neither clause forbids the other order, so the choice is argued. §5.5.2 (line
-  2043) is the spec's only ordering pressure — "It SHOULD respond with Pong
-  frame as soon as is practical" — and when the Ping arrived our Close was
-  queued but not yet on the wire, so the earliest practical frame is the next
-  one written. §5.5.1 (lines 2023–2026) is what gives that teeth: once the peer
-  has our Close and answers it, "an endpoint considers the WebSocket connection
-  closed and MUST close the underlying TCP connection. The server MUST close the
-  underlying TCP connection immediately" — a pong written behind our Close is
-  racing a socket the peer may already have shut.
+  **The order is queue-time first-in-first-out, and it is chosen for liveness.**
+  Whichever of the owed pong and the queued close was queued first drains first,
+  and a Ping arriving after `close()` cannot overtake the Close. Neither clause
+  forbids either order — §5.5.1 (line 2002) bans only further *data* frames
+  after a Close — so the order is argued:
 
-  **This is a behavioural change on the wire.** Two regressions pin it:
-  `Ping → close() → Ping → drain` emits both pongs in arrival order and then the
-  close (both, because a heap is available — Autobahn §2.10's rule; the bare tier
-  coalesces to the most recent by §5.5.3), and `close() → drain → Ping → drain`
-  emits the late pong after the close and accepts `encode_pong` by hand. A third
-  pins the boundary: once the peer's Close ARRIVES, §5.5.2's exemption applies,
-  the echo is all that drains, and `encode_pong` is refused.
+  * §5.5.2 (line 2043) asks for the Pong "as soon as is practical", and for a
+    Ping received while our Close was queued but not yet on the wire the next
+    frame written IS the earliest practical one. So a pre-close pong goes first.
+  * But **unconditional pong priority permits unbounded Close starvation.** A
+    driver that alternates one inbound Ping with exactly one `poll_transmit`
+    emits a Pong every time and never reaches its Close, so `close_deadline`
+    never arms. The queue cap does not help — only one pong is outstanding at a
+    time — and this crate cannot assume a drain-to-`None` schedule, because the
+    public API neither enforces nor can express one. An earlier revision of this
+    branch claimed that schedule as a caller contract; that claim is withdrawn.
+
+  `SendState::pongs_before_close` is frozen when the close is queued and only
+  ever decremented, so **the Close is emitted within `pongs_before_close + 1`
+  calls** — at most 18, and exactly 1 when nothing was owed. A counter rather
+  than a flag because the heap tiers can owe several at that instant.
+
+  **This is a behavioural change on the wire, measured in both directions.**
+  `Ping → close() → Ping → drain` emits Pong(before), Close, Pong(after) — the
+  middle one moved. `close() → drain → Ping → drain` still emits the late pong
+  after the close and still accepts `encode_pong` by hand. And
+  `a_close_cannot_be_starved_by_a_ping_per_poll` runs the adversarial schedule
+  itself: one Ping in, exactly one poll out, and the Close must appear by poll 2
+  with `close_deadline` armed on that drain. Under the old rule it never
+  appeared at all.
+
+- **A later peer Close no longer retroactively discards a Pong already owed.**
+  For `Ping → peer Close` in one input batch the Ping queues a Pong before the
+  Close is parsed; parsing the Close made the connection terminal, and a
+  lifecycle gate in `poll_transmit` then swallowed that Pong and emitted only
+  the echo. §5.5.2 (line 2042 of `.rfc-cache/rfc6455.txt`) does not say that:
+  "Upon receipt of a Ping frame, an endpoint MUST send a Pong frame in response,
+  unless it already received a Close frame" makes the exemption a property of
+  **the moment the Ping arrives**. A Close that arrives later cancels nothing.
+
+  The question is now settled where the Ping lands, in `Events::queue_pong`,
+  and the drain-time gate is gone — one decision, at the point the clause is
+  about. So the same batch emits **Pong then Close**, while a Ping arriving
+  after a received Close still owes nothing (and cannot even be offered:
+  `handle` refuses input once terminal). `fail` clears the owed pongs itself,
+  because §7.1.7 (line 2399) is a different rule with a different answer — an
+  endpoint told to _Fail the WebSocket Connection_ "MUST NOT continue to attempt
+  to process data" — and it is applied at its own entrance rather than filtered
+  for at drain time.
+
+  **Two tests had pinned the nonconforming reading** and both are rewritten
+  rather than deleted: the same-batch regression now expects Pong-then-Close and
+  says in its own comment that it used to assert the opposite, and the boundary
+  test is split so that each half of §5.5.2's sentence has its own assertion.
 
 - **The one-slot consolidation is reverted, and the size claim with it.** An
   earlier revision of this branch merged `SendState::pending_close` and
@@ -97,13 +133,9 @@ changes turn properties this crate already had into properties something checks.
   `SendState`, and neither erases the other in either order.
 
   So the **−128 bytes is given back**: 536 → **544** bare, 568 → **576** with
-  `std` / `alloc` / `no-atomic`, 592 → **592** with `deflate` (where the growth
-  lands in existing padding). The branch's whole net size effect is the `+8` of
-  `last_now`. **A smaller `Connection` does not license a nonconformance.**
-
-  A ping flood cannot starve the close: within one drain loop no `handle` runs,
-  so what precedes it is the one owed pong plus at most `MAX_PENDING_PONGS`
-  behind it on the heap tiers, and exactly one on the bare tier.
+  `std` / `alloc` / `no-atomic`, 592 → **600** with `deflate` (which also carries
+  the queue-order byte). **A smaller `Connection` does not license a
+  nonconformance.**
 
 - **`prepare_binary` / `prepare_text`: the zero-copy send is now the obvious
   one.** A whole message with no payload copy was spelled
@@ -242,6 +274,11 @@ changes turn properties this crate already had into properties something checks.
   `connection::tests::assert_contracts`, deliberately outside the proof file.
   The comment claiming `--all-features` stayed viable is corrected.
 
+  **The control's SHAPE is constrained by that `shim-check` rule rather than
+  chosen.** One gated shim per file, named `shim_lie`, blocks any second
+  must-fail control a crate might legitimately want — filed as an `xtask`
+  defect, not recorded as a limitation of this design.
+
 - **The panic wall's claim is narrowed to what it enforces, and the gap is a
   number.** `contract.rs` said the one `allow` on `contract_violation` was the
   only place a panic could be written in this crate. That is stronger than the
@@ -267,6 +304,29 @@ changes turn properties this crate already had into properties something checks.
   `Connection::handle` and the whole `handshake::h1` surface. Widening the proof
   is deliberately not this branch's work — `tests/no_panic.rs` records why the
   connection tree does not inline into one shim.
+
+- **The receipt-time terminal check is paired rather than merely present, and
+  two intra-doc links that never resolved are fixed.** `Events::queue_pong`
+  refuses a Ping received after a Close — §5.5.2's own condition — and that
+  refusal **cannot fire through the public API**: `Events::next` opens by
+  returning `None` once the connection is terminal, so a Ping later in the same
+  batch is never decoded, and `handle` refuses a subsequent call outright.
+  Deleting the check would therefore red nothing, which is the shape this crate
+  has twice mistaken for coverage.
+
+  It is kept, because the short-circuit is about ignoring the rest of the input
+  (§1.4) while the check is about §5.5.2's obligation, and a refactor separating
+  them would reintroduce the defect silently. But it is now **pinned**:
+  `a_post_close_ping_owes_no_pong_even_past_the_cursor_short_circuit` reaches the
+  state `next` refuses to walk into — terminal, with a Ping still buffered — and
+  shows the guard refusing. The doc names both halves of the pair and the test
+  that proves each.
+
+  The `doc-check --require-all` gate also caught two unresolved intra-doc links
+  to `contract_violation` in `contract.rs`'s module doc. They arrived with the
+  feature two rounds ago and no gate in the list had run since; qualifying them
+  as `crate::contract::contract_violation` fixes both. That is a gate earning
+  its place on the first run.
 
 - **The panic taxonomy had two voices, and now has one.** `contract.rs` opened
   by calling "feeding a terminal connection" a contract error while its own
