@@ -274,6 +274,21 @@
 //! admits: it takes the production-shaped lines and nothing else, so no quote
 //! character inside a fence is ever paired.
 //!
+//! The masking unit is a PARAGRAPH ([`mask_paragraph`]), and it was a line.
+//! A code span that wraps across two comment lines met no closing backtick on
+//! the first of them, so the masker gave up and emitted the rest of that line
+//! as prose — leaking every quote character inside the span into the block.
+//! An ODD number of leaked quotes displaces every real quotation after it,
+//! since [`quoted_spans`] pairs left to right, and where the prose between the
+//! leak and the quotation falls under the two floors above, [`grade`] returns
+//! before it counts anything: the quotation is then never graded, never
+//! counted and never reported. That is the escape the ABNF bullet above
+//! describes, reached through the quotation path, and
+//! `a_code_span_wrapped_across_lines_does_not_leak_its_quotes` is the block it
+//! used to swallow. The unit is the paragraph rather than the whole block
+//! because a code span may not cross a blank line: pairing over a block pairs
+//! two paragraphs' unrelated strays and masks the quotation between them.
+//!
 //! What is read is every `//` comment, a comment that FOLLOWS code on the same
 //! line included. Finding one of those means walking the code before it,
 //! because only the walk tells `// a comment` from the `"//!"` inside
@@ -321,6 +336,15 @@ type Error = Box<dyn std::error::Error>;
 
 /// The candidate ABNF productions found in one file.
 type Spans = Vec<Candidate>;
+
+/// How one paragraph's lines reach the comment block: one masked body per
+/// line, in the paragraph's own order.
+///
+/// [`mask_paragraph`] is the only implementation this command runs. It is a
+/// parameter, and not a call, so that the tests can drive the REAL extraction
+/// over the per-line masking that shipped before this — see
+/// [`take_paragraph`].
+type Masker = fn(&[(usize, &str)]) -> Vec<String>;
 
 /// One ABNF production candidate: the span as extracted, and the whole rule
 /// that span is part of.
@@ -1463,14 +1487,21 @@ fn exempted_spans_for(path: &Path, source: &str) -> HashSet<String> {
 /// paired, so a quotation wrapped across lines is one span rather than several.
 /// A backticked production is found per PARAGRAPH — the same joining, over the
 /// smaller unit a Markdown code span may wrap across ([`abnf_spans`]) — and
-/// before [`mask_code_spans`] runs on the line. But which block it belongs to,
-/// and so whether [`cited_rfcs`] admits it as a candidate at all, is decided at
-/// the block's flush, once the whole block exists to be asked. Every quoted
-/// span pulled from the same block carries the same citations, for the same
-/// reason: the block, not the line, is what was cited. A FENCED production
-/// never joins a block at all — see
-/// [`fence_holds_grammar`] for why its admission is the fence's to answer.
+/// before [`mask_paragraph`] erases the spans holding a `"`. But which block it
+/// belongs to, and so whether [`cited_rfcs`] admits it as a candidate at all,
+/// is decided at the block's flush, once the whole block exists to be asked.
+/// Every quoted span pulled from the same block carries the same citations,
+/// for the same reason: the block, not the line, is what was cited. A FENCED
+/// production never joins a block at all — see [`fence_holds_grammar`] for why
+/// its admission is the fence's to answer.
 fn quotations(source: &str) -> Extracted {
+  quotations_masked(source, mask_paragraph)
+}
+
+/// [`quotations`] with the masking unit named, which is the one thing about it
+/// a test may vary: `mask` decides what a paragraph's lines look like by the
+/// time they are joined into a block, and nothing else here changes with it.
+fn quotations_masked(source: &str, mask: Masker) -> Extracted {
   let mut out: QuotedSpans = Vec::new();
   let mut productions = Vec::new();
   let mut skipped = 0usize;
@@ -1508,12 +1539,7 @@ fn quotations(source: &str) -> Extracted {
     // readings of the answer still differ.
     let cited = cited_rfcs(block);
     for (at, span) in quoted_spans(block) {
-      let line = marks
-        .iter()
-        .take_while(|(offset, _)| *offset <= at)
-        .last()
-        .map_or(0, |(_, line)| *line);
-      out.push((line, span.to_string(), cited.clone()));
+      out.push((line_of(marks, at), span.to_string(), cited.clone()));
     }
     if cited.is_empty() {
       skipped += pending.len();
@@ -1531,8 +1557,9 @@ fn quotations(source: &str) -> Extracted {
       // Drained before the flush, every time: `flush` is what decides whether
       // this block's candidates are admitted or counted uncited, and a
       // paragraph still held here when it ran would be admitted by the NEXT
-      // block's citations instead of its own.
-      take_paragraph(&mut paragraph, &mut pending);
+      // block's citations instead of its own — and its LINES would never reach
+      // the block at all, since the drain is what appends them.
+      take_paragraph(&mut paragraph, &mut pending, &mut block, &mut marks, mask);
       flush(&mut block, &mut marks, &mut pending);
       continue;
     };
@@ -1542,7 +1569,7 @@ fn quotations(source: &str) -> Extracted {
         // A fence never continues the one before it, open or close.
         continuing = None;
         // Nor does a code span reach across one, in either direction.
-        take_paragraph(&mut paragraph, &mut pending);
+        take_paragraph(&mut paragraph, &mut pending, &mut block, &mut marks, mask);
         if fenced {
           grammar_fence = fence_holds_grammar(info);
           if grammar_fence {
@@ -1570,21 +1597,23 @@ fn quotations(source: &str) -> Extracted {
       // would have had to close before the code line that carries it.
       fenced = false;
     }
-    if !block.is_empty() {
-      block.push(' ');
-    }
-    marks.push((block.len(), index + 1));
     // A `///` with nothing after it is the blank line of the comment's own
     // Markdown, and a code span may not hold one — so it ends the paragraph
-    // while leaving the block, and its citations, standing.
+    // while leaving the block, and its citations, standing. Its own separator
+    // and mark are pushed AFTER the drain, which is where the paragraph it
+    // ends lands: the block reads in the source's order or the marks name the
+    // wrong lines.
     if body.is_empty() {
-      take_paragraph(&mut paragraph, &mut pending);
+      take_paragraph(&mut paragraph, &mut pending, &mut block, &mut marks, mask);
+      if !block.is_empty() {
+        block.push(' ');
+      }
+      marks.push((block.len(), index + 1));
     } else {
       paragraph.push((index + 1, body));
     }
-    block.push_str(&mask_code_spans(body));
   }
-  take_paragraph(&mut paragraph, &mut pending);
+  take_paragraph(&mut paragraph, &mut pending, &mut block, &mut marks, mask);
   flush(&mut block, &mut marks, &mut pending);
   // Merged here rather than in the loop: `flush`'s borrow of `productions`
   // ends at the call above. Re-sorted by line so one file's candidates stay
@@ -1627,6 +1656,12 @@ fn quotations(source: &str) -> Extracted {
 /// to separate two unrelated paragraphs than a real quotation is to straddle
 /// one.
 fn markdown_quotations(source: &str) -> Extracted {
+  markdown_quotations_masked(source, mask_paragraph)
+}
+
+/// [`markdown_quotations`] with the masking unit named, mirroring
+/// [`quotations_masked`] for the same reason.
+fn markdown_quotations_masked(source: &str, mask: Masker) -> Extracted {
   let mut out: QuotedSpans = Vec::new();
   let mut productions = Vec::new();
   let mut skipped = 0usize;
@@ -1655,12 +1690,7 @@ fn markdown_quotations(source: &str) -> Extracted {
     // for both the spans below and the production gate.
     let cited = cited_rfcs(block);
     for (at, span) in quoted_spans(block) {
-      let line = marks
-        .iter()
-        .take_while(|(offset, _)| *offset <= at)
-        .last()
-        .map_or(0, |(_, line)| *line);
-      out.push((line, span.to_string(), cited.clone()));
+      out.push((line_of(marks, at), span.to_string(), cited.clone()));
     }
     if cited.is_empty() {
       skipped += pending.len();
@@ -1685,7 +1715,7 @@ fn markdown_quotations(source: &str) -> Extracted {
           fences_skipped += 1;
         }
       }
-      take_paragraph(&mut paragraph, &mut pending);
+      take_paragraph(&mut paragraph, &mut pending, &mut block, &mut marks, mask);
       flush(&mut block, &mut marks, &mut pending);
       continue;
     }
@@ -1706,22 +1736,19 @@ fn markdown_quotations(source: &str) -> Extracted {
       continue;
     }
     if raw.trim().is_empty() {
-      take_paragraph(&mut paragraph, &mut pending);
+      take_paragraph(&mut paragraph, &mut pending, &mut block, &mut marks, mask);
       flush(&mut block, &mut marks, &mut pending);
       continue;
     }
-    if !block.is_empty() {
-      block.push(' ');
-    }
-    marks.push((block.len(), index + 1));
-    // Trimmed, where `mask_code_spans` below is handed the raw line: a
-    // paragraph's lines are about to be JOINED, and the indentation Markdown
-    // uses to lay a paragraph out would otherwise land inside a span that
-    // wraps across one of them.
-    paragraph.push((index + 1, raw.trim()));
-    block.push_str(&mask_code_spans(raw));
+    // The RAW line, and [`take_paragraph`] trims a copy for [`abnf_spans`]:
+    // the indentation Markdown uses to lay a paragraph out belongs inside a
+    // code span that wraps across two of its lines and does not belong to a
+    // production read from one. Two readings of one line, which is what it
+    // was before the paragraph unit and is left standing here so that unit is
+    // the only thing this commit changes.
+    paragraph.push((index + 1, raw));
   }
-  take_paragraph(&mut paragraph, &mut pending);
+  take_paragraph(&mut paragraph, &mut pending, &mut block, &mut marks, mask);
   flush(&mut block, &mut marks, &mut pending);
   // See `quotations` for why the merge waits until `flush` is done with.
   let fenced_read = from_fences.len();
@@ -1745,7 +1772,7 @@ fn markdown_quotations(source: &str) -> Extracted {
 /// because the only thing that distinguishes `// a comment` from the `"//!"`
 /// inside `strip_prefix("//!")` is whether the slashes sit inside a string
 /// literal. The code half is then DISCARDED rather than scanned, which is the
-/// same argument [`mask_code_spans`] makes for an inline code span, applied to
+/// same argument [`mask_paragraph`] makes for an inline code span, applied to
 /// a whole line: a string literal cannot be read as a quotation if it is never
 /// read at all.
 ///
@@ -1900,10 +1927,12 @@ fn quoted_spans(block: &str) -> Vec<(usize, &str)> {
 /// The backticked ABNF productions in one PARAGRAPH of comment, each paired
 /// with the source line its opening backtick run sits on.
 ///
-/// Runs BEFORE [`mask_code_spans`], which erases a backticked span holding a
+/// Runs BEFORE [`mask_paragraph`], which erases a backticked span holding a
 /// `"` — and a production's terminals are quoted, so by the time a block is
 /// built its productions are gone. [`quoted_spans`] would not have found them
-/// either: a production without a terminal carries no `"` at all.
+/// either: a production without a terminal carries no `"` at all. Both read the
+/// paragraph's spans through [`code_spans`], so what the mask erases and what
+/// this admits are the same spans under the same rule.
 ///
 /// A span counts when it opens with `name =` or RFC 2046's `name :=`, which is
 /// what separates a grammar rule from a backticked identifier. `=/`
@@ -1929,15 +1958,15 @@ fn quoted_spans(block: &str) -> Vec<(usize, &str)> {
 ///
 /// # Backtick RUNS, not backticks
 ///
-/// A span opened by N backticks closes on the next run of exactly N. That is
-/// CommonMark's rule rather than a refinement of it, and joining lines is what
-/// makes it load-bearing here: a comment writes a literal backtick by wrapping
-/// it in two, and one such span in this very file — [`exempted_spans`]'s own
-/// doc comment — is wrapped across two lines. Pairing single backticks would
-/// take that span's head from one line and its tail from the next and offer the
-/// join as a grammar rule; `a_doubled_backtick_span_is_not_two_single_ones`
-/// quotes those two lines verbatim and holds it to reading one span, which
-/// holds backticks and is not production-shaped.
+/// A span opened by N backticks closes on the next run of exactly N — the rule
+/// [`code_spans`] walks, and joining lines is what makes it load-bearing here:
+/// a comment writes a literal backtick by wrapping it in two, and one such span
+/// in this very file — [`exempted_spans`]'s own doc comment — is wrapped across
+/// two lines. Pairing single backticks would take that span's head from one line
+/// and its tail from the next and offer the join as a grammar rule;
+/// `a_doubled_backtick_span_is_not_two_single_ones` quotes those two lines
+/// verbatim and holds it to reading one span, which holds backticks and is not
+/// production-shaped.
 ///
 /// An opening run that finds no closer in the paragraph is literal text, and
 /// the walk resumes at the run after it: one stray backtick costs the spans
@@ -1945,12 +1974,24 @@ fn quoted_spans(block: &str) -> Vec<(usize, &str)> {
 /// at that point, which is why widening the unit had to widen the recovery with
 /// it — a paragraph is a great deal more to abandon than a line.
 fn abnf_spans(paragraph: &[(usize, &str)]) -> Vec<(usize, String)> {
+  let (text, starts) = join_paragraph(paragraph);
   let mut out = Vec::new();
-  // The paragraph as one text, with the source line each joined line's first
-  // byte belongs to. Joined on `\n` rather than on a space so the join stays
-  // VISIBLE to the walk below: only a line ending INSIDE a span becomes a
-  // space, and a span has to be able to tell that space from one its author
-  // wrote.
+  for span in code_spans(&text) {
+    let rule = code_span_text(span.content);
+    if is_production(&rule) {
+      out.push((line_of(&starts, span.at), rule));
+    }
+  }
+  out
+}
+
+/// One paragraph of comment as a single text, beside the source line each
+/// joined line's first byte belongs to.
+///
+/// Joined on `\n` rather than on a space so the join stays VISIBLE to the
+/// walks over it: only a line ending INSIDE a code span becomes a space, and a
+/// span has to be able to tell that space from one its author wrote.
+fn join_paragraph(paragraph: &[(usize, &str)]) -> (String, Vec<(usize, usize)>) {
   let mut text = String::new();
   let mut starts: Vec<(usize, usize)> = Vec::new();
   for (line, body) in paragraph {
@@ -1960,12 +2001,58 @@ fn abnf_spans(paragraph: &[(usize, &str)]) -> Vec<(usize, String)> {
     starts.push((text.len(), *line));
     text.push_str(body);
   }
-  let runs = backtick_runs(&text);
+  (text, starts)
+}
+
+/// The source line a byte offset sits on, given the offset each line starts at
+/// in increasing order.
+///
+/// One function for the two places that ask it — a code span inside a joined
+/// paragraph, and a quoted span inside a joined block — because it is the same
+/// question over two different join tables, and asking it twice is how the two
+/// answers come to differ.
+fn line_of(starts: &[(usize, usize)], at: usize) -> usize {
+  starts
+    .iter()
+    .take_while(|(offset, _)| *offset <= at)
+    .last()
+    .map_or(0, |(_, line)| *line)
+}
+
+/// One inline code span: where its delimiters begin and end, and what they
+/// enclose before [`code_span_text`] reads it.
+struct CodeSpan<'a> {
+  /// Byte offset of the opening backtick run.
+  at: usize,
+  /// One past the closing backtick run, so `at..end` is the whole span with
+  /// its delimiters — which is what [`mask_paragraph`] replaces.
+  end: usize,
+  /// The bytes between the two runs.
+  content: &'a str,
+}
+
+/// Every inline code span in one joined paragraph, in the order their opening
+/// runs appear.
+///
+/// This is the ONE reading of a code span in this module. The ABNF path
+/// ([`abnf_spans`]) asks which of these spans is a production; the quotation
+/// path ([`mask_paragraph`]) asks which of them holds a `"`. They were two
+/// walks under two pairing rules, and the defect lived in the gap: the
+/// quotation path's walk was per LINE, so a span wrapped across two comment
+/// lines met no closing backtick, and every `"` inside it leaked into the
+/// block for [`quoted_spans`] to pair with a real quotation's.
+///
+/// A span opened by N backticks closes on the next run of exactly N, and the
+/// runs between the two are content — CommonMark's rule rather than a
+/// refinement of it, and [`abnf_spans`] names the doubled-backtick span in this
+/// very file that makes it load-bearing. An opening run that finds no closer is
+/// literal text, and the walk resumes at the run AFTER it rather than giving up
+/// on what follows: one stray backtick costs the spans behind it nothing.
+fn code_spans(text: &str) -> Vec<CodeSpan<'_>> {
+  let runs = backtick_runs(text);
+  let mut out = Vec::new();
   let mut at = 0usize;
   while let Some(&(open, len)) = runs.get(at) {
-    // The closer is the next run of the SAME length, and the runs between the
-    // two are content. A run with no such partner is literal text, so the walk
-    // resumes at the run after it rather than giving up on the paragraph.
     let Some((index, &(close, _))) = runs
       .iter()
       .enumerate()
@@ -1979,15 +2066,11 @@ fn abnf_spans(paragraph: &[(usize, &str)]) -> Vec<(usize, String)> {
     let Some(content) = text.get(open.saturating_add(len)..close) else {
       continue;
     };
-    let span = code_span_text(content);
-    if is_production(&span) {
-      let line = starts
-        .iter()
-        .take_while(|(offset, _)| *offset <= open)
-        .last()
-        .map_or(0, |(_, line)| *line);
-      out.push((line, span));
-    }
+    out.push(CodeSpan {
+      at: open,
+      end: close.saturating_add(len),
+      content,
+    });
   }
   out
 }
@@ -2035,20 +2118,53 @@ fn code_span_text(content: &str) -> String {
     .to_string()
 }
 
-/// Reads the paragraph collected so far into `pending` as candidates, and
-/// empties it for the next one.
+/// Reads the paragraph collected so far into `pending` as candidates and into
+/// `block` as masked text, and empties it for the next one.
 ///
 /// [`Candidate::rule`] is the span itself: a backticked production is whole
 /// where its author left it, so unlike a fenced one ([`read_fenced_line`])
 /// there is no continuation to join onto it — a span wrapped across lines was
 /// already joined by [`abnf_spans`] before it reached here.
-fn take_paragraph(paragraph: &mut Vec<(usize, &str)>, pending: &mut Spans) {
-  for (line, span) in abnf_spans(paragraph) {
+///
+/// The block half lands HERE rather than in the caller's loop because masking
+/// is a paragraph-wide question ([`mask_paragraph`]): a line cannot be masked
+/// until the paragraph holding it is complete, so a line cannot be appended
+/// until then either. The two are one call so the order stays the source's
+/// own — every caller drains the paragraph at exactly the point its lines
+/// would otherwise have been pushed.
+///
+/// `mask` is a parameter rather than [`mask_paragraph`] named directly, so the
+/// differential in this module's tests can run the real extraction over the
+/// LINE unit this replaced and compare. A counterfactual reimplemented beside
+/// the loop would share none of the loop, and so could not grade it.
+fn take_paragraph(
+  paragraph: &mut Vec<(usize, &str)>,
+  pending: &mut Spans,
+  block: &mut String,
+  marks: &mut Vec<(usize, usize)>,
+  mask: Masker,
+) {
+  // Trimmed for the ABNF path alone: a `.rs` body arrives trimmed already
+  // ([`comment_body`]) and a `.md` line arrives raw, and a production is not
+  // its paragraph's layout indentation.
+  let trimmed: Vec<(usize, &str)> = paragraph
+    .iter()
+    .map(|(line, body)| (*line, body.trim()))
+    .collect();
+  for (line, span) in abnf_spans(&trimmed) {
     pending.push(Candidate {
       line,
       rule: span.clone(),
       span,
     });
+  }
+  let masked = mask(paragraph);
+  for ((line, _), body) in paragraph.iter().zip(masked) {
+    if !block.is_empty() {
+      block.push(' ');
+    }
+    marks.push((block.len(), *line));
+    block.push_str(&body);
   }
   paragraph.clear();
 }
@@ -2507,31 +2623,82 @@ fn cited_rfcs(block: &str) -> Vec<u32> {
   found
 }
 
-/// Masks an inline code span that contains a `"`.
+/// What one masked code span leaves behind in the block.
+///
+/// Length is not preserved and does not need to be: the block's line marks are
+/// recorded as the masked bodies are appended, so an offset in the block is an
+/// offset into what this replacement produced.
+const MASK: &str = "<code>";
+
+/// Masks the inline code spans holding a `"` across one PARAGRAPH, returning
+/// one masked body per line in the paragraph's own order.
 ///
 /// `` `"` `` is a quote character being NAMED, not one opening a quotation, and
-/// leaving it in place pairs it with a real quotation's and swallows a paragraph.
-fn mask_code_spans(line: &str) -> String {
-  let mut out = String::with_capacity(line.len());
-  let mut rest = line;
-  while let Some(open) = rest.find('`') {
-    out.push_str(&rest[..open]);
-    let after = &rest[open + 1..];
-    let Some(close) = after.find('`') else {
-      out.push_str(&rest[open..]);
-      return out;
-    };
-    let span = &after[..close];
-    if span.contains('"') {
-      out.push_str("<code>");
-    } else {
-      out.push('`');
-      out.push_str(span);
-      out.push('`');
+/// leaving it in place pairs it with a real quotation's and swallows a
+/// paragraph.
+///
+/// # Why the unit is a paragraph and not a line
+///
+/// It was a line, and a line is where a QUOTATION could leave this gate
+/// altogether — the same escape [`abnf_spans`] closed one path over, arriving
+/// through this one. A code span too long for one comment line gets wrapped;
+/// masking a line at a time met an opening backtick with no closer on that
+/// line, and every `"` inside the span leaked into the block. [`quoted_spans`]
+/// pairs quotes left to right, so an ODD number of leaked quotes displaces
+/// every real quotation after it: the author's opening `"` is consumed as a
+/// closer and their closing `"` becomes an opener. Whether anyone found out
+/// depended on the prose between the two — long enough to be graded and the
+/// false span surfaced as untriaged, shorter than [`MIN_WORDS`] / [`MIN_CHARS`]
+/// and [`grade`] returned early without counting it, so the real quotation was
+/// never graded, never counted and never reported.
+///
+/// # Why the unit is not the whole block
+///
+/// A block is several paragraphs, and a code span may not cross a blank line —
+/// so pairing backticks over a whole block pairs two paragraphs' unrelated
+/// stray backticks and masks everything between them, quotations included.
+/// Measured on this workspace the block unit invented a span in this module's
+/// own doc comment, which is one span more than the line unit it was meant to
+/// improve on; `a_stray_backtick_pairs_no_further_than_its_own_paragraph` holds
+/// that boundary. The paragraph is the unit rustdoc renders and the unit
+/// [`abnf_spans`] already reads, so it is the unit both paths now share.
+fn mask_paragraph(paragraph: &[(usize, &str)]) -> Vec<String> {
+  let (text, starts) = join_paragraph(paragraph);
+  // Sorted and non-overlapping, because `code_spans` resumes after the closer
+  // of the span it just read — which is what lets the walk below advance a
+  // cursor through them once per line.
+  let masked: Vec<(usize, usize)> = code_spans(&text)
+    .iter()
+    .filter(|span| span.content.contains('"'))
+    .map(|span| (span.at, span.end))
+    .collect();
+  let mut out = Vec::with_capacity(paragraph.len());
+  for (index, (_, body)) in paragraph.iter().enumerate() {
+    let start = starts.get(index).map_or(0, |(offset, _)| *offset);
+    let end = start.saturating_add(body.len());
+    let mut line = String::with_capacity(body.len());
+    let mut cursor = start;
+    for &(from, to) in &masked {
+      if to <= start || from >= end {
+        continue;
+      }
+      let head = from.clamp(start, end);
+      if head > cursor {
+        line.push_str(text.get(cursor..head).unwrap_or_default());
+      }
+      // The mask is emitted once, on the line the span OPENS on: a line that
+      // merely holds the span's continuation contributes nothing for it, which
+      // is what a wrapped span looks like once it is one span again.
+      if from >= start {
+        line.push_str(MASK);
+      }
+      cursor = to.clamp(start, end).max(cursor);
     }
-    rest = &after[close + 1..];
+    if cursor < end {
+      line.push_str(text.get(cursor..end).unwrap_or_default());
+    }
+    out.push(line);
   }
-  out.push_str(rest);
   out
 }
 
@@ -2850,8 +3017,111 @@ fn is_ignored(path: &Path) -> Result<bool, Error> {
 
 #[cfg(test)]
 mod tests {
-  use super::{markdown_quotations, quotations, spans_for, untriaged_drift};
-  use std::{collections::BTreeMap, path::Path};
+  use super::{
+    MIN_CHARS, MIN_WORDS, Masker, markdown_quotations, markdown_quotations_masked, mask_paragraph,
+    normalise, quotations, quotations_masked, spans_for, untriaged_drift,
+  };
+  use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+  };
+
+  // ==== the masking unit, and the differential that grades the choice ====
+
+  /// The per-line masking this command shipped before the paragraph unit,
+  /// verbatim, as the counterfactual the differential below measures against.
+  ///
+  /// It is here rather than in the module because nothing but a measurement
+  /// may run it: an opening backtick with no closer ON THAT LINE made it give
+  /// up and emit the rest of the line raw, which is the leak
+  /// [`super::mask_paragraph`] exists to close.
+  fn mask_each_line(paragraph: &[(usize, &str)]) -> Vec<String> {
+    paragraph.iter().map(|(_, body)| mask_line(body)).collect()
+  }
+
+  fn mask_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+      out.push_str(&rest[..open]);
+      let after = &rest[open + 1..];
+      let Some(close) = after.find('`') else {
+        out.push_str(&rest[open..]);
+        return out;
+      };
+      let span = &after[..close];
+      if span.contains('"') {
+        out.push_str("<code>");
+      } else {
+        out.push('`');
+        out.push_str(span);
+        out.push('`');
+      }
+      rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+  }
+
+  /// The spans one source yields under `mask` that are large enough for
+  /// `grade` to have an opinion about — the same ellipsis split, the same
+  /// `normalise`, and the same two floors `grade` applies before it will look
+  /// at a span at all.
+  ///
+  /// The floors are the whole point of measuring here rather than counting
+  /// what `run` prints: a span BELOW them leaves `grade` as a silent `None`
+  /// that is not counted anywhere, so a quotation displaced into one
+  /// disappears without moving a single printed number.
+  fn graded_spans(path: &Path, source: &str, mask: Masker) -> Vec<(usize, String)> {
+    let extracted = if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+      markdown_quotations_masked(source, mask)
+    } else {
+      quotations_masked(source, mask)
+    };
+    let mut out = Vec::new();
+    for (line, span, _) in extracted.quoted {
+      for segment in span.split(['…']).flat_map(|part| part.split("...")) {
+        let quoted = normalise(segment);
+        if quoted.split_whitespace().count() >= MIN_WORDS && quoted.chars().count() >= MIN_CHARS {
+          out.push((line, quoted));
+        }
+      }
+    }
+    out
+  }
+
+  /// Every graded-size span the two masking units disagree about in one
+  /// source, as (line, span, which unit found it).
+  fn masking_disagreements(path: &Path, source: &str) -> Vec<(usize, String, &'static str)> {
+    let paragraph = graded_spans(path, source, mask_paragraph);
+    let line = graded_spans(path, source, mask_each_line);
+    let mut out = Vec::new();
+    for span in &paragraph {
+      if !line.contains(span) {
+        out.push((span.0, span.1.clone(), "paragraph unit only"));
+      }
+    }
+    for span in &line {
+      if !paragraph.contains(span) {
+        out.push((span.0, span.1.clone(), "line unit only"));
+      }
+    }
+    out
+  }
+
+  /// Every `.rs` and `.md` file this workspace tracks, by the same walk
+  /// `run` makes — ignored trees left out, so the number this test holds is
+  /// the number CI would hold.
+  fn workspace_sources() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+      .parent()
+      .expect("the workspace root");
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    super::collect_sources(root, &mut out, false, &mut skipped).expect("the source walk");
+    out.sort();
+    out
+  }
 
   fn counts(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
     pairs
@@ -3087,7 +3357,7 @@ mod tests {
       .collect()
   }
 
-  // An ABNF production reaches neither existing path: `mask_code_spans` erases
+  // An ABNF production reaches neither existing path: `mask_paragraph` erases
   // a backticked span holding a `"`, and `quoted_spans` only takes `"…"`. It
   // needs its own extractor, and this is the shape that finds one.
   #[test]
@@ -4132,5 +4402,171 @@ mod tests {
     );
     assert!(graded.is_none(), "verbatim in the anchored spec");
     assert_eq!((narrow, fallback), (0, 1));
+  }
+
+  // ==== the masking unit ====
+
+  // The defect, demonstrated: a code span wrapped across two comment lines
+  // holds ONE `"`, the line unit meets no closing backtick and emits the rest
+  // of the line raw, and `quoted_spans` pairs that leaked quote with the
+  // author's opening one. The real quotation's closing mark is then an opener
+  // with nothing to close on, so the quotation is not extracted AT ALL — not
+  // mis-graded, not reported, absent.
+  #[test]
+  fn a_code_span_wrapped_across_lines_does_not_leak_its_quotes() {
+    let source = concat!(
+      "/// RFC 9110 §5.6.1.2: a member such as `a=\"x,\n",
+      "/// y`. It says: \"Empty elements do not contribute to the count of\n",
+      "/// elements present.\"\n",
+    );
+
+    assert_eq!(
+      spans_under(source, mask_paragraph),
+      ["Empty elements do not contribute to the count of elements present."],
+      "the span is one code span, so the quotation behind it is the block's only one"
+    );
+    assert_eq!(
+      spans_under(source, mask_each_line),
+      ["x, y`. It says: "],
+      "the line unit pairs the leaked quote with the quotation's opening mark"
+    );
+  }
+
+  // …and why nothing found out. The false span the leak produces is below both
+  // of `grade`'s floors, so `grade` returns the same silent `None` it returns
+  // for a field value — it is not counted untriaged, nothing is printed, and
+  // the run's numbers do not move. That is the escape #75 closed on the ABNF
+  // path, reached through the quotation one.
+  #[test]
+  fn a_leaked_quote_can_take_a_quotation_out_of_the_gate_without_a_trace() {
+    let source = concat!(
+      "/// RFC 9110 §5.6.1.2: a member such as `a=\"x,\n",
+      "/// y`. It says: \"Empty elements do not contribute to the count of\n",
+      "/// elements present.\"\n",
+    );
+    let path = Path::new("demonstration.rs");
+
+    assert!(
+      graded_spans(path, source, mask_each_line).is_empty(),
+      "the false span is 4 words and 15 characters: `grade` returns before it counts anything"
+    );
+    let graded = graded_spans(path, source, mask_paragraph);
+    assert_eq!(graded.len(), 1, "{graded:?}");
+    assert_eq!(
+      graded[0].1,
+      "Empty elements do not contribute to the count of elements present."
+    );
+  }
+
+  // The differential below reports zero over this workspace, and a detector
+  // that cannot fail reports zero too. This is the same helper on a source
+  // that DOES leak, so the zero is a measurement rather than a property of
+  // the helper.
+  #[test]
+  fn the_differential_reports_a_leak_it_is_given() {
+    let source = concat!(
+      "/// RFC 9110 §5.6.1.2: a member such as `a=\"x,\n",
+      "/// y`. It says: \"Empty elements do not contribute to the count of\n",
+      "/// elements present.\"\n",
+    );
+    let found = masking_disagreements(Path::new("demonstration.rs"), source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].2, "paragraph unit only");
+    assert_eq!(
+      found[0].1,
+      "Empty elements do not contribute to the count of elements present."
+    );
+  }
+
+  // The measurement the fix shipped with, as a check rather than a sentence:
+  // over every file this command reads, the unit that replaced the per-line
+  // one changes no span large enough to be graded. Written down it decays the
+  // moment somebody edits a comment; run here it cannot.
+  //
+  // A disagreement is not automatically a defect — the paragraph unit is the
+  // right answer and a comment may legitimately become the first in this
+  // workspace to wrap a code span around a quote. It is a REPORT: read the
+  // block, satisfy yourself the paragraph unit's answer is the one you want,
+  // and record it here. What it refuses is the same change arriving unread.
+  #[test]
+  fn the_two_masking_units_agree_on_every_graded_span_in_this_workspace() {
+    let sources = workspace_sources();
+    let mut found = Vec::new();
+    let mut graded = 0usize;
+    for path in &sources {
+      let text =
+        std::fs::read_to_string(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+      graded += graded_spans(path, &text, mask_paragraph).len();
+      for (line, span, which) in masking_disagreements(path, &text) {
+        found.push(format!("{}:{line}: {which}: {span:?}", path.display()));
+      }
+    }
+    assert!(found.is_empty(), "{found:#?}");
+
+    // A walk that read nothing agrees with itself about nothing, and would
+    // pass the assertion above without having compared a single comment.
+    assert!(
+      sources.len() >= 100,
+      "the walk found {} source files",
+      sources.len()
+    );
+    assert!(graded >= 500, "the walk found {graded} graded-size spans");
+  }
+
+  // Why the unit is the paragraph and not the whole block, which is the other
+  // way to close the leak. A code span may not cross a blank line, so pairing
+  // backticks over a block pairs two paragraphs' unrelated strays and masks
+  // everything between them — the quotation included. Nothing in this
+  // workspace spells that today (both units read its 10 000-odd blocks the
+  // same way), which is exactly why the boundary is held by a constructed
+  // case rather than by the corpus.
+  #[test]
+  fn a_stray_backtick_pairs_no_further_than_its_own_paragraph() {
+    let first = [(1usize, "RFC 9110 §5.6.1.2 writes a ` in prose")];
+    let second = [(
+      3usize,
+      "It says: \"Empty elements do not contribute to the count of elements present.\" and a ` here",
+    )];
+    let block: Vec<(usize, &str)> = first.iter().chain(second.iter()).copied().collect();
+
+    let by_paragraph = [mask_paragraph(&first), mask_paragraph(&second)].concat();
+    assert!(
+      by_paragraph.iter().all(|line| !line.contains(super::MASK)),
+      "an opening run with no closer in its own paragraph is literal text: {by_paragraph:?}"
+    );
+    assert_eq!(
+      quoted_spans_of(&by_paragraph),
+      ["Empty elements do not contribute to the count of elements present."]
+    );
+
+    let by_block = mask_paragraph(&block);
+    assert!(
+      by_block[0].contains(super::MASK),
+      "the whole-block unit pairs the two paragraphs' strays: {by_block:?}"
+    );
+    assert!(
+      quoted_spans_of(&by_block).is_empty(),
+      "and swallows the quotation between them: {by_block:?}"
+    );
+  }
+
+  /// The spans `quotations` finds under a named masking unit — [`spans`] with
+  /// the unit made visible, for the two tests that need to see both answers.
+  fn spans_under(source: &str, mask: Masker) -> Vec<String> {
+    quotations_masked(source, mask)
+      .quoted
+      .into_iter()
+      .map(|(_, span, _)| span)
+      .collect()
+  }
+
+  /// The quoted spans of masked lines once they are joined into a block, which
+  /// is the one thing the masking unit is chosen to get right.
+  fn quoted_spans_of(lines: &[String]) -> Vec<String> {
+    let block = lines.join(" ");
+    super::quoted_spans(&block)
+      .into_iter()
+      .map(|(_, span)| span.to_string())
+      .collect()
   }
 }
