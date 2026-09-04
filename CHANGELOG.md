@@ -1,616 +1,12 @@
 # UNRELEASED
 
-## `http-semantics` — why `encoding_acceptability` has no corpus, recorded where its tests are
-
-The three differential harnesses here grade a reader over records that are
-BYTES. That shape cannot express this function's input, and the gap is in the
-ARGUMENTS rather than in the bytes: presence is not a byte string (zero field
-lines and one empty line are different inputs with different answers), direction
-is not in the field, and the question itself is an `Option<coding>` the caller
-passes. Records would need roughly `{ direction, field_lines, coding }`, and the
-harness would be a differential over arguments as well as bytes, which none of
-the three existing ones is.
-
-One narrowing on that, derived rather than taken: for THIS reader a single-value
-record loses only the zero-lines case and not every line split. The walk is
-`lines.flat_map(list_elements)` and RFC 9110 §5.2's join inserts a comma no
-element may hold, so any non-empty set of lines answers as its joined value
-does — pinned for two fields by existing tests. What a value cannot carry is the
-difference between no lines and some, which is exactly where rule 1 and the
-response case live.
-
-The note sits at the head of the acceptability tests, where someone looking for
-the missing corpus will be.
-
-## `http-semantics` — an absent response advertises nothing, and now says so
-
-Zero field lines always answered `AcceptableByDefault`. RFC 9110 §12.5.3's
-absence rule names its direction — "If no Accept-Encoding header field is in the
-request, any content coding is considered acceptable by the user agent." — and
-gives a response's field meaning only when it is PRESENT: "When the
-Accept-Encoding header field is present in a response, it indicates what content
-codings the resource was willing to accept in the associated request." A
-response carrying no such field has advertised nothing, and the old answer told a
-client that a server which said nothing accepts everything, which the client can
-act on by encoding its next request.
-
-The previous round labelled this an extrapolation. A label is not a fix: naming
-an extrapolation is not the same as declining to make one.
-
-### Added
-
-- `negotiation::Direction`, with `Request` and `Response`.
-  `encoding_acceptability` takes it as its first argument — the function is new
-  and unreleased, so the signature was free.
-- `Acceptability::NotAdvertised`, for a response with no field. It is **not a
-  verdict**, so `Acceptability::is_acceptable` now returns `Option<bool>` and
-  answers `None` there: both bools would be wrong, since `true` says a server
-  that advertised nothing accepts this coding and `false` says it refuses one it
-  may well accept. `weight` is `None` there too.
-
-### The totality table, re-checked against the direction axis
-
-Rule 1 is the only entry that moves: it now requires no lines AND
-`Direction::Request`. Rule 7 is about a field that is THERE and still reads as
-such — rules 2 to 6 evaluate a present response field exactly as a request's,
-which is what that rule says — so `direction` reaches no arm of the walk and no
-arm of the verdict match. It decides the zero-line case and nothing else.
-`an_absent_response_advertises_nothing` asserts both halves: the four-way
-split on absence, and that five present fields answer identically in both
-directions for three different codings.
-
-## `http-semantics` — the wildcard reaches the uncoded representation only at zero
-
-The previous round had `"*"` lend its weight to a representation with no content
-coding, on the ground that nothing bounded rule 2's reach to a zero. An external
-reviewer read it the other way, and re-deriving it selects the reviewer's
-reading. Both readings were computed from the public walk over the same nine
-fields before anything changed, so the choice is between two measured answers
-rather than two arguments.
-
-### The test that settles it: which reading makes rule 2's own clause do work
-
-If `"*"` matched this state generally, rule 2's `*;q=0` clause would follow from
-the asterisk sentence plus §12.4.2 — and so would `identity;q=0`, and so would
-"without a more specific entry for `identity`". Everything after "acceptable by
-default" would restate machinery stated elsewhere. If `"*"` does not match it,
-rule 2 is the only source of the `*;q=0` exclusion and the precedence sub-clause
-is what keeps an explicit `identity` entry ahead of it. A reading that gives a
-sentence the RFC wrote something to do beats one that makes it ornament.
-
-**And this section marks its restatements.** Rule 3 restates §12.4.2 and says so
-in its own parenthesis: "As defined in Section 12.4.2, a qvalue of 0 means "not
-acceptable"." Rule 2 carries no such marker.
-
-Two further anchors, both textual:
-
-- The asterisk sentence matches "any available content coding not explicitly
-  listed in the field", and §8.4 has a representation's codings listed in
-  `Content-Encoding` with `identity` reserved out of it — so this state has no
-  available content coding for that sentence to range over.
-- `codings          = content-coding / "identity" / "*"` gives `identity` an
-  alternative beside `content-coding`, so a rule quantified over a
-  `content-coding` does not reach it. That separation is SEMANTIC: the three
-  alternatives derive one language, which is why one `Element` arm reads them
-  all, and it is the meanings that are distinct.
-
-**The section's own example is neutral and is reported as such.**
-`Accept-Encoding: gzip;q=1.0, identity; q=0.5, *;q=0` pairs an explicit
-`identity` entry with `*;q=0`; under both readings that `*;q=0` excludes the
-uncoded representation and the explicit entry overrides it, so both make the
-spelling natural and both give it identical answers. It is not evidence either
-way and is not used as any.
-
-**What the rejected reading actually cost, which is the reverse of how the
-previous round read it.** Over `Accept-Encoding: *;q=0.001, gzip;q=0.5` it hands
-the uncoded representation `Weighed(1)`, ranking it BELOW `gzip` — turning a
-status rule 2 states unconditionally into a near-refusal the field never wrote.
-That is not preserving the client's ordering; it is inventing one, in the
-direction that most damages the representation rule 2 protects.
-
-### Fixed
-
-- A wildcard reaches the no-coding state only at zero. The identity/`None`
-  normalisation is untouched — the two halves are independent, and only the
-  second moved.
-- The pin names the reading NOT taken and its answers, so the next reader meets
-  both sides: under it the three parting fields answer `Weighed(500)`,
-  `Weighed(500)` and `Weighed(1)` where this reader answers rule 2's default.
-  Measured over both readings; they part on exactly one shape — a non-zero
-  wildcard with no explicit `identity` entry — and agree everywhere else,
-  including on every field asked about a coding the representation has.
-
-### Added
-
-- `the_sections_own_example_line_parses_and_answers` pins §12.5.3's own example
-  at `.rfc-cache/rfc9110.txt:5555`. Its `identity; q=0.5` carries OWS AFTER the
-  semicolon, which §12.4.2's `weight = OWS ";" OWS "q=" qvalue` brackets, where
-  this reader's refusals are around the `=` that production writes bare. A
-  specification's own example is an input no reader has licence to refuse, so it
-  is pinned rather than assumed: three preferences at 1000 / 500 / 0, and the
-  four answers `encoding_acceptability` gives over it.
-
-## `http-semantics` — the domain `encoding_acceptability` answers over is narrower than its section's subject
-
-Totality holds — every rule RFC 9110 §12.5.3 states about acceptability is
-expressible from the two inputs — but two narrowings sit between the function
-and the section, and neither is visible from the signature. Both are now stated.
-
-### Changed
-
-- **One coding, where a representation may carry several.** §12.5.3: "A
-  representation could be encoded with multiple content codings.", and §8.4 has
-  the sender list them in the order they were applied, so
-  `Content-Encoding: gzip, br` is one representation with two. This answers
-  about one — the unit the section's own rules are stated over — and a caller
-  holding two asks twice. The conjunction is the caller's composition, not a
-  sentence this crate can cite, and `a_representation_with_two_codings_is_two_questions`
-  says so where a reader will look for an `is_acceptable` over a list.
-- **A field that is there.** Rule 7 carries the response direction for a field
-  that is PRESENT — "When the Accept-Encoding header field is present in a
-  response, it indicates what content codings the resource was willing to accept
-  in the associated request." — while rule 1's absence case is written about the
-  REQUEST. So answering `AcceptableByDefault` for a RESPONSE carrying no such
-  field extends rule 1 past the direction it names. It is the only answer that
-  keeps one function serving both directions, and the alternative is a direction
-  argument for a case §12.5.3 does not rule on, so the extrapolation is taken and
-  named rather than hidden.
-
-## `http-semantics` — two citations `quote-check` cannot see
-
-That gate grades a quotation's WORDS against the spec text; it never reads the
-section number beside them, so an accurate sentence hung on the wrong section
-passes. Both of these did.
-
-### Fixed
-
-- The case-insensitive-matching MUST was attributed to RFC 4647 §2.1. The
-  sentence is at `.rfc-cache/rfc4647.txt:187-188`, under **§2** — §2 begins at
-  `:150` and §2.1 at `:190`. Corrected to §2. Every other RFC 4647 §2.1 citation
-  in this branch was re-checked against those line numbers and is right: they
-  cite the ABNF at `:197-198` and the ill-formed-ranges sentence at `:203`, both
-  inside §2.1, and one cites §2.2's `extended-language-range` at `:220`.
-- The module summary listed RFC 4647 §2.1's `language-range` as ALPHA, DIGIT and
-  `-` and no other byte, which omits the `"*"` that rule's own second
-  alternative admits and that this reader accepts. The sentence's point — that
-  no element here can hold a `;`, so nothing but `[ weight ]` can open — is
-  unaffected, and now the list is the rule's.
-
-## `http-semantics` — `NotAWeight`'s doc named a case the code answers `BadWeight`
-
-The variant's doc said it covered "a second one behind the first". Measured,
-`gzip;q=0.5;q=0.7`, `gzip;q=0.5;p=1` and `gzip;q=0.5;` all answer `BadWeight`.
-
-### Fixed
-
-The production decides, and the CODE was right. RFC 9110 §12.5.3's
-`Accept-Encoding  = #( codings [ weight ] )` brackets one weight, so once
-§12.4.2's `"q="` literal has matched there is nothing left for a second `;` to
-open and everything to the element's end is the `qvalue` slot —
-`gzip;q=0.5;q=0.7` puts `0.5;q=0.7` in it, which is no `qvalue`. `NotAWeight` is
-what the literal FAILING to match earns: a parameter by another name, a `q` with
-§5.6.3's `BWS` in front of the `=`, or nothing behind the `;` at all.
-
-`what_follows_a_matched_q_is_the_qvalue_slot` pins both sides of that partition
-over six values each, so the doc and the code cannot drift apart again in
-silence.
-
-## `http-semantics` — one crate, one answer to the repeated-entry tie
-
-The RFC search that established RFC 9110 settles nothing about a field naming
-one value twice was right, and it stands. What it missed is that this crate had
-already broken the tie: `media::weight_for` resolves a repeated media range by
-FIELD ORDER, first standing, and its own comment rejects the alternative in
-writing: relaxing its `<` to `<=` is recorded there as what would send every tie
-to the last range instead of the first. §12.5.1 gets the same silence that
-§12.5.3
-does, so a second reader picking the other end made one crate answer one
-unsettled question two ways.
-
-Measured before the change:
-`weight_for(text/plain, ["text/plain;q=0.25, text/plain;q=0.75"])` is **250**;
-`encoding_acceptability(Some(b"gzip"), ["gzip;q=0.25, gzip;q=0.75"])` was
-**750**.
-
-### Fixed
-
-- `fold_repeated_entry` takes the FIRST entry in field order where no entry is
-  zero, following `media`. Its doc keeps the search that shows RFC 9110 settles
-  nothing, and gains the reason the tie is nevertheless not this module's to
-  break. `media` is untouched.
-
-### The half that still differs, and why that is licensed
-
-`weight_for` absorbs no zero — measured,
-`weight_for(text/plain, ["text/plain;q=1, text/plain;q=0"])` is **1000** — and
-it should not: §12.5.1 has no counterpart to §12.5.3 rule 3's "unless it is
-accompanied by a qvalue of 0", which is the sentence this reader has and that
-one does not. So the two readers agree wherever the RFC is silent and part only
-where it speaks to one of them. The test asserts both halves, calling
-`weight_for` directly so the comparison is between two readers rather than
-between one reader and a remembered number.
-
-### Which assertion catches which reading is measured, and it is not what was predicted
-
-The mirror assertion was written to exclude a largest-wins reading. Under
-first-wins it excludes a **smallest**-wins one instead: three mutations of
-`fold_repeated_entry`, each run and then restored from a copy, put last-in-field-
-order and zero-absorbing-largest-wins on the FIRST assertion (750 against 250)
-and zero-absorbing-smallest-wins on the MIRROR (250 against 750). The comment
-now says so.
-
-## `http-semantics` — `identity` and no coding are one state, and the wildcard reaches it
-
-`encoding_acceptability` gave one representation two answers depending on how a
-caller spelled it. Measured with a probe crate against the branch before the
-fix: `(Some(b"identity"), [b"gzip"])` answered `Unmentioned` where
-`(None, [b"gzip"])` answered `AcceptableByDefault`, and over `[b"*;q=0.5"]` the
-two were `Weighed(500)` and `AcceptableByDefault`. The test that was supposed to
-cover this passed `Some(b"identity")` only over a field that NAMES identity,
-where the two paths coincide.
-
-### The derivation, because this reverses a reading the branch had pinned
-
-**A representation does not HAVE the coding `identity`.** RFC 9110 §12.5.3: "An
-"identity" token is used as a synonym for "no encoding" in order to communicate
-when no encoding is preferred." §8.4 makes that exclusive rather than idiomatic:
-"Note that the coding named "identity" is reserved for its special role in
-Accept-Encoding and thus SHOULD NOT be included." — in a `Content-Encoding` —
-and §18.6's registry gives the name the description `Reserved`, pointing at
-§12.5.3 rather than at §8.4.1 where the real codings are defined. So `None` and
-`Some(b"identity")` name one state and are normalised onto one path,
-case-insensitively per §8.4.1.
-
-**The `"*"` entry reaches that state at whatever weight it carries.** Rule 2
-establishes the reach itself: it has the field "stating either `identity;q=0` or
-`*;q=0`" exclude a representation with no content coding. What no sentence
-establishes is a weight boundary. Rule 2 is a rule about EXCLUSION — "acceptable
-by default unless specifically excluded" — so it enumerates what excludes, and
-by §12.4.2 only a zero does. Its naming `*;q=0` and not `*;q=0.5` is explained
-entirely by what the sentence is about.
-
-The branch read it the other way, so the wildcard reached this state only when
-its weight was zero — **a discontinuity no sentence states**, resting on what
-rule 2 does not say. The cost was measurable: over
-`Accept-Encoding: *;q=0.001, gzip;q=0.5` the uncoded representation answered
-`AcceptableByDefault` with NO weight, so a caller could not rank it against
-`gzip` and the client's own ordering was discarded — while the same bytes asked
-about `identity` by name answered `Weighed(1)`.
-
-### Fixed
-
-- `Some(b"identity")` normalises onto the no-coding path, and the match arm for
-  the wildcard no longer tests for zero: `(_, None, Some(w)) => Weighed(w)`.
-  Rule 2's `*;q=0` clause now falls out of that arm and §12.4.2 rather than
-  being a case of its own, and what is left of rule 2 is its default — the one
-  place the no-coding state parts from a named coding, since §12.4.3 answers
-  `Unmentioned` there.
-- `identity_and_no_coding_are_one_state_however_a_caller_spells_it` asks all
-  three spellings over seven fields that do NOT name `identity`, which is where
-  the paths part if they part at all, and pins that `identityx` and `ident` are
-  ordinary codings the normalisation does not swallow.
-- The pinned rule-2 test now asserts the consistent reading —
-  `acceptability(None, [b"*;q=0.5"])` is `Weighed(500)` — and carries the
-  measured field that showed the harm.
-
-## `http-semantics` — the rustdoc `-Dwarnings` build was red, and no gate here was looking at it
-
-`doc-check` documents private items, so it resolves links this crate's own
-published documentation cannot. CI's `doc` job does not: it runs
-`cargo doc -p http-semantics --all-features --no-deps` under
-`RUSTDOCFLAGS: --cfg docsrs -Dwarnings`, which exited **101** on four errors in
-`negotiation/mod.rs` — three `rustdoc::private_intra_doc_links` and one
-`rustdoc::redundant_explicit_links`.
-
-### Fixed
-
-- **RFC 4647 §2.1's rule moves to `accept_language`, where the public API meets
-  it.** Three of the four errors were public documentation linking to the
-  private `Element::LanguageRange` and to the private `fold_repeated_entry`, and
-  the link was the symptom: the language-range grammar and the repeated-entry
-  ruling were both documented only where a reader of the crate's docs could not
-  see them. `Element::LanguageRange` now points UP at the public entry point and
-  keeps only what is true of the walk, and `encoding_acceptability` states both
-  halves of the repeated-entry answer inline.
-- The fourth was `[`list_elements`](crate::grammar::list_elements)` in the module
-  summary, redundant because the name is imported.
-
-That command now exits 0.
-
-## `http-semantics` — two shims with one body are one symbol, and one of the two proved nothing
-
-`shim_accept_charset` and `shim_accept_encoding` had identical bodies. The two
-entry points are one walk at one element rule — which is a fact about the
-grammar and is pinned by a test — and `cloned()` and `copied()` over a `&&[u8]`
-lower to the same code, so after optimization the two shims WERE the same
-function and the linker folded them. One symbol survived for two shims, and
-`shim_accept_encoding`'s `no-panic` guard was never evaluated: its proof was
-empty while its own step reported `ok`.
-
-### Fixed
-
-- `shim_accept_charset` folds `is_wildcard` into its answer, which makes it a
-  different function from `shim_accept_encoding` and also drives an accessor no
-  other shim reaches. `shim-check`'s artifact half now reports
-  `http-semantics 21/21`; before it reported `20/21` and named the missing one.
-
-### How it was missed, which is the part worth writing down
-
-`shim-check` prints two lines. The first is the SOURCE half — how many shims are
-declared, how many call sites, how many arguments through `black_box` — and it
-was green throughout. The second is the ARTIFACT half, which asks the linker
-which shims are actually defined in the release test binary, and it was red from
-the commit that added the second shim. Three commit messages reported "all
-instantiated" on the strength of the first line alone, because the runs were
-piped through `head -1` and the exit code went with the pipe rather than with
-the command.
-
-That check exists precisely because identical code folding and a deleted call
-are the same silence in a symbol table. It caught this. What did not catch it
-was reading its output.
-
-## `http-semantics` — the roles this crate serves, as a scope rule and not a note
-
-al8n/wren#70 records two items resting on the ABSENCE of a scope rule: neither
-README says whether an intermediary is served, so §7.6.2's `Max-Forwards` and
-§7.6.3's `Via` sat in neither the implemented bucket nor the out-of-scope one.
-One sentence settles them, and it belongs where a reader looks for scope rather
-than at the one value that happens to have raised it.
-
-### Changed
-
-- **`http-semantics`'s README gains a role rule**: this crate serves an origin
-  server and a user agent, and an intermediary is out of scope. The rules RFC
-  9110 writes for an intermediary alone are STATED where a caller meets the
-  value they govern, so a caller acting as one can obey them, and are not
-  enforced here. RFC 9110 §12.5.5's "A proxy MUST NOT generate "*" in a Vary
-  field value." is named as one such rule; §7.6.2 and §7.6.3 are out of scope by
-  the same sentence rather than missing, which resolves #70's two pending items.
-
-  The rule says why enforcing one of them would be worse than stating it:
-  shipping a single prohibition while writing no `Vary`, no `Via`, no
-  `Max-Forwards` and stripping no hop-by-hop field a §7.6.1 `Connection` names
-  gives an intermediary author a floor that is not there. What the crate owes
-  such a caller instead is the FACT each rule turns on —
-  `negotiation::VaryMember::Wildcard` is that fact for §12.5.5 — so obeying it
-  needs no second parse and no reading of the section at the call site.
-
-  It is a rule about ROLES and is explicitly not the membership rule above it:
-  an item still belongs here when only an intermediary would read it. What this
-  settles is whether a MUST that binds an intermediary is enforced.
-
-- `VaryMember::Wildcard` now reads as the restatement it is, and points at the
-  README as where the ruling is settled once.
-- `encoding_acceptability` says why it walks the field once per coding asked
-  about: answering several candidates in one pass means remembering a weight per
-  candidate, which is storage a no-alloc reader cannot grow and would have to
-  bound the way `MAX_TRACKED_PARAMS` bounds `weight_for`'s per-instance match.
-  These fields hold a handful of members, and a caller that wants one pass has
-  `accept_encoding`.
-
-## `xtask` — two gates disagreed about what a citation is, and four correct quotations sat in the backlog for it
-
-`doc-check` requires a comment quoting an RFC sentence with an inline reference
-in it to escape the brackets — rustdoc reads a bare `[RFC6455]` as an intra-doc
-link and fails the build under `-D rustdoc::broken_intra_doc_links`. The spec
-being quoted writes the bare form. `quote-check` then had to agree that those
-are the same mark, and it did not.
-
-### Fixed
-
-- **`strip_bracket_insertions` now takes the escape's backslash with the
-  bracket.** That function removes a `[bracketed]` span and the space in front
-  of it; the escape puts a `\` between the space and the `[`, so the
-  space-eating loop stopped at the backslash and left a space the spec's side
-  had already dropped. `squeeze` then deleted the backslash and collapsed
-  whitespace, which HID the difference whenever a space followed the closing
-  bracket and EXPOSED it whenever anything else did.
-
-  **Measured with a probe carrying both positions, on two sentences of RFC 9110
-  §12.5.4, before the fix.** A citation mid-sentence — `Section 3 of` the
-  escaped reference `defines several matching schemes.` — was reported
-  verbatim. The same citation at the end of a sentence — `found in Section 2.3
-  of` the escaped reference, then a full stop — failed, printing a comment side
-  ending `Section 2.3 of .` against a spec side ending `Section 2.3 of.` One
-  space, in one position. A rule that holds for a citation in the middle of a
-  sentence and breaks for the same citation at the end of one is worse than
-  either answer, because the author who meets it reads the failure as being
-  about their words.
-
-  `an_escaped_bracket_is_the_same_mark_as_a_bare_one` drives both positions and
-  pins the literal normalised form, so the test cannot pass by comparing two
-  identically-wrong sides. The ABNF path is untouched: `[ … ]` is RFC 5234
-  syntax there and stays.
-
-### What the fix found
-
-Four quotations of RFC 8441 §5 in `websocket-proto` — its sentence about the
-`Origin`, `Sec-WebSocket-Version`, `Sec-WebSocket-Protocol` and
-`Sec-WebSocket-Extensions` fields, which carries two bracketed references and
-ends one of them with a full stop — were sitting in the untriaged backlog
-because of exactly this. One of them is introduced with the word *verbatim*: the
-author believed it was, and the gate could not confirm it. All four now grade
-verbatim against `.rfc-cache/rfc8441.txt:245`.
-
-`UNTRIAGED` is lowered accordingly, which is what that table asks for when
-triage happens: `websocket-proto/src/handshake/connect.rs` from 4 to 1 and
-`websocket-proto/src/handshake/fields.rs` from 5 to 4. The workspace backlog
-goes from 91 spans to 87, and the one span left in `connect.rs` is the author's
-own paraphrase in quotation marks, which is correctly still untriaged.
-
-### Changed
-
-- `http-semantics`'s `accept_charset` carries RFC 9110 §8.3.2's Note in full
-  again. It had been shortened past the bracket to get around this defect, which
-  is the local move that leaves the next author to rediscover it.
-
-## `http-semantics` — `Vary` is a different shape, and its proxy MUST NOT is stated rather than enforced
-
-RFC 9110 §12.5.5 shares §12.5's subject and none of its machinery.
-`Vary = #( "*" / field-name )` brackets no `[ weight ]`, so there is nothing for
-§12.4.2 to rank, and its `"*"` is an alternative of the ELEMENT rather than a
-name the `token` alternative happens to also derive. It gets its own item type,
-its own error type and its own walk, and shares only §5.6.1's list split with
-the three ranked readers beside it.
-
-### Added
-
-- `negotiation::vary` — RFC 9110 §12.5.5's `Vary = #( "*" / field-name )` over
-  §5.1's `field-name     = token`. It takes a field's lines, yields one
-  `VaryMember` per element in wire order, and latches on the first fault.
-- `negotiation::VaryMember`, whose two variants are `Wildcard` and
-  `FieldName(&str)`; and `negotiation::VaryError`, whose one variant is
-  `NotAFieldName`. Both carry `#[non_exhaustive]` where a variant could be
-  added.
-
-### The §12.5.5 rule that is stated and not enforced, and the ruling behind it
-
-RFC 9110 §12.5.5: "A proxy MUST NOT generate "*" in a Vary field value." It is
-stated at `VaryMember::Wildcard` and nothing checks it. **That is a decision,
-not an omission**, and `VaryMember::Wildcard` is where it is written down.
-
-**An intermediary is out of scope for this crate**, which resolves the open
-question al8n/wren#70 records. Enforcing this rule needs a `Vary` writer, which
-does not exist here, and the knowledge that the caller is an intermediary, which
-is no fact about any bytes this crate reads. Adding both to satisfy one
-prohibition would be worse than leaving it stated: a proxy needs far more than a
-single MUST NOT — §7.6.3's `Via`, §7.6.2's `Max-Forwards`, §7.6.1's `Connection`
-and the hop-by-hop fields it names — and shipping this one without the rest
-gives an intermediary author a FALSE FLOOR, a crate that looks like it has taken
-a position on forwarding when it has taken one and left the others unwritten.
-The same answer covers `Via` and `Max-Forwards`, which is why they are unfiled
-rather than pending.
-
-What this crate owes an intermediary is the fact it needs in order to obey the
-rule itself, and that fact is the variant: a proxy re-emitting the members it
-read knows from the variant alone which one it may not write.
-
-### The wildcard is a member, not a state of the whole value
-
-§12.5.5 puts `"*"` inside the list construct and speaks of a list containing it,
-so `*, accept-encoding` is one list of two members and the wildcard is the
-first. A `Vary` reader that made the wildcard a property of the value would
-answer a different question, and would have nowhere to put the field names
-beside it.
-
-## `http-semantics` — §12.5.3's acceptability rules, measured total rather than argued away
-
-The three readers hand a caller RFC 9110 §12.4.2's weight per member and leave
-§12.5.3's `identity` default — a representation with no content coding is
-acceptable unless the field explicitly refuses it — for every caller to
-reimplement out of the same paragraph. It was left out on the argument that a
-partial answer would be worse than none. That argument was not measured, and
-measuring it refutes it: **every rule §12.5.3 states about acceptability is
-expressible from two inputs a caller already holds** — the representation's
-content coding or its absence, and the field's lines or none of them.
-
-### Added
-
-- `negotiation::encoding_acceptability(coding, lines)`, answering RFC 9110
-  §12.5.3's own question: "A server tests whether a content coding for a given
-  representation is acceptable using these rules". `coding` is `None` where the
-  representation HAS no coding, which is rule 2's subject; no lines is an absent
-  field, which is rule 1's.
-- `negotiation::Acceptability`, with `is_acceptable` and `weight`. Three states,
-  because §12.5.3 reaches its verdict through three different sentences:
-  `AcceptableByDefault` (acceptable, no weight named), `Weighed(Weight)`
-  (acceptable iff not zero) and `Unmentioned` (§12.4.3's unacceptable, with no
-  weight). `weight` is `None` for the two that name none, rather than
-  `Weight::ONE` — §12.4.2's default of 1 is what an absent `q` on a PRESENT
-  member means, and there is no member in either case.
-
-### The enumeration, rule by rule
-
-| # | rule | expressible from (coding-or-absence, lines-or-none)? |
-|---|---|---|
-| 1 | Rule 1 — no field, any coding acceptable | **yes**: a field is present exactly when a line names it, so no lines is the absent field and one empty line is not |
-| 2 | Rule 2 — no coding, acceptable unless `identity;q=0`, or `*;q=0` with no more specific `identity` entry | **yes** |
-| 3 | Rule 3 — a listed coding is acceptable unless accompanied by a qvalue of 0 | **yes**, case-insensitively per §8.4.1 |
-| 4 | §12.5.3's asterisk sentence — `*` matches any coding not explicitly listed | **yes** |
-| 5 | §12.4.3 — no wildcard, unmentioned values unacceptable | **yes**; this is the sentence that closes the question, since rules 1 to 3 leave that case with no verdict |
-| 6 | §12.5.3's empty-field sentence | **yes**, and as a CONSEQUENCE of 2, 3 and 5 rather than a case: no branch spells it, and a test asserts it falls out |
-| 7 | §12.5.3's response direction — evaluated the same way as in a request | **yes**: one function, no direction argument |
-
-**Verdict: total.** Nothing was left needing an input the caller cannot hand
-over, so the "total except one load-bearing site" objection does not apply and
-it ships.
-
-Two further rules of §12.5.3 are **not** acceptability rules and are not
-answered: preferring the highest non-zero qvalue among codings "that have the
-same purpose", and the SHOULD about what to send when nothing is acceptable.
-Each needs the set of representations the responder holds, which is not this
-field and not this coding. The first ranks by `Acceptability::weight`, asked
-once per candidate.
-
-### Two clauses that a plain reading of rule 2 gets backwards
-
-Both are tests rather than prose.
-
-- **A `*;q=0` does not exclude a representation with no coding when the field
-  also carries an `identity` entry.** That entry is rule 2's "more specific
-  entry", and it governs whatever it says.
-- **A non-zero `*` lends no weight to a representation with no coding at all.**
-  Rule 2 names only `*;q=0` as reaching that case, so `Accept-Encoding: *;q=0.5`
-  answers `AcceptableByDefault` with no weight, not `Weighed(500)`.
-
-### A coding the field names twice: one half is derived, the other is chosen
-
-**RFC 9110 does not settle what a field naming one coding twice with two
-different weights means.** That sentence is worth more than either half below,
-and `fold_repeated_entry` carries where the rule that would settle it was looked
-for and is not: §12.4.2, which defines the weight and never mentions repetition;
-§12.5.1's only ordering sentence, which is about a parameter's position INSIDE
-one member; §5.6.1 and §5.6.1.2, which bound cardinality and empty elements and
-say nothing about a repeated one; §5.3, which says order is significant without
-saying which end — "The order in which field lines with the same name are
-received is therefore significant to the interpretation of the field value" —
-and §8.6, the one place RFC 9110 rules on a repeat, which rules for one field on
-the case where the repeats are IDENTICAL and so never reaches two different
-weights.
-
-The two halves do not have the same standing, and reading them as one rule is
-the mistake the split is there to prevent:
-
-- **Derived.** A zero anywhere among the entries naming a coding excludes it.
-  Rule 3's own wording read plainly, and independent of order, so two recipients
-  reading the same field from opposite ends agree whatever rule each took.
-- **Chosen, and not by this module.** Where no entry is zero, the FIRST in
-  field order gives the weight — see the section below, which is the correction
-  to what this originally shipped.
-
-**The undecidedness is now visible rather than implied.**
-`a_repeated_entry_is_undecided_and_this_is_the_reading_taken` asserts the
-zero-absorbing half in BOTH orders — which is what makes it derived rather than
-chosen, since no reading can move it — and asserts the non-zero pair both ways
-round, so the reading is pinned on the ORDER and not on a value that happens to
-be larger. A future reading that takes the first entry, or the largest, reds
-there instead of quietly disagreeing.
-
-Both of those are measured rather than predicted: replacing
-`fold_repeated_entry`'s body with `seen.unwrap_or(found)` reds the test, and
-replacing it with a zero-absorbing largest-wins reds it on the mirror assertion,
-naming that assertion's own message. The function was restored from a copy after
-each.
-
-`absorbing_zero` is renamed `fold_repeated_entry`, because a name that describes
-only the derived half asserted the chosen half was settled.
-
-### Why there is no `Accept-Language` counterpart
-
-RFC 9110 §12.5.4 states no acceptability rules and hands the question away in
-one sentence: "For matching, Section 3 of [RFC4647] defines several matching
-schemes. Implementations can offer the most appropriate matching scheme for
-their requirements." A function here would be picking one of those schemes on
-the caller's behalf. The same enumeration for §12.5.2 finds only §12.4.3's
-wildcard rule and no default of its own, so it has nothing §12.5.3's rule 2
-gives it either.
-
-## `http-semantics` — the rest of RFC 9110 §12.5, over an element that carries no parameters
+## `http-semantics` — RFC 9110 §12.5's other four fields, over an element that carries no parameters
 
 `Accept` and its ranking shipped in this crate; §12.5's other four fields had no
 reader at all. The three that rank share one shape and one walk — a §5.6.1 list
 of a bare name with §12.4.2's weight optionally hung off it — and differ only in
-which names the element production admits.
+which names the element production admits. `Vary` shares the list split and
+nothing else.
 
 ### Added
 
@@ -625,12 +21,49 @@ which names the element production admits.
   does NOT spell.
 - `negotiation::accept_charset` — RFC 9110 §12.5.2's
   `Accept-Charset = #( ( token / "*" ) [ weight ] )`.
+- `negotiation::vary` — RFC 9110 §12.5.5's `Vary = #( "*" / field-name )` over
+  §5.1's `field-name     = token`, yielding `negotiation::VaryMember` (either
+  `Wildcard` or `FieldName`) and failing with `negotiation::VaryError`. It
+  brackets no `[ weight ]`, so there is nothing for §12.4.2 to rank and a shared
+  `Preference` would have carried a weight that was always `Weight::ONE`; its
+  `"*"` is an alternative of the ELEMENT rather than a name the `token`
+  alternative happens to also derive, and it is a MEMBER rather than a state of
+  the whole value, since §12.5.5 puts it inside the list construct — so
+  `*, accept-encoding` is one list of two members.
 - `negotiation::Preference`, with `name` (`None` for the wildcard `*`),
   `is_wildcard` and `weight`; and `negotiation::NegotiationError`, whose three
   variants are `NotAnElement`, `NotAWeight` and `BadWeight`. It is
   `#[non_exhaustive]`.
 - `4647` in `quote_check`'s `FETCHED`, and RFC 4647's text in the cache CI
   grades against.
+
+### Changed
+
+- `media::parse_qvalue` keeps `pub(crate)`, and its doc now carries the ruling:
+  the four RFC 9110 elements that end in `[ weight ]`, why a reader in this
+  crate needs no export, and why the `TE` reader §10.1.4's `t-codings` implies
+  is in the same position and gets the same answer.
+
+### The export that was going to unblock three readers was not one
+
+al8n/wren#70's Phase 2 says one line unblocks three of the four fields it adds:
+`media::parse_qvalue` is `pub(crate)`, and publishing it turns three "cannot"
+into three "inconvenient". Measured before writing any of them, both halves of
+that sentence are wrong.
+
+**It is not one line, and it is not a line at all.** `pub(crate)` is crate-wide.
+The three readers land in this crate, so they call the function with no edit to
+its visibility — there was never anything to unblock. What a `pub` would change
+is what a caller OUTSIDE the crate can reach, which is a different question that
+no reader in Phase 2 asks.
+
+**And it is the wrong shape for the question it was answering.** `Weight` is
+already `pub`; what a caller wants is the weight a member CARRIES, which
+`MediaRange::weight` hands over off a member this crate has already walked. A
+public `qvalue` reader beside it is a standing invitation to read the same bytes
+a second time — the thing that accessor exists to remove — and this crate has
+already published this function once, for `http1-proto`'s panic shim and no
+other caller, and taken it back.
 
 ### RFC 9110 §12.5.4 hands its element out, and the workspace did not have the spec
 
@@ -653,13 +86,19 @@ says: "is incorrect, since it disallows the use of digits anywhere in the
 
 It is §2.1's BASIC range and not §2.2's `extended-language-range`, which admits
 a `*` in any subtag position: §12.5.4's `prose-val` names §2.1, so `en-*` is no
-element of this field.
+element of this field. RFC 4647's range is NARROWER than RFC 9110 §5.6.2's
+`token` and inside it — ALPHA, DIGIT, `-` and `*` are all `tchar`s — so no
+`language-range` can move an element boundary, and the narrowing is checked
+rather than widened away. A test holds both halves of that over its own samples:
+every range in the list is a token, and five of the thirteen are tokens and no
+range.
 
-RFC 4647's range is NARROWER than RFC 9110 §5.6.2's `token` and inside it —
-ALPHA, DIGIT and `-` are all `tchar`s — so no `language-range` can move an
-element boundary, and the narrowing is checked rather than widened away. A test
-holds both halves of that over its own samples: every range in the list is a
-token, and five of the thirteen are tokens and no range.
+Matching is not here either. RFC 9110 §12.5.4 hands it to "Section 3 of
+\[RFC4647\]", which defines several schemes, and which is appropriate depends on
+the representations a responder holds — so it is the caller's, and it is why
+§12.5.4 gets no counterpart to `encoding_acceptability`. Nor is wire order
+priority: §12.5.4 says of that reading "However, this behavior cannot be relied
+upon.", so nothing is derived from it and ranking is `Preference::weight`'s.
 
 ### §12.5.1's `q` rule is not inherited, and that is a refusal rather than an omission
 
@@ -688,6 +127,21 @@ grammar does not have, and each moves an answer:
   comma is §5.6.1's separator and the elements are exactly what
   `grammar::list_elements` splits. That is also why walking a field's lines and
   walking §5.2's joined value cannot part.
+
+### What `NotAWeight` covers, and what the production decides
+
+A second `;q=` behind a matched one is NOT `NotAWeight`, and the ABNF is what
+settles it rather than the reader's convenience. RFC 9110 §12.5.3's
+`Accept-Encoding  = #( codings [ weight ] )`
+brackets ONE weight, so once §12.4.2's `"q="` literal has matched there is
+nothing left for a second `;` to open: everything from there to the element's
+end is the `qvalue` slot, and `0.5;q=0.7` is no `qvalue`. Measured,
+`gzip;q=0.5;q=0.7`, `gzip;q=0.5;p=1` and `gzip;q=0.5;` all answer `BadWeight`.
+`NotAWeight` is what the literal FAILING to match earns — a parameter by another
+name, a `q` with §5.6.3's `BWS` in front of the `=` that `weight` writes
+nowhere, or nothing behind the `;` at all.
+`what_follows_a_matched_q_is_the_qvalue_slot` pins both sides over six values
+each, so the doc and the code cannot drift apart in silence.
 
 ### `Accept-Charset` is deprecated to SEND, and this is the receiving side
 
@@ -729,33 +183,363 @@ does share with existing readers are reached by CALLING the one implementation
 of each — `grammar::list_elements`, `grammar::is_token` and
 `media::parse_qvalue` — so there is no second reading to diverge from.
 
-## `http-semantics` — the export that was going to unblock three readers was not one
+## `http-semantics` — §12.5.3's acceptability rules, measured total rather than argued away
 
-al8n/wren#70's Phase 2 says one line unblocks three of the four fields it adds:
-`media::parse_qvalue` is `pub(crate)`, and publishing it turns three "cannot"
-into three "inconvenient". Measured before writing any of them, both halves of
-that sentence are wrong.
+al8n/wren#70 left these out on the argument that §12.5.3's rules need caller
+state, so any reader would be the "total except one" shape this repository
+refuses. That argument was never measured. Measuring it refutes it: every rule
+§12.5.3 states ABOUT ACCEPTABILITY is expressible from two inputs a caller
+already holds — the representation's content coding or its absence, and the
+field's lines or none — plus which message carried the field.
 
-**It is not one line, and it is not a line at all.** `pub(crate)` is crate-wide.
-The three readers land in this crate, so they call the function with no edit to
-its visibility — there was never anything to unblock. What a `pub` would change
-is what a caller OUTSIDE the crate can reach, which is a different question
-that no reader in Phase 2 asks.
+### Added
 
-**And it is the wrong shape for the question it was answering.** `Weight` is
-already `pub`; what a caller wants is the weight a member CARRIES, which
-`MediaRange::weight` hands over off a member this crate has already walked. A
-public `qvalue` reader beside it is a standing invitation to read the same bytes
-a second time — the thing that accessor exists to remove — and this crate has
-already published this function once, for `http1-proto`'s panic shim and no
-other caller, and taken it back.
+- `negotiation::encoding_acceptability(direction, coding, lines)`, answering RFC
+  9110 §12.5.3 for one content coding over one `Accept-Encoding` field.
+- `negotiation::Acceptability`, with four states because the section reaches
+  each through a different sentence: `AcceptableByDefault`, `Weighed(Weight)`,
+  `Unmentioned` and `NotAdvertised`. `is_acceptable` answers `Option<bool>` and
+  `weight` answers `Option<Weight>`, `None` in both cases where the section
+  names none.
+- `negotiation::Direction`, `Request` or `Response`, because one of §12.5.3's
+  rules is written for one direction only.
+- `a_representation_with_two_codings_is_two_questions`,
+  `identity_and_no_coding_are_one_state_however_a_caller_spells_it`,
+  `an_absent_response_advertises_nothing` and
+  `the_sections_own_example_line_parses_and_answers`.
+
+### The seven rules, and where each is read
+
+The section's three numbered rules say nothing about a coding the field neither
+lists nor covers with `"*"`, so two further sentences of RFC 9110 are read
+beside them, and two more carry the empty field and the response direction.
+
+1. **Rule 1**, "If no Accept-Encoding header field is in the request, any
+   content coding is considered acceptable by the user agent." — no lines AND
+   `Direction::Request`, so `AcceptableByDefault` whatever the coding is.
+2. **Rule 2**, "If the representation has no content coding, then it is
+   acceptable by default unless specifically excluded by the Accept-Encoding
+   header field stating either `identity;q=0` or `*;q=0` without a more specific
+   entry for `identity`." — an entry naming `identity` is that "more specific
+   entry" and governs; failing that a `*;q=0`, and only a zero one, excludes;
+   failing both, the DEFAULT.
+3. **Rule 3**, "If the representation's content coding is one of the content
+   codings listed in the Accept-Encoding field value, then it is acceptable
+   unless it is accompanied by a qvalue of 0." — an entry naming the coding
+   governs.
+4. **§12.5.3's asterisk sentence**, "The asterisk "*" symbol in an
+   Accept-Encoding field matches any available content coding not explicitly
+   listed in the field." — a coding with no entry of its own takes the `"*"`
+   entry's weight.
+5. **§12.4.3**, "If no wildcard is present, values that are not explicitly
+   mentioned in the field are considered unacceptable." — `Unmentioned`, and the
+   sentence that makes the answer total; without it rules 1 to 3 leave a case
+   with no verdict at all.
+6. **§12.5.3's empty-field sentence**, "An Accept-Encoding header field with a
+   field value that is empty implies that the user agent does not want any
+   content coding in response." — a CONSEQUENCE of 2, 3 and 5 rather than a case
+   of its own, and a test says so.
+7. **§12.5.3's response direction**, "When the Accept-Encoding header field is
+   present in a response, it indicates what content codings the resource was
+   willing to accept in the associated request. The field value is evaluated the
+   same way as in a request." — so `direction` decides the zero-line case and
+   nothing else.
+
+Two rules of the section are NOT answered and are not acceptability rules,
+because each needs the set of representations the responder holds: the ranking
+among codings that "have the same purpose", and what to send when nothing listed
+is acceptable — "If a non-empty Accept-Encoding header field is present in a
+request and none of the available representations for the response have a
+content coding that is listed as acceptable, the origin server SHOULD send a
+response without any content coding unless the identity coding is indicated as
+unacceptable."
+
+### `identity` and no coding at all are one state
+
+RFC 9110 §12.5.3 calls the token "a synonym for "no encoding""; §8.4 makes that
+exclusive rather than merely idiomatic — "Note that the coding named "identity"
+is reserved for its special role in Accept-Encoding and thus SHOULD NOT be
+included." — and §18.6's registry gives the name the description `Reserved`. So
+`None` and `Some(b"identity")` name ONE representation state, normalised onto
+one path case-insensitively per §8.4.1's "All content codings are
+case-insensitive".
+
+Measured with a probe crate before this held: `(Some(b"identity"), [b"gzip"])`
+answered `Unmentioned` where `(None, [b"gzip"])` answered `AcceptableByDefault`;
+over `[b"*;q=0.5"]` the two were `Weighed(500)` and `AcceptableByDefault`. The
+test meant to cover it passed `Some(b"identity")` only over a field that NAMES
+identity, where the two paths coincide, so the oracle excused it.
+
+### The criterion that settled rule 2's wildcard clause
+
+Whether `"*"` reaches the uncoded representation at any weight or only at zero
+was derived two opposite ways in two rounds. **What settled it is which reading
+leaves rule 2's own sentence work to do — not what the section declines to
+say.** If `"*"` matched this state generally, rule 2's `*;q=0` clause would
+follow from the asterisk sentence plus §12.4.2, and so would `identity;q=0`, and
+so would "without a more specific entry for `identity`": everything after
+"acceptable by default" would restate machinery stated elsewhere. If `"*"` does
+not match it, rule 2 is the only source of that exclusion and its precedence
+sub-clause is what keeps an explicit `identity` entry ahead of it. The section
+marks its restatements where it makes one — rule 3 carries "As defined in
+Section 12.4.2, a qvalue of 0 means "not acceptable"." in its own parenthesis,
+and rule 2 carries none.
+
+Two further anchors, both textual:
+
+- The asterisk sentence matches "any available content coding not explicitly
+  listed in the field", and §8.4 has a representation's codings listed in
+  `Content-Encoding` with `identity` reserved out of it — so this state has no
+  available content coding for that sentence to range over.
+- RFC 9110 §12.5.3's `codings          = content-coding / "identity" / "*"`
+  gives `identity` an alternative beside `content-coding`, so a rule quantified
+  over a `content-coding` does not reach it. That separation is SEMANTIC: the
+  three alternatives derive one language, which is why one `Element` arm reads
+  them all, and it is the meanings that are distinct.
+
+**The section's own example is neutral and is reported as such.**
+`Accept-Encoding: gzip;q=1.0, identity; q=0.5, *;q=0` pairs an explicit
+`identity` entry with `*;q=0`; under both readings that `*;q=0` excludes the
+uncoded representation and the explicit entry overrides it, so both make the
+spelling natural and both give it identical answers. It is not evidence either
+way and is not used as any.
+
+**What the reading NOT taken costs.** Over
+`Accept-Encoding: *;q=0.001, gzip;q=0.5` it hands the uncoded representation
+`Weighed(1)`, ranking it BELOW `gzip` — turning a status rule 2 states
+unconditionally into a near-refusal the field never wrote. The pin names that
+reading and its three answers, so the next reader meets both sides; the two part
+on exactly one shape, a non-zero wildcard with no explicit `identity` entry, and
+agree everywhere else.
+
+`the_sections_own_example_line_parses_and_answers` pins §12.5.3's own example at
+`.rfc-cache/rfc9110.txt:5555`. Its `identity; q=0.5` carries OWS AFTER the
+semicolon, which RFC 9110 §12.4.2's `weight = OWS ";" OWS "q=" qvalue`
+brackets, where this reader's refusals are around the `=` that production writes
+bare. A specification's own example is an input no reader has licence to refuse,
+so it is pinned rather than assumed: three preferences at 1000 / 500 / 0, and
+the four answers `encoding_acceptability` gives over it.
+
+### An absent response advertises nothing
+
+Rule 1's absence case names the REQUEST, and rule 7 gives a response's field
+meaning only when it is PRESENT. A response carrying no such field has
+advertised nothing, so it answers `NotAdvertised` — which is no verdict, which
+is why `is_acceptable` returns `Option<bool>` and answers `None` there. Both
+bools would be wrong: `true` says a server that advertised nothing accepts this
+coding, `false` says it refuses one it may well accept. Reading it as
+`AcceptableByDefault` instead extends rule 1 across the direction it names and
+tells a client that a server which said nothing accepts everything, which the
+client can act on by encoding its next request.
+
+### The domain, narrower than the section's subject
+
+Two narrowings sit between the function and §12.5.3's own subject, and neither
+is visible from the signature. **One coding, where a representation may carry
+several:** §12.5.3 says "A representation could be encoded with multiple content
+codings." and §8.4 has the sender list them "in the order in which they were
+applied", but the rules are stated over one — "A server tests whether a content
+coding for a given representation is acceptable using these rules" — so a caller
+holding two asks twice, and composing the answers is the caller's rather than a
+sentence this crate can cite. **One walk per coding asked about:** a caller
+ranking five candidates walks the field five times, which is the trade a
+no-alloc reader makes rather than an oversight, and a caller wanting one pass
+has `accept_encoding`.
+
+### Why there is no differential corpus for it
+
+The three differential harnesses here grade a reader over records that are
+BYTES, and that shape cannot express this function's input. The gap is in the
+ARGUMENTS rather than the bytes: presence is not a byte string, since zero field
+lines and one empty line are different inputs with different answers; direction
+is not in the field; and the question is an `Option<coding>` the caller passes.
+Records would need roughly `{ direction, field_lines, coding }` and the harness
+would be a differential over arguments as well as bytes, which none of the three
+is. The note sits at the head of the acceptability tests, where someone looking
+for the missing corpus will be.
+
+## `http-semantics` — a coding the field names twice: one crate, one answer
+
+`Accept-Encoding: gzip;q=0.25, gzip;q=0.75` has no answer in RFC 9110, and the
+answer this crate gives has two halves of unequal standing. Both are stated
+rather than hidden behind one name that asserted the pair was settled —
+`fold_repeated_entry`, renamed from `absorbing_zero`.
+
+**Derived.** A zero anywhere among the entries naming a coding excludes it,
+which is rule 3's "unless it is accompanied by a qvalue of 0" read plainly, and
+holds whichever end of the field a recipient reads from.
+
+**Chosen.** Where no entry is zero, the FIRST in field order gives the weight.
+Nothing in RFC 9110 picks between that, the last and the largest — what picks it
+is that `media::weight_for` already resolves the same open tie the same way for
+`Accept`, and one crate may not answer one unsettled question two ways. Measured
+before the two were aligned:
+`weight_for(text/plain, ["text/plain;q=0.25, text/plain;q=0.75"])` is 250 and
+`encoding_acceptability(Some(b"gzip"), ["gzip;q=0.25, gzip;q=0.75"])` was 750.
+
+### Where the sentence that would settle it was looked for, and is not
+
+Searched over the cached text: **§12.4.2** defines `weight` and `qvalue` and
+says nothing about a value appearing more than once; **§12.5.1's** only ordering
+sentence is about a parameter's position INSIDE one member — "Senders using
+weights SHOULD send "q" last (after all media-range parameters)." — and not
+about a member repeated in a list; **§5.6.1 and §5.6.1.2** bound cardinality and
+empty elements — "Empty elements do not contribute to the count of elements
+present." — and say nothing about a repeated one; **§5.3** says order matters
+without saying which end — "The order in which field lines with the same name
+are received is therefore significant to the interpretation of the field value"
+— which is what makes a positional rule admissible rather than obviously wrong,
+and does not choose one; and **§8.6**, the one place RFC 9110 rules on a repeat,
+rules for one field on the case where the repeats are IDENTICAL — "a recipient
+of a Content-Length header field value consisting of the same decimal value
+repeated as a comma-separated list (e.g, `Content-Length: 42, 42`) MAY either
+reject the message as invalid or replace that invalid field value with a single
+instance of the decimal value". Two entries with DIFFERENT weights are the case
+it does not reach.
+
+### The half that still differs, and why that is licensed
+
+`weight_for` absorbs no zero — measured,
+`weight_for(text/plain, ["text/plain;q=1, text/plain;q=0"])` is 1000 — and it
+should not, because §12.5.1 has no counterpart to §12.5.3 rule 3's "unless it is
+accompanied by a qvalue of 0". So the two readers agree wherever the RFC is
+silent and part only where it speaks to one of them; the test calls `weight_for`
+directly, so that is a comparison between two readers rather than against a
+remembered number.
+
+`a_repeated_entry_is_undecided_and_this_is_the_reading_taken` asserts the
+zero-absorbing half in BOTH orders, which is what makes it derived rather than
+chosen, and the non-zero pair both ways round so the pin is on the ORDER rather
+than on a value that happens to be larger. Which assertion catches which reading
+is measured and is not what was predicted: three mutations, each run and
+restored from a copy — last-in-field-order and zero-absorbing-largest-wins red
+the FIRST assertion (750 against 250), and zero-absorbing-smallest-wins reds the
+MIRROR (250 against 750).
+
+## `http-semantics` — the roles this crate serves, as a scope rule and not a note
+
+al8n/wren#70 recorded two items resting on the ABSENCE of a scope rule: neither
+README said whether an intermediary is served, so §7.6.2's `Max-Forwards` and
+§7.6.3's `Via` sat in neither the implemented bucket nor the out-of-scope one.
+`http-semantics`'s README now carries the rule, under **Which HTTP roles it
+serves**: this crate serves an origin server and a user agent, and an
+intermediary is out of scope.
+
+That settles what happens to a MUST RFC 9110 writes for an intermediary alone.
+It is STATED where a caller meets the value it governs, so a caller acting as
+one can obey it, and it is not enforced here. §12.5.5's "A proxy MUST NOT
+generate "*" in a Vary field value." is one such rule, stated at
+`negotiation::VaryMember::Wildcard`; §7.6.2 and §7.6.3 are out of scope by the
+same sentence rather than missing.
+
+**Enforcing one would be worse than stating it, and that is an argument rather
+than a preference.** It needs a `Vary` writer, which does not exist here, and
+the knowledge that the caller is an intermediary, which is no fact about any
+bytes this crate reads. A proxy needs far more than a single prohibition —
+§7.6.3's `Via`, §7.6.2's `Max-Forwards`, §7.6.1's `Connection` and the
+hop-by-hop fields it names, stripped rather than forwarded — and shipping this
+one without the rest would give an intermediary author a FALSE FLOOR: a crate
+that looks like it has taken a position on forwarding when it has taken one and
+left the others unwritten. What the crate owes such a caller instead is the FACT
+each rule turns on, and for §12.5.5 that fact is the variant, so a proxy
+re-emitting the members it read knows from the variant alone which one it may
+not write — no registry, no second parse, no reading of the section at the call
+site.
+
+It is a rule about ROLES and says so: an item whose subject is
+version-independent and whose answer is a function of its input still belongs
+here when only an intermediary would read it, and what this rule settles is
+whether a MUST that binds one is enforced.
+
+## `http-semantics` — two shims with one body are one symbol, and one of the two proved nothing
+
+`shim_accept_charset` and `shim_accept_encoding` had identical bodies. The two
+entry points are one walk at one element rule — a fact about the grammar, pinned
+by a test — and `cloned()` and `copied()` over a `&&[u8]` lower to the same
+code, so after optimization the two shims WERE the same function and the linker
+folded them. One symbol survived for two shims, and `shim_accept_encoding`'s
+`no-panic` guard was never evaluated: its proof was empty while its own step
+reported ok.
+
+### Fixed
+
+- `shim_accept_charset` now folds `is_wildcard` into its answer. That makes it a
+  different function from its twin and drives an accessor no other shim reaches,
+  which is the cheapest difference that also proves something. `shim-check`
+  reports `http-semantics 21/21`; before it reported 20/21 and named the missing
+  shim, with the binary's path and the reason a symbol table cannot tell folding
+  from deletion.
+
+### How it was missed, which is the part worth writing down
+
+`shim-check` prints a SOURCE half — shims declared, call sites, arguments
+through `black_box` — and an ARTIFACT half that asks the linker which shims are
+defined. The source half was green throughout; the artifact half was red from
+the commit that added the second shim, the `Accept-Charset` reader, and stayed
+red through three commits whose messages reported "all instantiated" off the
+first line alone, because those runs were piped through `head -1` and the exit
+code went with the pipe. The check that exists because folding and deletion are
+the same silence did its job; reading its output did not.
+
+## `xtask` — two gates disagreed about what a citation is, and four correct quotations sat in the backlog for it
+
+`doc-check` requires a comment quoting an RFC sentence that carries an inline
+reference to escape the brackets — rustdoc reads a bare `[RFC6455]` as an
+intra-doc link and reds the build under `-D rustdoc::broken_intra_doc_links`.
+The spec being quoted writes the bare form. `quote-check` then has to agree that
+those are the same editorial mark, and it did not.
+
+### Fixed
+
+- `strip_bracket_insertions` pops the backslash before the space it stands
+  between. It removes a bracketed span AND the space in front of it; the escape
+  puts a `\` between the two, so the space-eating loop stopped at the backslash
+  and left a space the spec's side had already dropped. `squeeze` then deleted
+  the backslash and collapsed whitespace, which HID the difference wherever a
+  space followed the closing bracket and EXPOSED it wherever anything else did.
+  A rule that holds in the middle of a sentence and breaks at the end of one is
+  worse than either answer, because the author who meets it reads the failure as
+  being about their words. Measured with a probe carrying both positions on two
+  sentences of RFC 9110 §12.5.4: a space after the close reported verbatim, a
+  full stop after it failed with a comment side ending `Section 2.3 of .`
+  against a spec side ending `Section 2.3 of.`
+  `an_escaped_bracket_is_the_same_mark_as_a_bare_one` drives both positions and
+  pins the literal normalised form, so it cannot pass by comparing two
+  identically-wrong sides. The ABNF path is untouched: `[ … ]` is RFC 5234
+  syntax there.
+
+### What the fix found
+
+Four quotations of RFC 8441 §5 in `websocket-proto` were in the untriaged
+backlog for exactly this reason, one of them introduced with the word verbatim —
+`connect.rs` three times and `fields.rs` once, all of the sentence beginning
+"The Origin", whose `\[RFC6454\]` is followed by a comma and whose `\[RFC6455\]`
+is followed by a full stop. All four now grade verbatim against
+`.rfc-cache/rfc8441.txt:245`, and `UNTRIAGED` is lowered as that table asks.
+`accept_charset` carries RFC 9110 §8.3.2's Note in full again; it had been
+shortened past the bracket to get around this, which is the local move that
+leaves the next author to rediscover it.
+
+### A limit of this gate, stated rather than discovered again
+
+`quote-check` grades a quotation's WORDS against the spec text and never reads
+the section number beside them, so an accurate sentence hung on the wrong
+section passes it. Nothing here closes that; what closes one instance of it is
+re-checking a citation against the cached file's own line numbers, which is how
+this branch's RFC 4647 citations were verified — §2 begins at
+`.rfc-cache/rfc4647.txt:150` and §2.1 at `:190`, so the case-insensitive
+matching MUST at `:187-188` is §2's and the ABNF at `:197-198` is §2.1's.
 
 ### Changed
 
-- `media::parse_qvalue` keeps `pub(crate)`, and its doc now carries the ruling:
-  the four RFC 9110 elements that end in `[ weight ]`, why a reader in this
-  crate needs no export, and why the `TE` reader §10.1.4's `t-codings` implies
-  is in the same position and gets the same answer.
+- The two sentences `strip_bracket_insertions` is measured on are each kept on
+  ONE line. The masking unit is a paragraph, and a code span that wraps is
+  masked by it while a per-line unit leaks the quote characters inside it —
+  `the_two_masking_units_agree_on_every_graded_span_in_this_workspace` reports
+  that disagreement, and these two were the workspace's first. The paragraph
+  unit's answer is the one wanted, since both sentences are DATA this function
+  is measured on rather than quotations making a claim, so the spans stop
+  wrapping rather than the divergence being recorded. Both stay byte-exact.
 
 ## `xtask` — a code span that wrapped, a citation that wrapped, and a block whose marks do not pair
 
