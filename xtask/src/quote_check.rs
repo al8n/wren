@@ -480,8 +480,16 @@ pub const DEFAULT_DIR: &str = ".rfc-cache";
 /// 822's lexical classes, and those productions are gradeable only against RFC
 /// 822's own text. That is the opposite of quoting a dead spec a live one now
 /// governs: the live spec is what sends a reader here.
+///
+/// RFC 4647 stands where RFC 2046 does: RFC 9110 hands a production OUT to it.
+/// §12.5.4 spells `Accept-Language`'s element
+/// `language-range  = <language-range, see [RFC4647], Section 2.1>` — a
+/// `prose-val`, so RFC 9110's own text holds no grammar to grade a transcription
+/// of it against. `http-semantics` reads that field, so the rule it implements
+/// is RFC 4647 §2.1's `language-range   = (1*8ALPHA *("-" 1*8alphanum)) / "*"`
+/// and is gradeable only against RFC 4647.
 const FETCHED: &[u32] = &[
-  822, 2045, 2046, 3986, 5322, 6454, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220,
+  822, 2045, 2046, 3986, 4647, 5322, 6454, 6455, 7692, 8441, 9110, 9111, 9112, 9113, 9114, 9220,
 ];
 
 /// The untriaged backlog, per file, as it stands — and the whole of what makes

@@ -564,8 +564,10 @@ http_semantics::media::weight_for
 http_semantics::media::weight_for_with
 http_semantics::negotiation
 http_semantics::negotiation::Element
+http_semantics::negotiation::Element::LanguageRange
 http_semantics::negotiation::Element::Token
 http_semantics::negotiation::Element::admits
+http_semantics::negotiation::MAX_SUBTAG
 http_semantics::negotiation::NegotiationError
 http_semantics::negotiation::NegotiationError::BadWeight
 http_semantics::negotiation::NegotiationError::NotAWeight
@@ -576,6 +578,8 @@ http_semantics::negotiation::Preference::name
 http_semantics::negotiation::Preference::weight
 http_semantics::negotiation::WILDCARD
 http_semantics::negotiation::accept_encoding
+http_semantics::negotiation::accept_language
+http_semantics::negotiation::is_language_range
 http_semantics::negotiation::preference_from
 http_semantics::negotiation::preferences
 http_semantics::negotiation::read_weight
