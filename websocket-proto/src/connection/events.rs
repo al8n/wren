@@ -33,11 +33,16 @@ impl MessageKind {
 pub struct MessageStart {
   kind: MessageKind,
   compressed: bool,
+  skipped: bool,
 }
 
 impl MessageStart {
-  pub(crate) const fn new(kind: MessageKind, compressed: bool) -> Self {
-    Self { kind, compressed }
+  pub(crate) const fn new(kind: MessageKind, compressed: bool, skipped: bool) -> Self {
+    Self {
+      kind,
+      compressed,
+      skipped,
+    }
   }
 
   /// Text or binary.
@@ -55,6 +60,40 @@ impl MessageStart {
   #[inline(always)]
   pub const fn compressed(&self) -> bool {
     self.compressed
+  }
+
+  /// **No chunk will follow for this message; a consumer holds nothing for
+  /// it.** Only [`Event::MessageEnd`] closes it.
+  ///
+  /// True when the payload is being skipped rather than decoded: this message
+  /// began under [`Connection::observe`](super::Connection::observe), or it is
+  /// a compressed message arriving after the inbound inflate context was
+  /// poisoned (see that method). Its `MessageEnd` still arrives — what is
+  /// absent is the payload.
+  ///
+  /// **What stays bounded, and what does not.** Framing, fragment sequencing,
+  /// the control-frame rules and the per-frame
+  /// [`max_frame_payload`](super::ConnectionConfig::max_frame_payload) limit
+  /// all apply exactly as they do to any other message: a violation still
+  /// fails the connection. The AGGREGATE
+  /// [`max_message_size`](super::ConnectionConfig::max_message_size)
+  /// accounting is deliberately not performed — a skipped message retains
+  /// nothing, so there is nothing for that cap to bound, and counting bytes
+  /// this endpoint never looked at would fail a conforming peer for a message
+  /// it was never going to deliver. A skipped message can therefore exceed
+  /// `max_message_size` on the wire without the 1009 an ordinary one would
+  /// draw.
+  ///
+  /// A folder must not open an accumulator for such a message: doing so
+  /// delivers an EMPTY message where the peer sent bytes. Both assemblers in
+  /// this crate read this flag and discard to the boundary instead
+  /// ([`SliceAssembler::push`](crate::message::SliceAssembler::push),
+  /// [`MessageAssembler::push`](crate::message::MessageAssembler::push)), so a
+  /// caller using either needs no special case; a caller with its own folder
+  /// does.
+  #[inline(always)]
+  pub const fn skipped(&self) -> bool {
+    self.skipped
   }
 }
 
@@ -174,6 +213,27 @@ pub enum Event<'a> {
   TextChunk(TextChunk<'a>),
   /// The current message ended (its FIN frame completed).
   MessageEnd,
+  /// **The message in progress will not be delivered: drop what you hold for
+  /// it.** No further chunk follows; its [`MessageEnd`](Event::MessageEnd)
+  /// still arrives at the boundary, and assembly resumes at the next
+  /// [`MessageStart`](Event::MessageStart).
+  ///
+  /// Emitted exactly ONCE per message, at the first payload run the machine
+  /// skips of a message whose `MessageStart` was already emitted saying
+  /// otherwise — that is, a message that began under
+  /// [`handle`](super::Connection::handle) and was still in flight when
+  /// [`observe`](super::Connection::observe) took over. A message whose start
+  /// already said [`MessageStart::skipped`] never gets this event: its start
+  /// carried the same fact, and nothing was accumulated for it to drop.
+  ///
+  /// It exists because that fact cannot travel on the start — the start was
+  /// emitted before the decision — and cannot be left to the caller: an
+  /// observation feed can produce NO events at all (every byte of it can be
+  /// continuation payload), so there is no moment a caller could reliably
+  /// react to. Both assemblers in this crate act on it in `push`; a caller
+  /// with its own folder must drop its partial here, or a `MessageEnd` will
+  /// later seal a TRUNCATED message.
+  MessageAbandoned,
   /// A ping arrived; the payload is copied inline and the pong echo is
   /// queued automatically — drain
   /// [`poll_transmit`](super::Connection::poll_transmit).

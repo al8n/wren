@@ -20,9 +20,11 @@ use core::time::Duration;
 ///
 /// The `now` a caller hands across calls on ONE
 /// [`Connection`](crate::Connection) must be non-decreasing, and the crate
-/// checks it rather than trusting it: `handle`, `poll_transmit` and
-/// `handle_timeout` each compare `now` against the latest instant that
-/// connection has been given and refuse a strictly earlier one with a
+/// checks it rather than trusting it. FOUR entry points take a `now` —
+/// `handle`, `observe`, `poll_transmit` and `handle_timeout` — over three
+/// refusal sites, because `handle` and `observe` share one implementation and
+/// so one check. Each compares `now` against the latest instant that
+/// connection has been given and refuses a strictly earlier one with a
 /// `ClockWentBackwards` error, leaving the connection untouched. An EQUAL
 /// instant is accepted, so a driver that reads its clock once per wakeup may
 /// hand the same one to every call in a batch.

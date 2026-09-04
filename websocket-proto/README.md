@@ -198,26 +198,58 @@ caller-provided buffer and yields a borrowed [`MessageRef`] on every tier
 (including the bare `no_std` build); drivers that prefer streaming can consume
 the events directly.
 
-```rust,ignore
-use std::time::Instant;
+```rust,no_run
+# // `Message`/`MessageAssembler` are the heap tiers' owned folder, so the
+# // example is gated the way the crate gates them; the bare tier's mirror is
+# // `SliceAssembler`, whose loop has the same shape.
+# #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
+# mod heap_tier {
+use core::time::Duration;
 use websocket_proto::{
-    Message, MessageAssembler,
-    connection::{Connection, Event, role::Server},
+    ConnectionConfig, Message, MessageAssembler, Negotiated,
+    connection::{Closed, Connection, Event, role::Server},
+    time::Instant,
 };
 
+/// The caller's clock. `std::time::Instant` implements the trait too, but only
+/// under the `std` feature — a driver on the `alloc` or `no-atomic` tier
+/// brings its own, and it need be no more than a monotonic counter.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Micros(u64);
+
+impl Instant for Micros {
+    fn checked_add_duration(self, d: Duration) -> Option<Self> {
+        u64::try_from(d.as_micros()).ok().and_then(|m| self.0.checked_add(m)).map(Micros)
+    }
+    fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
+        self.0.checked_sub(earlier.0).map(Duration::from_micros)
+    }
+}
+
+fn now() -> Micros {
+    // Your monotonic clock; a counter here so the example is tier-neutral.
+    Micros(0)
+}
+
+/// Answers the connection's outcome once it has one.
 fn echo_step(
-    conn: &mut Connection<Instant, Server>,
+    conn: &mut Connection<Micros, Server>,
     asm: &mut MessageAssembler,
     inbound: &mut [u8],
     out: &mut [u8],
-) {
+) -> Option<Closed> {
     // Drain inbound bytes into events, folding messages with the assembler.
     let mut completed: Vec<Message> = Vec::new();
+    let mut outcome: Option<Closed> = None;
     {
-        let mut events = conn.handle(Instant::now(), inbound).expect("not terminal");
+        let mut events = conn.handle(now(), inbound).expect("not terminal");
         while let Some(event) = events.next() {
+            // Your own handling: RECORD the terminal condition, do not leave
+            // on it. Every event is pushed below, this one included — that is
+            // what lets the assembler drop a message the connection has ended
+            // under, which no later event can tell it about.
             match &event {
-                Event::Closed(_) => return,           // drain poll_transmit then drop
+                Event::Closed(closed) => outcome = Some(*closed),
                 Event::Ping(_) | Event::Pong(_) => {} // pong echo is auto-queued
                 _ => {}
             }
@@ -226,20 +258,51 @@ fn echo_step(
             }
         }
     }
-    // Echo each completed message (text as text, binary as binary).
-    for msg in completed {
-        let _n = match msg {
-            Message::Text(s) => conn.encode_text(&s, out),
-            Message::Binary(b) => conn.encode_binary(&b, out),
+    // Echo each completed message (text as text, binary as binary) — but not
+    // onto a connection that has ended; encoding refuses there.
+    if outcome.is_none() {
+        for msg in completed {
+            let _n = match msg {
+                Message::Text(s) => conn.encode_text(&s, out),
+                Message::Binary(b) => conn.encode_binary(&b, out),
+            }
+            .expect("buffer large enough");
+            // ... write out[..n] to the socket ...
         }
-        .expect("buffer large enough");
-        // ... write out[..n] to the socket ...
     }
     // Flush protocol-generated frames (pong/close echoes, keepalive pings).
-    while let Some(_n) = conn.poll_transmit(Instant::now(), out).expect("encode") {
+    // This runs on the terminal pass too: the close echo the machine queued
+    // is here, and dropping the transport before writing it is what leaves a
+    // peer waiting.
+    while let Some(_n) = conn.poll_transmit(now(), out).expect("encode") {
         // ... write out[.._n] to the socket ...
     }
+    // `Some` means: everything owed is on the wire; drop the transport.
+    outcome
 }
+
+// One pass over a stand-in transport, so the loop above is compiled rather
+// than described. `no_run`: the bytes are a literal, not a socket.
+pub fn one_pass() {
+    let mut conn = Connection::new(
+        &Negotiated::none(),
+        ConnectionConfig::new(),
+        Server::new(),
+        now(),
+    );
+    let mut asm = MessageAssembler::new(64 * 1024);
+    // One masked client-to-server Ping, as a socket would have handed it over.
+    let mut inbound = [0x89, 0x84, 0x00, 0x00, 0x00, 0x00, b'p', b'i', b'n', b'g'];
+    let mut out = [0u8; 1024];
+    if let Some(closed) = echo_step(&mut conn, &mut asm, &mut inbound, &mut out) {
+        let _ = closed.clean();
+    }
+}
+# }
+# fn main() {
+#     #[cfg(any(feature = "std", feature = "alloc", feature = "no-atomic"))]
+#     heap_tier::one_pass();
+# }
 ```
 
 ### Client: connect

@@ -28,8 +28,10 @@ use crate::{
   utf8::Utf8Validator,
 };
 
-/// Caller-contract errors from [`Connection::handle`]. Protocol violations
-/// are NOT errors — they surface as a final [`Event::Closed`].
+/// Caller-contract errors from [`Connection::handle`] and
+/// [`Connection::observe`] — two entry points over one refusal site, since
+/// both are the same `feed`. Protocol violations are NOT errors — they surface
+/// as a final [`Event::Closed`].
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum HandleError {
@@ -37,8 +39,9 @@ pub enum HandleError {
   #[error("connection is terminal")]
   Terminal,
 
-  /// `now` is earlier than an instant this connection has already been given.
-  /// See [`Connection::handle`].
+  /// `now` is earlier than an instant this connection has already been given
+  /// through any of its four `now`-taking entry points. See
+  /// [`Connection::handle`] and [`Connection::observe`].
   #[error("`now` is earlier than an instant this connection has already been given")]
   ClockWentBackwards,
 }
@@ -77,6 +80,21 @@ pub(crate) enum MessageState {
     kind: MessageKind,
     compressed: bool,
     received: u64,
+    /// This message's payload is being SKIPPED — no unmask, no UTF-8
+    /// validation, no inflate, no size accounting — and only
+    /// `MessageStart`/`MessageEnd` are surfaced for it. Set at the message's
+    /// start when the cursor is in observation mode
+    /// ([`Connection::observe`]) or when the inbound inflate context is
+    /// poisoned, and at any run a cursor skips.
+    ///
+    /// It is per-MESSAGE rather than per-call because the two entry points
+    /// can feed one message between them: a message half of which was never
+    /// decoded must not be decoded from the middle. The UTF-8 validator is
+    /// the sharpest reason — its carry is seeded at `MessageStart`, so
+    /// validating a tail whose head was skipped can split a multi-byte
+    /// character and fail a conforming peer with 1007 — and the inflater is
+    /// the same shape one layer down.
+    skipped: bool,
   },
 }
 
@@ -110,6 +128,27 @@ pub(crate) struct RecvState {
   /// dictionary alone is ~32 KiB).
   #[cfg(feature = "deflate")]
   pub(crate) inflate: Option<std::boxed::Box<inflate::InflateBox>>,
+  /// The inbound DEFLATE stream can no longer be decoded: a compressed
+  /// message was SKIPPED (by [`Connection::observe`]) while the inbound
+  /// direction kept its context, so the sliding window is missing that
+  /// message's output and every later compressed message would back-reference
+  /// bytes this endpoint never produced. From here on, compressed data frames
+  /// are skipped the way observation skips them — `MessageStart`/`MessageEnd`
+  /// and no chunks — rather than inflated into garbage or failed as 1007:
+  /// the connection has already sent its Close, the application has said it
+  /// is done, and a dictionary that cannot be rebuilt is not an error the
+  /// peer caused. Uncompressed messages are unaffected.
+  ///
+  /// **Beside the `Option` rather than inside the box**, which the box could
+  /// not do: the very first compressed message of a connection can be the one
+  /// observation skips, and at that moment `inflate` is `None` — creating the
+  /// box to hold the flag would allocate the ~32 KiB dictionary that skipping
+  /// exists to avoid. Measured to cost nothing: `Connection<Nanos, Server>`
+  /// stays at 600 bytes with `deflate` (it lands in existing padding), which
+  /// is what [`CONNECTION_SIZE_BUDGET`](super::CONNECTION_SIZE_BUDGET)
+  /// asserts.
+  #[cfg(feature = "deflate")]
+  pub(crate) inflate_poisoned: bool,
 }
 
 impl RecvState {
@@ -142,6 +181,8 @@ impl RecvState {
       control_len: 0,
       #[cfg(feature = "deflate")]
       inflate: None,
+      #[cfg(feature = "deflate")]
+      inflate_poisoned: false,
     }
   }
 }
@@ -198,6 +239,15 @@ pub(crate) mod inflate {
     /// block ends the old one — there is nothing to take context from), and
     /// any further input for the CURRENT message is malformed.
     ended: bool,
+    /// Test-only: inflated bytes across the connection's whole life, never
+    /// reset. See [`inflated_ever`](Self::inflated_ever).
+    ///
+    /// Gated to the tier its READERS are on, not to `test` alone: the only
+    /// reader is `inflated_ever`, whose only callers are in the `std`-gated
+    /// test module, so on a `--no-default-features --features deflate` build
+    /// a `#[cfg(test)]` field is written by `run` and read by nobody.
+    #[cfg(all(test, feature = "std"))]
+    inflated_ever: u64,
   }
 
   impl InflateBox {
@@ -217,12 +267,33 @@ pub(crate) mod inflate {
         buf: Vec::new(),
         inflated_total: 0,
         ended: false,
+        #[cfg(all(test, feature = "std"))]
+        inflated_ever: 0,
       })
     }
 
     /// The inflated output of the most recent [`run`](Self::run).
     pub(crate) fn output(&self) -> &[u8] {
       &self.buf
+    }
+
+    /// The output buffer's CAPACITY, which is its high-water mark by
+    /// construction: `run` clears the buffer rather than shrinking it and
+    /// `Vec` never gives capacity back, so this is the largest single run
+    /// this connection has ever inflated, rounded up to the growth step.
+    /// The measurement behind the observation regressions.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn buf_capacity(&self) -> usize {
+      self.buf.capacity()
+    }
+
+    /// Every byte this decompressor has ever produced, across all messages.
+    /// `inflated_total` is per-message and resets; this does not, which is
+    /// what makes it the oracle for "how much work did a discarded message
+    /// cost" — the buffer's capacity only shows the largest single frame.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn inflated_ever(&self) -> u64 {
+      self.inflated_ever
     }
 
     /// Resets the decompressor for a new message (inbound
@@ -286,6 +357,12 @@ pub(crate) mod inflate {
         self.inflated_total = self
           .inflated_total
           .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        #[cfg(all(test, feature = "std"))]
+        {
+          self.inflated_ever = self
+            .inflated_ever
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        }
         if self.inflated_total > max {
           return Err(InflateFail::TooLarge);
         }
@@ -371,6 +448,14 @@ where
   pub(crate) pending_message_end: bool,
   /// A terminal `Closed` owed after a `CloseReceived` was yielded.
   pub(crate) pending_closed: Option<Closed>,
+  /// This cursor is in OBSERVATION mode ([`Connection::observe`]): data
+  /// payload bytes are advanced over and never decoded. A field on the
+  /// CURSOR and not on the connection, because the mode is a property of the
+  /// bytes being fed — where they came from — and not of the connection: a
+  /// driver that has both kinds of input must not be able to leave a mode
+  /// set. (It is also why the mode cannot cost a `Connection` field; that
+  /// struct's size is const-asserted.)
+  pub(crate) observing: bool,
 }
 
 impl<I, Ro> Drop for Events<'_, '_, I, Ro>
@@ -403,6 +488,102 @@ where
     now: I,
     data: &'a mut [u8],
   ) -> Result<Events<'a, 'c, I, Ro>, HandleError> {
+    self.feed(now, data, false)
+  }
+
+  /// Feeds inbound transport bytes as an OBSERVER: everything `handle` does,
+  /// except that data payload bytes are advanced over instead of decoded.
+  ///
+  /// For a caller that has stopped consuming — it has sent its Close and is
+  /// now only waiting to see the peer's — and must still be a conforming
+  /// endpoint while it waits. Framing is unchanged in every respect: opcode
+  /// and RSV validation, the mask-bit rule, fragment sequencing, the
+  /// control-frame length rule, the clock check and the terminal
+  /// short-circuit all apply, and a framing violation still fails the
+  /// connection exactly as it would under `handle`. Control frames are
+  /// processed identically — a Ping still queues its Pong into the outbound
+  /// slots, a Pong still surfaces, and the peer's Close still echoes and
+  /// terminates. [`Event::MessageStart`] and [`Event::MessageEnd`] are still
+  /// emitted, so a caller's assembler can keep tracking message boundaries.
+  ///
+  /// What it does NOT do is any work on the data payload: the bytes are not
+  /// unmasked, not validated as UTF-8, not inflated, and not counted against
+  /// [`ConnectionConfig::max_message_size`](super::ConnectionConfig::max_message_size),
+  /// and no chunk event is yielded for them. Skipping the UTF-8 check is not
+  /// a relaxation of RFC 6455 §8.1 (line 2643 of `.rfc-cache/rfc6455.txt`).
+  /// That obligation is conditioned on interpreting the bytes: "When an
+  /// endpoint is to interpret a byte stream as UTF-8 but finds that the byte
+  /// stream is not, in fact, a valid UTF-8 stream, that endpoint MUST _Fail
+  /// the WebSocket Connection_." An observer is not interpreting them. The
+  /// specific clause was checked rather than the general one: §5.6 (line
+  /// 2098) says of a text frame that "the whole message MUST contain valid
+  /// UTF-8", which is a rule on what a SENDER may put on the wire, and it
+  /// routes the receiver's handling to §8.1 rather than stating a second
+  /// obligation of its own.
+  ///
+  /// **A message is skipped whole.** The mode is per-CALL, but the fact that
+  /// a message's bytes were skipped is remembered on the connection until
+  /// that message's final frame: half a message must never be decoded from
+  /// the middle, whether its remaining frames arrive through this method or
+  /// through [`handle`](Connection::handle). Assembly resumes at the next
+  /// message.
+  ///
+  /// # What a consumer is told, and when
+  ///
+  /// **Everything it needs is in the events; there is nothing to remember
+  /// across calls.** Two of them carry the fact that a message's payload is
+  /// not being delivered, and between them they cover both ways a message can
+  /// come to be skipped:
+  ///
+  /// - A message that STARTS here says so in its own start:
+  ///   [`MessageStart::skipped`] is set, so a folder discards to the boundary
+  ///   instead of opening an accumulator.
+  /// - A message already IN PROGRESS when observation begins cannot say it in
+  ///   its start — that start was emitted under
+  ///   [`handle`](Connection::handle), before this decision existed — so it is
+  ///   said once, at the first run skipped, as
+  ///   [`Event::MessageAbandoned`]: drop what you hold for it. Its
+  ///   `MessageEnd` still arrives at the boundary, possibly through `handle`
+  ///   long afterwards, and would otherwise seal what a folder is holding as
+  ///   a complete, TRUNCATED message.
+  ///
+  /// That second event is why this is not a pairing obligation on the caller:
+  /// **a whole `observe` call can yield NO other events at all** — an observed
+  /// read whose every byte is continuation payload produces nothing else — so
+  /// there is no moment a caller could have been asked to react to instead.
+  /// Both assemblers in this crate act on both events in `push`.
+  ///
+  /// # permessage-deflate and context takeover
+  ///
+  /// Skipping a compressed message's bytes means the inflater never saw them.
+  /// With `no_context_takeover` on the inbound direction that costs nothing —
+  /// each message is its own DEFLATE stream, and the next one resets. **With
+  /// context takeover it is not recoverable**: the sliding window is now
+  /// missing that message's output, so every later compressed message would
+  /// back-reference bytes this endpoint never produced. Observing a
+  /// compressed data frame under context takeover therefore POISONS the
+  /// inbound inflate context, and from then on `handle` treats compressed
+  /// data frames exactly as this method does — skipped, `MessageStart` and
+  /// `MessageEnd` only, no chunks, and no error. Uncompressed messages are
+  /// unaffected. It is not an error because the peer did not cause it: this
+  /// endpoint has sent its Close and its application has said it is done, and
+  /// a dictionary that cannot be rebuilt is a consequence of that decision.
+  pub fn observe<'a, 'c>(
+    &'c mut self,
+    now: I,
+    data: &'a mut [u8],
+  ) -> Result<Events<'a, 'c, I, Ro>, HandleError> {
+    self.feed(now, data, true)
+  }
+
+  /// The body of both entry points; `observing` is the single difference and
+  /// it is carried by the cursor.
+  fn feed<'a, 'c>(
+    &'c mut self,
+    now: I,
+    data: &'a mut [u8],
+    observing: bool,
+  ) -> Result<Events<'a, 'c, I, Ro>, HandleError> {
     // The clock check comes FIRST, before the state-dependent refusal below,
     // because it is a statement about this call's ARGUMENT rather than about
     // the connection: a driver validating its own timekeeping gets the same
@@ -428,7 +609,50 @@ where
       data: Some(data),
       pending_message_end: false,
       pending_closed: None,
+      observing,
     })
+  }
+}
+
+/// Test-only windows onto the inbound decompressor: what it has retained and
+/// what it has done. Both are what the observation regressions assert on, and
+/// neither is a public API — the crate publishes no way to ask, and should
+/// not.
+///
+/// **The cfg is the UNION of what the CALLERS carry, not `test` plus the
+/// feature the code is about.** All three are called only from
+/// `tests::deflate`, a `#[cfg(feature = "deflate")]` module nested inside
+/// `#[cfg(all(test, feature = "std"))] mod tests`. Gated on `deflate` alone
+/// they compile with no caller at all on
+/// `--no-default-features --features deflate`, and `-D warnings` fails that
+/// build on `dead_code` — which is what CI's `cargo hack test --each-feature`
+/// found and the local gate list did not run. Widen this only together with
+/// the tests that call it.
+#[cfg(all(test, feature = "std", feature = "deflate"))]
+impl<I, Ro> Connection<I, Ro> {
+  /// The inflate output buffer's capacity, or 0 when no decompressor was ever
+  /// created. See [`InflateBox::buf_capacity`](inflate::InflateBox::buf_capacity).
+  pub(crate) fn inflate_buf_capacity(&self) -> usize {
+    self
+      .recv
+      .inflate
+      .as_deref()
+      .map_or(0, inflate::InflateBox::buf_capacity)
+  }
+
+  /// Every byte the decompressor has produced on this connection.
+  pub(crate) fn inflated_ever(&self) -> u64 {
+    self
+      .recv
+      .inflate
+      .as_deref()
+      .map_or(0, inflate::InflateBox::inflated_ever)
+  }
+
+  /// Whether the inbound inflate context has been poisoned by a skipped
+  /// compressed message.
+  pub(crate) fn inflate_is_poisoned(&self) -> bool {
+    self.recv.inflate_poisoned
   }
 }
 
@@ -508,6 +732,17 @@ where
             InflateDecision::Fail(code) => return Some(self.fail(code)),
             InflateDecision::Nothing => {}
           },
+          // Observed (or otherwise skipped) payload: no chunk, and the
+          // message's boundary still surfaces so a caller's assembler can
+          // track it.
+          DataStep::Skipped { message_done } => {
+            if message_done {
+              return Some(Event::MessageEnd);
+            }
+          }
+          // The same, plus the one-time notice that a message already in
+          // progress is being given up on.
+          DataStep::Abandoned => return Some(Event::MessageAbandoned),
           DataStep::Fail(code) => return Some(self.fail(code)),
           DataStep::NeedMore => return None,
           DataStep::Continue => {}
@@ -667,15 +902,38 @@ where
           kind,
           compressed,
           received: 0,
+          skipped: false,
         };
         self.conn.recv.utf8.reset();
         self.conn.recv.text_carry = ([0; 4], 0);
+        // Whether this message will be decoded at all is settled HERE, once,
+        // for the whole message — an observed message, and a compressed one
+        // arriving after the inflate context was poisoned, are both skipped
+        // to their final frame however their later frames are fed. Deciding
+        // it per RUN instead would let a message be decoded from the middle,
+        // which is what the `skipped` flag exists to prevent.
+        let skipping = self.observing || (compressed && self.inflate_poisoned());
+        if skipping {
+          self.mark_message_skipped();
+        }
         #[cfg(feature = "deflate")]
-        if compressed {
+        if compressed && !skipping {
+          // Deliberately NOT run for a skipped message: it would create the
+          // ~32 KiB decompressor for bytes nobody will inflate. Nothing later
+          // needs the per-message bookkeeping it does, because the next
+          // message this connection actually decodes runs it again — and with
+          // `no_context_takeover` that call resets the window, while with
+          // takeover the context is poisoned and no such message exists.
           self.begin_inflate_message();
         }
         self.begin_data_payload(header);
-        Some(Event::MessageStart(MessageStart::new(kind, compressed)))
+        // The event carries the fact. A consumer that opens an accumulator for
+        // a message whose payload is skipped delivers an EMPTY message where
+        // the peer sent bytes, and no later event can tell it otherwise — the
+        // only other event this message produces is its `MessageEnd`.
+        Some(Event::MessageStart(MessageStart::new(
+          kind, compressed, skipping,
+        )))
       }
       _ => Some(self.fail(CloseCode::ProtocolError)),
     }
@@ -690,20 +948,88 @@ where
     };
   }
 
-  /// Prepares the inbound decompressor for a new compressed message: create
-  /// it lazily, reset its window when the inbound direction negotiated
-  /// `no_context_takeover`, and clear the per-message inflated-byte counter.
+  /// Whether the inbound direction negotiated `no_context_takeover` — the
+  /// direction the peer SENDS on: client→server for a server connection,
+  /// server→client for a client connection.
+  ///
+  /// The negotiated parameters are the record: they are stored on the
+  /// connection as `Connection::deflate` at
+  /// [`Connection::new`](Connection::new) from
+  /// [`Negotiated::deflate`](crate::negotiation::Negotiated::deflate), and
+  /// read back through
+  /// [`DeflateParams::client_no_context_takeover`](crate::negotiation::DeflateParams::client_no_context_takeover)
+  /// / [`server_no_context_takeover`](crate::negotiation::DeflateParams::server_no_context_takeover).
+  /// Nothing else records takeover, and nothing mutates it after the
+  /// handshake.
   #[cfg(feature = "deflate")]
-  fn begin_inflate_message(&mut self) {
-    // The inbound direction is the one the peer SENDS on: client→server for a
-    // server connection, server→client for a client connection.
-    let no_takeover = self.conn.deflate.is_some_and(|params| {
+  fn inbound_no_context_takeover(&self) -> bool {
+    self.conn.deflate.is_some_and(|params| {
       if Ro::EXPECT_MASKED_INBOUND {
         params.client_no_context_takeover()
       } else {
         params.server_no_context_takeover()
       }
-    });
+    })
+  }
+
+  /// Whether the inbound inflate context has been poisoned by a skipped
+  /// compressed message (see [`Connection::observe`]). Always `false` without
+  /// the `deflate` feature, where no compressed message can be accepted at
+  /// all.
+  fn inflate_poisoned(&self) -> bool {
+    #[cfg(feature = "deflate")]
+    {
+      self.conn.recv.inflate_poisoned
+    }
+    #[cfg(not(feature = "deflate"))]
+    {
+      false
+    }
+  }
+
+  /// Records that the in-progress message's payload is NOT being decoded, and
+  /// — when that message is compressed and the inbound direction kept its
+  /// context — that the inflate context is now unusable.
+  ///
+  /// **The single writer of both facts.** Two sites decide to skip (a message
+  /// that starts under observation or under a poisoned context, and a run an
+  /// observing cursor walks past mid-message), and routing both through one
+  /// function is what keeps "a skipped compressed message poisons the
+  /// context" from being true at one of them and not the other.
+  ///
+  /// The poison is set for ANY skipped compressed run, including an empty
+  /// one. DEFLATE is a bit stream, so what a skipped frame costs the inflater
+  /// is not measured in the bytes it carried — an endpoint that resumed
+  /// mid-stream would be reading at the wrong bit offset — and a rule that
+  /// asked "did this frame carry payload" would be a second, weaker rule.
+  fn mark_message_skipped(&mut self) {
+    let MessageState::InMessage {
+      kind,
+      compressed,
+      received,
+      ..
+    } = self.conn.recv.message
+    else {
+      return;
+    };
+    self.conn.recv.message = MessageState::InMessage {
+      kind,
+      compressed,
+      received,
+      skipped: true,
+    };
+    #[cfg(feature = "deflate")]
+    if compressed && !self.inbound_no_context_takeover() {
+      self.conn.recv.inflate_poisoned = true;
+    }
+  }
+
+  /// Prepares the inbound decompressor for a new compressed message: create
+  /// it lazily, reset its window when the inbound direction negotiated
+  /// `no_context_takeover`, and clear the per-message inflated-byte counter.
+  #[cfg(feature = "deflate")]
+  fn begin_inflate_message(&mut self) {
+    let no_takeover = self.inbound_no_context_takeover();
     let had_context = self.conn.recv.inflate.is_some();
     let inflate = self
       .conn
@@ -735,6 +1061,21 @@ where
       return DataStep::Continue;
     };
 
+    // The message state is read BEFORE any byte is touched, because whether
+    // this run is decoded decides whether the input is written to at all: an
+    // observed run is not unmasked, so the caller's buffer comes back as the
+    // wire had it.
+    let MessageState::InMessage {
+      kind,
+      compressed,
+      received,
+      skipped,
+    } = self.conn.recv.message
+    else {
+      return DataStep::Fail(CloseCode::ProtocolError);
+    };
+    let skip = self.observing || skipped;
+
     let available = self.remaining();
     let take = clamp_to_usize(remaining, available);
     if take == 0 && remaining > 0 {
@@ -742,7 +1083,9 @@ where
     }
 
     let head = self.take_front(take);
-    if let Some(k) = key {
+    if let Some(k) = key
+      && !skip
+    {
       mask(head, k, offset);
     }
     // `head` borrows the input (`'a`), which is disjoint from `self`.
@@ -764,15 +1107,40 @@ where
       };
     }
 
-    let MessageState::InMessage {
-      kind,
-      compressed,
-      received,
-    } = self.conn.recv.message
-    else {
-      return DataStep::Fail(CloseCode::ProtocolError);
-    };
     let message_done = frame_done && fin;
+
+    // Skipped: the cursor has advanced over the payload and that is all it
+    // does with it. No unmask (above), no UTF-8 validation, no inflate, and
+    // no size accounting — `received` is deliberately left where it was,
+    // because a cap on bytes this endpoint never looked at bounds nothing.
+    if skip {
+      // The FIRST skipped run of a message whose start said otherwise. That
+      // start was emitted before this decision existed, so the fact travels
+      // as its own event — once, here, and never for a message whose start
+      // already carried `skipped`.
+      //
+      // `self.observing && !skipped` is the whole condition, and the inflate
+      // poison adds no second cause: the poison is written only by
+      // `mark_message_skipped`, which acts on the message in flight, and only
+      // one message is ever in flight (a Text or Binary frame inside an open
+      // message fails the connection in `on_header`). So the poison is set at
+      // the same instant that message is marked skipped — by this branch —
+      // and every LATER compressed message meets it at its own `on_header`,
+      // where it is marked skipped at the start and its `MessageStart` says
+      // so. A poisoned message in flight is unreachable, so there is no
+      // second emission site to write and no untestable branch guarding one.
+      let abandons = !skipped;
+      self.mark_message_skipped();
+      if message_done {
+        self.conn.recv.message = MessageState::Idle;
+      }
+      if abandons {
+        // The boundary, if this same run carried it, follows the abandon.
+        self.pending_message_end = message_done;
+        return DataStep::Abandoned;
+      }
+      return DataStep::Skipped { message_done };
+    }
 
     #[cfg(feature = "deflate")]
     if compressed {
@@ -799,6 +1167,7 @@ where
         kind,
         compressed,
         received,
+        skipped: false,
       }
     };
     DataStep::YieldInput {
@@ -1240,6 +1609,13 @@ enum DataStep<'a> {
     kind: MessageKind,
     message_done: bool,
   },
+  /// The run was advanced over and not decoded (see
+  /// [`Connection::observe`]): nothing to yield but the message's `End`.
+  Skipped { message_done: bool },
+  /// The first run skipped of a message whose `MessageStart` said otherwise:
+  /// yield [`Event::MessageAbandoned`]. A `MessageEnd` owed by the same run is
+  /// left pending on the cursor and follows it.
+  Abandoned,
   /// Fail the connection with this close code.
   Fail(CloseCode),
   /// The current frame is not finished and the input is exhausted.
@@ -1406,7 +1782,7 @@ mod tests {
     connection::{
       Connection, ConnectionConfig,
       role::Server,
-      tests::{Ev, drain, fold_events, server},
+      tests::{Ev, drain, drain_observed, fold_events, server},
     },
     frame::{CloseCode, FrameHeader, Opcode, encode_close_payload, mask as apply_mask},
     negotiation::Negotiated,
@@ -2031,6 +2407,186 @@ mod tests {
     ));
   }
 
+  #[test]
+  fn observation_yields_boundaries_without_payload_and_still_answers_control() {
+    // The whole contract of `observe` in one feed: the message's boundaries
+    // are surfaced and its payload is not, while control frames are processed
+    // exactly as `handle` processes them — the Ping's echo is queued and the
+    // peer's Close terminates.
+    let mut conn = server();
+    let mut bytes = frame(Opcode::Text, false, false, b"Hel");
+    bytes.extend(frame(Opcode::Ping, true, false, b"k"));
+    bytes.extend(frame(Opcode::Continuation, true, false, b"lo"));
+    let got = fold(drain_observed(&mut conn, &bytes));
+    assert_eq!(
+      got,
+      [
+        Ev::SkippedStart(MessageKind::Text, false),
+        Ev::Ping(b"k".to_vec()),
+        Ev::End
+      ],
+      "no chunk between Start and End, and the start says so"
+    );
+
+    // The Pong is queued, not skipped along with the payload.
+    let mut out = [0u8; 64];
+    let n = conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("the ping's echo is owed");
+    assert_eq!(&out[..n], &[0x8A, 0x01, b'k'], "an unmasked pong for `k`");
+
+    let mut payload = [0u8; MAX_CONTROL_PAYLOAD];
+    let n = encode_close_payload(CloseCode::Normal, "", &mut payload).unwrap();
+    let close = frame(Opcode::Close, true, false, &payload[..n]);
+    let got = drain_observed(&mut conn, &close);
+    assert_eq!(
+      got,
+      [Ev::CloseRecv(1000, String::new()), Ev::Closed(1000, true)],
+      "the close handshake completes under observation"
+    );
+    assert!(conn.is_terminal());
+  }
+
+  #[test]
+  fn observation_leaves_the_input_buffer_unmasked() {
+    // Not unmasking is the point rather than an accident: an observer does no
+    // work on the payload, and the caller's buffer therefore comes back as
+    // the wire had it.
+    let mut conn = server();
+    let bytes = frame(Opcode::Binary, true, false, b"payload");
+    let mut data = bytes.clone();
+    drop(conn.observe(TestInstant(0), &mut data).unwrap());
+    assert_eq!(data, bytes, "the observed payload was not written to");
+  }
+
+  #[test]
+  fn a_framing_violation_still_fails_the_connection_under_observation() {
+    // Every header-level rule is unchanged: an unmasked client frame is a
+    // 1002 whether the cursor is observing or receiving.
+    let mut conn = server();
+    let unmasked = [0x82u8, 0x01, 0x00];
+    let got = drain_observed(&mut conn, &unmasked);
+    assert_eq!(got, [Ev::Closed(1002, false)]);
+    assert!(conn.is_terminal());
+  }
+
+  #[test]
+  fn a_message_half_observed_is_skipped_to_its_end_by_handle() {
+    // The mode is per CALL; which message is being skipped is state the
+    // connection keeps. Feeding the tail of an observed message through
+    // `handle` must not decode it from the middle — for text that would run
+    // the UTF-8 validator over a tail whose head it never saw, splitting a
+    // multi-byte character and failing a CONFORMING peer with 1007.
+    let mut conn = server();
+    // "€" is E2 82 AC; the split lands inside it.
+    let head = frame(Opcode::Text, false, false, &[0xE2]);
+    let tail = frame(Opcode::Continuation, true, false, &[0x82, 0xAC]);
+
+    let got = drain_observed(&mut conn, &head);
+    assert_eq!(got, [Ev::SkippedStart(MessageKind::Text, false)]);
+    let got = drain(&mut conn, &tail);
+    assert_eq!(got, [Ev::End], "the tail is skipped, not validated");
+    assert!(!conn.is_terminal(), "and the peer is not blamed for it");
+
+    // The NEXT message assembles normally: skipping ends at the boundary.
+    let got = fold(drain(&mut conn, &frame(Opcode::Text, true, false, b"ok")));
+    assert_eq!(
+      got,
+      [
+        Ev::Start(MessageKind::Text, false),
+        Ev::Text("ok".into()),
+        Ev::End
+      ]
+    );
+  }
+
+  #[test]
+  fn a_message_in_flight_is_abandoned_once_when_observation_takes_over() {
+    // The event the caller used to owe as an action. It fires at the FIRST run
+    // skipped of a message whose `MessageStart` was already emitted saying
+    // otherwise, once, and its `MessageEnd` still arrives at the boundary.
+    let mut conn = server();
+    let got = drain(&mut conn, &frame(Opcode::Binary, false, false, b"head"));
+    assert_eq!(
+      got,
+      [
+        Ev::Start(MessageKind::Binary, false),
+        Ev::Bin(b"head".to_vec())
+      ],
+      "the message begins under `handle` and its start says nothing about skipping"
+    );
+
+    let got = drain_observed(
+      &mut conn,
+      &frame(Opcode::Continuation, false, false, b"one"),
+    );
+    assert_eq!(got, [Ev::Abandoned], "the notice, and no chunk");
+    let got = drain_observed(
+      &mut conn,
+      &frame(Opcode::Continuation, false, false, b"two"),
+    );
+    assert_eq!(
+      got,
+      [],
+      "exactly once: the second observed run says nothing"
+    );
+
+    // The boundary still arrives, and through `handle` — which is where the
+    // truncation happened: a folder that had not been told would seal here.
+    let got = drain(&mut conn, &frame(Opcode::Continuation, true, false, b"end"));
+    assert_eq!(
+      got,
+      [Ev::End],
+      "the boundary, with no chunk and no second notice"
+    );
+    assert!(!conn.is_terminal());
+
+    // And the next message is unaffected.
+    let got = fold(drain(
+      &mut conn,
+      &frame(Opcode::Text, true, false, b"after"),
+    ));
+    assert_eq!(
+      got,
+      [
+        Ev::Start(MessageKind::Text, false),
+        Ev::Text("after".into()),
+        Ev::End
+      ]
+    );
+  }
+
+  #[test]
+  fn a_message_observed_from_its_start_is_never_abandoned() {
+    // The other half of "exactly once": a message whose start already said
+    // `skipped` gets no notice, because its start carried the same fact and
+    // nothing was ever accumulated for it to drop.
+    let mut conn = server();
+    let mut bytes = frame(Opcode::Binary, false, false, b"one");
+    bytes.extend(frame(Opcode::Continuation, false, false, b"two"));
+    bytes.extend(frame(Opcode::Continuation, true, false, b"three"));
+    let got = drain_observed(&mut conn, &bytes);
+    assert_eq!(
+      got,
+      [Ev::SkippedStart(MessageKind::Binary, false), Ev::End],
+      "a skipped start and its boundary, and no abandon notice between them"
+    );
+  }
+
+  #[test]
+  fn observed_payload_is_not_counted_against_the_message_cap() {
+    // No size accounting on bytes this endpoint never looked at: a cap on
+    // them would bound nothing, and tripping 1009 on a discarded message
+    // would blame the peer for our own decision to stop reading.
+    let config = ConnectionConfig::new().with_max_message_size(8);
+    let mut conn = Connection::new(&Negotiated::none(), config, Server::new(), TestInstant(0));
+    let bytes = frame(Opcode::Binary, true, false, &[0xAB; 4096]);
+    let got = drain_observed(&mut conn, &bytes);
+    assert_eq!(got, [Ev::SkippedStart(MessageKind::Binary, false), Ev::End]);
+    assert!(!conn.is_terminal(), "4 KiB observed under an 8-byte cap");
+  }
+
   #[cfg(feature = "deflate")]
   mod deflate {
     use super::*;
@@ -2349,6 +2905,234 @@ mod tests {
         got.extend(drain(&mut conn, &whole[cut..]));
         assert_eq!(fold(got), expected, "cut at {cut}");
       }
+    }
+
+    /// One compressed "bomb" message on the wire: `FRAGMENTS` frames, whose
+    /// concatenated payload inflates to `BOMB_BYTES` of a repeated byte.
+    /// Compressed by `peer`, so it continues that peer's DEFLATE stream.
+    fn compressed_bomb(peer: &mut RefCompressor) -> Vec<u8> {
+      let payload = peer.compress(&vec![b'A'; BOMB_BYTES]);
+      let per_frame = payload.len().div_ceil(FRAGMENTS);
+      let mut wire = Vec::new();
+      let mut chunks = payload.chunks(per_frame).peekable();
+      let mut first = true;
+      while let Some(chunk) = chunks.next() {
+        let fin = chunks.peek().is_none();
+        let opcode = if first {
+          Opcode::Binary
+        } else {
+          Opcode::Continuation
+        };
+        wire.extend(frame(opcode, fin, first, chunk));
+        first = false;
+      }
+      wire
+    }
+
+    /// Hundreds of frames, each inflating to tens of KiB — the shape a peer
+    /// that keeps sending after our Close can produce from one read chunk.
+    #[cfg(not(miri))]
+    const FRAGMENTS: usize = 256;
+    #[cfg(not(miri))]
+    const BOMB_BYTES: usize = 8 * 1024 * 1024;
+
+    /// The same SHAPE at 1/512th the bytes, for the interpreter.
+    ///
+    /// Only one test builds a bomb under miri —
+    /// `no_context_takeover_survives_an_observed_message`, whose subject is
+    /// semantic (nothing is poisoned, the next message still arrives) and
+    /// which those two assertions reach at any size. The one whose subject IS
+    /// the magnitude is `#[cfg_attr(miri, ignore = ...)]` instead, because
+    /// shrinking it would delete the thing it measures.
+    ///
+    /// 8 fragments still exercises the fragmented path (a first frame, a
+    /// final frame and continuations between), and 16 KiB is four times
+    /// `INFLATE_CHUNK` (4 KiB), so a bomb this size would still grow the
+    /// output buffer several times over if it were HANDLED. That is what
+    /// makes the two assertions — capacity and `inflated_ever` both unmoved —
+    /// say something under the interpreter rather than pass vacuously.
+    #[cfg(miri)]
+    const FRAGMENTS: usize = 8;
+    #[cfg(miri)]
+    const BOMB_BYTES: usize = 16 * 1024;
+
+    // MEASURED on CI at 1934.5 s inside the interpreter, against
+    // `xtask miri-test`'s 3600 s per-test and 4000 s per-crate budgets — this
+    // test and the one below it were 3859.8 s of the crate's 3956.6 s and the
+    // wrapper killed the run. What it asserts is that observation inflates
+    // NOTHING: the output buffer's capacity and `inflated_ever` are unmoved
+    // across a bomb. Miri cannot make an allocation bound wrong — it runs the
+    // same `Vec` growth the same way, only slower — and the bound is the
+    // whole subject, so shrinking the bomb would delete what is being
+    // measured rather than make it cheaper to measure.
+    #[test]
+    #[cfg_attr(
+      miri,
+      ignore = "an allocation bound over megabytes; miri cannot make it wrong"
+    )]
+    fn observation_skips_a_compressed_bomb_and_poisons_the_context() {
+      // The finding this exists for: with `deflate`, discarding the EVENT is
+      // one layer too late — the payload has already been inflated into the
+      // decompressor's buffer, and one read of a fragmented bomb costs
+      // megabytes of output for a message nobody will ever see.
+      let mut peer = RefCompressor::new();
+      let mut conn = deflate_server(default_params());
+
+      // Baseline: one complete compressed message through `handle`, which is
+      // what an ordinary receive costs.
+      let baseline = peer.compress(b"the quick brown fox");
+      let got = fold(drain(
+        &mut conn,
+        &frame(Opcode::Binary, true, true, &baseline),
+      ));
+      assert_eq!(
+        got,
+        [
+          Ev::Start(MessageKind::Binary, true),
+          Ev::Bin(b"the quick brown fox".to_vec()),
+          Ev::End
+        ]
+      );
+      let capacity = conn.inflate_buf_capacity();
+      let inflated = conn.inflated_ever();
+      assert!(capacity > 0, "the baseline created the decompressor");
+
+      // The bomb, observed. Boundaries and nothing else.
+      let bomb = compressed_bomb(&mut peer);
+      let got = fold(drain_observed(&mut conn, &bomb));
+      assert_eq!(
+        got,
+        [Ev::SkippedStart(MessageKind::Binary, true), Ev::End],
+        "no chunk is yielded for {FRAGMENTS} observed frames, and the start says so"
+      );
+      assert_eq!(
+        conn.inflate_buf_capacity(),
+        capacity,
+        "the inflate buffer did not grow for a message nobody reads"
+      );
+      assert_eq!(
+        conn.inflated_ever(),
+        inflated,
+        "and not one byte of the {BOMB_BYTES}-byte bomb was inflated"
+      );
+      assert!(!conn.is_terminal(), "skipping is not a failure");
+
+      // Context takeover was in effect, so the window is now missing that
+      // message: every later compressed message is skipped too, silently.
+      assert!(conn.inflate_is_poisoned());
+      let after = peer.compress(b"the quick brown fox jumps over");
+      let got = fold(drain(&mut conn, &frame(Opcode::Binary, true, true, &after)));
+      assert_eq!(
+        got,
+        [Ev::SkippedStart(MessageKind::Binary, true), Ev::End],
+        "a compressed message after the poison is skipped, not decoded — and its \
+         MessageStart says `skipped`, so a folder discards it instead of sealing an \
+         EMPTY message at the MessageEnd"
+      );
+      assert!(
+        !conn.is_terminal(),
+        "and it is not an error: the peer did not cause it"
+      );
+      assert_eq!(conn.inflated_ever(), inflated, "nothing more was inflated");
+
+      // Uncompressed messages are unaffected by the poison.
+      let got = fold(drain(
+        &mut conn,
+        &frame(Opcode::Text, true, false, b"plain"),
+      ));
+      assert_eq!(
+        got,
+        [
+          Ev::Start(MessageKind::Text, false),
+          Ev::Text("plain".into()),
+          Ev::End
+        ]
+      );
+    }
+
+    #[test]
+    fn no_context_takeover_survives_an_observed_message() {
+      // The other half of the ruling: with `no_context_takeover` on the
+      // inbound direction each message is its own DEFLATE stream, so skipping
+      // one costs the next nothing and there is nothing to poison.
+      use crate::negotiation::{ServerDeflateConfig, accept_deflate_offer};
+      let params = match accept_deflate_offer(
+        [b"permessage-deflate; client_no_context_takeover".as_slice()],
+        &ServerDeflateConfig::new(),
+      ) {
+        Some((params, _)) => params,
+        None => panic!("offer must be accepted"),
+      };
+      assert!(params.client_no_context_takeover());
+
+      let mut peer = RefCompressor::new();
+      let mut conn = deflate_server(params);
+      let baseline = peer.compress(b"the quick brown fox");
+      peer.reset();
+      let got = fold(drain(
+        &mut conn,
+        &frame(Opcode::Binary, true, true, &baseline),
+      ));
+      assert_eq!(got[1], Ev::Bin(b"the quick brown fox".to_vec()));
+      let capacity = conn.inflate_buf_capacity();
+      let inflated = conn.inflated_ever();
+
+      let bomb = compressed_bomb(&mut peer);
+      peer.reset();
+      let got = fold(drain_observed(&mut conn, &bomb));
+      assert_eq!(got, [Ev::SkippedStart(MessageKind::Binary, true), Ev::End]);
+      assert_eq!(conn.inflate_buf_capacity(), capacity);
+      assert_eq!(conn.inflated_ever(), inflated);
+      assert!(
+        !conn.inflate_is_poisoned(),
+        "each message resets the stream, so nothing was lost"
+      );
+
+      let after = peer.compress(b"delivered after the skipped one");
+      let got = fold(drain(&mut conn, &frame(Opcode::Binary, true, true, &after)));
+      assert_eq!(
+        got,
+        [
+          Ev::Start(MessageKind::Binary, true),
+          Ev::Bin(b"delivered after the skipped one".to_vec()),
+          Ev::End
+        ],
+        "the message after an observed one is still delivered"
+      );
+    }
+
+    #[test]
+    fn a_compressed_message_half_observed_is_skipped_to_its_end() {
+      // The per-message rule under `deflate`: a message the inflater stopped
+      // following cannot be resumed from the middle of its stream. `handle`
+      // finishes swallowing it, with no chunk and no 1007.
+      let mut peer = RefCompressor::new();
+      let mut conn = deflate_server(default_params());
+      let payload = peer.compress(b"aaaaaaaaaabbbbbbbbbbcccccccccc");
+      let mid = payload.len() / 2;
+
+      let got = drain(
+        &mut conn,
+        &frame(Opcode::Binary, false, true, &payload[..mid]),
+      );
+      assert!(
+        matches!(got.first(), Some(Ev::Start(MessageKind::Binary, true))),
+        "{got:?}"
+      );
+      let observed = drain_observed(&mut conn, &frame(Opcode::Continuation, false, false, &[]));
+      assert_eq!(
+        observed,
+        [Ev::Abandoned],
+        "even an empty observed run of a message in flight yields the notice — \
+         what it abandons is the message, not the bytes"
+      );
+      assert!(conn.inflate_is_poisoned());
+      let got = drain(
+        &mut conn,
+        &frame(Opcode::Continuation, true, false, &payload[mid..]),
+      );
+      assert_eq!(got, [Ev::End], "the rest is skipped, not inflated");
+      assert!(!conn.is_terminal());
     }
 
     #[test]

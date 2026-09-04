@@ -134,9 +134,11 @@ pub struct Connection<I, Ro> {
   pub(crate) close_deadline: Option<I>,
   /// Next instant at which a keepalive ping should be sent.
   pub(crate) next_keepalive: Option<I>,
-  /// The latest instant any of the three `now`-taking entry points has been
-  /// given. See [`Connection::accept_now`] for what it is compared against and
-  /// why it is an `I` rather than an `Option<I>`.
+  /// The latest instant any of the FOUR `now`-taking entry points has been
+  /// given — `handle`, `observe`, `poll_transmit`, `handle_timeout` — over
+  /// three refusal sites, because `handle` and `observe` are two names for one
+  /// `feed` and share its check. See [`Connection::accept_now`] for what it is
+  /// compared against and why it is an `I` rather than an `Option<I>`.
   pub(crate) last_now: I,
   pub(crate) _clock: core::marker::PhantomData<I>,
 }
@@ -224,6 +226,14 @@ impl Instant for Nanos {
 /// check's stored instant, an `I` rather than an `Option<I>` precisely so it is
 /// eight and not sixteen (see [`accept_now`](Connection::accept_now)). With
 /// `deflate` even that lands in existing padding and the number does not move.
+///
+/// Observation ([`Connection::observe`]) added two `bool`s to this struct's
+/// interior — `MessageState::InMessage::skipped` and, under `deflate`,
+/// `RecvState::inflate_poisoned` — and **re-measured at 544 / 576 / 600, all
+/// three unmoved**: both land in padding the enum and the struct already had.
+/// Re-measured rather than assumed, with the same probe, because that is the
+/// only way this doc's numbers stay measurements. The mode itself is a cursor
+/// field and is not in this struct at all.
 ///
 /// A middle revision of this branch was 128 bytes smaller, by merging
 /// `SendState`'s close slot and `RecvState`'s pong slot into one tagged slot.
@@ -357,8 +367,9 @@ where
   /// **The deadline it returns may be OLDER than the last instant this
   /// connection was given**, and that is not a bug in either method: a deadline
   /// is armed from the `now` of the call that armed it, while `last_now`
-  /// advances on every `handle` / `poll_transmit` / `handle_timeout`. A keepalive
-  /// armed at `t+5` is already stale once a `poll_transmit(t+20)` has gone by.
+  /// advances on every `handle` / `observe` / `poll_transmit` /
+  /// `handle_timeout`. A keepalive armed at `t+5` is already stale once a
+  /// `poll_transmit(t+20)` has gone by.
   ///
   /// So this value is a *when to wake up*, not a *what to pass*. Arrange the
   /// timer for it, and then call `handle_timeout` with a **fresh** reading of
@@ -392,11 +403,15 @@ where
   ///
   /// **Equal is accepted.** Only a strictly earlier instant is refused. A
   /// driver that reads its clock once per wakeup and hands the same instant to
-  /// `handle`, `poll_transmit` and `handle_timeout` in one batch is the shape
-  /// this crate is written for, and every call in that batch must succeed.
+  /// `handle`, `observe`, `poll_transmit` and `handle_timeout` in one batch is
+  /// the shape this crate is written for, and every call in that batch must
+  /// succeed.
   ///
   /// **It RETURNS by default — and panics under `assert-contracts` — with the
-  /// decision in one flag rather than three call sites.** All three refusals go through
+  /// decision in one flag rather than three call sites.** FOUR entry points
+  /// take a `now` and three sites refuse one: `handle` and `observe` are two
+  /// names for one `feed`, so they share a single check, and
+  /// `poll_transmit` and `handle_timeout` have their own. All three refusals go through
   /// [`contract_violation`](crate::contract::contract_violation), which hands
   /// the error back — or, under the `assert-contracts` feature, panics naming
   /// this contract. A clock that goes backwards is a bug in the caller's
@@ -434,8 +449,9 @@ where
   ///
   /// [`TimeoutError::ClockWentBackwards`] when `now` is EARLIER than an instant
   /// already handed to this connection through this method,
-  /// [`handle`](Connection::handle) or
-  /// [`poll_transmit`](Connection::poll_transmit). An equal instant is fine.
+  /// [`handle`](Connection::handle), [`observe`](Connection::observe) or
+  /// [`poll_transmit`](Connection::poll_transmit) — the four entry points that
+  /// take a `now`. An equal instant is fine.
   /// The refusal leaves the connection untouched, so the call can be retried
   /// with a correct instant. The rule — and the `assert-contracts` exception,
   /// under which this refusal panics rather than returning — is on
@@ -496,6 +512,13 @@ pub(crate) mod tests {
   #[derive(Debug, PartialEq, Eq, Clone)]
   pub(crate) enum Ev {
     Start(MessageKind, bool),
+    /// A `MessageStart` whose [`MessageStart::skipped`](super::MessageStart::skipped)
+    /// is set. A SEPARATE variant rather than a third field, so that every
+    /// existing expectation written as `Ev::Start(..)` also asserts the start
+    /// was NOT skipped — a start that becomes skipped stops matching.
+    SkippedStart(MessageKind, bool),
+    /// [`Event::MessageAbandoned`](super::Event::MessageAbandoned).
+    Abandoned,
     Text(String),
     Bin(Vec<u8>),
     End,
@@ -505,17 +528,39 @@ pub(crate) mod tests {
     Closed(u16, bool),
   }
 
-  /// Feeds `bytes` into `conn` and collects every event as owned `Ev`s.
+  /// Feeds `bytes` into `conn` through [`Connection::handle`] and collects
+  /// every event as owned `Ev`s.
   pub(crate) fn drain(conn: &mut Connection<TestInstant, Server>, bytes: &[u8]) -> Vec<Ev> {
     let mut data = bytes.to_vec();
-    let mut events = conn.handle(TestInstant(0), &mut data).unwrap();
+    let events = conn.handle(TestInstant(0), &mut data).unwrap();
+    collect(events)
+  }
+
+  /// The same through [`Connection::observe`], the observation entry point.
+  pub(crate) fn drain_observed(
+    conn: &mut Connection<TestInstant, Server>,
+    bytes: &[u8],
+  ) -> Vec<Ev> {
+    let mut data = bytes.to_vec();
+    let events = conn.observe(TestInstant(0), &mut data).unwrap();
+    collect(events)
+  }
+
+  fn collect(mut events: super::Events<'_, '_, TestInstant, Server>) -> Vec<Ev> {
     let mut out = Vec::new();
     while let Some(e) = events.next() {
       out.push(match e {
-        Event::MessageStart(s) => Ev::Start(s.kind(), s.compressed()),
+        Event::MessageStart(s) => {
+          if s.skipped() {
+            Ev::SkippedStart(s.kind(), s.compressed())
+          } else {
+            Ev::Start(s.kind(), s.compressed())
+          }
+        }
         Event::TextChunk(t) => Ev::Text(format!("{}{}", t.prefix(), t.body())),
         Event::BinaryChunk(b) => Ev::Bin(b.to_vec()),
         Event::MessageEnd => Ev::End,
+        Event::MessageAbandoned => Ev::Abandoned,
         Event::Ping(p) => Ev::Ping(p.as_slice().to_vec()),
         Event::Pong(p) => Ev::Pong(p.as_slice().to_vec()),
         Event::CloseReceived(c) => Ev::CloseRecv(c.code().as_u16(), c.reason().to_string()),
@@ -678,7 +723,12 @@ pub(crate) mod tests {
     assert_eq!(conn.poll_timeout(), Some(TestInstant(12_000_000)));
   }
 
-  /// The monotonicity contract, at all three entry points that take a `now`.
+  /// The monotonicity contract, at all FOUR entry points that take a `now`.
+  ///
+  /// Four entry points over three refusal sites: `handle` and `observe` are
+  /// two names for one `feed` and share its check, so `observe` is exercised
+  /// here rather than assumed to inherit it — a later edit could give it a
+  /// body of its own.
   ///
   /// The state comparison is a `Debug` render taken before and after, which is
   /// the cheapest thing that is actually BYTE-identical rather than
@@ -736,9 +786,24 @@ pub(crate) mod tests {
     ));
     assert_eq!(format!("{conn:?}"), snapshot);
 
-    // EQUAL is accepted at all three, which is the shape a driver that reads
+    // `observe`: the fourth entry point, sharing `handle`'s refusal site.
+    assert!(matches!(
+      conn.observe(TestInstant(1_999), &mut more),
+      Err(HandleError::ClockWentBackwards)
+    ));
+    assert_eq!(more, more_before, "a refused observe reads nothing either");
+    assert_eq!(format!("{conn:?}"), snapshot);
+
+    // EQUAL is accepted at all four, which is the shape a driver that reads
     // its clock once per wakeup and fans it across a batch depends on.
     assert!(conn.handle_timeout(TestInstant(2_000)).is_ok());
+    {
+      let mut ev = conn
+        .observe(TestInstant(2_000), &mut more)
+        .expect("an equal instant is not a rewind for `observe` either");
+      while ev.next().is_some() {}
+    }
+    let mut more = masked_frame(Opcode::Ping, true, b"xyz");
     {
       let mut ev = conn
         .handle(TestInstant(2_000), &mut more)
@@ -778,7 +843,7 @@ pub(crate) mod tests {
     assert!(conn.handle_timeout(TestInstant(9_999)).is_ok());
   }
 
-  /// The same contract under `assert-contracts`, at each of the three entry
+  /// The same contract under `assert-contracts`, at each of the four entry
   /// points, one panic per test because a `should_panic` test can only witness
   /// the first.
   ///
@@ -815,6 +880,14 @@ pub(crate) mod tests {
 
     #[test]
     #[should_panic(expected = "`now` must not go backwards")]
+    fn observe_panics_on_a_rewound_now() {
+      let mut conn = at(1_000);
+      let mut frame = masked_frame(Opcode::Ping, true, b"x");
+      let _ = conn.observe(TestInstant(999), &mut frame);
+    }
+
+    #[test]
+    #[should_panic(expected = "`now` must not go backwards")]
     fn poll_transmit_panics_on_a_rewound_now() {
       let mut conn = at(1_000);
       let mut out = [0u8; 16];
@@ -837,6 +910,8 @@ pub(crate) mod tests {
       let mut out = [0u8; 16];
       assert!(conn.handle_timeout(TestInstant(1_000)).is_ok());
       assert!(conn.poll_transmit(TestInstant(1_000), &mut out).is_ok());
+      let mut frame = masked_frame(Opcode::Ping, true, b"x");
+      assert!(conn.observe(TestInstant(1_000), &mut frame).is_ok());
     }
   }
 

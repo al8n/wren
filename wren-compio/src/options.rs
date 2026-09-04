@@ -55,6 +55,18 @@ impl ClientOptions {
   /// for the peer's echo (counted from the flush), and the transport
   /// shutdown — each individually, so a close takes at most a small
   /// multiple of it. The default is the protocol's (10 s).
+  ///
+  /// **A budget the clock cannot represent is no budget.** Each of those
+  /// deadlines is computed as `anchor.checked_add(timeout)`, and a `timeout`
+  /// large enough to overflow — `Duration::MAX`, say — answers `None`, which
+  /// the pump reads as "no deadline" and parks on. That is what asking for an
+  /// unbounded wait means, and it is honoured rather than clamped; what it
+  /// costs is that the post-Close wait for the peer's echo has no end, and each
+  /// pass of the flush loop registers a doorbell listener and a timer
+  /// (~600 bytes, freed at the end of the pass). So a peer that keeps the loop
+  /// re-entering drives unbounded allocation CHURN for unbounded time.
+  /// Retention is not affected: it stays one read chunk plus the protocol's own
+  /// buffers, whatever the budget.
   #[must_use]
   pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
     self.close_timeout = Some(timeout);
@@ -135,6 +147,18 @@ impl AcceptOptions {
   /// for the peer's echo (counted from the flush), and the transport
   /// shutdown — each individually, so a close takes at most a small
   /// multiple of it. The default is the protocol's (10 s).
+  ///
+  /// **A budget the clock cannot represent is no budget.** Each of those
+  /// deadlines is computed as `anchor.checked_add(timeout)`, and a `timeout`
+  /// large enough to overflow — `Duration::MAX`, say — answers `None`, which
+  /// the pump reads as "no deadline" and parks on. That is what asking for an
+  /// unbounded wait means, and it is honoured rather than clamped; what it
+  /// costs is that the post-Close wait for the peer's echo has no end, and each
+  /// pass of the flush loop registers a doorbell listener and a timer
+  /// (~600 bytes, freed at the end of the pass). So a peer that keeps the loop
+  /// re-entering drives unbounded allocation CHURN for unbounded time.
+  /// Retention is not affected: it stays one read chunk plus the protocol's own
+  /// buffers, whatever the budget.
   #[must_use]
   pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
     self.close_timeout = Some(timeout);

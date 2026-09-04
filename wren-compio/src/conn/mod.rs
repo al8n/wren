@@ -96,8 +96,57 @@ pub(crate) struct Inner<Ro, S> {
   /// `None` only while a [`PumpIo`] guard owns the stream, or after
   /// teardown.
   stream: Option<S>,
-  /// Inbound bytes not yet fed to `conn` (handshake leftover, then reads).
-  pending_input: Vec<u8>,
+  /// **The one inbound vector**: unconsumed bytes at the front, the next
+  /// read's window in the space behind them.
+  ///
+  /// `len` is what has arrived and has not yet been fed to `conn` — the
+  /// handshake leftover first, then whatever the last read produced. A read
+  /// arms the vector to `len + READ_CHUNK`, fills from `len` on, and truncates
+  /// to what it actually got; Phase 1 feeds the whole of it and clears it,
+  /// keeping the allocation. It travels into [`PumpIo`] with the stream,
+  /// because a read borrows it across an await and the `RefCell` must not be
+  /// borrowed there, and comes back on the guard's drop.
+  ///
+  /// **The retained bound is exactly one `READ_CHUNK` per connection.** It was
+  /// TWO: a scratch and a stash, swapped on every read and each resized back
+  /// to a full chunk, so a connection that had read once held ~32 KiB across
+  /// two vectors — and an oversized handshake leftover was never given back.
+  /// Ownership across the await is what needed the buffer moved into the
+  /// guard; it never needed a second allocation. Every commit ends with
+  /// `shrink_to(READ_CHUNK)`, so a prefix that briefly forced a longer vector
+  /// gives the excess back as soon as it drains.
+  ///
+  /// Because `len` carries that meaning, a read window armed onto the end of
+  /// it is NOT input until it is committed — see [`PumpIo::armed`] for the
+  /// cancellation rule that keeps the two apart.
+  inbound: Vec<u8>,
+  /// `inbound` was read while a post-Close write was blocked, so it is
+  /// OBSERVATION input: Phase 1 feeds it with data assembly discarded. Set by
+  /// the arm that stashed it and consumed by the feed, rather than inferred
+  /// from connection state — the mode is a property of where the bytes came
+  /// from, not of when they are fed.
+  observation_input: bool,
+  /// **Nobody will read what these bytes would assemble.** The consumer-side
+  /// twin of [`observation_input`](Inner::observation_input): that flag says
+  /// WHERE the bytes came from — a read taken behind a blocked post-Close
+  /// write — while this one says there is no reader left for the messages
+  /// they would become, wherever they came from.
+  ///
+  /// Set by the unsplit [`WebSocket::close`], which CONSUMES the handle: no
+  /// application code can ever call `next()` again, and `close`'s own loop
+  /// discards every message the pump hands it. Without this, Phase 4's
+  /// ordinary reads during the echo wait went through `handle` — inflating
+  /// and assembling in full, up to the message cap, a peer's compressed bomb
+  /// that the very next line threw away. Set again wherever
+  /// [`read_half_alive`](Inner::read_half_alive) becomes false, which is the
+  /// same situation one type over.
+  ///
+  /// It is NOT set by `WriteHalf::close` on a live split: that half's
+  /// `ReadHalf` may keep reading messages after the local Close, and
+  /// `Connection::observe`'s own contract — `MessageAbandoned` for a message
+  /// in flight — is what covers a message that was mid-assembly when this
+  /// flag went up.
+  inbound_unread: bool,
   assembler: MessageAssembler,
   /// Completed messages not yet handed out (one input chunk can finish
   /// several).
@@ -142,6 +191,24 @@ pub(crate) struct Inner<Ro, S> {
   /// those bytes would reach the wire after both Close frames. Set only where
   /// the handshake completes; the timeout teardown is a different verdict (the
   /// peer's Close never came) and keeps its bounded graceful close.
+  ///
+  /// **What this guarantees, exactly: NO FURTHER PUSH.** After a completed
+  /// handshake abandoned bytes inside the transport, this driver neither
+  /// flushes nor closes gracefully — it drops. It cannot RETRACT what the
+  /// transport already committed lower down; a record handed to the kernel is
+  /// on its way whatever happens here. And `AsyncWrite` offers no
+  /// discard-on-`Drop` contract to lean on, so for a transport this crate does
+  /// not know about the property is best-effort by construction.
+  ///
+  /// Measured for the transports it does support, none of which publishes
+  /// buffered writes on drop: `compio_io::compat::AsyncStream` (0.10.1) has
+  /// neither `Drop` nor `PinnedDrop` in its `compat` module — its write buffer
+  /// is a plain `Vec` and its only flush is an async method;
+  /// `compio_tls::TlsStream` (0.10.0) has none, and under this crate's
+  /// `rustls` backend neither does `futures_rustls::TlsStream` (0.26.0) nor
+  /// rustls itself (0.23), which is sans-I/O and holds no socket to write to;
+  /// `MaybeTls` and `compio_net::TcpStream` have none; and the test pipe's
+  /// halves only mark their direction closed.
   teardown_abortive: bool,
   /// Set on the first write-path failure. A failed batch may have left a
   /// partial frame on the wire, so everything after it is refused with
@@ -151,13 +218,72 @@ pub(crate) struct Inner<Ro, S> {
   is_split: bool,
   #[cfg(test)]
   pings_seen: usize,
+  /// How many reads the flush phase has taken behind a blocked post-Close
+  /// write. The allocation regressions state their bound "across at least N
+  /// observation reads", so N has to be a number a test can read rather than
+  /// one it assumes from the bytes it wrote.
+  #[cfg(test)]
+  observation_reads: usize,
+  /// How many ORDINARY reads Phase 4 has completed. The inbound-bound
+  /// regression states "after at least eight reads", and that has to be a
+  /// number it reads rather than one it infers from the bytes it wrote.
+  #[cfg(test)]
+  reads_seen: usize,
+  /// The largest the one inbound vector has ever been, recorded at each
+  /// commit. The retained bound is a claim about a LIVE connection, and a live
+  /// connection's vector sits inside [`PumpIo`] whenever a read is in flight —
+  /// so a test reading the field directly would see the empty one left behind.
+  #[cfg(test)]
+  inbound_capacity_high_water: usize,
   /// The deepest `ready` has ever been. The read behind a blocked write
   /// assembles into a queue nothing is draining, so its bound is a number a
   /// test has to be able to read.
   #[cfg(test)]
   ready_high_water: usize,
+  /// The most the assembler's in-progress message has ever held. `ready` is
+  /// only half the retention: a message still arriving is held entirely inside
+  /// the assembler, where a queue-length bound cannot see it.
+  #[cfg(test)]
+  partial_high_water: usize,
   #[cfg(test)]
   pongs_seen: usize,
+}
+
+impl<Ro, S> Inner<Ro, S> {
+  /// The inbound vector's capacity — this driver's whole retained inbound
+  /// bound, and a number a test must be able to READ rather than infer from
+  /// an allocator total.
+  #[cfg(test)]
+  fn inbound_capacity(&self) -> usize {
+    self.inbound.capacity()
+  }
+}
+
+/// Keeps the `n` bytes a read actually produced, gives the rest of the window
+/// back, and normalises the capacity to one chunk.
+///
+/// Called on EVERY exit from a read, not only the successful one: the window
+/// is zero-filled, so a truncation missed on an error path would hand those
+/// zeros to the protocol as if the peer had sent them.
+/// It takes the guard rather than the vector so that it can also RECORD the
+/// capacity. A test cannot read that off `Inner` while a read is in flight —
+/// the guard holds the vector and leaves an empty one behind, which is the
+/// same reason the active batch is invisible then — so the high-water is
+/// written here, at the one place where the live vector and the shared state
+/// are both in hand.
+fn commit_read<Ro, S>(io: &mut PumpIo<'_, Ro, S>, start: usize, n: usize) {
+  io.inbound.truncate(start.saturating_add(n));
+  io.inbound.shrink_to(READ_CHUNK);
+  // The window is accounted for; the guard's drop has nothing left to undo.
+  io.armed = None;
+  #[cfg(test)]
+  {
+    let capacity = io.inbound.capacity();
+    let mut guard = io.inner.borrow_mut();
+    if capacity > guard.inbound_capacity_high_water {
+      guard.inbound_capacity_high_water = capacity;
+    }
+  }
 }
 
 /// An established WebSocket connection over `S`.
@@ -250,7 +376,9 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
       inner: Rc::new(RefCell::new(Inner {
         conn,
         stream: Some(stream),
-        pending_input: leftover,
+        inbound: leftover,
+        observation_input: false,
+        inbound_unread: false,
         assembler: MessageAssembler::new(cap),
         ready: VecDeque::new(),
         outbound: VecDeque::new(),
@@ -267,7 +395,15 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
         #[cfg(test)]
         pings_seen: 0,
         #[cfg(test)]
+        observation_reads: 0,
+        #[cfg(test)]
+        reads_seen: 0,
+        #[cfg(test)]
+        inbound_capacity_high_water: 0,
+        #[cfg(test)]
         ready_high_water: 0,
+        #[cfg(test)]
+        partial_high_water: 0,
         #[cfg(test)]
         pongs_seen: 0,
       })),
@@ -360,6 +496,18 @@ impl<Ro: role::Role, S: Duplex> WebSocket<Ro, S> {
   pub async fn close(self, code: CloseCode, reason: &str) -> Result<Closed, Error> {
     {
       let mut inner = self.inner.borrow_mut();
+      // This method CONSUMES the handle, so no application code can ever
+      // receive another message — and the loop below discards every one the
+      // pump produces. Say so before the first pass, so the pump observes
+      // rather than receives: otherwise a peer sending a compressed bomb
+      // during the echo wait is inflated and assembled in full, to the
+      // message cap, and then thrown away.
+      inner.inbound_unread = true;
+      // Nobody can read either half of what is held: the partial has no
+      // consumer and neither do the complete messages behind it. Both go now
+      // rather than living as long as the caller holds this connection.
+      inner.assembler.reset();
+      inner.ready.clear();
       if inner.closed.is_none() {
         debug!(code = ?code, reason, "starting close handshake");
         inner.conn.close(code, reason)?;
@@ -435,27 +583,79 @@ struct PumpIo<'a, Ro, S> {
   inner: &'a Rc<RefCell<Inner<Ro, S>>>,
   stream: Option<S>,
   write: Option<PendingWrite>,
+  /// The one inbound vector, out on loan for the same reason as the stream: a
+  /// read borrows it across an await, and the `RefCell` may not be borrowed
+  /// there. It goes back on `Drop`, so a cancelled caller future strands the
+  /// bytes it holds no more than it strands the stream.
+  inbound: Vec<u8>,
+  /// Where an ARMED but uncommitted read window starts, if one is open.
+  ///
+  /// The window is zero-filled space appended to `inbound`, and `inbound`'s
+  /// `len` is the protocol's unconsumed input — so between the arm and the
+  /// commit the vector reads as 16 KiB of zeros the peer never sent. Every
+  /// ordinary exit commits, but a CANCELLED caller drops this guard from
+  /// inside the `.await`, with no exit to commit on, and `Drop` would restore
+  /// those zeros into `Inner` for the next pass to feed to `handle` as if the
+  /// peer had sent them. So the arm is recorded here and `Drop` gives back a
+  /// vector that ends where the last committed byte does.
+  ///
+  /// One vector rather than two is what makes this a hazard: a scratch buffer
+  /// separate from the input carried no such meaning in its `len`.
+  armed: Option<usize>,
 }
 
 impl<'a, Ro, S> PumpIo<'a, Ro, S> {
   fn take(inner: &'a Rc<RefCell<Inner<Ro, S>>>) -> Self {
-    let (stream, write) = {
+    let (stream, write, inbound) = {
       let mut guard = inner.borrow_mut();
-      (guard.stream.take(), guard.pending_write.take())
+      (
+        guard.stream.take(),
+        guard.pending_write.take(),
+        std::mem::take(&mut guard.inbound),
+      )
     };
     Self {
       inner,
       stream,
       write,
+      inbound,
+      armed: None,
     }
+  }
+
+  /// Arms the inbound vector for a read and answers where the window starts:
+  /// the unconsumed prefix keeps the front, and a full `READ_CHUNK` of
+  /// zero-filled space follows it for the read to fill.
+  ///
+  /// Zero-filled rather than spare capacity, because a `&mut [u8]` over a
+  /// `Vec`'s uninitialised tail needs `unsafe` and would buy nothing the
+  /// memset does not: the two-buffer design zeroed a whole chunk per read as
+  /// well.
+  ///
+  /// A method rather than a free function over the vector, because arming
+  /// must record the window on the guard — see [`PumpIo::armed`].
+  fn arm_inbound(&mut self) -> usize {
+    let start = self.inbound.len();
+    self.inbound.resize(start.saturating_add(READ_CHUNK), 0);
+    self.armed = Some(start);
+    start
   }
 }
 
 impl<Ro, S> Drop for PumpIo<'_, Ro, S> {
   fn drop(&mut self) {
+    // A read window that was armed and never committed is not input: it is
+    // zeros this driver wrote. Give it back before the vector goes home. This
+    // is the cancellation path — a caller that drops `next()` mid-read runs
+    // this and no commit — and it is also the backstop for any future exit
+    // that forgets one.
+    if let Some(start) = self.armed.take() {
+      self.inbound.truncate(start);
+    }
     let mut guard = self.inner.borrow_mut();
     guard.stream = self.stream.take();
     guard.pending_write = self.write.take();
+    guard.inbound = std::mem::take(&mut self.inbound);
   }
 }
 
@@ -503,12 +703,74 @@ fn stream_gone() -> Error {
   Error::Io(std::io::Error::from(std::io::ErrorKind::ResourceBusy))
 }
 
+/// Records an IRREVERSIBLE transport termination, and everything that follows
+/// from it, in one place.
+///
+/// The condition becomes sticky (`poisoned`), so every later `next()` answers
+/// the error before it reaches delivery and every later send is refused; the
+/// queue is failed, because nothing will ever write it; and the folder's
+/// partial and the completed messages behind it are dropped, because nothing
+/// can ever hand them out. Those last two are the reason this is a function:
+/// the fact was written at six sites and the release reached three of them,
+/// which is the shape this branch has now paid for three times.
+///
+/// **`ready` is cleared rather than delivered, and that is a consequence of
+/// the poison rather than a choice made here.** The sticky check is the first
+/// thing the pump does, before Phase 1 and long before delivery, so a message
+/// left in `ready` after this call could never be returned to anyone. A site
+/// that wants its queued messages delivered must therefore NOT terminate here
+/// — and one such site exists: the close-flush settle with a protocol verdict
+/// records `closed`, resets the folder and keeps `ready`, because it falls
+/// through to delivery instead of returning an error. It is a protocol
+/// outcome, not an I/O termination, and it calls `reset()` directly; so do the
+/// no-reader transitions, which clear `ready` themselves for the opposite
+/// reason (nobody is left to receive it).
+///
+/// It does not touch the stream: whether the transport is dropped here, torn
+/// down, or left to the guard is the caller's, and the two callers that own it
+/// already differ.
+fn terminate_io<Ro, S>(
+  inner: &mut Inner<Ro, S>,
+  kind: std::io::ErrorKind,
+  doorbell: &Doorbell,
+  in_hand: Option<PendingWrite>,
+) {
+  // First writer wins: a later symptom must not relabel the original fault.
+  if inner.poisoned.is_none() {
+    inner.poisoned = Some(kind);
+  }
+  // Every frame this termination strands, wherever it is. `in_hand` is the
+  // batch a caller took out of the state and still holds — the write path's
+  // own failure has it in a local, and a batch failed nowhere is a sender
+  // parked on a `Queued` state that nothing will ever change. It is a
+  // REQUIRED parameter rather than something the helper looks for, so a
+  // caller holding one cannot pass this point without saying so.
+  for batch in in_hand.into_iter().chain(inner.pending_write.take()) {
+    for state in &batch.states {
+      state.set(FrameState::Failed(kind));
+    }
+  }
+  while let Some(frame) = inner.outbound.pop_front() {
+    frame.state.set(FrameState::Failed(kind));
+  }
+  inner.assembler.reset();
+  inner.ready.clear();
+  // And wake everyone waiting on a state this just changed. The doorbell is a
+  // parameter for the same reason `in_hand` is: the sticky poison means no
+  // later pump pass settles anything, so a notify the caller forgot is a
+  // sender that waits for the life of the process — and a caller that has to
+  // hand the doorbell over cannot forget to ring it. (A `#[must_use]` return
+  // was the alternative and is weaker: `let _ =` silences it.)
+  doorbell.notify(usize::MAX);
+}
+
 /// What one drive resolved to.
 pub(crate) enum DriveOutcome {
   /// The batch finished, or failed; the frame states are settled.
   Written(Result<(), Error>),
-  /// Inbound bytes arrived while the write was blocked. Reachable only when
-  /// the caller hands over a read buffer.
+  /// Inbound bytes arrived while the write was blocked, and are in the
+  /// guard's inbound vector, already committed. Reachable only when the caller
+  /// asked for the read race.
   Input(std::io::Result<usize>),
   /// The deadline passed before a poll this drive was about to make.
   /// Reachable only when the caller hands over a deadline.
@@ -526,8 +788,10 @@ enum RawDrive {
 /// flush, then frame-state transitions. The cursor advances only on
 /// completed sub-writes, so cancellation mid-batch resumes losslessly.
 ///
-/// With `read_into`, a write that CANNOT progress also polls the inbound
-/// direction and yields whatever arrives. The two directions are independent,
+/// With `race_read`, a write that CANNOT progress also polls the inbound
+/// direction — into the guard's own inbound vector, which is why the buffer is
+/// not a parameter — and yields whatever arrives. The two directions are
+/// independent,
 /// and after our Close has flushed the peer's Close is the thing that ends the
 /// handshake — leaving it unread until a blocked Pong batch times out turns a
 /// handshake that completed at once into an unclean close at the deadline.
@@ -548,13 +812,35 @@ enum RawDrive {
 async fn drive_pending_write<Ro, S: Duplex>(
   io: &mut PumpIo<'_, Ro, S>,
   doorbell: &Doorbell,
-  read_into: Option<&mut [u8]>,
+  race_read: bool,
   deadline: Option<Instant>,
 ) -> DriveOutcome {
+  // Where a read would put its bytes: after whatever is still unconsumed.
+  // Armed before the borrows below, and committed after them on EVERY exit.
+  let start = if race_read {
+    io.arm_inbound()
+  } else {
+    io.inbound.len()
+  };
+  // The two refusals come before the field borrows, so the window they leave
+  // behind is committed through the guard like every other exit.
+  if io.stream.is_none() {
+    commit_read(io, start, 0);
+    return DriveOutcome::Written(Err(stream_gone()));
+  }
+  if io.write.is_none() {
+    commit_read(io, start, 0);
+    return DriveOutcome::Written(Ok(()));
+  }
   let raw = {
+    // Three DISJOINT field borrows of one guard: the stream to poll, the batch
+    // to write, and the vector to read into. That vector lives on the guard so
+    // it survives `continue 'pump`, and a `&mut [u8]` parameter taken from it
+    // would have aliased the `&mut PumpIo` this function already holds.
     let PumpIo {
       stream,
       write: batch,
+      inbound,
       ..
     } = &mut *io;
     let Some(stream) = stream.as_mut() else {
@@ -563,7 +849,7 @@ async fn drive_pending_write<Ro, S: Duplex>(
     let Some(pending) = batch.as_mut() else {
       return DriveOutcome::Written(Ok(()));
     };
-    let mut read_into = read_into;
+    let mut read_into = race_read.then(|| inbound.get_mut(start..).unwrap_or(&mut []));
     futures_util::future::poll_fn(move |cx| {
       // Read afresh before every poll below: the deadline is an instant, and
       // an earlier reading of the clock says nothing about this one.
@@ -612,6 +898,13 @@ async fn drive_pending_write<Ro, S: Duplex>(
     })
     .await
   };
+  // The window was zero-filled; keep only what the read produced, on every
+  // arm — a missed truncation would hand those zeros to the protocol.
+  let read_n = match &raw {
+    RawDrive::Input(Ok(n)) => *n,
+    _ => 0,
+  };
+  commit_read(io, start, read_n);
   let result = match raw {
     RawDrive::Input(result) => return DriveOutcome::Input(result),
     RawDrive::Expired => return DriveOutcome::Expired,
@@ -645,20 +938,12 @@ async fn drive_pending_write<Ro, S: Duplex>(
     Err(e) => {
       warn!(error = %e, "transport write failed");
       let kind = e.kind();
-      for state in &pending.states {
-        state.set(FrameState::Failed(kind));
-      }
-      // A partial frame may be on the wire: poison the connection so no
-      // later frame splices into the corrupt stream, and fail everything
-      // still queued (nothing will ever drain it).
-      {
-        let mut guard = io.inner.borrow_mut();
-        guard.poisoned = Some(kind);
-        while let Some(frame) = guard.outbound.pop_front() {
-          frame.state.set(FrameState::Failed(kind));
-        }
-      }
-      doorbell.notify(usize::MAX);
+      // A partial frame may be on the wire: this connection is over, and
+      // nothing may splice into the corrupt stream after it. The failing
+      // batch is IN HAND here rather than in the state — it was taken out
+      // above — so it is handed over rather than failed separately, and the
+      // entrance does the one notify.
+      terminate_io(&mut io.inner.borrow_mut(), kind, doorbell, Some(pending));
       Err(Error::Io(e))
     }
   })
@@ -689,9 +974,9 @@ async fn send_frame<Ro: role::Role, S: Duplex>(
         None => return Ok(()),
       }
     }
-    match drive_pending_write(&mut io, doorbell, None, None).await {
+    match drive_pending_write(&mut io, doorbell, false, None).await {
       DriveOutcome::Written(result) => result?,
-      // Neither a read buffer nor a deadline was handed over, so neither of
+      // Neither the read race nor a deadline was asked for, so neither of
       // these is reachable. Looping re-drives the same batch, which is what
       // this path would want from a spurious wake anyway.
       DriveOutcome::Input(_) | DriveOutcome::Expired => {}
@@ -748,7 +1033,9 @@ async fn teardown<Ro, S: Duplex>(inner: &Rc<RefCell<Inner<Ro, S>>>) {
     // A graceful close flushes what the transport is holding before it writes
     // close_notify, and what it is holding is a batch the completed handshake
     // discarded. Dropping abandons those bytes, which is the point: §5.5.1
-    // (line 2023) leaves nowhere for them to go.
+    // (line 2023) leaves nowhere for them to go. The guarantee is "no further
+    // push" and it is best-effort per transport — see `Inner::teardown_abortive`
+    // for what that means and for the measurement behind it.
     warn!("bytes were abandoned inside the transport; dropping without close_notify");
     drop(stream);
     return;
@@ -781,7 +1068,7 @@ fn close_flush_timed_out<Ro: role::Role, S: Duplex>(
   let pending = io.write.take();
   drop(io);
   drop(stream);
-  let outcome = {
+  {
     let mut guard = inner.borrow_mut();
     if let Some(pending) = &pending {
       for state in &pending.states {
@@ -809,16 +1096,22 @@ fn close_flush_timed_out<Ro: role::Role, S: Duplex>(
     };
     if let Some(closed) = verdict {
       guard.closed = Some(closed);
+      // The same settle, one function over: an outcome reached through our own
+      // timer rather than through a peer frame, so nothing was pushed and a
+      // partial in the folder has nothing left to close it.
+      guard.assembler.reset();
+      // A protocol outcome, not an I/O termination: this arm falls through to
+      // delivery, so it keeps `ready` and rings the doorbell itself.
+      doorbell.notify(usize::MAX);
       None
     } else {
       // No protocol verdict (the Close never even drained into a
-      // batch): fail sticky instead of publishing any outcome.
-      guard.poisoned = Some(kind);
+      // batch): fail sticky instead of publishing any outcome. The entrance
+      // notifies, so this arm must not — one ring, not two.
+      terminate_io(&mut guard, kind, doorbell, None);
       Some(Err(Error::Io(kind.into())))
     }
-  };
-  doorbell.notify(usize::MAX);
-  outcome
+  }
 }
 
 /// The protocol deadline, corrected for transport flush: while the Close
@@ -877,70 +1170,123 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       if let Some(kind) = guard.poisoned {
         return Some(Err(Error::Io(kind.into())));
       }
-      if guard.closed.is_none() && !guard.pending_input.is_empty() {
-        let mut input = std::mem::take(&mut guard.pending_input);
-        let inner_mut = &mut *guard;
-        let now = Instant::now();
-        match inner_mut.conn.handle(now, &mut input) {
-          Ok(mut events) => {
-            while let Some(event) = events.next() {
-              #[cfg(test)]
-              if matches!(event, Event::Ping(_)) {
-                inner_mut.pings_seen += 1;
-              }
-              #[cfg(test)]
-              if matches!(event, Event::Pong(_)) {
-                inner_mut.pongs_seen += 1;
-              }
-              if let Event::Closed(closed) = &event {
-                debug!(code = ?closed.code(), clean = closed.clean(), "connection closed");
-                if inner_mut.close_flushed_at.is_some() {
-                  // Our Close is ALREADY on the wire, so the peer's completes
-                  // the handshake right here: no echo is owed, nothing is
-                  // staged, and the outcome holds now. §5.5.1 (line 2023 of
-                  // `.rfc-cache/rfc6455.txt`) closes the connection at this
-                  // instant, so every frame the pump has not written yet has
-                  // missed its chance — the queue, and a batch already
-                  // half-written whose remaining bytes would follow both
-                  // Closes onto the wire.
-                  inner_mut.closed = Some(*closed);
-                  // Bytes the transport already accepted cannot be taken back,
-                  // and a graceful `close()` would push them out after both
-                  // Close frames. When there are any, the teardown abandons
-                  // them with the transport instead.
-                  if discard_unwritten(&mut inner_mut.outbound, &mut inner_mut.pending_write) {
-                    inner_mut.teardown_abortive = true;
-                  }
-                  wake_senders = true;
-                } else {
-                  // Stage, do not publish: the outcome only holds once the
-                  // echo the protocol just queued reaches the wire. The event
-                  // cursor borrows `conn`, so this raise is written as a
-                  // disjoint FIELD access — `&mut Inner` as a whole is not
-                  // available here.
-                  inner_mut.staged_close = Some(*closed);
-                  inner_mut.close_owed.get_or_insert(now);
+      if guard.closed.is_none() && !guard.inbound.is_empty() {
+        let mut input = std::mem::take(&mut guard.inbound);
+        // Two independent reasons to observe rather than receive: these
+        // bytes were read behind a blocked post-Close write, or nobody is
+        // left to read what they would assemble. Only the first is a property
+        // of the input, so only the first is taken.
+        let observing = std::mem::take(&mut guard.observation_input) || guard.inbound_unread;
+        // An explicit scope: the cursor borrows `input` AND `guard`, and both
+        // borrows have to end before the buffers below can be put back.
+        {
+          let inner_mut = &mut *guard;
+          // Observation: parse everything, decode nothing. The application has
+          // said it is done — it called `close()` — and the write carrying our
+          // reply is blocked, so nothing will drain a message decoded now and a
+          // message still arriving would be held whole. Control frames are
+          // processed exactly as ever: Pings queue Pongs into the protocol's own
+          // bounded slots, and the peer's Close completes the handshake. Bounded
+          // memory and a Close that is always seen are worth more here than late
+          // data.
+          //
+          // The choice is `observe` vs `handle` at the PROTOCOL, not at the
+          // assembler. Discarding the event was one layer too late: with
+          // `deflate`, `handle` inflates the payload into the decompressor's
+          // buffer before there is an event to discard, so a 16 KiB read of a
+          // compressed bomb cost megabytes of output that nothing would ever
+          // look at. The assembler learns the same fact from the events
+          // themselves, rather than from a mode a caller has to pair with a
+          // feed that may produce nothing to pair it with.
+          //
+          // Which call to make is decided per feed, from the flag taken above,
+          // so no mode survives a feed that never happens.
+          let now = Instant::now();
+          let fed = if observing {
+            inner_mut.conn.observe(now, &mut input)
+          } else {
+            inner_mut.conn.handle(now, &mut input)
+          };
+          match fed {
+            Ok(mut events) => {
+              while let Some(event) = events.next() {
+                #[cfg(test)]
+                if matches!(event, Event::Ping(_)) {
+                  inner_mut.pings_seen += 1;
                 }
-              }
-              match inner_mut.assembler.push(&event) {
-                Ok(Some(message)) => {
-                  inner_mut.ready.push_back(message);
-                  #[cfg(test)]
-                  {
-                    let depth = inner_mut.ready.len();
-                    if depth > inner_mut.ready_high_water {
-                      inner_mut.ready_high_water = depth;
+                #[cfg(test)]
+                if matches!(event, Event::Pong(_)) {
+                  inner_mut.pongs_seen += 1;
+                }
+                if let Event::Closed(closed) = &event {
+                  debug!(code = ?closed.code(), clean = closed.clean(), "connection closed");
+                  if inner_mut.close_flushed_at.is_some() {
+                    // Our Close is ALREADY on the wire, so the peer's completes
+                    // the handshake right here: no echo is owed, nothing is
+                    // staged, and the outcome holds now. §5.5.1 (line 2023 of
+                    // `.rfc-cache/rfc6455.txt`) closes the connection at this
+                    // instant, so every frame the pump has not written yet has
+                    // missed its chance — the queue, and a batch already
+                    // half-written whose remaining bytes would follow both
+                    // Closes onto the wire.
+                    inner_mut.closed = Some(*closed);
+                    // Bytes the transport already accepted cannot be taken back,
+                    // and a graceful `close()` would push them out after both
+                    // Close frames. When there are any, the teardown abandons
+                    // them with the transport instead.
+                    if discard_unwritten(&mut inner_mut.outbound, &mut inner_mut.pending_write) {
+                      inner_mut.teardown_abortive = true;
+                    }
+                    wake_senders = true;
+                  } else {
+                    // Stage, do not publish: the outcome only holds once the
+                    // echo the protocol just queued reaches the wire. The event
+                    // cursor borrows `conn`, so this raise is written as a
+                    // disjoint FIELD access — `&mut Inner` as a whole is not
+                    // available here.
+                    inner_mut.staged_close = Some(*closed);
+                    inner_mut.close_owed.get_or_insert(now);
+                  }
+                }
+                // One call for both modes, and nothing else to do: the
+                // protocol says which messages carry no payload
+                // (`MessageStart::skipped`) and which one already in progress
+                // is being given up on (`Event::MessageAbandoned`), so `push`
+                // is safe on observed events and fabricates nothing.
+                match inner_mut.assembler.push(&event) {
+                  Ok(Some(message)) => {
+                    inner_mut.ready.push_back(message);
+                    #[cfg(test)]
+                    {
+                      let depth = inner_mut.ready.len();
+                      if depth > inner_mut.ready_high_water {
+                        inner_mut.ready_high_water = depth;
+                      }
                     }
                   }
+                  Ok(None) => {}
+                  Err(e) => return Some(Err(e.into())),
                 }
-                Ok(None) => {}
-                Err(e) => return Some(Err(e.into())),
+                #[cfg(test)]
+                {
+                  let held = inner_mut.assembler.buffered();
+                  if held > inner_mut.partial_high_water {
+                    inner_mut.partial_high_water = held;
+                  }
+                }
               }
             }
+            Err(e) => return Some(Err(e.into())),
           }
-          Err(e) => return Some(Err(e.into())),
         }
-        // All input is consumed by the cursor (drop-drains).
+        // All input is consumed by the cursor (drop-drains), so clearing
+        // loses nothing — and the ALLOCATION goes back rather than being
+        // dropped with the local. Empty, so the next read's window starts at
+        // the front; with its capacity, so that read allocates nothing.
+        // (The early returns above do not restore it. They end this pump with
+        // an error, and a connection that is failing has no next read.)
+        input.clear();
+        guard.inbound = input;
       }
       // Settle overdue protocol timers on every pass — AFTER the input
       // feed, so an echo that already arrived beats the deadline clock
@@ -957,6 +1303,13 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
             Ok(Some(closed)) => {
               debug!(clean = closed.clean(), "close deadline elapsed");
               guard.closed = Some(closed);
+              // The connection ended on OUR timer, so no peer frame said so
+              // and no event carried it: `push` never runs, and a partial
+              // accumulated before this instant would be held until the
+              // caller drops the whole connection. `ready` is KEPT — this
+              // pump promises to hand out complete messages before it
+              // answers `None`, and they are still deliverable.
+              guard.assembler.reset();
             }
             Ok(None) => {}
             Err(e) => warn!(error = %e, "clock went backwards settling protocol timers"),
@@ -1099,12 +1452,10 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       continue 'pump;
     }
 
-    // One buffer for the whole phase, grown once and reused across every
-    // `Reconsider` and `Input` re-entry: a peer that can drive re-entry (its
-    // Close and a local sender's doorbell both land here) must not drive a
-    // 16 KiB allocation with each one. Empty until an arm actually reads, so a
-    // plain flush still allocates nothing.
-    let mut read_scratch: Vec<u8> = Vec::new();
+    // The read buffer is `Inner::inbound` and NOT a local of this phase: a
+    // local would be dropped by the `Input` arm's `continue 'pump`. Armed by
+    // the drive itself, and only on the arm that reads, so a plain flush still
+    // allocates nothing.
     while inner.borrow().pending_write.is_some() {
       // `None` is the unbounded plain flush; `Some(d)` is what is LEFT of this
       // flush's slice of the close budget. `race_read` marks the post-Close
@@ -1125,31 +1476,22 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         } else if let Some(flushed) = guard.close_flushed_at {
           (
             FlushBound::Echo(at(flushed)),
-            // The read-behind exists to SEE the peer's Close, not to receive
-            // data. Nothing drains `ready` while this write is blocked —
-            // delivery comes after Phase 3 — so everything Phase 1 assembles
-            // from read-behind input only accumulates, and a peer that stops
-            // reading and floods small messages grows it for as long as the
-            // budget lasts, which the caller may set to `Duration::MAX`.
-            // Gating it on an EMPTY `ready` bounds that at one read chunk's
-            // worth: a peer that keeps flooding instead of closing forfeits
-            // the read-behind and meets the budget instead. Delivery is
-            // untouched — what was assembled still drains before `None`.
-            guard.ready.is_empty(),
+            // Every read is allowed, because the peer's Close may be behind
+            // any of them — a peer is entitled to finish its current message
+            // before answering ours. What is bounded is not how much is READ
+            // but how much is KEPT: this input is flagged as observation and
+            // Phase 1 assembles none of it. A gate on `ready` was the wrong
+            // shape twice over — a message still arriving leaves `ready` empty
+            // while the assembler grows to `max_message_size`, and one
+            // completed message closes the gate over the very next read, which
+            // is where the Close would have been.
+            true,
           )
         } else {
           (FlushBound::Plain, false)
         }
       };
       let deadline = bound.deadline();
-      let read_into = if race_read {
-        if read_scratch.len() < READ_CHUNK {
-          read_scratch.resize(READ_CHUNK, 0);
-        }
-        Some(read_scratch.as_mut_slice())
-      } else {
-        None
-      };
       let mut io = PumpIo::take(inner);
       // An early exit, not the mechanism any more: the drive checks the same
       // deadline immediately before every poll it makes, so one reached after
@@ -1157,7 +1499,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
       let outcome = if deadline.is_some_and(|at| Instant::now() >= at) {
         FlushArm::Budget
       } else {
-        let drive = drive_pending_write(&mut io, doorbell, read_into, deadline).fuse();
+        let drive = drive_pending_write(&mut io, doorbell, race_read, deadline).fuse();
         let timer = async {
           match deadline {
             Some(at) => compio::time::sleep_until(at).await,
@@ -1217,9 +1559,9 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
           drop(io);
           // The same reading Phase 4 gives it.
           debug!("transport EOF before the close handshake completed");
-          return Some(Err(Error::Io(std::io::Error::from(
-            std::io::ErrorKind::UnexpectedEof,
-          ))));
+          let kind = std::io::ErrorKind::UnexpectedEof;
+          terminate_io(&mut inner.borrow_mut(), kind, doorbell, None);
+          return Some(Err(Error::Io(kind.into())));
         }
         FlushArm::Input(Ok(n)) => {
           drop(io);
@@ -1227,14 +1569,31 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
             bytes = n,
             "transport read behind a blocked post-close write"
           );
-          inner
-            .borrow_mut()
-            .pending_input
-            .extend_from_slice(read_scratch.get(..n).unwrap_or(&[]));
+          {
+            let mut guard = inner.borrow_mut();
+            // The flag describes the WHOLE of what is unconsumed, so nothing
+            // else may be in front of these bytes: Phase 1 takes all of
+            // `inbound` on every pass where `closed` is none, and Phase 4 —
+            // the only other source — cannot run while a batch is pending.
+            // Asserted rather than argued, so a future path that leaves
+            // ordinary input in front of these fails loudly instead of having
+            // it silently observed. (The drive has already committed the read,
+            // so `inbound` is exactly those `n` bytes.)
+            debug_assert!(
+              guard.inbound.len() == n,
+              "observation input must not be mixed with input nobody flagged"
+            );
+            guard.observation_input = true;
+            #[cfg(test)]
+            {
+              guard.observation_reads += 1;
+            }
+          }
           continue 'pump;
         }
         FlushArm::Input(Err(e)) => {
           drop(io);
+          terminate_io(&mut inner.borrow_mut(), e.kind(), doorbell, None);
           return Some(Err(Error::Io(e)));
         }
       }
@@ -1262,12 +1621,23 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
     // arms drop poll-based futures, which is loss-free: a partial read
     // lives in the transport's own buffers, never in the dropped future.
     let mut io = PumpIo::take(inner);
-    let Some(stream) = io.stream.as_mut() else {
+    // The same vector Phase 3 reads into, and for the same reason: a fresh
+    // `vec![0u8; READ_CHUNK]` per parked read is an allocation a peer drives.
+    let start = io.arm_inbound();
+    if io.stream.is_none() {
+      commit_read(&mut io, start, 0);
+      return Some(Err(stream_gone()));
+    }
+    let PumpIo {
+      stream, inbound, ..
+    } = &mut io;
+    let Some(stream) = stream.as_mut() else {
       return Some(Err(stream_gone()));
     };
-    let mut scratch = vec![0u8; READ_CHUNK];
     let outcome = {
-      let read = stream.read(&mut scratch).fuse();
+      let read = stream
+        .read(inbound.get_mut(start..).unwrap_or(&mut []))
+        .fuse();
       let timer = async {
         match deadline {
           // An ABSOLUTE deadline, so no `Instant + Duration` anywhere on the
@@ -1286,6 +1656,12 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         () = bell => Park::Doorbell,
       }
     };
+    // Every arm, not only the reading one: the window is zero-filled.
+    let read_n = match &outcome {
+      Park::Read(Ok(n)) => *n,
+      _ => 0,
+    };
+    commit_read(&mut io, start, read_n);
     drop(io);
 
     match outcome {
@@ -1294,18 +1670,22 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         // created once `closed` is recorded, so a parked read only
         // resolves to EOF while the connection is open.
         debug!("transport EOF before the close handshake completed");
-        return Some(Err(Error::Io(std::io::Error::from(
-          std::io::ErrorKind::UnexpectedEof,
-        ))));
+        let kind = std::io::ErrorKind::UnexpectedEof;
+        terminate_io(&mut inner.borrow_mut(), kind, doorbell, None);
+        return Some(Err(Error::Io(kind.into())));
       }
       Park::Read(Ok(n)) => {
         trace!(bytes = n, "transport read");
-        let mut guard = inner.borrow_mut();
-        guard
-          .pending_input
-          .extend_from_slice(scratch.get(..n).unwrap_or(&[]));
+        // The bytes are already in `inbound`, committed above.
+        #[cfg(test)]
+        {
+          inner.borrow_mut().reads_seen += 1;
+        }
       }
-      Park::Read(Err(e)) => return Some(Err(Error::Io(e))),
+      Park::Read(Err(e)) => {
+        terminate_io(&mut inner.borrow_mut(), e.kind(), doorbell, None);
+        return Some(Err(Error::Io(e)));
+      }
       // The next pass's settle advances the timers (one code path, with
       // the flush-anchored deadline correction applied).
       Park::Timer | Park::Doorbell => {}
@@ -1339,6 +1719,20 @@ enum FlushBound {
   Close(Option<Instant>),
   /// Our Close has flushed: what remains of the echo budget. The only arm
   /// that may also poll a read.
+  ///
+  /// **`None` here is an unbounded wait, and it is the caller's own request.**
+  /// The instant is `close_flushed_at.checked_add(close_budget)`, so a budget
+  /// the clock cannot represent — `with_close_timeout(Duration::MAX)` —
+  /// answers `None`, the timer becomes `future::pending()`, and this arm parks
+  /// on the peer with no end. What that costs is CHURN rather than retention:
+  /// every pass of the loop below registers a doorbell listener and a timer
+  /// (~600 bytes, freed when the pass ends), so a peer that keeps driving
+  /// re-entry drives that allocation for as long as it likes. Retention stays
+  /// bounded by one read chunk plus the protocol's own buffers, because the
+  /// input this arm reads is observation input and nothing accumulates it.
+  /// Disclosed rather than clamped: an unbounded wait is what the budget
+  /// asked for, and flooring it would silently give a caller a deadline it
+  /// did not choose.
   Echo(Option<Instant>),
   /// A plain flush with no Close in its past: unbounded, and it parks.
   Plain,

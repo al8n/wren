@@ -46,6 +46,68 @@ changes turn properties this crate already had into properties something checks.
   measures **568** rather than the 448 a field-by-field count predicted — which
   is why that figure is measured in the doc rather than reasoned.
 
+- **`Connection::observe` — framing, boundaries, control frames and Close, with
+  no work on the payload.** A second byte-taking entry point beside `handle`,
+  same signature, differing in one thing: the cursor it returns is in
+  observation mode, and data payload bytes are advanced over instead of
+  decoded. Every header-level rule is unchanged (opcode and RSV validation, the
+  mask-bit rule, fragment sequencing, control-frame length, the clock check and
+  the terminal short-circuit), control frames are processed identically — a
+  Ping still queues its Pong, the peer's Close still echoes and terminates —
+  and `MessageStart`/`MessageEnd` still surface so a caller's assembler can
+  track boundaries. What does not happen is the unmask, the UTF-8 validation,
+  the inflate, the size accounting and the chunk event.
+
+  **For the driver that has stopped consuming**: `wren-compio` reads the
+  inbound direction while a post-Close write is blocked, to see the peer's
+  Close. It used to feed those bytes to `handle` and throw the resulting events
+  away — one layer too late under `deflate`, where the payload had already been
+  inflated into the decompressor's buffer. MEASURED on the new regression:
+  **9 688 bytes of wire — less than one 16 KiB read — inflated to 8 388 627
+  bytes** and grew the retained inflate buffer from 8 192 to 65 536 bytes,
+  before a single event was discarded. Through `observe` both numbers are
+  unchanged from the baseline.
+
+  Skipping the UTF-8 check is not a relaxation of RFC 6455 §8.1 (line 2643 of
+  `.rfc-cache/rfc6455.txt`): its obligation is conditioned on interpreting the
+  bytes — "When an endpoint is to interpret a byte stream as UTF-8 but finds
+  that the byte stream is not, in fact, a valid UTF-8 stream, that endpoint
+  MUST _Fail the WebSocket Connection_." — and an observer does not interpret
+  them. §5.6 (line 2098) says "the whole message MUST contain valid UTF-8" of
+  what a sender puts on the wire, and routes the receiver's handling to §8.1
+  rather than stating a second obligation.
+
+  **A message is skipped WHOLE, and that is connection state rather than a
+  per-call mode.** The two entry points can feed one message between them, and
+  a message half of which was never decoded must not be decoded from the
+  middle: for text, validating a tail whose head was skipped can split a
+  multi-byte character and fail a conforming peer with 1007. `MessageState`
+  therefore carries a `skipped` flag, set at the message's start under
+  observation and at any run a cursor walks past, and cleared only at the
+  message boundary. It costs no bytes — the flag lands in the enum's existing
+  padding.
+
+  **permessage-deflate and context takeover, ruled explicitly.** Skipping a
+  compressed message's bytes means the inflater never saw them. With
+  `no_context_takeover` on the inbound direction that costs nothing: each
+  message is its own DEFLATE stream and the next one resets. With context
+  takeover the window is now missing that message's output, so every later
+  compressed message would back-reference bytes this endpoint never produced —
+  decoding to garbage, or failing as a 1007 the peer did not cause. Observing a
+  compressed data frame under takeover therefore **poisons** the inbound
+  inflate context, and from then on `handle` skips compressed data frames the
+  same way: `MessageStart`/`MessageEnd`, no chunks, no error. Uncompressed
+  messages are unaffected. The connection has sent its Close and its
+  application has said it is done; a dictionary that cannot be rebuilt is a
+  consequence of that, not a protocol violation.
+
+  The poison is a `RecvState` flag beside the `Option<Box<InflateBox>>` and not
+  a field inside the box, because the box may not exist when the poison has to
+  be recorded — the first compressed message of a connection can be the one
+  observation skips, and creating the box to hold a flag would allocate the
+  ~32 KiB dictionary that skipping exists to avoid. It costs nothing: the tier
+  sizes stay **544 / 576 / 600**.
+
 ### Changed
 
 - **A Pong owed when this endpoint has sent — but not received — a Close is now
@@ -299,11 +361,14 @@ changes turn properties this crate already had into properties something checks.
   points — `FrameHeader::{decode, encode}`, `mask`, `Utf8Validator::feed`, the
   internal base64 encoder, and `Connection::{prepare_binary, prepare_text,
   handle_timeout}`. Counted so the next batch has a target rather than an
-  intention: of the **46** public functions taking a `&[u8]` / `&mut [u8]` /
-  `&str`, **7** are shim-covered and **39** are not, headed by
-  `Connection::handle` and the whole `handshake::h1` surface. Widening the proof
-  is deliberately not this branch's work — `tests/no_panic.rs` records why the
-  connection tree does not inline into one shim.
+  intention: of the **47** public functions taking a `&[u8]` / `&mut [u8]` /
+  `&str`, **7** are shim-covered and **40** are not, headed by
+  `Connection::handle` and the whole `handshake::h1` surface. (It was 46/7/39
+  before `Connection::observe`, which shares `handle`'s tree and so joins the
+  uncovered side; `contract.rs` now carries the command the number comes from,
+  which it did not before.) Widening the proof is deliberately not this
+  branch's work — `tests/no_panic.rs` records why the connection tree does not
+  inline into one shim.
 
 - **The receipt-time terminal check is paired rather than merely present, and
   two intra-doc links that never resolved are fixed.** `Events::queue_pong`
@@ -407,6 +472,137 @@ changes turn properties this crate already had into properties something checks.
   The inbound **close** case that motivated the question is in fact the benign
   one — a received close makes the connection terminal and only the close echo
   drains — which is exactly why it is not the sequence to reason from.
+
+## `websocket-proto` + `wren-compio` — the event tells the truth about a skipped message
+
+A cross-family review of the round below found one root under a high and a
+medium: the fact "this message's payload will never be delivered" lived only in
+the protocol's own state, and a folder — this crate's `MessageAssembler`, or a
+caller's own — could not see it. Both failures are the folder acting on a
+message it had no way to know was already gone.
+
+### Breaking
+
+- **`MessageAssembler::observe` is removed**, superseded by the two events
+  below. It was a per-event mirror of `Connection::observe`, and pairing a mode
+  event by event cannot work when a feed yields NO events: an observed read
+  whose every byte is continuation payload of a message already in progress
+  produces nothing at all. A caller upgrading pushes every event and does
+  nothing else — which is what the driver now does.
+
+### Added
+
+- **`MessageStart::skipped`** — "no chunk will follow for this message; a
+  consumer holds nothing for it". Set for a message that starts under
+  `Connection::observe`, and for a compressed message arriving after the
+  inbound inflate context is poisoned. `SliceAssembler::push` and
+  `MessageAssembler::push` both read it and discard to the boundary instead of
+  opening an accumulator.
+
+  **What it fixes**: after the poison, `handle` — the ordinary receive path,
+  for the rest of the connection's life — yields `MessageStart` + `MessageEnd`
+  with nothing between for every later compressed message, and `push` sealed
+  that into a fabricated empty `Message::Binary(b"")` where the peer had sent
+  bytes. Measured on the new driver regression, a 300-byte compressed message
+  after the poison: `delivered=[0, 0, 4]` unfixed against `[4]` fixed.
+
+- **`Event::MessageAbandoned`** — "the message in progress will not be
+  delivered: drop what you hold for it". Emitted exactly ONCE per message, at
+  the first payload run the machine skips of a message whose `MessageStart` was
+  already emitted saying otherwise; its `MessageEnd` still arrives at the
+  boundary. A message whose start already said `skipped` never gets it.
+  Both assemblers act on it in `push`.
+
+  **What it fixes**: a message whose head was assembled under `handle` and
+  whose continuations were then observed is not finished by the peer as far as
+  this endpoint is concerned — but its `MessageEnd` still arrives, under
+  `handle`, once the wedged write drains, and it sealed the stale accumulator
+  as a COMPLETE message. The application received 125 bytes of a 50 125-byte
+  message and a clean close, with no way to tell it from a message the peer
+  really ended there. Measured: `delivered=[125]` unfixed against `[]` fixed.
+
+  **It is an event and not a method a caller must call**, and that is the
+  point. The first shape of this fix was `MessageAssembler::abandon` plus a
+  documented obligation to call it before each observed feed — which is "the
+  event tells the truth" with one site left to the caller, and a contract
+  prose cannot enforce. `Event` is `#[non_exhaustive]`, so the variant costs no
+  caller a compile error; what it buys is that there is nothing left to
+  remember. `Connection::observe`'s documentation now describes what a consumer
+  is TOLD rather than what it owes.
+
+  The inflate poison adds no second cause, walked rather than assumed: the
+  poison is written only where a message is marked skipped, that site acts on
+  the message in flight, and only one message is ever in flight — so a poisoned
+  message in flight is unreachable, and every later compressed message is
+  marked at its own start where `MessageStart::skipped` carries it.
+
+### Changed
+
+- **`wren-compio`'s Phase 1 calls `push` for every event in both modes and
+  nothing else.** The mode is gone from the assembler entirely, and so is the
+  action: the protocol says which messages carry no payload
+  (`MessageStart::skipped`) and which one already in progress is being given up
+  on (`Event::MessageAbandoned`).
+
+## `wren-compio` — the read buffers a comment said were reused
+
+### Changed
+
+- **Observation is now chosen at the PROTOCOL, not at the assembler.** Phase 1
+  fed the read behind a blocked post-Close write to `Connection::handle` and
+  then chose `MessageAssembler::observe` over `push` for each event it
+  produced. That discard is one layer too late under `deflate`: producing the
+  event is what inflates the payload into the decompressor's buffer, so a peer
+  that keeps sending compressed fragments after our Close turned each read into
+  megabytes of output before anything was discarded — bounded only by
+  `max_message_size`, on a connection whose application has already said it is
+  done. Phase 1 now calls [`Connection::observe`] when the taken
+  `observation_input` flag is set and `handle` otherwise; the event loop is
+  shared. (The assembler kept a matching per-event `observe` in this commit;
+  the cross-family round below removed it — a mode paired event by event cannot
+  cover a feed that yields no events, and that hole is a finding of its own.)
+
+  Measured through the counting allocator, on a fragmented compressed bomb
+  behind a wedged write: **77 845 bytes of wire inflating to 4 194 304**, over
+  10 observation reads, allocated **6 209 bytes — against 180 625 with the
+  discard back at the assembler**. That second number is the inflate buffer's
+  growth rather than the inflating, because the buffer is reused across frames;
+  `websocket-proto`'s own regression measures the work and reads 8 388 627
+  bytes inflated for 9 688 bytes of wire.
+
+### Fixed
+
+- **Every read behind a blocked write allocated two 16 KiB buffers, under a
+  comment claiming they were reused.** `read_scratch` was declared inside the
+  outer `'pump` loop and the arm that reads leaves that loop with
+  `continue 'pump`, which dropped it; Phase 1 then `mem::take`'d the
+  `pending_input` the bytes had been copied into and dropped that as well. So a
+  peer that keeps sending after our Close drove a fresh chunk allocation plus a
+  fresh stash allocation on every read, and the budget bounding that flood may
+  be `Duration::MAX`. Phase 4's parked read allocated its own `vec![0u8;
+  READ_CHUNK]` per pass on top.
+
+  Both buffers now live on `Inner` and are recycled: `read_scratch` is taken
+  and restored by `PumpIo` exactly like the stream (a read borrows it across an
+  await, where the `RefCell` may not be borrowed), armed lazily so a connection
+  that never reads never pays for it, and used by both reads. `Inner::stash_read`
+  is the single entrance: it SWAPS the two buffers rather than copying the
+  bytes — the stash is empty on every pass Phase 1 fed, so a swap loses no
+  ordering, and the empty buffer it gives back becomes the next read's scratch.
+  It falls back to appending when the stash is not empty, because a swap there
+  would put new bytes in front of old ones. Phase 1 clears the stash and puts
+  it back instead of dropping it.
+
+  **The oracle is bytes allocated, because a capacity cannot tell these
+  apart**: a buffer freed and reallocated at the same size reads identically by
+  capacity, and that is the defect exactly. The test binary therefore carries a
+  `#[cfg(test)] #[global_allocator]` wrapping `System` and counting bytes on
+  the calling thread while armed — per thread because `cargo test` runs tests
+  in parallel and a compio runtime's tasks live on the thread that made them,
+  and const-initialised so the counter itself never allocates from inside
+  `alloc`. MEASURED across 20 observation reads behind a wedged write:
+  **12 369 bytes allocated, against 487 502 unfixed** — 29.8 read chunks, about
+  24 KiB per read, which is the two buffers.
 
 ## CI — three gates the workspace claimed and no job ran
 

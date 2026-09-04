@@ -169,6 +169,101 @@ fn default_tls_connector() -> compio_tls::TlsConnector {
 #[cfg(test)]
 mod duplex;
 
+/// The oracle for this crate's allocation bounds: a `#[global_allocator]` for
+/// the unit-test binary that counts bytes allocated ON THE CALLING THREAD
+/// while armed.
+///
+/// A bound written as "this loop must not allocate per pass" cannot be
+/// asserted by reading a buffer's capacity — the buffer under test may be
+/// dropped and freshly allocated on every pass, which is precisely the defect,
+/// and its capacity then reads the same either way. Counting is the only
+/// measurement that tells those apart, so this wraps `System` and the tests
+/// arm it around the window they mean.
+///
+/// **Per THREAD, and const-initialised**, both deliberately. `cargo test` runs
+/// tests in parallel threads, and a process-wide counter would attribute their
+/// allocations to whichever test happened to be armed; a compio runtime and
+/// the tasks it spawns live on the thread that created them, so a
+/// thread-local counter sees exactly the driver under test and nothing else.
+/// Const initialisation keeps the counter itself out of the allocator: a
+/// lazily-initialised `thread_local!` would allocate on first touch, from
+/// inside `alloc`.
+#[cfg(test)]
+pub(crate) mod counting_alloc {
+  use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
+  };
+
+  thread_local! {
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+    static BYTES: Cell<u64> = const { Cell::new(0) };
+  }
+
+  /// `System`, plus the count.
+  pub(crate) struct Counting;
+
+  // SAFETY: every method forwards to `System` with the arguments it was given
+  // and returns its pointer unchanged, so the safety contract is `System`'s.
+  // The counter is a side effect on a const-initialised thread-local `Cell`,
+  // which allocates nothing and so cannot re-enter.
+  unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+      record(layout.size());
+      unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+      record(layout.size());
+      unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+      unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+      // Only the GROWTH counts: a `Vec` that doubles from 8 KiB to 16 KiB
+      // acquired 8 KiB, and counting the whole new size would make one
+      // grown buffer look like two fresh ones.
+      record(new_size.saturating_sub(layout.size()));
+      unsafe { System.realloc(ptr, layout, new_size) }
+    }
+  }
+
+  fn record(bytes: usize) {
+    // `try_with` rather than `with`: during thread teardown the thread-local
+    // is gone, and an allocation there must not panic out of the allocator.
+    let _ = ARMED.try_with(|armed| {
+      if armed.get() {
+        let _ = BYTES.try_with(|total| {
+          total.set(
+            total
+              .get()
+              .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX)),
+          );
+        });
+      }
+    });
+  }
+
+  /// Starts counting on this thread, from zero.
+  pub(crate) fn arm() {
+    BYTES.with(|total| total.set(0));
+    ARMED.with(|armed| armed.set(true));
+  }
+
+  /// Stops counting and answers the bytes allocated since [`arm`].
+  pub(crate) fn disarm() -> u64 {
+    ARMED.with(|armed| armed.set(false));
+    BYTES.with(Cell::get)
+  }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: counting_alloc::Counting = counting_alloc::Counting;
+
 pub use error::{AcceptError, ConnectError, Error};
 pub use options::{AcceptOptions, ClientOptions};
 

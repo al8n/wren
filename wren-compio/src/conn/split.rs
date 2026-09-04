@@ -78,6 +78,19 @@ impl<Ro, S> Drop for ReadHalf<Ro, S> {
   fn drop(&mut self) {
     let mut inner = self.inner.borrow_mut();
     inner.read_half_alive = false;
+    // The same fact one type over: with the pump gone, nothing will read what
+    // an inbound byte would assemble. Set beside the flag it follows from, so
+    // "no reader exists" is written wherever it becomes true rather than
+    // argued from `read_half_alive` at the point of use. Nothing reads on this
+    // path today — the transport goes below — so it is a totality, not a
+    // reachable saving.
+    inner.inbound_unread = true;
+    // And nothing will read what is already held: the folder's partial and
+    // every complete message behind it are unreachable the moment this half
+    // is gone, so they are dropped here rather than kept alive by whatever
+    // still holds the shared state.
+    inner.assembler.reset();
+    inner.ready.clear();
     // Nothing will ever pump these; fail the waiting senders loudly.
     while let Some(frame) = inner.outbound.pop_front() {
       frame.state.set(FrameState::Orphaned);

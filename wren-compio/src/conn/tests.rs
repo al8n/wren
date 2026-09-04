@@ -1353,7 +1353,7 @@ async fn a_queued_ping_is_not_written_after_both_close_frames() {
     );
     assert_eq!(state.outbound.len(), 1, "the Ping is queued behind it");
     assert!(
-      state.pending_input.is_empty(),
+      state.inbound.is_empty(),
       "the peer's Close is still in the pipe, not in the driver"
     );
   }
@@ -1817,8 +1817,16 @@ async fn a_recorded_outcome_discards_the_batch_it_finds_rather_than_writing_it()
 
 /// A transport whose FLUSH can be held pending while writes keep succeeding —
 /// the shape a TLS record or an adapter buffer has, and the one the pipe alone
-/// cannot express, because its flush is always ready. `poll_close` records that
-/// it was called, which is what tells a graceful teardown from an abortive one.
+/// cannot express, because its flush is always ready. It counts every way this
+/// driver could push bytes the transport is holding — `poll_flush` and
+/// `poll_close` — but only AFTER the read that carried the peer's Close, which
+/// is where the guarantee starts. Before it the blocked drive is still trying
+/// to finish its batch and re-flushes on every wake, INCLUDING the wake that
+/// delivers that Close; those are not pushes after the handshake.
+///
+/// The boundary is exact rather than timed: the test arms `watch` when the pipe
+/// is empty and the peer's Close is the only thing left to send, so the next
+/// read that returns bytes IS that Close.
 ///
 /// `poll_flush` returns `Pending` WITHOUT registering a waker: nothing here ever
 /// clears the flag, and the wakeups that matter come from the read side, which
@@ -1826,6 +1834,9 @@ async fn a_recorded_outcome_discards_the_batch_it_finds_rather_than_writing_it()
 struct BlockedFlush {
   inner: PipeDuplex,
   flush_blocked: Rc<Cell<bool>>,
+  watch: Rc<Cell<bool>>,
+  saw_close_read: Rc<Cell<bool>>,
+  pushes_after_close: Rc<Cell<usize>>,
   close_called: Rc<Cell<bool>>,
 }
 
@@ -1835,7 +1846,14 @@ impl futures_util::AsyncRead for BlockedFlush {
     cx: &mut std::task::Context<'_>,
     buf: &mut [u8],
   ) -> Poll<std::io::Result<usize>> {
-    Pin::new(&mut self.inner).poll_read(cx, buf)
+    let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+    if self.watch.get()
+      && let Poll::Ready(Ok(n)) = &polled
+      && *n > 0
+    {
+      self.saw_close_read.set(true);
+    }
+    polled
   }
 }
 
@@ -1852,6 +1870,11 @@ impl futures_util::AsyncWrite for BlockedFlush {
     mut self: Pin<&mut Self>,
     cx: &mut std::task::Context<'_>,
   ) -> Poll<std::io::Result<()>> {
+    if self.saw_close_read.get() {
+      self
+        .pushes_after_close
+        .set(self.pushes_after_close.get().saturating_add(1));
+    }
     if self.flush_blocked.get() {
       return Poll::Pending;
     }
@@ -1863,6 +1886,11 @@ impl futures_util::AsyncWrite for BlockedFlush {
     cx: &mut std::task::Context<'_>,
   ) -> Poll<std::io::Result<()>> {
     self.close_called.set(true);
+    if self.saw_close_read.get() {
+      self
+        .pushes_after_close
+        .set(self.pushes_after_close.get().saturating_add(1));
+    }
     Pin::new(&mut self.inner).poll_close(cx)
   }
 }
@@ -1884,11 +1912,17 @@ async fn a_batch_left_inside_the_transport_is_not_flushed_by_the_teardown() {
   let (c, s) = duplex();
   let negotiated = Negotiated::none();
   let flush_blocked = Rc::new(Cell::new(false));
+  let watch = Rc::new(Cell::new(false));
+  let saw_close_read = Rc::new(Cell::new(false));
+  let pushes_after_close = Rc::new(Cell::new(0usize));
   let close_called = Rc::new(Cell::new(false));
   let client = WebSocket::<ClientRole, _>::client(
     BlockedFlush {
       inner: c.into_duplex(),
       flush_blocked: flush_blocked.clone(),
+      watch: watch.clone(),
+      saw_close_read: saw_close_read.clone(),
+      pushes_after_close: pushes_after_close.clone(),
       close_called: close_called.clone(),
     },
     &negotiated,
@@ -1942,6 +1976,10 @@ async fn a_batch_left_inside_the_transport_is_not_flushed_by_the_teardown() {
     seen = probe.borrow().pings_seen;
   }
 
+  // The pipe is empty and the peer's Close is the only thing left to send, so
+  // the next read that returns bytes is that Close: arm the boundary.
+  watch.set(true);
+
   // The peer's Close completes the handshake through the read behind that
   // blocked write.
   let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
@@ -1956,8 +1994,17 @@ async fn a_batch_left_inside_the_transport_is_not_flushed_by_the_teardown() {
     "a completed handshake is not an error: {ended:?}"
   );
   assert!(
+    saw_close_read.get(),
+    "the boundary must have been crossed for the count below to mean anything"
+  );
+  assert_eq!(
+    pushes_after_close.get(),
+    0,
+    "nothing may push the abandoned bytes onto the wire after both Close frames"
+  );
+  assert!(
     !close_called.get(),
-    "a graceful close would flush the abandoned bytes onto the wire after both Close frames"
+    "and a graceful close would push them ahead of its close_notify"
   );
   assert!(
     cread.closed().expect("the handshake completes").clean(),
@@ -1971,11 +2018,11 @@ async fn a_peer_flooding_data_behind_a_wedged_write_cannot_grow_the_ready_queue(
 
   // The read behind a blocked write exists to SEE the peer's Close. Nothing
   // drains `ready` while that write is blocked — delivery comes after Phase 3 —
-  // so a peer that stops reading and floods small data messages grows an
+  // so a peer that stops reading and floods small data messages would grow an
   // unbounded queue for as long as the budget lasts, and the budget may be
-  // `Duration::MAX`. The gate is `ready.is_empty()`: one read chunk's worth of
-  // messages may be assembled, and a peer that then keeps flooding instead of
-  // closing forfeits the read-behind and meets the budget.
+  // `Duration::MAX`. Every read still happens, because the Close may be behind
+  // any of them; what stops is ASSEMBLY, so the flood costs one read chunk of
+  // scratch and nothing else, and the Close at the end of it is still seen.
   //
   // The two directions are bounded independently here: the client's is small
   // enough to wedge its Pong batch, the peer's is wide enough to flood in one
@@ -1988,10 +2035,9 @@ async fn a_peer_flooding_data_behind_a_wedged_write_cannot_grow_the_ready_queue(
   // An unmasked server-to-client Text frame with a one-byte payload.
   const DATA_FRAME: [u8; 3] = [0x81, 0x01, b'x'];
   const DATA_LEN: usize = DATA_FRAME.len();
-  // What one read can hand Phase 1, and so what one feed can assemble.
-  const MAX_READY: usize = READ_CHUNK / DATA_LEN;
-  // Twice that, so the flood cannot be mistaken for one chunk's worth.
-  const FLOOD: usize = 2 * MAX_READY + 1;
+  // More than twice what one read can carry, so the flood cannot be mistaken
+  // for a single chunk's worth.
+  const FLOOD: usize = 2 * (READ_CHUNK / DATA_LEN) + 1;
   const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
   const {
     assert!(
@@ -2066,8 +2112,8 @@ async fn a_peer_flooding_data_behind_a_wedged_write_cannot_grow_the_ready_queue(
   let expected = flood.len();
   let compio_buf::BufResult(res, _) = sw.write(flood).await;
   assert_eq!(res.expect("the flood"), expected, "the flood is one write");
-  // The Close is last, and behind more than a chunk of data: a peer that
-  // floods rather than closes does not get to be heard.
+  // The Close is last, behind more than a chunk of data — and it is still
+  // read, because observation parses everything it is handed.
   let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
   res.expect("the peer's Close");
 
@@ -2077,26 +2123,2317 @@ async fn a_peer_flooding_data_behind_a_wedged_write_cannot_grow_the_ready_queue(
     .unwrap();
   let elapsed = t0.elapsed();
   let high_water = probe.borrow().ready_high_water;
-  assert!(
-    high_water <= MAX_READY + 1,
-    "the read behind a blocked write may assemble one chunk's worth ({MAX_READY}) \
-     and a straddling frame, not the whole {FLOOD}-frame flood: {high_water}"
-  );
-  assert!(
-    ended.is_none(),
-    "the budget verdict is an outcome, not an error: {ended:?}"
+  // EXACTLY zero for the same reason: not one message of the flood is kept.
+  assert_eq!(
+    high_water, 0,
+    "observation parses the {FLOOD}-frame flood and assembles none of it"
   );
   assert_eq!(
-    delivered, high_water,
-    "everything the read-behind assembled is delivered before `None`"
+    delivered, 0,
+    "so there is nothing to deliver from it either"
   );
+  assert!(ended.is_none(), "the handshake completes: {ended:?}");
   let closed = cread.closed().expect("the connection ends");
   assert!(
-    !closed.clean(),
-    "a peer that floods instead of closing forfeits the read-behind: {closed:?}"
+    closed.clean(),
+    "the Close behind the flood is read like everything else: {closed:?}"
   );
   assert!(
-    elapsed < BUDGET * 4,
-    "bounded by the budget, not by how long the peer keeps writing: {elapsed:?}"
+    elapsed < BUDGET,
+    "seen at once, not at the deadline: {elapsed:?}"
   );
+}
+
+#[compio::test]
+async fn a_long_partial_message_behind_a_wedged_write_is_not_retained() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // A queue-length bound cannot see a message that has not arrived yet: `ready`
+  // stays empty for as long as the peer keeps sending continuation frames, so a
+  // fragmented message begun before our Close can grow to `max_message_size`
+  // behind a wedged write, whatever that cap is set to. The bound has to be on
+  // what is RETAINED, and while the write is blocked the driver is observing
+  // for the peer's Close, not receiving — so data is discarded rather than
+  // assembled.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  // Unmasked server-to-client fragments: a non-final Text start, then
+  // continuations, then an empty final continuation.
+  const CHUNK_PAYLOAD: usize = 125;
+  const FRAGMENTS: usize = 400;
+  const FRAGMENT_BYTES: usize = FRAGMENTS * (2 + CHUNK_PAYLOAD);
+  const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+    assert!(
+      FRAGMENT_BYTES > READ_CHUNK,
+      "the message must outgrow a read chunk"
+    );
+  }
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default()
+      .with_close_timeout(BUDGET)
+      // Large on purpose: the cap is what the old bound leaned on.
+      .with_max_message_size(8 * 1024 * 1024),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let reader = compio_runtime::spawn(async move {
+    let mut delivered = 0usize;
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      match m {
+        Ok(_) => delivered += 1,
+        Err(e) => {
+          ended = Some(e);
+          break;
+        }
+      }
+    }
+    (delivered, ended, cread)
+  });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+
+  // One long message that never ends, then its final fragment, then the Close.
+  let t0 = std::time::Instant::now();
+  let mut fragments = Vec::with_capacity(FRAGMENT_BYTES);
+  for i in 0..FRAGMENTS {
+    // Text start on the first, continuation after; none is final.
+    fragments.push(if i == 0 { 0x01_u8 } else { 0x00_u8 });
+    fragments.push(CHUNK_PAYLOAD as u8);
+    fragments.extend(std::iter::repeat_n(b'x', CHUNK_PAYLOAD));
+  }
+  fragments.extend_from_slice(&[0x80, 0x00]);
+  fragments.extend_from_slice(&[0x88, 0x02, 0x03, 0xE8]);
+  let expected = fragments.len();
+  let compio_buf::BufResult(res, _) = sw.write(fragments).await;
+  assert_eq!(res.expect("the fragments"), expected, "one write");
+
+  let (delivered, ended, cread) = compio::time::timeout(std::time::Duration::from_secs(5), reader)
+    .await
+    .expect("the peer's Close is seen behind the fragments")
+    .unwrap();
+  let elapsed = t0.elapsed();
+  let partial = probe.borrow().partial_high_water;
+  // EXACTLY zero, not "within a chunk": observation assembles nothing at all,
+  // and a bound of one chunk would be satisfied by a driver that retained one.
+  // Unfixed, this read 50000 — the whole message.
+  assert_eq!(
+    partial, 0,
+    "a message arriving while the write is blocked is observed, not retained: \
+     {partial} bytes held of a {FRAGMENT_BYTES}-byte message"
+  );
+  assert_eq!(delivered, 0, "observed data is discarded, not delivered");
+  assert!(ended.is_none(), "the handshake completes: {ended:?}");
+  assert!(
+    cread.closed().expect("the connection ends").clean(),
+    "the peer's Close is behind the fragments and must still be seen"
+  );
+  assert!(
+    elapsed < BUDGET,
+    "seen at once, not at the deadline: {elapsed:?}"
+  );
+}
+
+#[compio::test]
+async fn a_completed_message_does_not_hide_the_close_in_the_next_read() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // A peer may finish its current fragmented message before answering our
+  // Close. If that message completes in one read and the Close lands in the
+  // next, a driver that stops reading once it holds a message never sees the
+  // Close and reports an unclean timeout instead.
+  //
+  // The two reads are forced by the pipe rather than by a sleep: the inbound
+  // direction holds exactly the message, so the peer's Close write parks until
+  // the driver has drained it.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  const MSG_PAYLOAD: usize = 60;
+  // A non-final Text start with its payload, then an empty final continuation.
+  const MSG_BYTES: usize = (2 + MSG_PAYLOAD) + 2;
+  const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+    assert!(
+      MSG_BYTES == PIPE_CAPACITY,
+      "the message must fill the inbound pipe exactly, so the Close parks behind it"
+    );
+    assert!(
+      PINGS * PING_FRAME.len() <= PIPE_CAPACITY,
+      "the pings must fit the same pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacity(PIPE_CAPACITY);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let reader = compio_runtime::spawn(async move {
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      if let Err(e) = m {
+        ended = Some(e);
+        break;
+      }
+    }
+    (ended, cread)
+  });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+
+  // The whole message, filling the inbound pipe…
+  let t0 = std::time::Instant::now();
+  let mut message = vec![0x01_u8, MSG_PAYLOAD as u8];
+  message.extend(std::iter::repeat_n(b'y', MSG_PAYLOAD));
+  message.extend_from_slice(&[0x80, 0x00]);
+  assert_eq!(message.len(), MSG_BYTES);
+  let compio_buf::BufResult(res, _) = sw.write(message).await;
+  assert_eq!(res.expect("the message"), MSG_BYTES, "one write, one read");
+  // …and the Close behind it, which cannot land until the driver reads.
+  let peer_close = compio_runtime::spawn(async move {
+    let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+    res
+  });
+
+  let (ended, cread) = compio::time::timeout(std::time::Duration::from_secs(5), reader)
+    .await
+    .expect("the Close in the second read is seen")
+    .unwrap();
+  let elapsed = t0.elapsed();
+  assert!(ended.is_none(), "the handshake completes: {ended:?}");
+  assert!(
+    cread.closed().expect("the connection ends").clean(),
+    "a message completed in one read must not hide the Close in the next"
+  );
+  assert!(
+    elapsed < BUDGET,
+    "seen at once, not at the deadline: {elapsed:?}"
+  );
+  let _ = compio::time::timeout(std::time::Duration::from_secs(2), peer_close).await;
+}
+
+#[compio::test]
+async fn observation_reads_behind_a_wedged_write_recycle_their_buffers() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // The read behind a blocked write used to allocate TWICE per read: the flush
+  // phase's `read_scratch` was a local of a loop the `Input` arm leaves with
+  // `continue 'pump`, so it was dropped and rebuilt on every one, and Phase 1
+  // then took the stash it had been copied into and dropped that too. A peer
+  // that keeps sending drives both, and the budget bounding it may be
+  // `Duration::MAX`.
+  //
+  // The oracle is bytes ALLOCATED, not a capacity: a buffer that is freed and
+  // reallocated at the same size reads identically by capacity, which is
+  // exactly the defect. Both buffers reach their steady state during the ping
+  // read, which happens before the counter is armed, so the bound over the
+  // flood is zero-plus-noise rather than "one more chunk".
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  // An unmasked server-to-client Text frame with a one-byte payload.
+  const DATA_FRAME: [u8; 3] = [0x81, 0x01, b'x'];
+  // Enough to need at least ten reads of a full chunk.
+  const READS: usize = 10;
+  const FLOOD: usize = READS * (READ_CHUNK / DATA_FRAME.len()) + 1;
+  const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let reader = compio_runtime::spawn(async move {
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      if let Err(e) = m {
+        ended = Some(e);
+        break;
+      }
+    }
+    (ended, cread)
+  });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  // The peer stops reading here, and its owed Pongs wedge.
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+
+  // Everything this test allocates is allocated HERE, before the counter is
+  // armed: the flood buffer, and the peer pipe's own queue as it accepts it.
+  // The inbound direction is unbounded, so neither write parks — they resolve
+  // on their first poll, which is what keeps the driver from running between
+  // this point and the arming below.
+  let mut flood = Vec::with_capacity(FLOOD * DATA_FRAME.len());
+  for _ in 0..FLOOD {
+    flood.extend_from_slice(&DATA_FRAME);
+  }
+  let expected = flood.len();
+  let compio_buf::BufResult(res, _) = sw.write(flood).await;
+  assert_eq!(res.expect("the flood"), expected, "the flood is one write");
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the peer's Close");
+  assert_eq!(
+    probe.borrow().observation_reads,
+    0,
+    "the driver has not read any of it yet"
+  );
+
+  crate::counting_alloc::arm();
+  let outcome = compio::time::timeout(std::time::Duration::from_secs(5), reader).await;
+  let allocated = crate::counting_alloc::disarm();
+  let (ended, cread) = outcome.expect("the flood is read, not waited out").unwrap();
+
+  let reads = probe.borrow().observation_reads;
+  assert!(
+    reads >= 8,
+    "the bound is over at least eight observation reads; there were {reads}"
+  );
+  // MEASURED: 20 reads, 12 369 bytes. Unfixed, the same run allocated 487 502
+  // — 29.8 chunks, about 24 KiB per read, which is the two buffers.
+  assert!(
+    allocated < READ_CHUNK as u64,
+    "{reads} observation reads allocated {allocated} bytes, which is not under one \
+     {READ_CHUNK}-byte read chunk"
+  );
+  // The same bound, scale-free. What is left in the total is the flush loop's
+  // own per-pass cost — an `event_listener` node and a timer, neither of them
+  // a read buffer and neither of them this round's subject — at about 600
+  // bytes a pass, so the TOTAL above would stop holding somewhere past
+  // twenty-five reads while the property it is testing still did. The defect
+  // was two 16 KiB buffers per read; a kilobyte per read is not that, at any
+  // length of flood.
+  assert!(
+    allocated < reads as u64 * 1024,
+    "{allocated} bytes over {reads} reads is not under a kilobyte a read"
+  );
+  assert!(ended.is_none(), "the handshake completes: {ended:?}");
+  assert!(
+    cread.closed().expect("the connection ends").clean(),
+    "the Close behind the flood is still seen"
+  );
+}
+
+/// One compressed message on the wire, `fragments` frames long, whose payload
+/// inflates to `inflated_bytes`.
+///
+/// The payload is mostly a repeated byte — that is what makes it a bomb — with
+/// one incompressible kilobyte every sixty-four, so that the WIRE is long
+/// enough to take several reads. A pure run of one byte compresses to a couple
+/// of kilobytes and arrives in one read, which cannot state a bound "across at
+/// least eight observation reads"; the noise buys the read count at a
+/// still-large ratio.
+///
+/// Built with `websocket-proto`'s own compressor in the SERVER role, so the
+/// frames are unmasked server-to-client exactly as this test's peer would send
+/// them, and then re-framed: the crate encodes a whole message as one frame,
+/// and a bomb wants many, because it is a fragmented message arriving after
+/// our Close that the old code inflated one frame at a time.
+#[cfg(feature = "deflate")]
+fn compressed_bomb(inflated_bytes: usize, fragments: usize) -> Vec<u8> {
+  use websocket_proto::negotiation::DeflateParams;
+
+  let negotiated = Negotiated::none().with_deflate(Some(DeflateParams::default()));
+  let mut peer = websocket_proto::Connection::<std::time::Instant, ServerRole>::new(
+    &negotiated,
+    websocket_proto::ConnectionConfig::default(),
+    ServerRole::new(),
+    std::time::Instant::now(),
+  );
+  let mut payload = Vec::with_capacity(inflated_bytes);
+  let mut lcg: u32 = 0x1234_5678;
+  while payload.len() < inflated_bytes {
+    let run = (inflated_bytes - payload.len()).min(63 * 1024);
+    payload.extend(std::iter::repeat_n(b'A', run));
+    let noise = (inflated_bytes - payload.len()).min(1024);
+    for _ in 0..noise {
+      lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      payload.push((lcg >> 24) as u8);
+    }
+  }
+
+  let mut out = vec![0u8; inflated_bytes + 4096];
+  let n = peer
+    .encode_binary_compressed(&payload, &mut out)
+    .expect("permessage-deflate is negotiated with 15-bit windows");
+  out.truncate(n);
+
+  // Strip the header the crate wrote: unmasked, so the length is 2, 4 or 10
+  // bytes in from the front depending on the second byte's 7-bit length.
+  let header = match out.get(1).copied().unwrap_or(0) {
+    0..=125 => 2,
+    126 => 4,
+    _ => 10,
+  };
+  let body = out.split_off(header);
+  assert!(
+    body.len() * 16 < inflated_bytes,
+    "the bomb must compress at least sixteenfold: {} bytes of wire for {inflated_bytes}",
+    body.len()
+  );
+
+  let per_frame = body.len().div_ceil(fragments);
+  let mut wire = Vec::new();
+  let mut chunks = body.chunks(per_frame).peekable();
+  let mut first = true;
+  while let Some(chunk) = chunks.next() {
+    let last = chunks.peek().is_none();
+    // FIN only on the last; RSV1 only on the first (RFC 7692 §7.2.3.1).
+    let opcode = if first { 0x02_u8 } else { 0x00 };
+    let fin = if last { 0x80 } else { 0x00 };
+    let rsv1 = if first { 0x40 } else { 0x00 };
+    wire.push(fin | rsv1 | opcode);
+    let len = chunk.len();
+    if len < 126 {
+      wire.push(len as u8);
+    } else {
+      wire.push(126);
+      wire.extend_from_slice(&(len as u16).to_be_bytes());
+    }
+    wire.extend_from_slice(chunk);
+    first = false;
+  }
+  wire
+}
+
+#[cfg(feature = "deflate")]
+#[compio::test]
+async fn a_compressed_bomb_behind_a_wedged_write_is_not_inflated() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+  use websocket_proto::negotiation::DeflateParams;
+
+  // The R7 finding: discarding at the assembler rather than the protocol discards
+  // the EVENT, and with `deflate` the event is produced only after
+  // `Connection::handle` has inflated the payload into the decompressor's
+  // buffer and kept its capacity. So a peer that keeps sending compressed
+  // fragments after our Close turned each read into megabytes of output that
+  // nothing would ever read — up to the message cap, on a connection whose
+  // application has already said it is done.
+  //
+  // The oracle is the counting allocator: inflating is allocating, so bytes
+  // allocated across the observation reads sees both this and the buffer
+  // churn of the round's other finding at once.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  const BOMB_BYTES: usize = 4 * 1024 * 1024;
+  const FRAGMENTS: usize = 512;
+  const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let negotiated = Negotiated::none().with_deflate(Some(DeflateParams::default()));
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let reader = compio_runtime::spawn(async move {
+    let mut delivered = 0usize;
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      match m {
+        Ok(_) => delivered += 1,
+        Err(e) => {
+          ended = Some(e);
+          break;
+        }
+      }
+    }
+    (delivered, ended, cread)
+  });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+
+  // Compressed and written before the counter is armed, for the reason the
+  // uncompressed sibling gives: neither write parks, so the driver does not
+  // run between here and the arming.
+  let bomb = compressed_bomb(BOMB_BYTES, FRAGMENTS);
+  let wire = bomb.len();
+  let compio_buf::BufResult(res, _) = sw.write(bomb).await;
+  assert_eq!(res.expect("the bomb"), wire, "the bomb is one write");
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the peer's Close");
+
+  crate::counting_alloc::arm();
+  let outcome = compio::time::timeout(std::time::Duration::from_secs(30), reader).await;
+  let allocated = crate::counting_alloc::disarm();
+  let (delivered, ended, cread) = outcome.expect("the bomb is skipped, not inflated").unwrap();
+
+  let reads = probe.borrow().observation_reads;
+  assert!(
+    reads >= 8,
+    "the bound is over at least eight observation reads; there were {reads}"
+  );
+  // MEASURED: 77 845 bytes of wire inflating to 4 194 304, 10 reads, 6 209
+  // bytes allocated. With the discard back at the assembler — `handle` where
+  // `observe` now stands — the same run allocated 180 625. That number is the
+  // inflate buffer's GROWTH and not the inflating: the buffer is reused across
+  // frames, so the allocator sees the largest frame rather than the four
+  // megabytes of output. `websocket-proto`'s own regression measures the work
+  // directly, and reads 8 388 627 bytes inflated for 9 688 bytes of wire.
+  assert!(
+    allocated < READ_CHUNK as u64,
+    "{wire} bytes of wire inflating to {BOMB_BYTES} allocated {allocated} bytes over \
+     {reads} observation reads, which is not under one {READ_CHUNK}-byte read chunk"
+  );
+  // The scale-free form, for the reason the uncompressed sibling gives.
+  assert!(
+    allocated < reads as u64 * 1024,
+    "{allocated} bytes over {reads} reads is not under a kilobyte a read"
+  );
+  assert_eq!(delivered, 0, "the bomb is discarded, not delivered");
+  assert!(ended.is_none(), "the handshake completes: {ended:?}");
+  assert!(
+    cread.closed().expect("the connection ends").clean(),
+    "the Close behind the bomb is still seen"
+  );
+}
+
+#[compio::test]
+async fn a_message_begun_before_observation_is_not_delivered_truncated() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // The cross-family review's probe. The peer opens a fragmented Binary
+  // message and one non-final frame arrives while the driver is still
+  // RECEIVING, so `MessageAssembler` holds it. The application then closes,
+  // the peer wedges the Pong batch, and every later read is observed — and an
+  // observed read of pure continuation payload yields NO events at all, so
+  // nothing in the event loop can tell the assembler to let go. When the wedge
+  // drains, the message's final frame arrives under `handle` and its
+  // `MessageEnd` sealed the stale partial as a COMPLETE message: the
+  // application received 125 bytes of a 50 125-byte message and a clean close,
+  // with no way to tell it from a message the peer really ended there.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  const CHUNK: usize = 125;
+  const CONTINUATIONS: usize = 400;
+  const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (mut sr, mut sw) = s.split();
+
+  // The reader must be running for the head to reach the assembler at all:
+  // the pump is what feeds `push`, and it only runs while `next()` is polled.
+  let reader = compio_runtime::spawn(async move {
+    let mut delivered = Vec::new();
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      match m {
+        Ok(msg) => delivered.push(msg.len()),
+        Err(e) => {
+          ended = Some(e);
+          break;
+        }
+      }
+    }
+    (delivered, ended, cread)
+  });
+
+  // The head, BEFORE the close: assembled by `push` into the accumulator.
+  let mut head = vec![0x02_u8, CHUNK as u8];
+  head.extend(std::iter::repeat_n(b'H', CHUNK));
+  let head_len = head.len();
+  let compio_buf::BufResult(res, _) = sw.write(head).await;
+  assert_eq!(res.expect("the head"), head_len);
+  let waited = std::time::Instant::now();
+  while probe.borrow().partial_high_water == 0 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the head must reach the assembler before the close"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+  assert_eq!(
+    probe.borrow().partial_high_water,
+    CHUNK,
+    "the assembler is holding the head when observation begins"
+  );
+
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  // The peer stops reading; its owed Pongs wedge and observation begins.
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+
+  // Pure continuation payload — every observed read of it yields ZERO events.
+  let mut body = Vec::with_capacity(CONTINUATIONS * (2 + CHUNK));
+  for _ in 0..CONTINUATIONS {
+    body.push(0x00_u8);
+    body.push(CHUNK as u8);
+    body.extend(std::iter::repeat_n(b'C', CHUNK));
+  }
+  let body_len = body.len();
+  let compio_buf::BufResult(res, _) = sw.write(body).await;
+  assert_eq!(res.expect("the continuations"), body_len);
+  let waited = std::time::Instant::now();
+  while probe.borrow().observation_reads == 0 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the continuations must be read behind the wedged write"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+
+  // The peer drains the Pong batch, so the wedge clears and the pump returns
+  // to `handle` — where the message's final frame lands.
+  let mut drained = 0usize;
+  while drained < PINGS * PONG_LEN {
+    let compio_buf::BufResult(res, _) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+    match res {
+      Ok(0) => break,
+      Ok(n) => drained += n,
+      Err(_) => break,
+    }
+  }
+  // The premise of the rest of this test, asserted rather than assumed: the
+  // wedge is gone, so the final frame below is fed through `handle` and not
+  // observed. A change in the pump's re-entry conditions must red HERE, with
+  // the state it actually reached, rather than let the test pass because it
+  // never left observation.
+  let waited = std::time::Instant::now();
+  loop {
+    let (pending, reads) = {
+      let guard = probe.borrow();
+      (guard.pending_write.is_some(), guard.observation_reads)
+    };
+    if !pending && reads > 0 {
+      break;
+    }
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the wedge must drain before the final frame: pending_write={pending}, \
+       observation_reads={reads}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x80_u8, 0x00]).await;
+  res.expect("the final continuation");
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the peer's Close");
+
+  let (delivered, ended, cread) = compio::time::timeout(std::time::Duration::from_secs(5), reader)
+    .await
+    .expect("the close handshake completes")
+    .unwrap();
+  // Unfixed this read `delivered=[125]` — the head, sealed by a `MessageEnd`
+  // belonging to a message 400 frames of which were never seen.
+  assert_eq!(
+    delivered,
+    Vec::<usize>::new(),
+    "a message half of which was discarded must NOT be delivered"
+  );
+  assert!(ended.is_none(), "the handshake completes: {ended:?}");
+  assert!(
+    cread.closed().expect("the connection ends").clean(),
+    "and the close is clean"
+  );
+}
+
+#[cfg(feature = "deflate")]
+#[compio::test]
+async fn a_poisoned_compressed_message_is_dropped_not_delivered_empty() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+  use websocket_proto::negotiation::DeflateParams;
+
+  // The cross-family review's second probe. Observation poisons the inflate
+  // context (by design), the wedge then drains, and the driver returns to
+  // `handle` for the rest of the connection's life. Every later compressed
+  // message is skipped by the protocol — `MessageStart` + `MessageEnd`, no
+  // chunks — and an assembler that opens an accumulator on that start hands
+  // the application a fabricated EMPTY message where the peer sent bytes.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  // One peer compressor for the whole connection: context takeover means the
+  // messages share a DEFLATE stream, which is the state the poison is about.
+  let negotiated = Negotiated::none().with_deflate(Some(DeflateParams::default()));
+  let mut peer = websocket_proto::Connection::<std::time::Instant, ServerRole>::new(
+    &negotiated,
+    websocket_proto::ConnectionConfig::default(),
+    ServerRole::new(),
+    std::time::Instant::now(),
+  );
+  let mut scratch = vec![0u8; 8192];
+  let n = peer
+    .encode_binary_compressed(&[b'A'; 200], &mut scratch)
+    .expect("compressed");
+  let first = scratch.get(..n).unwrap_or(&[]).to_vec();
+  let n = peer
+    .encode_binary_compressed(&[b'B'; 300], &mut scratch)
+    .expect("compressed");
+  let second = scratch.get(..n).unwrap_or(&[]).to_vec();
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let reader = compio_runtime::spawn(async move {
+    let mut delivered = Vec::new();
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      match m {
+        Ok(msg) => delivered.push(msg.len()),
+        Err(e) => {
+          ended = Some(e);
+          break;
+        }
+      }
+    }
+    (delivered, ended, cread)
+  });
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+
+  // Observed behind the wedge: skipped, and the context is poisoned.
+  let len = first.len();
+  let compio_buf::BufResult(res, _) = sw.write(first).await;
+  assert_eq!(res.expect("the observed message"), len);
+  let waited = std::time::Instant::now();
+  while probe.borrow().observation_reads == 0 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the compressed message must be read behind the wedged write"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+
+  // The peer drains the Pongs, so the pump goes back to `handle`…
+  let mut drained = 0usize;
+  while drained < PINGS * PONG_LEN {
+    let compio_buf::BufResult(res, _) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+    match res {
+      Ok(0) => break,
+      Ok(n) => drained += n,
+      Err(_) => break,
+    }
+  }
+  // …where a compressed message carrying 300 bytes is skipped by the poison,
+  // and an uncompressed one is unaffected and must still arrive. The premise
+  // is that the wedge is gone AND the poison was set — both asserted, so a
+  // change in the pump's re-entry conditions reds here rather than letting
+  // this pass for the wrong reason.
+  let waited = std::time::Instant::now();
+  loop {
+    let (pending, reads) = {
+      let guard = probe.borrow();
+      (guard.pending_write.is_some(), guard.observation_reads)
+    };
+    if !pending && reads > 0 {
+      break;
+    }
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the wedge must drain before the poisoned message: pending_write={pending}, \
+       observation_reads={reads}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+
+  let len = second.len();
+  let compio_buf::BufResult(res, _) = sw.write(second).await;
+  assert_eq!(res.expect("the poisoned message"), len);
+  let mut plain = vec![0x82_u8, 4];
+  plain.extend_from_slice(b"tail");
+  let compio_buf::BufResult(res, _) = sw.write(plain).await;
+  res.expect("an uncompressed message");
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the peer's Close");
+
+  let (delivered, ended, cread) = compio::time::timeout(std::time::Duration::from_secs(5), reader)
+    .await
+    .expect("the close handshake completes")
+    .unwrap();
+  // Unfixed this read `delivered=[0, 0, 4]` — an EMPTY Binary fabricated for
+  // each skipped compressed message, then the uncompressed one.
+  //
+  // Two facts, two assertions, because one list assertion reds for either and
+  // names neither.
+  assert!(
+    !delivered.contains(&0),
+    "a skipped compressed message must not surface as an empty message; \
+     delivered {delivered:?}"
+  );
+  assert_eq!(
+    delivered,
+    vec![4],
+    "and the uncompressed message after the poison must still be delivered \
+     whole, alone; delivered {delivered:?}"
+  );
+  assert!(ended.is_none(), "the handshake completes: {ended:?}");
+  assert!(
+    cread.closed().expect("the connection ends").clean(),
+    "and the close is clean"
+  );
+}
+
+#[cfg(feature = "deflate")]
+#[compio::test]
+async fn an_unsplit_close_observes_reads_nobody_can_receive() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+  use websocket_proto::negotiation::DeflateParams;
+
+  // `WebSocket::close` CONSUMES the handle: no application code can receive
+  // another message, and the loop inside it discards every one the pump
+  // produces. There is no wedge here and nothing is blocked — this is the
+  // ordinary echo wait — so Phase 4 stashed its reads unflagged and Phase 1
+  // fed them to `handle`, inflating and assembling a peer's compressed bomb in
+  // full, to the message cap, one line before throwing it away.
+  const CLOSE_LEN: usize = 8;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const BOMB_BYTES: usize = 4 * 1024 * 1024;
+  const FRAGMENTS: usize = 512;
+  const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none().with_deflate(Some(DeflateParams::default()));
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let probe = client.inner.clone();
+  let closer = compio_runtime::spawn(async move { client.close(CloseCode::Normal, "").await });
+
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, _) = sr.read(Vec::with_capacity(64)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  // One Ping first, so the read buffers reach their steady state before the
+  // counter is armed and the window measures the bomb rather than the
+  // driver's first read.
+  let compio_buf::BufResult(res, _) = sw.write(PING_FRAME.to_vec()).await;
+  res.expect("the ping");
+  let waited = std::time::Instant::now();
+  while probe.borrow().pings_seen == 0 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the pump must still be reading during the echo wait"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+
+  // Built and written before arming: the pipe is unbounded, so neither write
+  // parks and the pump does not run between them and the arming below.
+  let bomb = compressed_bomb(BOMB_BYTES, FRAGMENTS);
+  let wire = bomb.len();
+  let compio_buf::BufResult(res, _) = sw.write(bomb).await;
+  assert_eq!(res.expect("the bomb"), wire, "the bomb is one write");
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the peer's Close");
+
+  crate::counting_alloc::arm();
+  let outcome = compio::time::timeout(std::time::Duration::from_secs(30), closer).await;
+  let allocated = crate::counting_alloc::disarm();
+  let closed = outcome
+    .expect("the bomb is skipped, not inflated")
+    .unwrap()
+    .expect("the close handshake completes");
+
+  // MEASURED: 77 845 bytes of wire inflating to 4 194 304 allocated 5 585
+  // bytes. With the flag not reaching Phase 1, the same run allocated
+  // 6 851 257 — 418 read chunks — because the inflater's buffer and then the
+  // assembler's accumulator both grew for a message `close` discards on the
+  // next line.
+  assert!(
+    allocated < READ_CHUNK as u64,
+    "{wire} bytes of wire inflating to {BOMB_BYTES} allocated {allocated} bytes during \
+     an unsplit close, which is not under one {READ_CHUNK}-byte read chunk"
+  );
+  assert!(closed.clean(), "and the close is clean: {closed:?}");
+}
+
+#[compio::test]
+async fn a_dropped_read_half_leaves_nothing_to_read_with() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // The split twin of the flag above, and the reason it has no bomb
+  // regression of its own: `ReadHalf::drop` is the pump's owner, so dropping
+  // it does not leave a pump reading into nothing — it takes the transport
+  // down with it and refuses the write half outright. `inbound_unread` is set
+  // there for totality (the fact becomes true at that line), and this pins
+  // that there is no read left for it to change.
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let (cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  drop(cread);
+
+  assert!(
+    probe.borrow().inbound_unread,
+    "dropping the read half says nobody will read what arrives"
+  );
+  assert!(
+    probe.borrow().stream.is_none(),
+    "and it takes the transport with it, so nothing can arrive"
+  );
+  assert!(
+    matches!(
+      cwrite.close(CloseCode::Normal, "").await,
+      Err(crate::Error::ReadHalfGone)
+    ),
+    "so the write half's close is refused rather than pumped"
+  );
+
+  // The peer sees EOF rather than a parked connection, and anything it sends
+  // after that reaches no reader at all.
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, _) = sr.read(Vec::with_capacity(64)).await;
+  assert_eq!(res.expect("the peer reads"), 0, "EOF");
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x89_u8, 0x00]).await;
+  let _ = res;
+}
+
+#[compio::test]
+async fn a_close_deadline_that_fires_drops_the_partial_it_will_never_finish() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // The connection ends on OUR timer: the peer drained our Close and then said
+  // nothing, so no frame is decoded, no event is pushed, and the assembler's
+  // terminal arms never run. A prefix accumulated before the close stayed in
+  // the folder for as long as anything held the shared state — and a split
+  // `WriteHalf` the caller keeps holding is exactly that.
+  const CHUNK: usize = 125;
+  const CLOSE_LEN: usize = 8;
+  const BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (mut sr, mut sw) = s.split();
+
+  // A fragmented message the peer never finishes.
+  let mut head = vec![0x01_u8, CHUNK as u8];
+  head.extend(std::iter::repeat_n(b'H', CHUNK));
+  let head_len = head.len();
+  let compio_buf::BufResult(res, _) = sw.write(head).await;
+  assert_eq!(res.expect("the head"), head_len);
+
+  let reader = compio_runtime::spawn(async move {
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      if let Err(e) = m {
+        ended = Some(e);
+        break;
+      }
+    }
+    (ended, cread)
+  });
+  let waited = std::time::Instant::now();
+  while probe.borrow().assembler.buffered() == 0 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the prefix must reach the assembler before the close"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+  assert_eq!(probe.borrow().assembler.buffered(), CHUNK);
+
+  cwrite
+    .close(CloseCode::Normal, "")
+    .await
+    .expect("the Close flushes");
+  let compio_buf::BufResult(res, _) = sr.read(Vec::with_capacity(64)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+  // …and answers nothing. The budget is what ends this.
+
+  let (ended, cread) = compio::time::timeout(std::time::Duration::from_secs(5), reader)
+    .await
+    .expect("the close deadline ends the connection")
+    .unwrap();
+  assert!(
+    ended.is_none(),
+    "the deadline is not an error here: {ended:?}"
+  );
+  assert!(
+    !cread.closed().expect("an outcome is recorded").clean(),
+    "the peer never echoed, so the close is unclean"
+  );
+  // Unfixed this read 125: nothing pushed, nothing reset.
+  assert_eq!(
+    probe.borrow().assembler.buffered(),
+    0,
+    "a close reached through our own timer must still drop the partial"
+  );
+  // The write half is still held, so the shared state is still alive — which
+  // is the shape that made the retention observable.
+  drop(cwrite);
+}
+
+#[compio::test]
+async fn a_dropped_read_half_drops_the_partial_and_the_queue() {
+  use compio_io::{AsyncWrite as _, util::Splittable as _};
+
+  // Nobody can read either half of what is held: not the partial, and not the
+  // complete messages already queued behind it.
+  const CHUNK: usize = 125;
+
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let (mut cread, _cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (_sr, mut sw) = s.split();
+
+  // Two whole messages and then a prefix, in one write: Phase 1 assembles both
+  // into `ready`, delivery hands out the first, and the second stays queued.
+  let mut wire = vec![0x81_u8, 3];
+  wire.extend_from_slice(b"one");
+  wire.push(0x81);
+  wire.push(3);
+  wire.extend_from_slice(b"two");
+  wire.push(0x01);
+  wire.push(CHUNK as u8);
+  wire.extend(std::iter::repeat_n(b'H', CHUNK));
+  let len = wire.len();
+  let compio_buf::BufResult(res, _) = sw.write(wire).await;
+  assert_eq!(res.expect("the write"), len);
+
+  let first = cread
+    .next()
+    .await
+    .expect("a message")
+    .expect("a message, not an error");
+  assert_eq!(first.len(), 3);
+  assert_eq!(probe.borrow().ready.len(), 1, "the second is still queued");
+  assert_eq!(
+    probe.borrow().assembler.buffered(),
+    CHUNK,
+    "and a prefix held"
+  );
+
+  drop(cread);
+
+  // Unfixed these read 1 and 125.
+  assert_eq!(
+    probe.borrow().ready.len(),
+    0,
+    "a message nobody can receive is not kept"
+  );
+  assert_eq!(
+    probe.borrow().assembler.buffered(),
+    0,
+    "and neither is a partial nobody can finish"
+  );
+}
+
+#[compio::test]
+async fn an_unsplit_close_drops_the_partial_and_the_queue() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // The same on the unsplit path, where `close(self, …)` consumes the handle:
+  // the messages its own loop would discard are dropped up front instead of
+  // being assembled, and what was already held goes with them.
+  const CHUNK: usize = 125;
+  const CLOSE_LEN: usize = 8;
+
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let mut client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let probe = client.inner.clone();
+  let (mut sr, mut sw) = s.split();
+
+  let mut wire = vec![0x81_u8, 3];
+  wire.extend_from_slice(b"one");
+  wire.push(0x81);
+  wire.push(3);
+  wire.extend_from_slice(b"two");
+  wire.push(0x01);
+  wire.push(CHUNK as u8);
+  wire.extend(std::iter::repeat_n(b'H', CHUNK));
+  let len = wire.len();
+  let compio_buf::BufResult(res, _) = sw.write(wire).await;
+  assert_eq!(res.expect("the write"), len);
+
+  let first = client
+    .next()
+    .await
+    .expect("a message")
+    .expect("a message, not an error");
+  assert_eq!(first.len(), 3);
+  assert_eq!(probe.borrow().ready.len(), 1);
+  assert_eq!(probe.borrow().assembler.buffered(), CHUNK);
+
+  // The assertion is taken WHILE the close is in flight, not after it. Both
+  // are empty by the end whatever happens — the terminal events reset the
+  // folder and `close`'s own loop drains `ready` — so the fact under test is
+  // that they go at the TRANSITION: `close` consumes the handle, and from
+  // that instant nothing held is reachable. `inbound_unread` and the reset are
+  // set under one borrow, so the flag being visible means the reset has run.
+  let closer = compio_runtime::spawn(async move { client.close(CloseCode::Normal, "").await });
+  let waited = std::time::Instant::now();
+  while !probe.borrow().inbound_unread {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the close must reach the no-reader transition"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+  // Unfixed these read 1 and 125.
+  let (queued, held) = {
+    let guard = probe.borrow();
+    (guard.ready.len(), guard.assembler.buffered())
+  };
+  assert_eq!(
+    queued, 0,
+    "queued for nobody, and dropped at the transition"
+  );
+  assert_eq!(held, 0, "held for nobody, and dropped at the transition");
+
+  // Then let the handshake finish, so the test ends on a clean close rather
+  // than a budget.
+  let compio_buf::BufResult(res, _) = sr.read(Vec::with_capacity(64)).await;
+  assert_eq!(res.expect("our Close"), CLOSE_LEN);
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the echo");
+  let closed = compio::time::timeout(std::time::Duration::from_secs(5), closer)
+    .await
+    .expect("the close handshake completes")
+    .unwrap()
+    .expect("the close handshake completes");
+  assert!(closed.clean());
+}
+
+#[compio::test]
+async fn a_flush_that_times_out_drops_the_partial_it_will_never_finish() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // The OTHER settle: `close_flush_timed_out`, reached when a batch built
+  // after our Close wedges and its slice of the budget runs out. It records
+  // the protocol's verdict exactly as Phase 1's settle does, and for the same
+  // reason must let go of a message nothing will ever finish — no peer frame
+  // arrives, so no event is pushed, and no data run is skipped, so no
+  // `MessageAbandoned` either.
+  //
+  // Reaching THIS site rather than Phase 1's takes two facts at once: our
+  // Close must have drained (that is what arms the protocol's deadline — a
+  // Close still queued gives `handle_timeout` nothing to report and the
+  // function takes its poisoning arm instead), and a LATER batch must be
+  // wedged when the budget expires. A Pong batch behind a peer that stopped
+  // reading is that batch.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  const CHUNK: usize = 125;
+  const BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (mut sr, mut sw) = s.split();
+
+  // A fragmented message the peer never finishes, accumulated under `handle`
+  // before anything closes.
+  let mut head = vec![0x01_u8, CHUNK as u8];
+  head.extend(std::iter::repeat_n(b'H', CHUNK));
+  let head_len = head.len();
+  let compio_buf::BufResult(res, _) = sw.write(head).await;
+  assert_eq!(res.expect("the head"), head_len);
+
+  let reader = compio_runtime::spawn(async move {
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      if let Err(e) = m {
+        ended = Some(e);
+        break;
+      }
+    }
+    (ended, cread)
+  });
+  let waited = std::time::Instant::now();
+  while probe.borrow().assembler.buffered() == 0 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the prefix must reach the assembler before the close"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+  assert_eq!(probe.borrow().assembler.buffered(), CHUNK);
+
+  cwrite
+    .close(CloseCode::Normal, "")
+    .await
+    .expect("the Close flushes");
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  // The peer pings and then stops reading: the owed Pongs wedge, and the echo
+  // arm's budget is what ends the connection.
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+  // …and nothing else is ever sent. No further data means no skipped run,
+  // so nothing in the event stream can say the message is over.
+
+  let (ended, cread) = compio::time::timeout(std::time::Duration::from_secs(5), reader)
+    .await
+    .expect("the echo budget ends the connection")
+    .unwrap();
+  assert!(
+    ended.is_none(),
+    "the flush timeout records an outcome rather than an error here: {ended:?}"
+  );
+  assert!(
+    !cread.closed().expect("an outcome is recorded").clean(),
+    "the peer never echoed, so the close is unclean"
+  );
+  // Unfixed — with this site's `reset()` deleted — this read 125.
+  assert_eq!(
+    probe.borrow().assembler.buffered(),
+    0,
+    "the flush-timeout settle must drop the partial too"
+  );
+  drop(cwrite);
+}
+
+#[compio::test]
+async fn a_timeout_close_still_hands_out_the_messages_it_already_holds() {
+  use compio_io::{AsyncWrite as _, util::Splittable as _};
+  use std::future::Future;
+
+  // Why `ready` is KEPT when Phase 1's settle records a timeout close, while
+  // the no-reader transitions clear it: this pump promises to hand out every
+  // complete message before it answers `None`, and a message that arrived
+  // before the close is one the application is still entitled to. Stated as a
+  // test rather than as a sentence in a comment, because the reset that sits
+  // beside it could clear `ready` just as easily and nothing would have said
+  // otherwise.
+  const BUDGET: std::time::Duration = std::time::Duration::from_millis(120);
+
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (_sr, mut sw) = s.split();
+
+  // Two whole messages in one write, so one feed assembles both and delivery
+  // hands out only the first — the second is what this test is about.
+  let mut wire = vec![0x81_u8, 3];
+  wire.extend_from_slice(b"one");
+  wire.push(0x81);
+  wire.push(3);
+  wire.extend_from_slice(b"two");
+  let len = wire.len();
+  let compio_buf::BufResult(res, _) = sw.write(wire).await;
+  assert_eq!(res.expect("the messages"), len);
+
+  // Polled ONCE, not spawned: on the split path the pump is `ReadHalf::next`,
+  // which this test drives itself one call at a time, and a spawned closer
+  // would race the first of those calls — enqueueing after the pump had
+  // already built its batch and then waiting for a pump nobody is running.
+  // One poll gets the Close into the queue and leaves the future pending.
+  let mut closer = Box::pin(cwrite.close(CloseCode::Normal, ""));
+  futures_util::future::poll_fn(|cx| {
+    assert!(closer.as_mut().poll(cx).is_pending());
+    std::task::Poll::Ready(())
+  })
+  .await;
+
+  let first = compio::time::timeout(std::time::Duration::from_secs(2), cread.next())
+    .await
+    .expect("the first message is already assembled")
+    .expect("a message")
+    .expect("a message, not an error");
+  assert_eq!(first, Message::Text("one".into()));
+  compio::time::timeout(std::time::Duration::from_secs(2), closer.as_mut())
+    .await
+    .expect("the Close flushed on that pass")
+    .expect("the Close flushed on that pass");
+  assert_eq!(
+    probe.borrow().ready.len(),
+    1,
+    "the second is queued, and the Close has flushed"
+  );
+  assert!(
+    probe.borrow().close_flushed_at.is_some(),
+    "so the protocol's close deadline is armed"
+  );
+
+  // Nothing polls the pump while the budget runs out — on this path the
+  // reader IS the pump — and the peer never echoes.
+  compio::time::sleep(BUDGET + std::time::Duration::from_millis(80)).await;
+
+  // The settle fires on this pass, BEFORE delivery. Unfixed — with that
+  // settle clearing `ready` as the no-reader transitions do — this call
+  // answered `None` and the message was lost.
+  let second = compio::time::timeout(std::time::Duration::from_secs(2), cread.next())
+    .await
+    .expect("the settle fires on this pass rather than parking")
+    .expect("the message queued before the close is still owed")
+    .expect("a message, not an error");
+  assert_eq!(second, Message::Text("two".into()));
+  assert!(
+    cread.closed().is_some(),
+    "and the outcome was recorded by the settle on that same pass"
+  );
+  assert!(
+    compio::time::timeout(std::time::Duration::from_secs(2), cread.next())
+      .await
+      .expect("and then it ends")
+      .is_none(),
+    "and only then, None"
+  );
+  assert!(
+    !cread.closed().expect("an outcome").clean(),
+    "the peer never echoed"
+  );
+}
+
+/// The `ErrorKind` a pump outcome carries, for tests that assert a sender saw
+/// the same one the connection recorded.
+#[cfg(test)]
+fn first_io_kind(ended: &Option<Error>) -> Option<std::io::ErrorKind> {
+  match ended {
+    Some(Error::Io(e)) => Some(e.kind()),
+    _ => None,
+  }
+}
+
+/// Drives a split client until the pump reports an error, and answers what the
+/// folder was still holding when it did.
+///
+/// The shared body of the four `terminate_io` regressions: each reaches a
+/// different irreversible transport condition, and every one of them must end
+/// with the partial dropped and the queue empty, because a sticky poison makes
+/// the pump answer the error before it ever reaches delivery.
+#[cfg(test)]
+async fn held_after_termination<S: crate::into_duplex::Duplex>(
+  cread: &mut ReadHalf<ClientRole, S>,
+  probe: &std::rc::Rc<std::cell::RefCell<Inner<ClientRole, S>>>,
+) -> (usize, usize, Option<Error>) {
+  let mut ended = None;
+  loop {
+    match compio::time::timeout(std::time::Duration::from_secs(5), cread.next()).await {
+      Ok(Some(Ok(_))) => continue,
+      Ok(Some(Err(e))) => {
+        ended = Some(e);
+        break;
+      }
+      Ok(None) => break,
+      Err(_) => panic!("the pump must terminate rather than park"),
+    }
+  }
+  let guard = probe.borrow();
+  (guard.assembler.buffered(), guard.ready.len(), ended)
+}
+
+#[compio::test]
+async fn a_close_flush_that_never_batched_releases_what_it_holds() {
+  use compio_io::{AsyncWrite as _, util::Splittable as _};
+  use std::future::Future;
+
+  // (a) The close flush expires while a plain batch is still wedged, so the
+  // Close never drained and `handle_timeout` has no verdict to report: the
+  // connection is poisoned rather than closed. The transport is already gone
+  // and the poison is sticky, so nothing held can ever be handed out.
+  const CHUNK: usize = 125;
+
+  let (c, s) = duplex_with_capacities(4 * 1024, 0);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_millis(100)),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (_sr, mut sw) = s.split();
+
+  // Two whole messages and a prefix, all before anything closes, and one pump
+  // pass to take them in: the first message is delivered, the second stays in
+  // `ready`, and the prefix stays in the folder. The pass has to happen HERE,
+  // before the wedging send — once the plain flush parks, Phase 4 never runs
+  // and nothing would ever be read at all.
+  let mut wire = vec![0x81_u8, 3];
+  wire.extend_from_slice(b"one");
+  wire.push(0x81);
+  wire.push(3);
+  wire.extend_from_slice(b"two");
+  wire.push(0x01);
+  wire.push(CHUNK as u8);
+  wire.extend(std::iter::repeat_n(b'H', CHUNK));
+  let len = wire.len();
+  let compio_buf::BufResult(res, _) = sw.write(wire).await;
+  assert_eq!(res.expect("the write"), len);
+
+  let first = compio::time::timeout(std::time::Duration::from_secs(2), cread.next())
+    .await
+    .expect("the messages are already on the wire")
+    .expect("a message")
+    .expect("a message, not an error");
+  assert_eq!(first.len(), 3);
+  assert_eq!(probe.borrow().ready.len(), 1, "the second is queued");
+  assert_eq!(
+    probe.borrow().assembler.buffered(),
+    CHUNK,
+    "the prefix is held"
+  );
+
+  // A 64 KiB send the peer never drains: the pump parks in an unbounded plain
+  // flush BEFORE delivery, so the queued message stays queued and the Close
+  // that follows cannot reach a batch.
+  {
+    let payload = vec![0xAB_u8; 64 * 1024];
+    let mut fut = Box::pin(cwrite.send_binary(&payload));
+    futures_util::future::poll_fn(|cx| {
+      assert!(fut.as_mut().poll(cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  let watch = probe.clone();
+  let reader = compio_runtime::spawn(async move {
+    let held = held_after_termination(&mut cread, &watch).await;
+    (held, cread)
+  });
+  compio::time::sleep(std::time::Duration::from_millis(30)).await;
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let close_err = compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the close resolves within the budget")
+    .unwrap()
+    .unwrap_err();
+  assert!(matches!(&close_err, Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut));
+
+  let ((held, queued, ended), _cread) =
+    compio::time::timeout(std::time::Duration::from_secs(5), reader)
+      .await
+      .expect("the reader observes the termination")
+      .unwrap();
+  assert!(
+    matches!(&ended, Some(Error::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut),
+    "the flush timeout with no verdict is an error, not an outcome: {ended:?}"
+  );
+  // Unfixed these read 125 and 1.
+  assert_eq!(held, 0, "a partial nothing can finish is not kept");
+  assert_eq!(
+    queued, 0,
+    "nor a message the sticky poison makes unreachable"
+  );
+}
+
+#[compio::test]
+async fn a_write_fault_releases_what_it_holds() {
+  use compio_io::{AsyncWrite as _, util::Splittable as _};
+  use std::future::Future;
+
+  // (b) The write path faults mid-batch. A partial frame may be on the wire,
+  // so the connection is poisoned for good.
+  const CHUNK: usize = 125;
+
+  let (c, s) = duplex_with_write_fault(4 * 1024);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (_sr, mut sw) = s.split();
+
+  // TWO whole messages and a prefix, and one pump pass to take them in, so
+  // that when the fault arms the state is one the test has CHECKED rather
+  // than one it hopes for: the first message delivered, the second queued,
+  // the prefix held. Without the pass the queue could be empty by then and
+  // the `ready` half of this test would prove nothing.
+  let mut wire = vec![0x81_u8, 3];
+  wire.extend_from_slice(b"one");
+  wire.push(0x81);
+  wire.push(3);
+  wire.extend_from_slice(b"two");
+  wire.push(0x01);
+  wire.push(CHUNK as u8);
+  wire.extend(std::iter::repeat_n(b'H', CHUNK));
+  let len = wire.len();
+  let compio_buf::BufResult(res, _) = sw.write(wire).await;
+  assert_eq!(res.expect("the write"), len);
+
+  let first = compio::time::timeout(std::time::Duration::from_secs(2), cread.next())
+    .await
+    .expect("the messages are already on the wire")
+    .expect("a message")
+    .expect("a message, not an error");
+  assert_eq!(first.len(), 3);
+  {
+    let guard = probe.borrow();
+    assert_eq!(
+      guard.ready.len(),
+      1,
+      "one message is queued when the fault arms"
+    );
+    assert_eq!(guard.assembler.buffered(), CHUNK, "and a prefix is held");
+  }
+
+  // 64 KiB, whose first 4 KiB arm the fault. Polled ONCE before the pump runs
+  // rather than spawned: a spawned sender races the pump's next pass, and if
+  // the pump wins it delivers the queued message before the batch even exists
+  // — which is how the `ready` half of this test measured nothing.
+  let payload = vec![0xAB_u8; 64 * 1024];
+  let mut sender = Box::pin(cwrite.send_binary(&payload));
+  futures_util::future::poll_fn(|cx| {
+    assert!(sender.as_mut().poll(cx).is_pending());
+    std::task::Poll::Ready(())
+  })
+  .await;
+  assert_eq!(
+    probe.borrow().ready.len(),
+    1,
+    "the queued message is still queued when the faulting batch is built"
+  );
+
+  let (held, queued, ended) = held_after_termination(&mut cread, &probe).await;
+  // The IN-HAND batch's sender, required to COMPLETE rather than merely
+  // awaited: this is the only path where `terminate_io` is handed a batch the
+  // state does not hold, and a helper that ignored that argument would leave
+  // this frame `Queued` for ever while a discarded timeout hid it.
+  let sent = compio::time::timeout(std::time::Duration::from_secs(2), sender.as_mut())
+    .await
+    .expect("the in-hand batch's sender must be failed, not left queued")
+    .expect_err("with the sticky kind the termination recorded");
+  assert!(
+    matches!(&sent, Error::Io(e) if Some(e.kind()) == first_io_kind(&ended)),
+    "the sender's kind is the connection's: {sent:?} against {ended:?}"
+  );
+  assert!(
+    matches!(&ended, Some(Error::Io(_))),
+    "the write fault surfaces as an error: {ended:?}"
+  );
+  // MEASURED unfixed, on this shape: held=125 queued=1.
+  assert_eq!(held, 0);
+  assert_eq!(queued, 0);
+}
+
+#[compio::test]
+async fn an_eof_in_the_parked_read_releases_what_it_holds() {
+  use compio_io::{AsyncWrite as _, util::Splittable as _};
+
+  // (c) The peer goes away with the connection still open: Phase 4's parked
+  // read answers EOF. Nothing more will ever arrive, so nothing held can ever
+  // be finished or delivered.
+  const CHUNK: usize = 125;
+
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let (mut cread, _cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (sr, mut sw) = s.split();
+
+  let mut wire = vec![0x81_u8, 3];
+  wire.extend_from_slice(b"one");
+  wire.push(0x81);
+  wire.push(3);
+  wire.extend_from_slice(b"two");
+  wire.push(0x01);
+  wire.push(CHUNK as u8);
+  wire.extend(std::iter::repeat_n(b'H', CHUNK));
+  let len = wire.len();
+  let compio_buf::BufResult(res, _) = sw.write(wire).await;
+  assert_eq!(res.expect("the write"), len);
+  // Both whole messages are handed out first; then the peer goes away.
+  drop(sw);
+  drop(sr);
+
+  let (held, queued, ended) = held_after_termination(&mut cread, &probe).await;
+  assert!(
+    matches!(&ended, Some(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+    "EOF before a close handshake is an error: {ended:?}"
+  );
+  // Unfixed this read 125.
+  assert_eq!(held, 0, "a partial the peer will never finish is not kept");
+  assert_eq!(queued, 0);
+}
+
+#[compio::test]
+async fn an_eof_behind_a_blocked_write_releases_what_it_holds() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // (d) The same EOF, reached through the OTHER read: the one the flush phase
+  // takes behind a blocked post-Close write.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  const CHUNK: usize = 125;
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(std::time::Duration::from_secs(5)),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (mut sr, mut sw) = s.split();
+
+  let mut head = vec![0x01_u8, CHUNK as u8];
+  head.extend(std::iter::repeat_n(b'H', CHUNK));
+  let head_len = head.len();
+  let compio_buf::BufResult(res, _) = sw.write(head).await;
+  assert_eq!(res.expect("the head"), head_len);
+
+  let watch = probe.clone();
+  let reader = compio_runtime::spawn(async move {
+    let held = held_after_termination(&mut cread, &watch).await;
+    (held, cread)
+  });
+  let waited = std::time::Instant::now();
+  while probe.borrow().assembler.buffered() == 0 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the prefix must reach the assembler first"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+
+  cwrite
+    .close(CloseCode::Normal, "")
+    .await
+    .expect("the Close flushes");
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+
+  // The peer stops WRITING, and only that: its read half stays alive, so our
+  // Pong batch remains merely blocked rather than broken, and the read the
+  // flush phase races against it is the one that answers EOF. Dropping both
+  // halves instead reaches the write-fault site, which is (b)'s subject.
+  drop(sw);
+
+  let ((held, queued, ended), _cread) =
+    compio::time::timeout(std::time::Duration::from_secs(5), reader)
+      .await
+      .expect("the EOF ends the connection")
+      .unwrap();
+  assert!(
+    matches!(&ended, Some(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+    "EOF behind the blocked write is an error: {ended:?}"
+  );
+  // Unfixed this read 125.
+  assert_eq!(held, 0);
+  assert_eq!(queued, 0);
+  drop(sr);
+  drop(cwrite);
+}
+
+#[compio::test]
+async fn a_termination_wakes_a_sender_blocked_behind_the_wedged_batch() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // A control frame queued while a post-Close batch is wedged waits on its
+  // own `FrameState`, and only the pump changes that state. A termination
+  // that failed `outbound` but not the ACTIVE batch, and returned without
+  // ringing the doorbell, left this sender asleep on a `Queued` state under a
+  // sticky poison — nothing would ever run again to settle it.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default()
+      .with_close_timeout(std::time::Duration::from_secs(30)),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (mut sr, mut sw) = s.split();
+
+  let watch = probe.clone();
+  let reader = compio_runtime::spawn(async move {
+    let held = held_after_termination(&mut cread, &watch).await;
+    (held, cread)
+  });
+
+  cwrite
+    .close(CloseCode::Normal, "")
+    .await
+    .expect("the Close flushes");
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+
+  // The peer pings and stops reading: the Pong batch wedges.
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+
+  // A control frame of our own, behind that wedge, in a SPAWNED task: it must
+  // be genuinely ASLEEP on the doorbell when the termination happens. A future
+  // the test polls itself re-reads its frame's state on the next poll and
+  // needs no wake at all, which is how a missing notify hides.
+  let pinger = compio_runtime::spawn(async move {
+    let outcome = cwrite.ping(b"mine").await;
+    (outcome, cwrite)
+  });
+  let waited = std::time::Instant::now();
+  while probe.borrow().outbound.is_empty() {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(1),
+      "the ping must be queued behind the wedged batch"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+  // The wedged batch itself is NOT observable here: `PumpIo` moves it out of
+  // the shared state for the duration of the flush await, which is precisely
+  // why the termination arms have to drop that guard before they can fail it
+  // — and why failing only `outbound` left it behind.
+
+  // The peer's write side goes away: the read the flush phase races answers
+  // EOF, and the connection is over for good.
+  drop(sw);
+
+  // Unfixed the ping never resolved: its frame's state stayed `Queued`, the
+  // active batch was left in the state, and no doorbell rang — so this timed
+  // out.
+  let (ping_outcome, mut cwrite) = compio::time::timeout(std::time::Duration::from_secs(2), pinger)
+    .await
+    .expect("a termination must wake every sender it strands")
+    .unwrap();
+  let ping_err = ping_outcome.expect_err("and hand it the sticky error");
+  assert!(
+    matches!(&ping_err, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+    "with the kind the termination recorded: {ping_err:?}"
+  );
+
+  let ((_held, _queued, ended), _cread) =
+    compio::time::timeout(std::time::Duration::from_secs(5), reader)
+      .await
+      .expect("the reader observes the termination")
+      .unwrap();
+  assert!(
+    matches!(&ended, Some(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+    "{ended:?}"
+  );
+  {
+    let guard = probe.borrow();
+    assert!(
+      guard.pending_write.is_none(),
+      "the active batch is failed and gone, not left in the state"
+    );
+    assert!(guard.outbound.is_empty(), "and the queue with it");
+  }
+  // And a second send is refused at once by the sticky poison.
+  let again = compio::time::timeout(std::time::Duration::from_secs(2), cwrite.ping(b"again"))
+    .await
+    .expect("a poisoned connection refuses without waiting")
+    .expect_err("with the recorded kind");
+  assert!(
+    matches!(&again, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+    "{again:?}"
+  );
+  drop(sr);
+}
+
+#[compio::test]
+async fn phase_four_is_only_reached_with_nothing_outstanding_to_wake() {
+  use compio_io::util::Splittable as _;
+
+  // The Phase-4 EOF arm notifies the doorbell like every other termination —
+  // the entrance does it, so no arm can forget — but on THIS arm the notify
+  // wakes nobody, and that is a property of the pump rather than an accident
+  // worth leaving unstated: Phase 2 empties `outbound` into a batch on every
+  // pass and Phase 3 must finish that batch before Phase 4 is reached, so
+  // when the pump parks on a read there is no `Queued` frame for a sender to
+  // be waiting on. A sender CAN only be stranded where a batch and a queued
+  // frame coexist, which is the flush phase — the sibling test above.
+  //
+  // Pinned rather than argued, because a future change that let Phase 4 be
+  // reached with something outstanding would make that notify load-bearing
+  // and nothing else would say so.
+  let (c, s) = duplex();
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default(),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (sr, sw) = s.split();
+
+  // The reader IS the pump, so it starts first; only then can a send
+  // complete, and only a completed send leaves the pump with nothing
+  // outstanding.
+  let watch = probe.clone();
+  let reader = compio_runtime::spawn(async move {
+    let held = held_after_termination(&mut cread, &watch).await;
+    (held, cread)
+  });
+  cwrite
+    .send_binary(&[0xCD_u8; 32])
+    .await
+    .expect("the peer's pipe is unbounded");
+  compio::time::sleep(std::time::Duration::from_millis(30)).await;
+  {
+    let guard = probe.borrow();
+    assert!(
+      guard.outbound.is_empty(),
+      "nothing is queued when the pump parks on a read"
+    );
+    assert!(
+      guard.pending_write.is_none(),
+      "and no batch is in flight either — so the EOF below strands no sender"
+    );
+  }
+
+  drop(sw);
+
+  let ((_held, _queued, ended), _cread) =
+    compio::time::timeout(std::time::Duration::from_secs(5), reader)
+      .await
+      .expect("the EOF ends the connection")
+      .unwrap();
+  assert!(
+    matches!(&ended, Some(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+    "{ended:?}"
+  );
+  // And a send AFTER it is refused at once by the sticky poison rather than
+  // parked on a pump that will never run again.
+  let refused = compio::time::timeout(
+    std::time::Duration::from_secs(2),
+    cwrite.send_binary(&[0x01_u8; 4]),
+  )
+  .await
+  .expect("a poisoned connection refuses without waiting")
+  .expect_err("with the recorded kind");
+  assert!(
+    matches!(&refused, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+    "{refused:?}"
+  );
+  drop(sr);
+}
+
+#[compio::test]
+async fn the_driver_retains_exactly_one_read_chunk() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // The retained inbound bound, read off the vector rather than inferred from
+  // an allocator total: ONE `READ_CHUNK`, whatever the connection has done.
+  // It was two — a scratch and a stash, swapped on every read and each
+  // resized back to a full chunk — so a connection that had read once held
+  // ~32 KiB in two vectors. Both read paths are driven here, because the
+  // recycling used to be a claim about two of them agreeing.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  const PONG_LEN: usize = 10;
+  const CLOSE_LEN: usize = 8;
+  // An unmasked server-to-client Text frame with a one-byte payload.
+  const DATA_FRAME: [u8; 3] = [0x81, 0x01, b'x'];
+  // More than eight chunks' worth on each path.
+  const FLOOD: usize = 10 * (READ_CHUNK / DATA_FRAME.len()) + 1;
+  const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch must not fit the pipe"
+    );
+  }
+
+  let (c, s) = duplex_with_capacities(PIPE_CAPACITY, 0);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  let probe = cread.inner.clone();
+  let (mut sr, mut sw) = s.split();
+
+  let reader = compio_runtime::spawn(async move {
+    while let Some(m) = cread.next().await {
+      if m.is_err() {
+        break;
+      }
+    }
+    cread
+  });
+
+  // ── the ordinary path: Phase 4's parked read, many chunks of it ──────────
+  let mut flood = Vec::with_capacity(FLOOD * DATA_FRAME.len());
+  for _ in 0..FLOOD {
+    flood.extend_from_slice(&DATA_FRAME);
+  }
+  let expected = flood.len();
+  let compio_buf::BufResult(res, _) = sw.write(flood).await;
+  assert_eq!(res.expect("the flood"), expected);
+  let waited = std::time::Instant::now();
+  while probe.borrow().reads_seen < 8 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(2),
+      "the ordinary read path must run at least eight times; it ran {}",
+      probe.borrow().reads_seen
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+  {
+    let guard = probe.borrow();
+    // Unfixed this was two vectors of 16 384 each, so 32 768 between them.
+    assert_eq!(
+      guard.inbound_capacity_high_water, READ_CHUNK,
+      "one chunk retained across {} ordinary reads",
+      guard.reads_seen
+    );
+  }
+
+  // ── the read-behind path: the same vector, the other phase ───────────────
+  cwrite
+    .close(CloseCode::Normal, "")
+    .await
+    .expect("the Close flushes");
+  let compio_buf::BufResult(res, _ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  assert_eq!(res.expect("the peer drains our Close"), CLOSE_LEN);
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  res.expect("the pings");
+  let mut seen = probe.borrow().pings_seen;
+  let waited = std::time::Instant::now();
+  while seen < PINGS {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(2),
+      "the driver must owe {PINGS} pongs; it counted {seen}"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    seen = probe.borrow().pings_seen;
+  }
+  let mut flood = Vec::with_capacity(FLOOD * DATA_FRAME.len());
+  for _ in 0..FLOOD {
+    flood.extend_from_slice(&DATA_FRAME);
+  }
+  let expected = flood.len();
+  let compio_buf::BufResult(res, _) = sw.write(flood).await;
+  assert_eq!(res.expect("the second flood"), expected);
+  let waited = std::time::Instant::now();
+  while probe.borrow().observation_reads < 8 {
+    assert!(
+      waited.elapsed() < std::time::Duration::from_secs(2),
+      "the read-behind path must run at least eight times; it ran {}",
+      probe.borrow().observation_reads
+    );
+    compio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+  {
+    let guard = probe.borrow();
+    assert_eq!(
+      guard.inbound_capacity_high_water, READ_CHUNK,
+      "and one chunk across {} reads behind the blocked write",
+      guard.observation_reads
+    );
+  }
+
+  // Let it end so the test does not leave a task parked.
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the peer's Close");
+  let cread = compio::time::timeout(std::time::Duration::from_secs(5), reader)
+    .await
+    .expect("the close handshake completes")
+    .unwrap();
+  assert!(cread.closed().expect("an outcome").clean());
+  assert_eq!(
+    probe.borrow().inbound_capacity(),
+    READ_CHUNK,
+    "and still one chunk at the end"
+  );
+  drop(cwrite);
+  drop(sr);
+}
+
+#[compio::test]
+async fn a_cancelled_read_gives_back_the_window_it_armed() {
+  use std::future::Future;
+
+  // ONE inbound vector means its `len` IS the protocol's unconsumed input, so
+  // an armed-but-uncommitted read window is 16 KiB of zeros this driver wrote
+  // sitting where the peer's bytes go. Every ordinary exit from a read commits
+  // the window; a caller that drops `next()` from inside the `.await` has no
+  // exit to commit on, and the guard's own drop is what must give it back.
+  // Unfixed, the next pass fed those zeros to `handle` as if the peer had sent
+  // them — a continuation frame with no message — and the connection died.
+  //
+  // The two-buffer design could not have this defect: a scratch separate from
+  // the input carried no meaning in its `len`. It is the price of one vector,
+  // and it is paid in `PumpIo::drop`.
+  let (mut client, mut server) = pair();
+  let probe = server.inner.clone();
+  {
+    let mut fut = Box::pin(server.next());
+    futures_util::future::poll_fn(|cx| {
+      assert!(
+        fut.as_mut().poll(cx).is_pending(),
+        "the pump must park on its read for there to be a window to cancel"
+      );
+      std::task::Poll::Ready(())
+    })
+    .await;
+  }
+  {
+    let guard = probe.borrow();
+    assert!(
+      guard.inbound.is_empty(),
+      "the cancelled read left {} bytes of its own window behind",
+      guard.inbound.len()
+    );
+    assert_eq!(
+      guard.inbound_capacity(),
+      READ_CHUNK,
+      "and gave back the window without giving back the allocation"
+    );
+  }
+  // The connection still reads what the peer ACTUALLY sends.
+  client.send_text("after cancel").await.unwrap();
+  let m = server
+    .next()
+    .await
+    .expect("a message rather than a terminal outcome")
+    .expect("and not a protocol error over zeros nobody sent");
+  assert_eq!(m, Message::Text("after cancel".into()));
 }

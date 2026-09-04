@@ -482,8 +482,9 @@ fn prepare_text_is_panic_free() {
 // ── the timer tick, and the monotonicity check inside it ─────────────────────
 //
 // `Connection::accept_now` is the new leaf: one `Ord` comparison and a store,
-// reached from all three `now`-taking entry points. `handle_timeout` is the
-// shallowest of the three by a wide margin — its whole tree is that comparison,
+// reached from all four `now`-taking entry points (`handle` and `observe`
+// share one refusal site; `poll_transmit` and `handle_timeout` have their own).
+// `handle_timeout` is the shallowest of the four by a wide margin — its whole tree is that comparison,
 // two `matches!` on the lifecycle, two `Option` compares and one
 // `checked_add_duration` — so it is the one that can be link-checked, and
 // checking it compiles the leaf. `handle` and `poll_transmit` reach the same
@@ -552,8 +553,9 @@ fn handle_timeout_is_panic_free() {
   // it here would abort `cargo test -p websocket-proto --all-features`, which is
   // a CI step. Measured: it did, before this gate. The feature-on behaviour has
   // its own coverage, deliberately kept OUT of this file and away from the
-  // proof: `connection::tests::assert_contracts` asserts the panic at all three
-  // entry points with `#[should_panic]` matching the contract's own words.
+  // proof: `connection::tests::assert_contracts` asserts the panic at all four
+  // `now`-taking entry points with `#[should_panic]` matching the contract's
+  // own words.
   //
   // The SHIM itself stays ungated, and must: `xtask shim-check` fails any shim
   // carrying a `cfg` except the single `shim_lie` control, because a shim the

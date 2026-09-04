@@ -38,9 +38,10 @@
 //! included — not "the crate's whole
 //! error set", which would also sweep in the handshake and frame errors this
 //! taxonomy has never ruled on. Of that set, the three clock refusals
-//! (`ClockWentBackwards` on `HandleError`, `EncodeError` and `TimeoutError`)
-//! are already routed through this wall; among the REST, **exactly one is a
-//! candidate**.
+//! (`ClockWentBackwards` on `HandleError`, `EncodeError` and `TimeoutError` —
+//! three error TYPES over four entry points, since `handle` and `observe`
+//! share one refusal site) are already routed through this wall; among the
+//! REST, **exactly one is a candidate**.
 //!
 //! | variant | panic-eligible? | why |
 //! |---|---|---|
@@ -127,16 +128,43 @@
 /// # The gap, as a number
 ///
 /// COUNTED, so the next batch has a target rather than an intention: of the
-/// **46** public functions in this crate that take a `&[u8]` / `&mut [u8]` /
+/// **47** public functions in this crate that take a `&[u8]` / `&mut [u8]` /
 /// `&str` — the shape peer-supplied bytes arrive in — **7** are covered by a
-/// `#[no_panic]` shim and **39** are not. (The first count of this was 36/5/31,
+/// `#[no_panic]` shim and **40** are not. (The first count of this was 36/5/31,
 /// from a regex that required an indented `pub fn` and so could not see a
 /// free function; `mask` and the UTF-8 validator's `feed` were among the ones
-/// it missed. The number is the second one.) The uncovered set is headed by
-/// `Connection::handle`, whose call tree is the entire inbound state machine,
-/// and includes `frame::decode_close_payload`, the whole `handshake::h1`
-/// surface (`classify`, `handle`, `encode_response`, `encode_rejection`) and
-/// `negotiation`'s three parsers.
+/// it missed. The second was 46/7/39, and `Connection::observe` is the
+/// forty-seventh: it shares `handle`'s tree, so it joins the uncovered side.)
+/// The uncovered set is headed by `Connection::handle`, whose call tree is the
+/// entire inbound state machine, and includes `frame::decode_close_payload`,
+/// the whole `handshake::h1` surface (`classify`, `handle`, `encode_response`,
+/// `encode_rejection`) and `negotiation`'s three parsers.
+///
+/// The COMMAND, so the number is re-derivable rather than merely asserted. It
+/// counts declarations with UNRESTRICTED `pub` — a `pub(crate)` helper is not
+/// part of the surface peer bytes arrive through — whose parameter list names
+/// one of the three shapes:
+///
+/// ```text
+/// rg -U --pcre2 --no-filename -o \
+///    "pub (?:const |unsafe |async )*fn \w+[^(]*\([^)]*&(?:'\w+ )?(?:mut )?(?:\[u8\]|str)" \
+///    websocket-proto/src | grep -c '^pub '
+/// ```
+///
+/// Drop the `grep` to see the names rather than the count; each match begins
+/// at its `pub`, and a multi-line signature prints as several lines, which is
+/// what the `grep` is counting past. The one thing it approximates is that the
+/// byte shape must appear before the parameter list's first `)` rather than
+/// anywhere inside a balanced one — true of every signature in this crate
+/// today, and cross-checked against a balanced-paren scan that returns the
+/// same 47 names.
+///
+/// Seven of those names are the shimmed ones: `FrameHeader::encode`,
+/// `FrameHeader::decode`, `mask`, and the `test-no-panic` surface
+/// `base64_encode`, `Utf8Validator::feed`, `Connection::prepare_binary` and
+/// `Connection::prepare_text`. `tests/no_panic.rs` shims an eighth entry
+/// point, `Connection::handle_timeout`, which takes no bytes and so is not in
+/// this population at all — which is why eight shims cover seven of them.
 ///
 /// Widening the proof is deliberately NOT this branch's work: `tests/no_panic.rs`
 /// records that the connection tree does not inline into one shim without
