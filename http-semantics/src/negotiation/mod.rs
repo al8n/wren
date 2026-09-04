@@ -353,6 +353,31 @@ where
   preferences(lines, Element::Token)
 }
 
+/// Which message an `Accept-Encoding` field was read from.
+///
+/// RFC 9110 §12.5.3 gives the field a job in each direction — "When sent by a
+/// user agent in a request, Accept-Encoding indicates the content codings
+/// acceptable in a response." and "When sent by a server in a response,
+/// Accept-Encoding provides information about which content codings are
+/// preferred in the content of a subsequent request to the same resource." —
+/// and one of its rules is written for one direction only, which is why this is
+/// an argument rather than something [`encoding_acceptability`] could infer.
+///
+/// Only the ABSENT field parts the two. Rule 7 has a field that is there read
+/// alike whichever message carried it: "The field value is evaluated the same
+/// way as in a request."
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Direction {
+  /// The field was in a request. RFC 9110 §12.5.3's rule 1 is written about
+  /// this direction, and an absent field means "If no Accept-Encoding header
+  /// field is in the request, any content coding is considered acceptable by
+  /// the user agent."
+  Request,
+  /// The field was in a response, where §12.5.3 gives an ABSENT field no
+  /// meaning at all — see [`Acceptability::NotAdvertised`].
+  Response,
+}
+
 /// What RFC 9110 §12.5.3 says about one content coding, for one
 /// `Accept-Encoding` field. Three states, because that section reaches its
 /// verdict through three different sentences and collapsing them would report
@@ -363,15 +388,23 @@ pub enum Acceptability {
   ///
   /// Two of §12.5.3's rules land here, and neither states a weight. Rule 1:
   /// "If no Accept-Encoding header field is in the request, any content coding
-  /// is considered acceptable by the user agent." Rule 2's default, for a
-  /// representation with no content coding the field does not exclude. So
+  /// is considered acceptable by the user agent." And rule 2's default, for a
+  /// representation with no content coding over a field that names neither
+  /// `identity` nor `"*"` — where §12.4.3 would answer
+  /// [`Unmentioned`](Self::Unmentioned) for a named coding. So
   /// [`weight`](Self::weight) is `None` rather than [`Weight::ONE`]: §12.4.2's
   /// default of 1 is what an ABSENT `q` on a PRESENT member means.
   AcceptableByDefault,
-  /// The field named this weight for the coding — through an entry that names
-  /// it, through the `"*"` entry that stands in for one, or through rule 2's
-  /// `*;q=0`. Acceptable iff the weight is not [`Weight::ZERO`]. RFC 9110
-  /// §12.4.2: "a value of 0 means "not acceptable"".
+  /// The field named this weight — through an entry that names the coding, or
+  /// through the `"*"` entry that stands in for one. Acceptable iff the weight
+  /// is not [`Weight::ZERO`]. RFC 9110 §12.4.2: "a value of 0 means "not
+  /// acceptable"".
+  ///
+  /// A representation with no content coding reaches this through an entry
+  /// naming `identity`, and through exactly one wildcard: rule 2's `*;q=0`. A
+  /// wildcard carrying any other weight does not reach that state at all — see
+  /// [`encoding_acceptability`]'s derivation — and answers
+  /// [`AcceptableByDefault`](Self::AcceptableByDefault) instead.
   Weighed(Weight),
   /// Unacceptable because the field mentions it nowhere and carries no
   /// wildcard to stand in.
@@ -381,17 +414,42 @@ pub enum Acceptability {
   /// from `Weighed(Weight::ZERO)`: the field said NOTHING here where that one
   /// says zero, and the two come from different sections.
   Unmentioned,
+  /// [`Direction::Response`] with no field at all: RFC 9110 §12.5.3 says
+  /// nothing about this case, so neither does this.
+  ///
+  /// **Not a verdict, which is why [`is_acceptable`](Self::is_acceptable)
+  /// answers `None` here.** The section's absence rule is written about the
+  /// other direction — "If no Accept-Encoding header field is in the request,
+  /// any content coding is considered acceptable by the user agent." — and it
+  /// gives a response's field meaning only when it is PRESENT: "When the
+  /// Accept-Encoding header field is present in a response, it indicates what
+  /// content codings the resource was willing to accept in the associated
+  /// request." A response that carries no such field has advertised nothing.
+  ///
+  /// Answering [`AcceptableByDefault`](Self::AcceptableByDefault) here, as this
+  /// module did before the direction was an argument, extends rule 1 across the
+  /// direction it names and tells a client that a server which said nothing
+  /// accepts everything — which a client can then act on by encoding its next
+  /// request.
+  NotAdvertised,
 }
 
 impl Acceptability {
   /// The verdict RFC 9110 §12.5.3 asks for: "A server tests whether a content
   /// coding for a given representation is acceptable using these rules".
+  ///
+  /// `None` where the section reaches no verdict, which is
+  /// [`NotAdvertised`](Self::NotAdvertised) and nothing else. An `Option` rather
+  /// than a `bool` because both bools would be wrong there: `true` says a server
+  /// that advertised nothing accepts this coding, and `false` says it refuses
+  /// one it may well accept.
   #[inline]
-  pub const fn is_acceptable(self) -> bool {
+  pub const fn is_acceptable(self) -> Option<bool> {
     match self {
-      Self::AcceptableByDefault => true,
-      Self::Weighed(weight) => weight.thousandths() != Weight::ZERO.thousandths(),
-      Self::Unmentioned => false,
+      Self::AcceptableByDefault => Some(true),
+      Self::Weighed(weight) => Some(weight.thousandths() != Weight::ZERO.thousandths()),
+      Self::Unmentioned => Some(false),
+      Self::NotAdvertised => None,
     }
   }
 
@@ -407,7 +465,7 @@ impl Acceptability {
   pub const fn weight(self) -> Option<Weight> {
     match self {
       Self::Weighed(weight) => Some(weight),
-      Self::AcceptableByDefault | Self::Unmentioned => None,
+      Self::AcceptableByDefault | Self::Unmentioned | Self::NotAdvertised => None,
     }
   }
 }
@@ -417,10 +475,12 @@ impl Acceptability {
 ///
 /// `coding` is the representation's content coding, or `None` where it HAS
 /// none, which is rule 2's subject and not a missing argument. NO lines is an
-/// absent field, which is rule 1's: a field is present exactly when a field line
-/// names it, so `Accept-Encoding:` arrives as one line whose value is empty and
-/// an absent field as none. Bytes rather than `&str` because §8.4.1 settles the
-/// comparison: "All content codings are case-insensitive".
+/// absent field: a field is present exactly when a field line names it, so
+/// `Accept-Encoding:` arrives as one line whose value is empty and an absent
+/// field as none. `direction` says which message carried it, and changes
+/// exactly one answer — see [`Direction`] and
+/// [`Acceptability::NotAdvertised`]. Bytes rather than `&str` because §8.4.1
+/// settles the comparison: "All content codings are case-insensitive".
 ///
 /// # Every rule §12.5.3 states about acceptability, and where it is read
 ///
@@ -428,16 +488,22 @@ impl Acceptability {
 /// neither lists nor covers with `"*"`, so two more sentences are read.
 ///
 /// 1. **Rule 1**, "If no Accept-Encoding header field is in the request, any
-///    content coding is considered acceptable by the user agent." — no lines,
-///    so [`Acceptability::AcceptableByDefault`], whatever `coding` is.
+///    content coding is considered acceptable by the user agent." — no lines
+///    AND [`Direction::Request`], so [`Acceptability::AcceptableByDefault`],
+///    whatever `coding` is. The rule names its direction, so no lines on a
+///    RESPONSE is a case it does not reach and answers
+///    [`Acceptability::NotAdvertised`].
 /// 2. **Rule 2**, "If the representation has no content coding, then it is
 ///    acceptable by default unless specifically excluded by the Accept-Encoding
 ///    header field stating either `identity;q=0` or `*;q=0` without a more
-///    specific entry for `identity`." — `coding` is `None`. An entry naming
-///    `identity` is that "more specific entry" and governs, weight and all; a
-///    `*;q=0` with no such entry excludes; anything else is the default.
-///    Note what this does NOT do: a `*;q=0.5` does not weigh a representation
-///    that has no coding, because rule 2 names only `*;q=0` as reaching it.
+///    specific entry for `identity`." — `coding` is `None`, or names `identity`,
+///    which is the same state; see the section below. An entry naming
+///    `identity` is that "more specific entry" and governs; failing that, a
+///    `*;q=0` — and only a zero one — excludes, which is this clause's own
+///    work rather than the asterisk sentence's; failing both, the DEFAULT this
+///    rule names. That default is the one place the no-coding case parts from a
+///    named one: it is the opposite of §12.4.3's answer for a value the field
+///    never mentions.
 /// 3. **Rule 3**, "If the representation's content coding is one of the content
 ///    codings listed in the Accept-Encoding field value, then it is acceptable
 ///    unless it is accompanied by a qvalue of 0." — an entry naming `coding`
@@ -457,9 +523,108 @@ impl Acceptability {
 ///    carries no wildcard, so every coding is `Unmentioned` and a representation
 ///    with none is acceptable by default. A special case for it would be a
 ///    second answer to a question already answered.
-/// 7. **§12.5.3's response direction**, "The field value is evaluated the same
-///    way as in a request." — so this one function serves both, and the
-///    direction is not an argument.
+/// 7. **§12.5.3's response direction**, "When the Accept-Encoding header field
+///    is present in a response, it indicates what content codings the resource
+///    was willing to accept in the associated request. The field value is
+///    evaluated the same way as in a request." — a PRESENT response field, read
+///    by 2 to 6 exactly as a request's is. So `direction` reaches no arm of the
+///    walk and no arm of the match; it decides the zero-line case and nothing
+///    else, which is all rule 1's own scope requires.
+///
+/// # `identity` and no coding at all are one state, and `"*"` reaches it only
+/// at zero
+///
+/// Two things, derived rather than assumed, because getting either wrong makes
+/// one representation get two answers depending on how a caller spells it. They
+/// are independent: the first stands whichever way the second goes.
+///
+/// **A representation does not HAVE the coding `identity`.** RFC 9110 §12.5.3:
+/// "An "identity" token is used as a synonym for "no encoding" in order to
+/// communicate when no encoding is preferred." §8.4 makes that exclusive rather
+/// than merely idiomatic: "Note that the coding named "identity" is reserved for
+/// its special role in Accept-Encoding and thus SHOULD NOT be included." — in a
+/// `Content-Encoding` — and §18.6's registry lists the name with the
+/// description `Reserved`, pointing at §12.5.3 rather than at §8.4.1 where the
+/// real codings are defined. So `None` and `Some(b"identity")` name one
+/// representation state, and this normalises the second onto the first
+/// (case-insensitively, per §8.4.1's "All content codings are
+/// case-insensitive"). Two spellings of one thing may not get two answers.
+///
+/// **A `"*"` entry reaches that state only at zero, and rule 2 is the whole of
+/// why it reaches it at all.** The two candidate readings are: `"*"` matches
+/// this state like any other and lends it whatever weight it carries; or `"*"`
+/// does not match it, and rule 2 separately names `*;q=0` as an excluder. Three
+/// things select the second.
+///
+/// - **Rule 2's `*;q=0` clause is load-bearing under one reading and
+///   decorative under the other.** If `"*"` matched this state generally, the
+///   clause would follow from the asterisk sentence plus §12.4.2's "a value of 0
+///   means "not acceptable"", and so would `identity;q=0`, and so would "without
+///   a more specific entry for `identity`" — the whole of rule 2 after
+///   "acceptable by default" would restate machinery stated elsewhere. If `"*"`
+///   does not match it, rule 2 is the only place the `*;q=0` exclusion comes
+///   from, and the precedence sub-clause is what keeps an explicit `identity`
+///   entry ahead of it. A reading that gives a sentence the RFC wrote something
+///   to do beats one that makes it ornament.
+///
+///   **And this section marks its restatements.** Rule 3 restates §12.4.2 and
+///   says so in its own parenthesis: "As defined in Section 12.4.2, a qvalue of
+///   0 means "not acceptable"." Rule 2 carries no such marker, so it does not
+///   read as a restatement.
+/// - **The asterisk sentence is quantified over something this state is not.**
+///   It matches "any available content coding not explicitly listed in the
+///   field", and §8.4 has a representation's codings listed in `Content-Encoding`
+///   with `identity` reserved out of it. A representation with no coding has no
+///   available content coding for that sentence to range over.
+/// - **The grammar separates the two.** `codings = content-coding / "identity" /
+///   "*"` gives `identity` an alternative of its own beside `content-coding`, so
+///   a rule quantified over a `content-coding` does not reach it. That
+///   separation is SEMANTIC, not lexical: the three alternatives derive one
+///   language, which is why one element rule reads all of them, and it is the
+///   meanings that are distinct.
+///
+/// The section's own example does NOT decide this, and is reported as neutral
+/// rather than pressed into service: `Accept-Encoding: gzip;q=1.0, identity;
+/// q=0.5, *;q=0` pairs an explicit `identity` entry with `*;q=0`, and under both
+/// readings that `*;q=0` excludes the uncoded representation and the explicit
+/// entry overrides it. Both readings make the spelling natural and both give it
+/// the same answers.
+///
+/// **What the rejected reading costs, which is the opposite of what it looked
+/// like.** Over `Accept-Encoding: *;q=0.001, gzip;q=0.5` it hands the uncoded
+/// representation `Weighed(1)`, ranking it below `gzip` — turning a status rule
+/// 2 states unconditionally, "acceptable by default", into a near-refusal the
+/// field never wrote. Reading a weight off `"*"` there is not preserving the
+/// client's ordering; it is inventing one, in the direction that most damages
+/// the representation rule 2 protects.
+///
+/// # The domain: ONE coding, and a present field
+///
+/// Two narrowings against §12.5.3's own subject, stated because neither is
+/// visible from the signature.
+///
+/// **One coding, where a representation may carry several.** RFC 9110 §12.5.3:
+/// "A representation could be encoded with multiple content codings." §8.4 has
+/// the sender list them "in the order in which they were applied", so
+/// `Content-Encoding: gzip, br` is one representation with two. This answers
+/// about one, which is the unit §12.5.3's own rules are stated over — "A server
+/// tests whether a content coding for a given representation is acceptable
+/// using these rules" — and a caller holding two asks twice. How to compose the
+/// two answers is not in this section either: the composition a caller wants is
+/// almost always the conjunction, since every coding listed has been applied
+/// and all of them have to be decodable, but that sentence is the caller's and
+/// not one this crate can cite.
+///
+/// **A field that is there.** Rule 7 carries the response direction for a field
+/// that is PRESENT: "When the Accept-Encoding header field is present in a
+/// response, it indicates what content codings the resource was willing to
+/// accept in the associated request." Rule 1's absence case is written about the
+/// REQUEST. Answering [`Acceptability::AcceptableByDefault`] for a RESPONSE that
+/// carries no such field would extend rule 1 past the direction it names, so
+/// this does not: [`Direction`] is an argument and the case answers
+/// [`Acceptability::NotAdvertised`], which is no verdict at all. Naming an
+/// extrapolation is not the same as declining to make one, and this module made
+/// one for a round before saying so.
 ///
 /// # Two rules of §12.5.3 that this deliberately does not answer
 ///
@@ -511,14 +676,22 @@ impl Acceptability {
 /// [`NegotiationError`], from the walk beneath this: the field must parse
 /// before it can be asked anything, and only the first fault is reported.
 pub fn encoding_acceptability<'a, I>(
+  direction: Direction,
   coding: Option<&[u8]>,
   lines: I,
 ) -> Result<Acceptability, NegotiationError>
 where
   I: IntoIterator<Item = &'a [u8]>,
 {
-  // Rule 2's "more specific entry" is an entry naming `identity`, so a
-  // representation with no coding is matched against that name.
+  // `identity` names no coding a representation can have (RFC 9110 §8.4
+  // reserves it out of `Content-Encoding`), so the two spellings of one state
+  // are normalised onto one path before anything is read. §8.4.1: "All content
+  // codings are case-insensitive". Rule 2's "more specific entry" is then an
+  // entry naming `identity`, which is what this state is matched against.
+  let coding = match coding {
+    Some(name) if !name.eq_ignore_ascii_case(IDENTITY) => Some(name),
+    _ => None,
+  };
   let wanted = coding.unwrap_or(IDENTITY);
   let mut lines_seen = 0usize;
   let mut named: Option<Weight> = None;
@@ -538,18 +711,29 @@ where
     }
   }
   if lines_seen == 0 {
-    // Rule 1, about the field's presence rather than its content.
-    return Ok(Acceptability::AcceptableByDefault);
+    // The one place the direction parts the two, and rule 1 is written for one
+    // of them: "If no Accept-Encoding header field is in the request, any
+    // content coding is considered acceptable by the user agent." A response
+    // carrying no such field is a case §12.5.3 does not rule on.
+    return Ok(match direction {
+      Direction::Request => Acceptability::AcceptableByDefault,
+      Direction::Response => Acceptability::NotAdvertised,
+    });
   }
   Ok(match (coding, named, wildcard) {
-    // Rules 2 and 3: an entry that names it governs, whatever it says.
+    // Rules 2 and 3: an entry that names it governs, whatever it says. For the
+    // no-coding state that entry is rule 2's "more specific entry".
     (_, Some(weight), _) => Acceptability::Weighed(weight),
-    // Rule 2, the `*;q=0` half: it is the only weight a wildcard entry lends a
-    // representation that has no coding at all.
+    // Rule 2's second named exclusion, and the ONLY way a wildcard reaches the
+    // no-coding state: the asterisk sentence ranges over an available content
+    // coding, which this state has none of, so nothing but rule 2 puts `*` here
+    // and rule 2 puts only its zero here.
     (None, None, Some(weight)) if weight == Weight::ZERO => Acceptability::Weighed(Weight::ZERO),
-    // Rule 2's default, reached with no `identity` entry and no `*;q=0`.
+    // Rule 2's default. A non-zero wildcard lands here rather than lending its
+    // weight, which is the whole of the reading the doc above derives.
     (None, None, _) => Acceptability::AcceptableByDefault,
-    // §12.5.3's asterisk sentence: `*` stands in for a coding not listed.
+    // §12.5.3's asterisk sentence, for a coding the representation actually
+    // HAS and the field does not list.
     (Some(_), None, Some(weight)) => Acceptability::Weighed(weight),
     // §12.4.3: nothing mentions it and there is no wildcard.
     (Some(_), None, None) => Acceptability::Unmentioned,

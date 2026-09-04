@@ -662,16 +662,70 @@ fn the_vary_walk_skips_empty_elements_latches_and_reads_lines_as_the_join() {
 }
 
 // ── RFC 9110 §12.5.3's acceptability rules ───────────────────────────────────
+//
+// WHY THERE IS NO CORPUS FOR THIS, AND WHAT ONE WOULD NEED.
+//
+// The three differential harnesses in this workspace — `handshake-corpus`,
+// `auth-corpus`, `coding-corpus` — grade a reader over records that are BYTES:
+// a field value, walked. That shape cannot express this function's input, and
+// the gap is in the arguments rather than in the bytes:
+//
+// - **Presence is not a byte string.** Zero field lines and one line whose
+//   value is empty are different inputs with different answers — measured in
+//   `rule_1_is_about_the_fields_presence_and_zero_lines_is_absent`, where the
+//   same coding is `(true, None)` over no lines and `(false, None)` over one
+//   empty one. A record that is a value has no way to say "there was no field".
+// - **Direction is not in the field.** `Direction::Request` and
+//   `Direction::Response` answer the zero-line case differently and nothing in
+//   the bytes distinguishes them.
+// - **The question is an argument.** The answer is about one `Option<coding>`,
+//   and the three interesting shapes — the no-coding state, a coding the field
+//   names, one it does not — are the caller's to pass, not the sender's to
+//   write.
+//
+// So records would need roughly `{ direction, field_lines, coding }`, and the
+// harness would be a differential over ARGUMENTS as well as over bytes, which
+// none of the three existing ones is.
+//
+// One narrowing on that, derived here rather than taken: for THIS reader a
+// single-value record loses only the zero-lines case, not every line split.
+// The walk is `lines.flat_map(list_elements)` and RFC 9110 §5.2's join inserts
+// a comma no element may hold, so any non-empty set of lines answers as its
+// joined value does — `field_lines_walk_as_the_join_between_them_would` pins
+// that for one field and `the_lines_are_walked_as_the_join_would_and_a_fault_is_reported`
+// for another. What a value cannot carry is the difference between no lines and
+// some, which is exactly where rule 1 and the response case live.
 
-/// One acceptability answer, rendered so a test can compare it without naming
-/// a `Weight` this module cannot construct: `(is_acceptable, thousandths)`.
+/// One acceptability answer for a REQUEST field, rendered so a test can compare
+/// it without naming a `Weight` this module cannot construct:
+/// `(is_acceptable, thousandths)`.
 ///
-/// The pair separates all three states. `AcceptableByDefault` is
-/// `(true, None)`, `Unmentioned` is `(false, None)`, and a `Weighed` is
-/// `(_, Some(_))`.
+/// The pair separates the three states a request reaches.
+/// `AcceptableByDefault` is `(true, None)`, `Unmentioned` is `(false, None)`,
+/// and a `Weighed` is `(_, Some(_))`. `NotAdvertised` is unreachable in this
+/// direction — RFC 9110 §12.5.3's rule 1 answers an absent request field — so
+/// the `expect` here is that scoping and not a shortcut;
+/// `an_absent_response_advertises_nothing` is where the fourth state is asked
+/// for.
 fn acceptability(coding: Option<&[u8]>, lines: &[&[u8]]) -> (bool, Option<u16>) {
-  let answer =
-    encoding_acceptability(coding, lines.iter().copied()).expect("the field is well formed");
+  let answer = encoding_acceptability(Direction::Request, coding, lines.iter().copied())
+    .expect("the field is well formed");
+  (
+    answer
+      .is_acceptable()
+      .expect("a request field always reaches a verdict"),
+    answer.weight().map(Weight::thousandths),
+  )
+}
+
+/// The same, for either direction and over all FOUR states.
+fn answer(
+  direction: Direction,
+  coding: Option<&[u8]>,
+  lines: &[&[u8]],
+) -> (Option<bool>, Option<u16>) {
+  let answer = encoding_acceptability(direction, coding, lines.iter().copied())
+    .expect("the field is well formed");
   (
     answer.is_acceptable(),
     answer.weight().map(Weight::thousandths),
@@ -783,11 +837,106 @@ fn rule_2_governs_a_representation_that_has_no_coding() {
     acceptability(None, &[b"*;q=0, identity;q=0"]),
     (false, Some(0))
   );
-  // And the direction rule 2 does NOT run in: a non-zero `*` lends no weight
-  // to a representation with no coding, because rule 2 names only `*;q=0` as
-  // reaching it. The answer is the default, with no weight, not `Some(500)`.
+  // A wildcard reaches this state ONLY at zero, and rule 2 is the whole of why
+  // it reaches it at all. `encoding_acceptability`'s doc carries the
+  // derivation; what is pinned here is the choice, with the reading it rejects
+  // named beside it so the next reader meets both sides rather than one.
+  //
+  // THE READING NOT TAKEN: `"*"` matches this state like any other coding and
+  // lends it whatever weight it carries. Under it the three assertions below
+  // answer `(true, Some(500))`, `(true, Some(500))` and `(true, Some(1))`.
+  // Measured with a probe crate over both readings before the change; the two
+  // part on exactly these shapes — a non-zero wildcard, no explicit `identity`
+  // entry — and agree everywhere else, including on every field where the
+  // coding is one the representation actually has.
   assert_eq!(acceptability(None, &[b"*;q=0.5"]), (true, None));
   assert_eq!(acceptability(None, &[b"gzip;q=1, *;q=0.5"]), (true, None));
+  // And the reason the rejected reading is not the caller-friendly one it looks
+  // like: it hands the uncoded representation `Weighed(1)` here, ranking it
+  // BELOW `gzip`, which turns a status rule 2 states unconditionally into a
+  // near-refusal the field never wrote.
+  assert_eq!(
+    acceptability(None, &[b"*;q=0.001, gzip;q=0.5"]),
+    (true, None)
+  );
+  // The zero is the one wildcard rule 2 does name, and it still excludes.
+  assert_eq!(acceptability(None, &[b"gzip;q=1, *;q=0"]), (false, Some(0)));
+}
+
+#[test]
+fn the_sections_own_example_line_parses_and_answers() {
+  // RFC 9110 §12.5.3's own example, at `.rfc-cache/rfc9110.txt:5555`:
+  //
+  //   Accept-Encoding: gzip;q=1.0, identity; q=0.5, *;q=0
+  //
+  // The `identity; q=0.5` element carries OWS AFTER the semicolon, which
+  // §12.4.2's `weight = OWS ";" OWS "q=" qvalue` brackets — the refusals this
+  // reader makes are around the `=`, which that production writes bare. A
+  // specification's own example is an input this reader has no licence to
+  // refuse, so it is pinned rather than assumed to fall out.
+  let line = b"gzip;q=1.0, identity; q=0.5, *;q=0".as_slice();
+  let mut walk = accept_encoding([line]);
+  let first = walk.next().expect("one").expect("well formed");
+  assert_eq!(
+    (first.name(), first.weight().thousandths()),
+    (Some("gzip"), 1000)
+  );
+  let second = walk.next().expect("two").expect("well formed");
+  assert_eq!(
+    (second.name(), second.weight().thousandths()),
+    (Some("identity"), 500)
+  );
+  let third = walk.next().expect("three").expect("well formed");
+  assert!(third.is_wildcard());
+  assert_eq!(third.weight(), Weight::ZERO);
+  assert!(walk.next().is_none());
+
+  // What it answers, for each way a caller can ask. The example does NOT
+  // discriminate the two wildcard readings and is not evidence for either: its
+  // explicit `identity` entry governs under both, so both answer exactly these
+  // four values. That is reported rather than pressed into the derivation.
+  let field: &[&[u8]] = &[line];
+  assert_eq!(acceptability(None, field), (true, Some(500)));
+  assert_eq!(acceptability(Some(b"identity"), field), (true, Some(500)));
+  assert_eq!(acceptability(Some(b"gzip"), field), (true, Some(1000)));
+  assert_eq!(acceptability(Some(b"br"), field), (false, Some(0)));
+}
+
+#[test]
+fn identity_and_no_coding_are_one_state_however_a_caller_spells_it() {
+  // RFC 9110 §12.5.3: "An "identity" token is used as a synonym for "no
+  // encoding" in order to communicate when no encoding is preferred." §8.4
+  // makes that exclusive: "Note that the coding named "identity" is reserved
+  // for its special role in Accept-Encoding and thus SHOULD NOT be included."
+  // — in a `Content-Encoding` — and §18.6's registry gives the name the
+  // description `Reserved`. So a representation never HAS this coding, and the
+  // two spellings of one state may not get two answers.
+  //
+  // Asked over fields that do NOT name `identity`, which is where the two
+  // paths part if anything does: a field that names it sends both spellings to
+  // the same entry and would agree under any reading.
+  for field in [
+    b"gzip".as_slice(),
+    b"gzip, compress",
+    b"",
+    b"*;q=0.5",
+    b"*;q=0",
+    b"*;q=0.001, gzip;q=0.5",
+    b"*;q=1",
+  ] {
+    let none = acceptability(None, &[field]);
+    for spelling in [b"identity".as_slice(), b"IDENTITY", b"Identity"] {
+      assert_eq!(
+        acceptability(Some(spelling), &[field]),
+        none,
+        "{field:?} answered differently for {spelling:?}"
+      );
+    }
+  }
+  // And the normalisation does not swallow a coding that merely looks like it:
+  // §8.4.1's case-insensitivity is over the whole token, not a prefix.
+  assert_eq!(acceptability(Some(b"identityx"), &[b"gzip"]), (false, None));
+  assert_eq!(acceptability(Some(b"ident"), &[b"gzip"]), (false, None));
 }
 
 #[test]
@@ -905,11 +1054,91 @@ fn the_lines_are_walked_as_the_join_would_and_a_fault_is_reported() {
   // A malformed field is answered with the walk's own fault rather than with a
   // verdict taken over the members in front of it.
   assert_eq!(
-    encoding_acceptability(Some(b"gzip"), [b"gzip, br;p=1".as_slice()]).expect_err("malformed"),
+    encoding_acceptability(
+      Direction::Request,
+      Some(b"gzip"),
+      [b"gzip, br;p=1".as_slice()]
+    )
+    .expect_err("malformed"),
     NegotiationError::NotAWeight
   );
   assert_eq!(
-    encoding_acceptability(None, [b"identity;q=blah".as_slice()]).expect_err("malformed"),
+    encoding_acceptability(Direction::Request, None, [b"identity;q=blah".as_slice()])
+      .expect_err("malformed"),
     NegotiationError::BadWeight
   );
+}
+
+#[test]
+fn a_representation_with_two_codings_is_two_questions() {
+  // RFC 9110 §12.5.3: "A representation could be encoded with multiple content
+  // codings." The rules are stated over ONE — "A server tests whether a content
+  // coding for a given representation is acceptable using these rules" — so a
+  // caller holding `Content-Encoding: gzip, br` asks once each. The conjunction
+  // is the caller's composition and not a sentence this crate can cite, which
+  // is why this test lives here rather than an `is_acceptable` over a list.
+  let field: &[&[u8]] = &[b"gzip;q=0.5, br;q=0"];
+  assert_eq!(acceptability(Some(b"gzip"), field), (true, Some(500)));
+  assert_eq!(acceptability(Some(b"br"), field), (false, Some(0)));
+  let both = acceptability(Some(b"gzip"), field).0 && acceptability(Some(b"br"), field).0;
+  assert!(
+    !both,
+    "one unacceptable coding is enough to refuse the pair"
+  );
+
+  // And the walk is per coding, so the same field answers a third question
+  // without either of the first two changing.
+  assert_eq!(acceptability(None, field), (true, None));
+}
+
+#[test]
+fn an_absent_response_advertises_nothing() {
+  // RFC 9110 §12.5.3's absence rule names its direction: "If no Accept-Encoding
+  // header field is in the request, any content coding is considered acceptable
+  // by the user agent." A RESPONSE is given meaning only when the field is
+  // there: "When the Accept-Encoding header field is present in a response, it
+  // indicates what content codings the resource was willing to accept in the
+  // associated request." So a response carrying no such field is a case the
+  // section does not rule on, and the answer is no verdict rather than a
+  // generous one.
+  let absent: &[&[u8]] = &[];
+  for coding in [None, Some(b"gzip".as_slice()), Some(b"identity".as_slice())] {
+    assert_eq!(
+      answer(Direction::Request, coding, absent),
+      (Some(true), None),
+      "rule 1, in the direction it names"
+    );
+    assert_eq!(
+      answer(Direction::Response, coding, absent),
+      (None, None),
+      "no verdict, and no weight to rank with"
+    );
+  }
+  // The harm the old answer allowed: a client meeting a response that said
+  // nothing was told every coding was acceptable, which it can act on by
+  // encoding its next request.
+  assert!(
+    answer(Direction::Response, Some(b"gzip"), absent)
+      .0
+      .is_none(),
+    "a response that advertised nothing must not read as acceptance"
+  );
+
+  // A field that IS there reads alike in both directions — rule 7 — so the
+  // direction reaches nothing but the zero-line case.
+  for field in [
+    b"".as_slice(),
+    b"gzip",
+    b"gzip;q=0.5, *;q=0",
+    b"*;q=0.5",
+    b"identity;q=0",
+  ] {
+    for coding in [None, Some(b"gzip".as_slice()), Some(b"br".as_slice())] {
+      assert_eq!(
+        answer(Direction::Request, coding, &[field]),
+        answer(Direction::Response, coding, &[field]),
+        "{field:?} parted by direction for {coding:?}"
+      );
+    }
+  }
 }
