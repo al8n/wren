@@ -1883,6 +1883,26 @@ no_panic_shim! {
   /// adapter per shim. Between the three, `Copied`, `Map` and `Cloned` are all
   /// covered.
   ///
+  /// # Why this body is not `shim_accept_encoding`'s
+  ///
+  /// `is_wildcard` is folded into the answer here and nowhere else, and it is
+  /// there to make this a DIFFERENT FUNCTION rather than for the coverage it
+  /// also buys.
+  ///
+  /// The two entry points are one walk at one element rule, and `cloned()` and
+  /// `copied()` over a `&&[u8]` lower to the same code — so with the same body
+  /// the two shims were identical after optimization and the linker FOLDED
+  /// them, leaving one symbol for two shims. `shim-check`'s artifact half is
+  /// what caught it: it asks the linker which shims are defined, and
+  /// `shim_accept_encoding` was not, so its proof was empty however green its
+  /// own step looked. Identical code folding and a deleted call are the same
+  /// silence in a symbol table, which is why that check reads the table rather
+  /// than the source.
+  ///
+  /// So a shim over an entry point that is another entry point's twin needs a
+  /// body that is not the twin's, and this is the cheapest such difference that
+  /// also proves something: no other shim drives `is_wildcard`.
+  ///
   /// Returns what it read, so a call whose result is dead cannot take the
   /// shim's body with it.
   fn shim_accept_charset(lines: &[&[u8]]) -> usize {
@@ -1891,6 +1911,7 @@ no_panic_shim! {
       let Ok(preference) = item else { break };
       seen = seen.wrapping_add(preference.name().map_or(0, str::len));
       seen = seen.wrapping_add(usize::from(preference.weight().thousandths()));
+      seen = seen.wrapping_add(usize::from(preference.is_wildcard()));
     }
     seen
   }
@@ -1904,9 +1925,11 @@ fn accept_charset_is_panic_free() {
     shim_accept_charset(black_box(&[b"iso-8859-5, unicode-1-1;q=0.8".as_slice()])),
     1821
   );
+  // The wildcard counts one more here than its weight, which is this shim's
+  // `is_wildcard` term and the reason its body is not `shim_accept_encoding`'s.
   assert_eq!(
     shim_accept_charset(black_box(&[b"*;q=0.5".as_slice()])),
-    500
+    501
   );
   // The two characters §8.3.2's Note names, which `token` does not hold, and
   // the weight faults behind a name it does.
