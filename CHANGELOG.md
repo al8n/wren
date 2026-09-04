@@ -204,14 +204,47 @@ Both are tests rather than prose.
   Rule 2 names only `*;q=0` as reaching that case, so `Accept-Encoding: *;q=0.5`
   answers `AcceptableByDefault` with no weight, not `Weighed(500)`.
 
-### A coding the field names twice
+### A coding the field names twice: one half is derived, the other is chosen
 
-RFC 9110 settles no rule for a repeat, so one is taken and stated. A zero
-ANYWHERE among the entries naming a coding excludes it — rule 3's own wording
-read plainly, and the reading that does not depend on which end of the field a
-recipient starts from. Where no entry is zero, the last in wire order gives the
-weight, which is what this crate already does for a repeated `q` inside one
-member.
+**RFC 9110 does not settle what a field naming one coding twice with two
+different weights means.** That sentence is worth more than either half below,
+and `fold_repeated_entry` carries where the rule that would settle it was looked
+for and is not: §12.4.2, which defines the weight and never mentions repetition;
+§12.5.1's only ordering sentence, which is about a parameter's position INSIDE
+one member; §5.6.1 and §5.6.1.2, which bound cardinality and empty elements and
+say nothing about a repeated one; §5.3, which says order is significant without
+saying which end — "The order in which field lines with the same name are
+received is therefore significant to the interpretation of the field value" —
+and §8.6, the one place RFC 9110 rules on a repeat, which rules for one field on
+the case where the repeats are IDENTICAL and so never reaches two different
+weights.
+
+The two halves do not have the same standing, and reading them as one rule is
+the mistake the split is there to prevent:
+
+- **Derived.** A zero anywhere among the entries naming a coding excludes it.
+  Rule 3's own wording read plainly, and independent of order, so two recipients
+  reading the same field from opposite ends agree whatever rule each took.
+- **Chosen, and derived from nothing.** Where no entry is zero, the last in wire
+  order gives the weight. Nothing chooses between that, the first, and the
+  largest.
+
+**The undecidedness is now visible rather than implied.**
+`a_repeated_entry_is_undecided_and_this_is_the_reading_taken` asserts the
+zero-absorbing half in BOTH orders — which is what makes it derived rather than
+chosen, since no reading can move it — and asserts the non-zero pair both ways
+round, so the reading is pinned on the ORDER and not on a value that happens to
+be larger. A future reading that takes the first entry, or the largest, reds
+there instead of quietly disagreeing.
+
+Both of those are measured rather than predicted: replacing
+`fold_repeated_entry`'s body with `seen.unwrap_or(found)` reds the test, and
+replacing it with a zero-absorbing largest-wins reds it on the mirror assertion,
+naming that assertion's own message. The function was restored from a copy after
+each.
+
+`absorbing_zero` is renamed `fold_repeated_entry`, because a name that describes
+only the derived half asserted the chosen half was settled.
 
 ### Why there is no `Accept-Language` counterpart
 

@@ -589,11 +589,11 @@ http_semantics::negotiation::VaryMember
 http_semantics::negotiation::VaryMember::FieldName
 http_semantics::negotiation::VaryMember::Wildcard
 http_semantics::negotiation::WILDCARD
-http_semantics::negotiation::absorbing_zero
 http_semantics::negotiation::accept_charset
 http_semantics::negotiation::accept_encoding
 http_semantics::negotiation::accept_language
 http_semantics::negotiation::encoding_acceptability
+http_semantics::negotiation::fold_repeated_entry
 http_semantics::negotiation::is_language_range
 http_semantics::negotiation::preference_from
 http_semantics::negotiation::preferences

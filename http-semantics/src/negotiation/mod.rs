@@ -637,16 +637,29 @@ impl Acceptability {
 /// [`MAX_TRACKED_PARAMS`]: crate::media::MAX_TRACKED_PARAMS
 /// [`weight_for`]: crate::media::weight_for
 ///
-/// # A coding the field names twice
+/// # A coding the field names twice: one half is derived, the other is chosen
 ///
-/// RFC 9110 settles no rule for a repeated entry, so this takes one and says
-/// so. A zero ANYWHERE among the entries naming a coding makes it
-/// `Weighed(Weight::ZERO)`, which is rule 3's own wording read plainly — a
-/// coding listed twice, once with `q=0`, is a coding "accompanied by a qvalue
-/// of 0" — and it is the reading that does not depend on order, so two
-/// recipients cannot disagree by reading the same field from different ends.
-/// Where no entry is zero, the LAST in wire order gives the weight, which is
-/// the rule this crate already applies to a repeated `q` inside one member.
+/// **RFC 9110 does not settle what a field naming one coding twice means.**
+/// That sentence is worth more than either half below, so it comes first, and
+/// [`fold_repeated_entry`] carries where it was looked for.
+///
+/// The two halves do not have the same standing, and reading them as one rule
+/// is the mistake this section exists to prevent.
+///
+/// - **Derived.** A zero ANYWHERE among the entries naming a coding makes it
+///   `Weighed(Weight::ZERO)`. That is rule 3's own wording read plainly — a
+///   coding listed twice, once with `q=0`, is a coding "accompanied by a qvalue
+///   of 0" — and it does not depend on order, so two recipients cannot disagree
+///   about it by reading the same field from opposite ends.
+/// - **Chosen, and derived from nothing.** Where no entry is zero, the LAST in
+///   wire order gives the weight. Nothing in RFC 9110 chooses between that and
+///   the first, or between either and the largest.
+///
+/// `a_repeated_entry_is_undecided_and_this_is_the_reading_taken` is where the
+/// second half is pinned rather than left to be inferred from behaviour: it
+/// asserts both orders of a zero agree, and asserts the non-zero pair BOTH ways
+/// round, so a future reading that takes the first entry — or the largest —
+/// reds there instead of quietly disagreeing with this one.
 ///
 /// # Errors
 ///
@@ -675,9 +688,9 @@ where
   ) {
     let preference = member?;
     match preference.name() {
-      None => wildcard = Some(absorbing_zero(wildcard, preference.weight())),
+      None => wildcard = Some(fold_repeated_entry(wildcard, preference.weight())),
       Some(name) if name.as_bytes().eq_ignore_ascii_case(wanted) => {
-        named = Some(absorbing_zero(named, preference.weight()));
+        named = Some(fold_repeated_entry(named, preference.weight()));
       }
       Some(_) => {}
     }
@@ -702,11 +715,43 @@ where
   })
 }
 
-/// Folds a second weight for one name onto the first, with zero absorbing.
+/// Folds a second entry naming one coding onto the first.
 ///
-/// See [`encoding_acceptability`]'s own doc for why a repeat is resolved this
-/// way and what RFC 9110 does and does not settle about it.
-fn absorbing_zero(seen: Option<Weight>, found: Weight) -> Weight {
+/// Two rules in four lines, and they do not have the same standing —
+/// [`encoding_acceptability`]'s own doc splits them, and this is the name that
+/// stopped asserting the second was settled. A zero absorbs, which rule 3's
+/// words give; otherwise the last in wire order wins, which nothing gives.
+///
+/// # Where the rule that would settle this was looked for, and is not
+///
+/// Searched at `6360957`'s successor on this branch, over the cached text:
+///
+/// - **§12.4.2**, which defines `weight` and `qvalue`, says nothing about a
+///   value appearing more than once.
+/// - **§12.5.1's only ordering sentence** is about a parameter's position
+///   INSIDE one member, not about a member repeated in a list: "Senders using
+///   weights SHOULD send "q" last (after all media-range parameters)." and the
+///   recipient half beside it, which reads any parameter named `q` as weight
+///   regardless of where in the member it sits.
+/// - **§5.6.1 and §5.6.1.2**, the list construct itself, bound cardinality and
+///   empty elements — "Empty elements do not contribute to the count of
+///   elements present." — and say nothing about a repeated one.
+/// - **§5.3** says order matters and does not say which end: "The order in
+///   which field lines with the same name are received is therefore significant
+///   to the interpretation of the field value". That is what makes a positional
+///   rule ADMISSIBLE here rather than obviously wrong; it does not choose one.
+/// - **§8.6** is the one place RFC 9110 rules on a repeat, and it rules for one
+///   field on the case where the repeats are IDENTICAL: "a recipient of a
+///   Content-Length header field value consisting of the same decimal value
+///   repeated as a comma-separated list (e.g, `Content-Length: 42, 42`) MAY
+///   either reject the message as invalid or replace that invalid field value
+///   with a single instance of the decimal value". Two entries with DIFFERENT
+///   weights are the case it does not reach.
+///
+/// What would settle it is a sentence saying which entry a recipient reads when
+/// a field names one value more than once with different weights. There is none,
+/// in the sections above or elsewhere in RFC 9110.
+fn fold_repeated_entry(seen: Option<Weight>, found: Weight) -> Weight {
   match seen {
     Some(previous) if previous == Weight::ZERO => previous,
     _ => found,
