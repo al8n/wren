@@ -48,7 +48,8 @@
 //!
 //! An element here carries none. `codings` is `content-coding / "identity" /
 //! "*"` and `content-coding` is `token`; §12.5.2's is `( token / "*" )`; RFC
-//! 4647 §2.1's `language-range` is ALPHA, DIGIT and `-` and no other byte. So
+//! 4647 §2.1's `language-range` is ALPHA, DIGIT, `-` and `*`, and no other
+//! byte — the `*` being that rule's own second alternative. So
 //! the only production a `;` inside such an element can open is `[ weight ]`,
 //! there is at most one, and ORDER is not a question anybody can ask — over
 //! this grammar §12.5.1's rule has no work to do.
@@ -119,11 +120,19 @@ pub enum NegotiationError {
   /// `codings          = content-coding / "identity" / "*"`.
   #[error("not an element of this negotiation field")]
   NotAnElement,
-  /// Something follows the element that RFC 9110 §12.4.2's
-  /// `weight = OWS ";" OWS "q=" qvalue` does not spell: a parameter by another
-  /// name, a second one behind the first, or the `BWS` that production writes
-  /// nowhere. Separate from [`BadWeight`](Self::BadWeight), which is a `q` in
-  /// the right place whose value is not a `qvalue`.
+  /// The `"q="` literal in RFC 9110 §12.4.2's
+  /// `weight = OWS ";" OWS "q=" qvalue` did not match at the start of what
+  /// follows the element's `;`: a parameter by another name, a `q` with the
+  /// `BWS` in front of the `=` that this production writes nowhere, or nothing
+  /// behind the `;` at all.
+  ///
+  /// A SECOND `;q=` is NOT this, and the production is what decides that.
+  /// `#( codings [ weight ] )` brackets one weight, so once the literal has
+  /// matched, everything from there to the element's end is the `qvalue` slot —
+  /// and `gzip;q=0.5;q=0.7` puts `0.5;q=0.7` in it, which is no `qvalue`. Same
+  /// for `gzip;q=0.5;p=1` and `gzip;q=0.5;`: all three are
+  /// [`BadWeight`](Self::BadWeight), measured, and
+  /// `what_follows_a_matched_q_is_the_qvalue_slot` pins the partition.
   #[error("what follows the element is not a weight")]
   NotAWeight,
   /// A `q` in the place RFC 9110 §12.4.2's `weight` puts one, whose value is
@@ -213,7 +222,7 @@ fn is_language_range(name: &[u8]) -> bool {
 /// For the reason [`MediaRange`] carries none: a derive compares bytes as
 /// WRITTEN, and the section defining each name this can hold matches it
 /// case-insensitively — RFC 9110 §8.4.1: "All content codings are
-/// case-insensitive"; RFC 4647 §2.1: "Matching of language tags to language
+/// case-insensitive"; RFC 4647 §2: "Matching of language tags to language
 /// ranges MUST be done in a case-insensitive manner." A caller compares
 /// [`name`](Self::name) with `str::eq_ignore_ascii_case`.
 ///

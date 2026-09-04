@@ -156,6 +156,26 @@ and the section, and neither is visible from the signature. Both are now stated.
   argument for a case §12.5.3 does not rule on, so the extrapolation is taken and
   named rather than hidden.
 
+## `http-semantics` — two citations `quote-check` cannot see
+
+That gate grades a quotation's WORDS against the spec text; it never reads the
+section number beside them, so an accurate sentence hung on the wrong section
+passes. Both of these did.
+
+### Fixed
+
+- The case-insensitive-matching MUST was attributed to RFC 4647 §2.1. The
+  sentence is at `.rfc-cache/rfc4647.txt:187-188`, under **§2** — §2 begins at
+  `:150` and §2.1 at `:190`. Corrected to §2. Every other RFC 4647 §2.1 citation
+  in this branch was re-checked against those line numbers and is right: they
+  cite the ABNF at `:197-198` and the ill-formed-ranges sentence at `:203`, both
+  inside §2.1, and one cites §2.2's `extended-language-range` at `:220`.
+- The module summary listed RFC 4647 §2.1's `language-range` as ALPHA, DIGIT and
+  `-` and no other byte, which omits the `"*"` that rule's own second
+  alternative admits and that this reader accepts. The sentence's point — that
+  no element here can hold a `;`, so nothing but `[ weight ]` can open — is
+  unaffected, and now the list is the rule's.
+
 ## `http-semantics` — `NotAWeight`'s doc named a case the code answers `BadWeight`
 
 The variant's doc said it covered "a second one behind the first". Measured,

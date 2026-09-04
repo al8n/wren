@@ -1106,6 +1106,55 @@ fn the_lines_are_walked_as_the_join_would_and_a_fault_is_reported() {
 }
 
 #[test]
+fn what_follows_a_matched_q_is_the_qvalue_slot() {
+  // Which of the two faults a value earns is decided by RFC 9110 §12.4.2's
+  // `weight = OWS ";" OWS "q=" qvalue` and by §12.5.3's
+  // `Accept-Encoding  = #( codings [ weight ] )` bracketing ONE of them.
+  //
+  // Before the `"q="` literal matches, nothing is a weight at all: a name that
+  // is not `q`, a `q` with §5.6.3's `BWS` in front of the `=` that this
+  // production admits nowhere, or nothing behind the `;`.
+  for line in [
+    b"gzip;p=1".as_slice(),
+    b"gzip;q =0.5",
+    b"gzip;q = 0.5",
+    b"gzip;",
+    b"gzip; ",
+    b"gzip;;q=0.5",
+  ] {
+    assert_eq!(
+      accept_encoding([line])
+        .next()
+        .expect("one")
+        .expect_err("malformed"),
+      NegotiationError::NotAWeight,
+      "{line:?}"
+    );
+  }
+  // Once it has matched, everything to the element's end is the `qvalue` slot,
+  // because the bracket holds one weight and there is nothing else for a second
+  // `;` to open. So a second parameter, a second WEIGHT, and a trailing `;` are
+  // all faults of the VALUE and not of the shape.
+  for line in [
+    b"gzip;q=0.5;q=0.7".as_slice(),
+    b"gzip;q=0.5;p=1",
+    b"gzip;q=0.5;",
+    b"gzip;q= 0.5",
+    b"gzip;q=\"0.5\"",
+    b"gzip;q=1.5",
+  ] {
+    assert_eq!(
+      accept_encoding([line])
+        .next()
+        .expect("one")
+        .expect_err("malformed"),
+      NegotiationError::BadWeight,
+      "{line:?}"
+    );
+  }
+}
+
+#[test]
 fn a_representation_with_two_codings_is_two_questions() {
   // RFC 9110 §12.5.3: "A representation could be encoded with multiple content
   // codings." The rules are stated over ONE — "A server tests whether a content
