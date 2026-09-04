@@ -2420,7 +2420,7 @@ mod json {
   }
 
   fn parse_string(bytes: &[u8], pos: &mut usize) -> Result<String, String> {
-    *pos += 1; // the opening '"'
+    *pos += 1; // the opening DQUOTE
     let mut out = String::new();
     let mut run_start = *pos;
     loop {

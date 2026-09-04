@@ -412,6 +412,36 @@ struct Extracted {
   /// boundary that remains is a number in the run's own output rather than a
   /// fact about the code that only a reader of the code can find.
   fenced: usize,
+  /// Blocks holding an ODD number of quote marks — see [`Unpaired`].
+  unpaired: Vec<Unpaired>,
+}
+
+/// A comment block whose quote marks do not pair, with one left over.
+///
+/// [`quoted_spans`] pairs left to right across the whole block, so a leftover
+/// mark is not a local mistake: every quotation after the one that consumed
+/// the wrong partner is cut at the wrong place, and the last one in the block
+/// is not extracted at all — it becomes an opener with nothing to close on.
+/// That is the disappearance [`mask_paragraph`] closed for a leaked quote,
+/// arriving from the author's own prose instead of from a code span, and it is
+/// the one this workspace held off with a hand-maintained convention: a
+/// `gate-exempt:` marker naming a field value whose quoted-string does not
+/// close is kept OUT of the doc comment it belongs to, in a block of its own,
+/// because the lone mark it carries would otherwise shift every pairing in
+/// that block by one. See [`UNPAIRED`] for where that convention held and the
+/// place it did not.
+///
+/// A convention people have to remember is a guard at one entrance. This is
+/// the gate saying so out loud rather than a rule about how to write a
+/// comment: nothing here guesses which mark the author meant, only that the
+/// block cannot be paired as written.
+struct Unpaired {
+  /// The first line of the block.
+  at: usize,
+  /// The line the leftover mark sits on.
+  mark: usize,
+  /// How many marks the block holds, after code spans are masked.
+  quotes: usize,
 }
 
 /// The default, gitignored cache directory, relative to the workspace root.
@@ -546,6 +576,72 @@ const UNTRIAGED: &[(&str, usize)] = &[
   ("xtask/src/quote_check.rs", 3),
 ];
 
+/// The comment blocks whose quotation marks do not pair, per file, as they
+/// stand — and what makes that a check rather than a printed number.
+///
+/// # What this closes
+///
+/// [`quoted_spans`] pairs marks left to right across a whole BLOCK, so one
+/// leftover mark is not a local mistake: every quotation behind it is cut at
+/// the wrong place and the last is not extracted at all. That is the same
+/// disappearance [`mask_paragraph`] closed for a quote leaked out of a code
+/// span, arriving from the author's own prose instead — and this workspace was
+/// holding it off by CONVENTION. `websocket-proto/src/negotiation.rs` keeps a
+/// `gate-exempt:` marker out of the doc comment below it, in a block of its
+/// own, and its comment says why: the span it names carries a lone mark, and
+/// writing it inside would shift every pairing in that block by one.
+/// `auth-corpus/src/main.rs` does the same with the same span.
+///
+/// A convention people have to remember is a guard at one entrance, and the
+/// third entrance was already open when this table was first filled in:
+/// `http-semantics/src/auth/mod.rs`'s four markers sit directly against the
+/// module doc with no blank line between them, so a `//` line continues the
+/// `//!` block and the module doc's own block holds 17 marks. It is harmless
+/// only by position — the lone mark is the last of the seventeen, so the
+/// sixteen in front of it still pair with each other. Move a marker, or add
+/// one, and the module doc's quotations start being cut somewhere else.
+///
+/// # Why counts per file rather than a fixed list of blocks
+///
+/// Same reason [`UNTRIAGED`] holds counts: a block is identified by the line
+/// it starts on, and every edit above it moves that line. A count per file is
+/// stable under editing and still fails on a block that APPEARS, which is the
+/// case this exists to catch. What it cannot see is one unpaired block
+/// replacing another in the same file — the same limit that constant records,
+/// and for the same reason.
+///
+/// # What is in here, and why each one is
+///
+/// - `http-semantics/src/auth/mod.rs` — the module doc above, and the one
+///   entry here that is a comment worth changing rather than a fact about
+///   this extractor or a deliberate marker. It is left alone in the branch
+///   that added this table because that file is not this change's to edit.
+/// - `auth-corpus/src/main.rs`, `websocket-proto/src/negotiation.rs` — a
+///   `gate-exempt:` marker naming a field value whose quoted-string does not
+///   close, isolated in a block of its own exactly as the convention says.
+///   The lone mark is the whole point of the span being named, so these are
+///   deliberate and stay.
+/// - `xtask/src/doc_check.rs` — four blocks that are not comments at all. They
+///   are continuation lines of multi-line Rust string literals — two `format!`
+///   templates, a fixture holding doc-comment text and a fixture holding
+///   captured rustc stderr — whose contents include a `//` or a `///`, and the
+///   lone mark is the one that CLOSES the Rust string. [`trailing_comment_at`]
+///   cannot know that: a string left open at end of line ends its walk, so the
+///   line after it is read as fresh code. That boundary is the extractor's, not
+///   the comment's, and is recorded here rather than worked around. A fifth
+///   was a real comment, `the opening '"'` describing the byte it steps over,
+///   and it is spelled DQUOTE now — the same repair this table asks of anyone
+///   who lands in it.
+///
+/// Regenerate from the run's own report: a failure names the file, both
+/// counts, and every block behind them.
+const UNPAIRED: &[(&str, usize)] = &[
+  ("auth-corpus/src/main.rs", 1),
+  ("http-semantics/src/auth/mod.rs", 1),
+  ("websocket-proto/src/negotiation.rs", 1),
+  ("xtask/src/doc_check.rs", 4),
+];
+
 /// How much of a span must be found in a spec for the span to be treated as a
 /// quotation OF that spec.
 const ANCHOR_CHARS: usize = 48;
@@ -676,6 +772,13 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
   // because they are already in hand: `grade` is handed the normalised span and
   // the line it sits on, and dropped both on the floor when it counted one.
   let mut untriaged_spans: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+  // Blocks whose quote marks do not pair, the total for the printed line and
+  // the split `UNPAIRED` is held against — the same shape as the untriaged
+  // backlog above, for the same reason: a number nobody can act on is a
+  // number the next reader raises.
+  let mut unpaired_blocks = 0usize;
+  let mut unpaired_by_file: BTreeMap<String, usize> = BTreeMap::new();
+  let mut unpaired_sites: BTreeMap<String, Vec<Unpaired>> = BTreeMap::new();
   for source in &sources {
     let text = fs::read_to_string(source)?;
     let shown = crate::report::site(source.strip_prefix(&root).unwrap_or(source));
@@ -687,6 +790,14 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     abnf_fenced_read += extracted.fenced_read;
     fences_skipped += extracted.fences_skipped;
     abnf_fenced += extracted.fenced;
+    if !extracted.unpaired.is_empty() {
+      unpaired_blocks += extracted.unpaired.len();
+      *unpaired_by_file.entry(shown.clone()).or_default() += extracted.unpaired.len();
+      unpaired_sites
+        .entry(shown.clone())
+        .or_default()
+        .extend(extracted.unpaired);
+    }
     // Per-file: a marker in one file cannot exempt a span in another. Read
     // once and reused below for both quotations and productions. Dispatched
     // by extension exactly as `spans_for` above dispatches extraction, so a
@@ -904,7 +1015,33 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     }
   }
 
-  if failures == 0 && abnf_failures == 0 && abnf_malformed == 0 && backlog.is_empty() {
+  // Never silent, pass or fail. A block whose marks do not pair mis-cuts every
+  // quotation behind the leftover one and drops the last of them entirely, and
+  // this workspace held that off with a convention its authors had to remember
+  // — see `Unpaired`. The count is printed every run and the split is held per
+  // file, so a block that becomes unpaired is a failure rather than a thing
+  // someone might notice.
+  println!(
+    "quote-check: {unpaired_blocks} comment block(s) hold an odd number of quotation marks — \
+     held per file against `UNPAIRED`"
+  );
+  let unpaired_backlog = unpaired_drift(&unpaired_by_file, UNPAIRED, include_ignored);
+  for (file, line) in &unpaired_backlog {
+    println!("{line}");
+    for odd in unpaired_sites.get(file).into_iter().flatten() {
+      println!(
+        "  {file}:{}: the block beginning at line {} holds {} quotation mark(s)",
+        odd.mark, odd.at, odd.quotes
+      );
+    }
+  }
+
+  if failures == 0
+    && abnf_failures == 0
+    && abnf_malformed == 0
+    && backlog.is_empty()
+    && unpaired_backlog.is_empty()
+  {
     println!(
       "quote-check: {checked} quotations verbatim, {abnf_checked} ABNF productions verbatim"
     );
@@ -930,6 +1067,12 @@ pub fn run(dir: Option<&str>, fetch: bool, include_ignored: bool) -> Result<(), 
     reasons.push(format!(
       "{} file(s) hold a different number of untriaged spans than `UNTRIAGED` records",
       backlog.len()
+    ));
+  }
+  if !unpaired_backlog.is_empty() {
+    reasons.push(format!(
+      "{} file(s) hold a different number of unpaired quotation marks than `UNPAIRED` records",
+      unpaired_backlog.len()
     ));
   }
   Err(reasons.join("; ").into())
@@ -961,46 +1104,117 @@ fn untriaged_drift(
   include_ignored: bool,
 ) -> Vec<(String, String)> {
   let mut out = Vec::new();
+  for (file, moved) in drift(counts, recorded, include_ignored) {
+    let line = match moved {
+      Drift::Above(found, recorded) => format!(
+        "quote-check: {file}: {found} untriaged span(s), `UNTRIAGED` records {recorded} — a \
+         span this run could not attribute to any spec it names. Read it: repair the \
+         quotation, mark it `gate-exempt`, or raise the number here once it is known to be \
+         the author's own words"
+      ),
+      Drift::Below(found, recorded) => format!(
+        "quote-check: {file}: {found} untriaged span(s), `UNTRIAGED` records {recorded} — \
+         triage was done and the table was not told. Lower the number here"
+      ),
+      Drift::Unlisted(found) => format!(
+        "quote-check: {file}: {found} untriaged span(s), and the file is not in `UNTRIAGED` — \
+         a file absent from that table must hold none"
+      ),
+      Drift::Stale(recorded) => format!(
+        "quote-check: {file}: 0 untriaged span(s), `UNTRIAGED` records {recorded} — the whole \
+         entry is stale; remove it"
+      ),
+    };
+    out.push((file, line));
+  }
+  out
+}
+
+/// Every file whose count of unpaired blocks differs from the one [`UNPAIRED`]
+/// records, as the lines [`run`] prints and fails on.
+///
+/// [`untriaged_drift`]'s rule, [`Unpaired`]'s wording. The two tables ratchet
+/// on the same four cases and prescribe different repairs, so the rule is one
+/// function ([`drift`]) and the sentences are two — a second copy of the rule
+/// is how the two tables would come to disagree about what a stale entry is.
+fn unpaired_drift(
+  counts: &BTreeMap<String, usize>,
+  recorded: &[(&str, usize)],
+  include_ignored: bool,
+) -> Vec<(String, String)> {
+  let mut out = Vec::new();
+  for (file, moved) in drift(counts, recorded, include_ignored) {
+    let line = match moved {
+      Drift::Above(found, recorded) => format!(
+        "quote-check: {file}: {found} block(s) with an odd number of quotation marks, \
+         `UNPAIRED` records {recorded} — a block whose marks do not pair cuts every quotation \
+         behind the leftover one in the wrong place and drops the last of them. Balance the \
+         marks, put the lone one in a block of its own, or raise the number here once it is \
+         known to be deliberate"
+      ),
+      Drift::Below(found, recorded) => format!(
+        "quote-check: {file}: {found} block(s) with an odd number of quotation marks, \
+         `UNPAIRED` records {recorded} — a block was balanced and the table was not told. \
+         Lower the number here"
+      ),
+      Drift::Unlisted(found) => format!(
+        "quote-check: {file}: {found} block(s) with an odd number of quotation marks, and the \
+         file is not in `UNPAIRED` — a file absent from that table must hold none"
+      ),
+      Drift::Stale(recorded) => format!(
+        "quote-check: {file}: 0 block(s) with an odd number of quotation marks, `UNPAIRED` \
+         records {recorded} — the whole entry is stale; remove it"
+      ),
+    };
+    out.push((file, line));
+  }
+  out
+}
+
+/// How one file's count stands against the table recording it.
+enum Drift {
+  /// Found more than recorded: `(found, recorded)`.
+  Above(usize, usize),
+  /// Found fewer than recorded: `(found, recorded)`.
+  Below(usize, usize),
+  /// Found some, and the file is not in the table.
+  Unlisted(usize),
+  /// Found none, and the table records some.
+  Stale(usize),
+}
+
+/// Every file whose count differs from the one `recorded` holds, in the order
+/// the counts are keyed.
+///
+/// The rule both ratchet tables run on, in one place. Both directions are
+/// reported, because MORE than recorded is the thing nobody has looked at and
+/// FEWER is work done that the table was not told about — a ratchet that only
+/// held one way would slip back the moment a file was edited. `include_ignored`
+/// relaxes exactly one half: a file absent from the table is required to hold
+/// zero only when the run scanned the tracked tree alone, since `docs/` is
+/// gitignored and exists on a developer's disk and not in CI.
+fn drift(
+  counts: &BTreeMap<String, usize>,
+  recorded: &[(&str, usize)],
+  include_ignored: bool,
+) -> Vec<(String, Drift)> {
+  let mut out = Vec::new();
   for (file, &found) in counts {
-    let recorded = recorded
+    let against = recorded
       .iter()
       .find(|(name, _)| *name == file)
       .map(|(_, count)| *count);
-    match recorded {
-      Some(recorded) if recorded == found => {}
-      Some(recorded) => out.push((
-        file.clone(),
-        format!(
-          "quote-check: {file}: {found} untriaged span(s), `UNTRIAGED` records {recorded} — \
-         {}",
-          if found > recorded {
-            "a span this run could not attribute to any spec it names. Read it: repair the \
-           quotation, mark it `gate-exempt`, or raise the number here once it is known to be \
-           the author's own words"
-          } else {
-            "triage was done and the table was not told. Lower the number here"
-          }
-        ),
-      )),
+    match against {
+      Some(against) if against == found => {}
+      Some(against) if found > against => out.push((file.clone(), Drift::Above(found, against))),
+      Some(against) => out.push((file.clone(), Drift::Below(found, against))),
       None if include_ignored => {}
-      None => out.push((
-        file.clone(),
-        format!(
-          "quote-check: {file}: {found} untriaged span(s), and the file is not in `UNTRIAGED` — \
-           a file absent from that table must hold none"
-        ),
-      )),
+      None => out.push((file.clone(), Drift::Unlisted(found))),
     }
   }
   for (file, recorded) in recorded {
     if !counts.contains_key(*file) {
-      out.push((
-        (*file).to_owned(),
-        format!(
-          "quote-check: {file}: 0 untriaged span(s), `UNTRIAGED` records {recorded} — the whole \
-           entry is stale; remove it"
-        ),
-      ));
+      out.push(((*file).to_owned(), Drift::Stale(*recorded)));
     }
   }
   out
@@ -1503,6 +1717,7 @@ fn quotations(source: &str) -> Extracted {
 /// time they are joined into a block, and nothing else here changes with it.
 fn quotations_masked(source: &str, mask: Masker) -> Extracted {
   let mut out: QuotedSpans = Vec::new();
+  let mut unpaired: Vec<Unpaired> = Vec::new();
   let mut productions = Vec::new();
   let mut skipped = 0usize;
   let mut fenced_productions = 0usize;
@@ -1540,6 +1755,9 @@ fn quotations_masked(source: &str, mask: Masker) -> Extracted {
     let cited = cited_rfcs(block);
     for (at, span) in quoted_spans(block) {
       out.push((line_of(marks, at), span.to_string(), cited.clone()));
+    }
+    if let Some(odd) = unpaired_mark(block, marks) {
+      unpaired.push(odd);
     }
     if cited.is_empty() {
       skipped += pending.len();
@@ -1629,6 +1847,7 @@ fn quotations_masked(source: &str, mask: Masker) -> Extracted {
     fenced_read,
     fences_skipped,
     fenced: fenced_productions,
+    unpaired,
   }
 }
 
@@ -1663,6 +1882,7 @@ fn markdown_quotations(source: &str) -> Extracted {
 /// [`quotations_masked`] for the same reason.
 fn markdown_quotations_masked(source: &str, mask: Masker) -> Extracted {
   let mut out: QuotedSpans = Vec::new();
+  let mut unpaired: Vec<Unpaired> = Vec::new();
   let mut productions = Vec::new();
   let mut skipped = 0usize;
   let mut fenced_productions = 0usize;
@@ -1691,6 +1911,9 @@ fn markdown_quotations_masked(source: &str, mask: Masker) -> Extracted {
     let cited = cited_rfcs(block);
     for (at, span) in quoted_spans(block) {
       out.push((line_of(marks, at), span.to_string(), cited.clone()));
+    }
+    if let Some(odd) = unpaired_mark(block, marks) {
+      unpaired.push(odd);
     }
     if cited.is_empty() {
       skipped += pending.len();
@@ -1762,6 +1985,7 @@ fn markdown_quotations_masked(source: &str, mask: Masker) -> Extracted {
     fenced_read,
     fences_skipped,
     fenced: fenced_productions,
+    unpaired,
   }
 }
 
@@ -1901,6 +2125,32 @@ fn char_literal_ends(bytes: &[u8], at: usize) -> usize {
     (Some(_), Some(b'\''), _) => at.saturating_add(3),
     _ => at.saturating_add(1),
   }
+}
+
+/// The leftover quote mark in one masked block, when the marks do not pair.
+///
+/// [`quoted_spans`] takes them two at a time from the left, so an ODD count
+/// leaves the LAST mark without a partner and every pairing behind it one
+/// place out. Which mark the author got wrong is not decidable here — the
+/// leftover is reported as the one the pairing ran out on, together with the
+/// line the block starts at, so a reader has both ends of the run to look
+/// along.
+///
+/// Read on the block AFTER masking, because that is the text
+/// [`quoted_spans`] reads: a mark inside a code span is not one of the block's
+/// to pair, and counting before the mask would report every comment that
+/// names a quote character.
+fn unpaired_mark(block: &str, marks: &[(usize, usize)]) -> Option<Unpaired> {
+  let quotes = block.matches('"').count();
+  if quotes.is_multiple_of(2) {
+    return None;
+  }
+  let last = block.rfind('"')?;
+  Some(Unpaired {
+    at: marks.first().map_or(0, |(_, line)| *line),
+    mark: line_of(marks, last),
+    quotes,
+  })
 }
 
 /// The `"…"` spans in one joined comment block, paired left to right.
@@ -4481,6 +4731,13 @@ mod tests {
   // workspace to wrap a code span around a quote. It is a REPORT: read the
   // block, satisfy yourself the paragraph unit's answer is the one you want,
   // and record it here. What it refuses is the same change arriving unread.
+  //
+  // Where it does NOT run: `ci.yml` carries `paths-ignore: '**.md'`, so a pull
+  // request touching only Markdown does not reach `cargo test -p xtask`. The
+  // gate itself still runs on every such request — `docs.yml` has no such
+  // filter, for the reason its own comment gives — so nothing escapes the
+  // check; what waits for the next non-Markdown commit is this differential's
+  // notice about it.
   #[test]
   fn the_two_masking_units_agree_on_every_graded_span_in_this_workspace() {
     let sources = workspace_sources();
@@ -4551,6 +4808,129 @@ mod tests {
       .into_iter()
       .map(|(_, span, _)| span)
       .collect()
+  }
+
+  // ==== blocks whose marks do not pair ====
+
+  /// One block's unpaired report flattened to what a test is about: where the
+  /// block starts, where the pairing ran out, and how many marks it held.
+  fn unpaired_of(source: &str) -> Vec<(usize, usize, usize)> {
+    quotations(source)
+      .unpaired
+      .into_iter()
+      .map(|odd| (odd.at, odd.mark, odd.quotes))
+      .collect()
+  }
+
+  // A leftover mark is reported with BOTH ends of the run — the line the block
+  // starts on and the line the pairing ran out on — because the mark the
+  // author got wrong is somewhere between them and nothing here can say which
+  // it is. The count is the third thing a reader needs: two marks are a
+  // quotation, three are a quotation and a mistake.
+  #[test]
+  fn a_block_whose_marks_do_not_pair_is_reported() {
+    let source = concat!(
+      "/// RFC 9110 §5.6.1.2: \"Empty elements do not contribute to the count of\n",
+      "/// elements present.\" And a lone \" mark after it.\n",
+    );
+    assert_eq!(unpaired_of(source), [(1, 2, 3)]);
+  }
+
+  // Balanced blocks are not reported, and neither is a mark inside a code
+  // span: the count is read AFTER masking, which is the text `quoted_spans`
+  // reads. Counting before it would report every comment that names a quote
+  // character, which is most of this file.
+  #[test]
+  fn a_balanced_block_and_a_masked_mark_are_not_reported() {
+    let balanced = "/// RFC 9110 §5.6.1.2: \"Empty elements do not contribute.\"\n";
+    assert!(unpaired_of(balanced).is_empty(), "{balanced}");
+
+    let masked = concat!(
+      "/// RFC 9110 §5.6.1.2: \"Empty elements do not contribute to the count of\n",
+      "/// elements present.\" The mark itself is written `\"` in prose.\n",
+    );
+    assert!(unpaired_of(masked).is_empty(), "{masked}");
+
+    // …and one mark inside a code span that WRAPS is masked too, which is the
+    // whole reason the two halves of this module ship together: before the
+    // paragraph unit that mark leaked, and a leaked mark is an odd block.
+    let wrapped = concat!(
+      "/// RFC 9110 §5.6.1.2: an element such as `x, \"y,\n",
+      "/// z` and nothing else.\n",
+    );
+    assert!(unpaired_of(wrapped).is_empty(), "{wrapped}");
+  }
+
+  // The shape `UNPAIRED` records for `http-semantics/src/auth/mod.rs`, pinned
+  // rather than asserted in prose: a `//` line is a comment like any other, so
+  // a marker written directly under a `//!` doc comment does not start a block
+  // of its own — it JOINS the doc comment's, and its lone mark is the doc
+  // comment's to pair. The blank line is what separates them, which is why the
+  // two files that got this right left one.
+  #[test]
+  fn a_line_comment_under_a_doc_comment_joins_its_block() {
+    let joined = concat!(
+      "//! RFC 9110 §5.6.1.2: \"Empty elements do not contribute.\"\n",
+      "// gate-exempt: trap=\"open — a value whose string never closes\n",
+    );
+    assert_eq!(
+      unpaired_of(joined),
+      [(1, 2, 3)],
+      "the marker's lone mark is counted in the module doc's own block"
+    );
+
+    let separated = concat!(
+      "//! RFC 9110 §5.6.1.2: \"Empty elements do not contribute.\"\n",
+      "\n",
+      "// gate-exempt: trap=\"open — a value whose string never closes\n",
+    );
+    assert_eq!(
+      unpaired_of(separated),
+      [(3, 3, 1)],
+      "with a blank line between them the marker is its own block, and the doc comment pairs"
+    );
+  }
+
+  // `UNPAIRED`'s gate, in every direction it has one — the same four cases
+  // `UNTRIAGED`'s has, because they run on one rule (`drift`) and differ only
+  // in what they tell the reader to do about it.
+  #[test]
+  fn the_unpaired_table_is_held_in_both_directions() {
+    let table = &[("a.rs", 2), ("b.rs", 1)];
+
+    assert!(super::unpaired_drift(&counts(&[("a.rs", 2), ("b.rs", 1)]), table, false).is_empty());
+
+    let grown = super::unpaired_drift(&counts(&[("a.rs", 3), ("b.rs", 1)]), table, false);
+    assert_eq!(grown.len(), 1, "{grown:?}");
+    assert_eq!(grown[0].0, "a.rs");
+    assert!(grown[0].1.contains("`UNPAIRED` records 2"));
+    assert!(grown[0].1.contains("Balance the marks"));
+
+    let shrunk = super::unpaired_drift(&counts(&[("a.rs", 1), ("b.rs", 1)]), table, false);
+    assert_eq!(shrunk.len(), 1, "{shrunk:?}");
+    assert!(shrunk[0].1.contains("Lower the number here"));
+
+    let stale = super::unpaired_drift(&counts(&[("a.rs", 2)]), table, false);
+    assert_eq!(stale.len(), 1, "{stale:?}");
+    assert_eq!(stale[0].0, "b.rs");
+    assert!(stale[0].1.contains("the whole entry is stale"));
+
+    let unlisted = super::unpaired_drift(
+      &counts(&[("a.rs", 2), ("b.rs", 1), ("c.md", 1)]),
+      table,
+      false,
+    );
+    assert_eq!(unlisted.len(), 1, "{unlisted:?}");
+    assert!(unlisted[0].1.contains("not in `UNPAIRED`"));
+    assert!(
+      super::unpaired_drift(
+        &counts(&[("a.rs", 2), ("b.rs", 1), ("c.md", 1)]),
+        table,
+        true
+      )
+      .is_empty(),
+      "the unlisted half is relaxed on an ignored-tree run, exactly as `UNTRIAGED`'s is"
+    );
   }
 
   /// The quoted spans of masked lines once they are joined into a block, which
