@@ -221,6 +221,7 @@
 //! one from a public module's own documentation is what
 //! `rustdoc::private_intra_doc_links` refuses under `-D warnings`. Each is
 //! documented where it is defined.
+
 // gate-exempt: realm = "x" — one field value shown in prose, carrying the BWS
 // this module accepts; not a production of any RFC.
 // gate-exempt: x="c", Digest realm=evil — one field value shown in prose, whose
@@ -230,6 +231,14 @@
 // gate-exempt: crate::validator — named for contrast: §8.8.3's `opaque-tag` is
 // what forced a walk of its own there, and an `auth-param` value having a real
 // `quoted-pair` is why none is forced here.
+//
+// The blank line above is load-bearing, and no gate can see it go. A `//`
+// line continues the `//!` block above it, so without that line these
+// markers join the module doc, and the lone mark the third of them carries
+// makes every mark in that block pair one place out. Isolated they are their
+// own block, the way `websocket-proto/src/negotiation.rs` keeps its own
+// marker and for the same reason. `quote-check` counts one odd block in this
+// file either way, which is why this note is here rather than left to it.
 
 use crate::grammar::{
   Delim, ParamValue, QuotedScan, Readings, eq_ignore_ascii, scan_quoted, scan_quoted_after_join,
