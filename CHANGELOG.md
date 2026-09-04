@@ -103,6 +103,85 @@ first. A `Vary` reader that made the wildcard a property of the value would
 answer a different question, and would have nowhere to put the field names
 beside it.
 
+## `http-semantics` — §12.5.3's acceptability rules, measured total rather than argued away
+
+The three readers hand a caller RFC 9110 §12.4.2's weight per member and leave
+§12.5.3's `identity` default — a representation with no content coding is
+acceptable unless the field explicitly refuses it — for every caller to
+reimplement out of the same paragraph. It was left out on the argument that a
+partial answer would be worse than none. That argument was not measured, and
+measuring it refutes it: **every rule §12.5.3 states about acceptability is
+expressible from two inputs a caller already holds** — the representation's
+content coding or its absence, and the field's lines or none of them.
+
+### Added
+
+- `negotiation::encoding_acceptability(coding, lines)`, answering RFC 9110
+  §12.5.3's own question: "A server tests whether a content coding for a given
+  representation is acceptable using these rules". `coding` is `None` where the
+  representation HAS no coding, which is rule 2's subject; no lines is an absent
+  field, which is rule 1's.
+- `negotiation::Acceptability`, with `is_acceptable` and `weight`. Three states,
+  because §12.5.3 reaches its verdict through three different sentences:
+  `AcceptableByDefault` (acceptable, no weight named), `Weighed(Weight)`
+  (acceptable iff not zero) and `Unmentioned` (§12.4.3's unacceptable, with no
+  weight). `weight` is `None` for the two that name none, rather than
+  `Weight::ONE` — §12.4.2's default of 1 is what an absent `q` on a PRESENT
+  member means, and there is no member in either case.
+
+### The enumeration, rule by rule
+
+| # | rule | expressible from (coding-or-absence, lines-or-none)? |
+|---|---|---|
+| 1 | Rule 1 — no field, any coding acceptable | **yes**: a field is present exactly when a line names it, so no lines is the absent field and one empty line is not |
+| 2 | Rule 2 — no coding, acceptable unless `identity;q=0`, or `*;q=0` with no more specific `identity` entry | **yes** |
+| 3 | Rule 3 — a listed coding is acceptable unless accompanied by a qvalue of 0 | **yes**, case-insensitively per §8.4.1 |
+| 4 | §12.5.3's asterisk sentence — `*` matches any coding not explicitly listed | **yes** |
+| 5 | §12.4.3 — no wildcard, unmentioned values unacceptable | **yes**; this is the sentence that closes the question, since rules 1 to 3 leave that case with no verdict |
+| 6 | §12.5.3's empty-field sentence | **yes**, and as a CONSEQUENCE of 2, 3 and 5 rather than a case: no branch spells it, and a test asserts it falls out |
+| 7 | §12.5.3's response direction — evaluated the same way as in a request | **yes**: one function, no direction argument |
+
+**Verdict: total.** Nothing was left needing an input the caller cannot hand
+over, so the "total except one load-bearing site" objection does not apply and
+it ships.
+
+Two further rules of §12.5.3 are **not** acceptability rules and are not
+answered: preferring the highest non-zero qvalue among codings "that have the
+same purpose", and the SHOULD about what to send when nothing is acceptable.
+Each needs the set of representations the responder holds, which is not this
+field and not this coding. The first ranks by `Acceptability::weight`, asked
+once per candidate.
+
+### Two clauses that a plain reading of rule 2 gets backwards
+
+Both are tests rather than prose.
+
+- **A `*;q=0` does not exclude a representation with no coding when the field
+  also carries an `identity` entry.** That entry is rule 2's "more specific
+  entry", and it governs whatever it says.
+- **A non-zero `*` lends no weight to a representation with no coding at all.**
+  Rule 2 names only `*;q=0` as reaching that case, so `Accept-Encoding: *;q=0.5`
+  answers `AcceptableByDefault` with no weight, not `Weighed(500)`.
+
+### A coding the field names twice
+
+RFC 9110 settles no rule for a repeat, so one is taken and stated. A zero
+ANYWHERE among the entries naming a coding excludes it — rule 3's own wording
+read plainly, and the reading that does not depend on which end of the field a
+recipient starts from. Where no entry is zero, the last in wire order gives the
+weight, which is what this crate already does for a repeated `q` inside one
+member.
+
+### Why there is no `Accept-Language` counterpart
+
+RFC 9110 §12.5.4 states no acceptability rules and hands the question away in
+one sentence: "For matching, Section 3 of [RFC4647] defines several matching
+schemes. Implementations can offer the most appropriate matching scheme for
+their requirements." A function here would be picking one of those schemes on
+the caller's behalf. The same enumeration for §12.5.2 finds only §12.4.3's
+wildcard rule and no default of its own, so it has nothing §12.5.3's rule 2
+gives it either.
+
 ## `http-semantics` — the rest of RFC 9110 §12.5, over an element that carries no parameters
 
 `Accept` and its ranking shipped in this crate; §12.5's other four fields had no

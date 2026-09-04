@@ -207,7 +207,10 @@ use http_semantics::{
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
   grammar::{ParamSyntax, ParamValue, parameterised_list},
   media::{media_type, weight_for},
-  negotiation::{VaryMember, accept_charset, accept_encoding, accept_language, vary},
+  negotiation::{
+    Acceptability, VaryMember, accept_charset, accept_encoding, accept_language,
+    encoding_acceptability, vary,
+  },
   range::{ContentRange, RangesSpecifier, Resolved},
   validator::{EntityTag, TagList},
 };
@@ -1974,6 +1977,101 @@ fn vary_is_panic_free() {
   assert_eq!(shim_vary(black_box(&[])), 0);
   assert_eq!(shim_vary(black_box(&[b"".as_slice()])), 0);
   assert_eq!(shim_vary(black_box(&[[0xffu8, 0x2c, 0x2a].as_slice()])), 0);
+}
+
+no_panic_shim! {
+  /// Shim over `negotiation::encoding_acceptability` — RFC 9110 §12.5.3's three
+  /// numbered rules plus the two sentences that close them, over the walk they
+  /// are asked of.
+  ///
+  /// `copied()`, and this is a fourth instantiation rather than a repeat of
+  /// `shim_accept_encoding`'s: the function under test wraps whatever it is
+  /// given in an `Inspect` before handing it to the walk, so the walk beneath
+  /// this shim is over `Inspect<Copied<..>>` where that one is over `Copied<..>`
+  /// alone. One adapter type per shim still holds; the adapter is just not the
+  /// one written at the call site.
+  ///
+  /// Encodes the whole answer so no arm is folded away: a fault is 0, the
+  /// default is 1, an unmentioned coding is 2, and a weighed one is its
+  /// thousandths past 3.
+  fn shim_encoding_acceptability(coding: Option<&[u8]>, lines: &[&[u8]]) -> usize {
+    match encoding_acceptability(coding, lines.iter().copied()) {
+      Err(_) => 0,
+      Ok(Acceptability::AcceptableByDefault) => 1,
+      Ok(Acceptability::Unmentioned) => 2,
+      Ok(Acceptability::Weighed(weight)) => usize::from(weight.thousandths()).wrapping_add(3),
+    }
+  }
+}
+
+#[test]
+fn encoding_acceptability_is_panic_free() {
+  // Rule 1, which is about the field's presence and reaches no member at all.
+  assert_eq!(
+    shim_encoding_acceptability(black_box(Some(b"gzip".as_slice())), black_box(&[])),
+    1
+  );
+  assert_eq!(
+    shim_encoding_acceptability(black_box(None), black_box(&[])),
+    1
+  );
+  // RFC 9110 §12.5.3's own example, asked as a named coding, as `identity`, and
+  // as a representation with no coding at all.
+  let example: &[&[u8]] = &[b"gzip;q=1.0, identity; q=0.5, *;q=0"];
+  assert_eq!(
+    shim_encoding_acceptability(black_box(Some(b"gzip".as_slice())), black_box(example)),
+    1003
+  );
+  assert_eq!(
+    shim_encoding_acceptability(black_box(None), black_box(example)),
+    503
+  );
+  assert_eq!(
+    shim_encoding_acceptability(black_box(Some(b"br".as_slice())), black_box(example)),
+    3
+  );
+  // §12.4.3's unmentioned value, and rule 2's default behind a non-zero
+  // wildcard that does not reach it.
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Some(b"br".as_slice())),
+      black_box(&[b"gzip".as_slice()])
+    ),
+    2
+  );
+  assert_eq!(
+    shim_encoding_acceptability(black_box(None), black_box(&[b"*;q=0.5".as_slice()])),
+    1
+  );
+  // The empty field, over RFC 9110 §5.2's lines, and the walk's own faults.
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Some(b"gzip".as_slice())),
+      black_box(&[b"".as_slice()])
+    ),
+    2
+  );
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Some(b"gzip".as_slice())),
+      black_box(&[b"gzip;q=1.0".as_slice(), b"", b"*;q=0"])
+    ),
+    1003
+  );
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Some(b"gzip".as_slice())),
+      black_box(&[b"gzip;p=1".as_slice()])
+    ),
+    0
+  );
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Some([0xffu8].as_slice())),
+      black_box(&[[0x67u8, 0x3b, 0x71, 0x3d, 0xff].as_slice()])
+    ),
+    0
+  );
 }
 
 // ── the lie-check: this file's own guard against going vacuous ────────────────
