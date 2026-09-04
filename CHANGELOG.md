@@ -1,5 +1,30 @@
 # UNRELEASED
 
+## `http-semantics` — the rustdoc `-Dwarnings` build was red, and no gate here was looking at it
+
+`doc-check` documents private items, so it resolves links this crate's own
+published documentation cannot. CI's `doc` job does not: it runs
+`RUSTDOCFLAGS="--cfg docsrs -Dwarnings" cargo doc -p http-semantics
+--all-features --no-deps`, which exited **101** on four errors in
+`negotiation/mod.rs` — three `rustdoc::private_intra_doc_links` and one
+`rustdoc::redundant_explicit_links`.
+
+### Fixed
+
+- **RFC 4647 §2.1's rule moves to `accept_language`, where the public API meets
+  it.** Three of the four errors were public documentation linking to the
+  private `Element::LanguageRange` and to the private `fold_repeated_entry`, and
+  the link was the symptom: the language-range grammar and the repeated-entry
+  ruling were both documented only where a reader of the crate's docs could not
+  see them. `Element::LanguageRange` now points UP at the public entry point and
+  keeps only what is true of the walk, and `encoding_acceptability` states both
+  halves of the repeated-entry answer inline.
+- The fourth was `[`list_elements`](crate::grammar::list_elements)` in the module
+  summary, redundant because the name is imported.
+
+`RUSTDOCFLAGS="--cfg docsrs -Dwarnings" cargo doc -p http-semantics
+--all-features --no-deps` now exits 0.
+
 ## `http-semantics` — two shims with one body are one symbol, and one of the two proved nothing
 
 `shim_accept_charset` and `shim_accept_encoding` had identical bodies. The two
