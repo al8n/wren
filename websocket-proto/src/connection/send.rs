@@ -2148,7 +2148,7 @@ mod tests {
     );
   }
 
-  /// F3: `CloseSent → Ping → peer Close`, in its four public shapes.
+  /// `CloseSent → Ping → peer Close`, in its four public shapes.
   ///
   /// A Ping received after our own `close()` is queued BEHIND that close by
   /// queue-time order. When the peer's Close then arrives the branch must say
@@ -2246,13 +2246,13 @@ mod tests {
     );
   }
 
-  /// **The starvation bound, on the schedule that exposes it.** Codex R2 ruled
-  /// this the high finding: with unconditional pong priority a driver that
-  /// alternates one inbound Ping with exactly ONE `poll_transmit` emits a Pong
-  /// every time and never reaches its Close, so `close_deadline` never arms. The
-  /// queue cap does not help — only one pong is outstanding at a time — and this
-  /// crate cannot assume a drain-to-`None` schedule, because the public API
-  /// neither enforces nor can express one.
+  /// **The starvation bound, on the schedule that exposes it.** With
+  /// unconditional pong priority a driver that alternates one inbound Ping with
+  /// exactly ONE `poll_transmit` emits a Pong every time and never reaches its
+  /// Close, so `close_deadline` never arms. The queue cap does not help — only
+  /// one pong is outstanding at a time — and this crate cannot assume a
+  /// drain-to-`None` schedule, because the public API neither enforces nor can
+  /// express one.
   ///
   /// The bound queue-time order gives is exact within an epoch:
   /// `pongs_before_close` is frozen when the close is queued and only shrinks

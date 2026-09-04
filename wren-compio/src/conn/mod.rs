@@ -791,10 +791,9 @@ enum RawDrive {
 /// With `race_read`, a write that CANNOT progress also polls the inbound
 /// direction — into the guard's own inbound vector, which is why the buffer is
 /// not a parameter — and yields whatever arrives. The two directions are
-/// independent,
-/// and after our Close has flushed the peer's Close is the thing that ends the
-/// handshake — leaving it unread until a blocked Pong batch times out turns a
-/// handshake that completed at once into an unclean close at the deadline.
+/// independent, and after our Close has flushed the peer's Close is what ends
+/// the handshake: leaving it unread until a blocked Pong batch times out turns
+/// a handshake that completed at once into an unclean close at the deadline.
 /// Written by hand rather than as two futures because both halves are
 /// `Pin<&mut S>` calls on one poll-based stream, so there is nothing to split.
 ///
@@ -1364,10 +1363,7 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         // settled in Phase 1, which completes the handshake on receipt when
         // `close_flushed_at` is set and never marks a Close owed for it, and in
         // `close_flush_timed_out`, which owns a batch that was torn down rather
-        // than flushed. A branch here that discharged `close_owed` and
-        // published a staged outcome was kept through R4 on a reachability
-        // argument; deleting it reds nothing in `test -p wren-compio` (49
-        // tests), so it is gone and the carrying flush is the sole publisher of
+        // than flushed. So the carrying flush is the sole publisher of
         // `staged_close`.
       }
       effective_deadline(&guard)
@@ -1382,10 +1378,9 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
     // Once the Close HAS flushed, any further write — a post-Close Pong
     // batch, which exists now that the protocol keeps answering Pings until
     // the peer's Close arrives — is bounded by what REMAINS of that echo
-    // budget. It must be: such a batch carries no Close and `close_owed`
-    // is already discharged, so the old two-way choice parked it unbounded and
-    // a peer that filled the socket and stopped reading wedged it forever,
-    // defeating the very bound `close_timeout` documents. The remaining time
+    // budget. It must be: such a batch carries no Close and `close_owed` is
+    // already discharged, so nothing else bounds it and a peer that filled the
+    // socket and stopped reading would wedge it forever. The remaining time
     // is read from `close_flushed_at` DIRECTLY rather than through
     // `effective_deadline`, which answers `None` once the peer's Close has
     // cleared the protocol timer — and `None` there would leave exactly this
@@ -1394,10 +1389,8 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
     // BOTH bounded arms are remaining time from an ABSOLUTE anchor, never a
     // fresh budget: `close_owed`'s own instant for the first,
     // `close_flushed_at` for the second. A `Reconsider` re-entry recomputes
-    // from the same
-    // anchor, so the bound only shrinks — a doorbell cannot buy a wedged
-    // flush another budget, which is what made `close_timeout` unbounded in
-    // the presence of any local sender. Zero remaining resolves to
+    // from the same anchor, so the bound only shrinks — a doorbell cannot buy
+    // a wedged flush another budget. Zero remaining resolves to
     // `FlushArm::Budget` BEFORE the drive is polled: `select_biased!` polls
     // the drive first, so an already-ready write would otherwise complete
     // after the budget was spent, and the deadline is a hard boundary.

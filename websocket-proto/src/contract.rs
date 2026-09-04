@@ -130,11 +130,9 @@
 /// COUNTED, so the next batch has a target rather than an intention: of the
 /// **47** public functions in this crate that take a `&[u8]` / `&mut [u8]` /
 /// `&str` — the shape peer-supplied bytes arrive in — **7** are covered by a
-/// `#[no_panic]` shim and **40** are not. (The first count of this was 36/5/31,
-/// from a regex that required an indented `pub fn` and so could not see a
-/// free function; `mask` and the UTF-8 validator's `feed` were among the ones
-/// it missed. The second was 46/7/39, and `Connection::observe` is the
-/// forty-seventh: it shares `handle`'s tree, so it joins the uncovered side.)
+/// `#[no_panic]` shim and **40** are not. Re-derive it with the command below
+/// rather than by eye: a regex that requires an indented `pub fn` cannot see a
+/// free function, and undercounts by `mask` and the UTF-8 validator's `feed`.
 /// The uncovered set is headed by `Connection::handle`, whose call tree is the
 /// entire inbound state machine, and includes `frame::decode_close_payload`,
 /// the whole `handshake::h1` surface (`classify`, `handle`, `encode_response`,
@@ -166,7 +164,7 @@
 /// point, `Connection::handle_timeout`, which takes no bytes and so is not in
 /// this population at all — which is why eight shims cover seven of them.
 ///
-/// Widening the proof is deliberately NOT this branch's work: `tests/no_panic.rs`
+/// Widening the proof is deliberately not done here: `tests/no_panic.rs`
 /// records that the connection tree does not inline into one shim without
 /// pervasively annotating the library, and finding the shape that does is a
 /// design question, not an edit.

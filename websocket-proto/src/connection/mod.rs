@@ -235,7 +235,7 @@ impl Instant for Nanos {
 /// only way this doc's numbers stay measurements. The mode itself is a cursor
 /// field and is not in this struct at all.
 ///
-/// A middle revision of this branch was 128 bytes smaller, by merging
+/// An earlier revision of this work was 128 bytes smaller, by merging
 /// `SendState`'s close slot and `RecvState`'s pong slot into one tagged slot.
 /// **That merge was a conformance defect and is reverted**: RFC 6455 §5.5.2
 /// (line 2042 of `.rfc-cache/rfc6455.txt`) owes a Pong until a Close is

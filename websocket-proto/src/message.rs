@@ -1420,7 +1420,7 @@ mod tests {
 
   #[test]
   fn push_after_the_abandon_notice_keeps_discarding_to_the_boundary() {
-    // The regression the cross-family review ran: the head is assembled under
+    // The head is assembled under
     // `handle`, the continuations are observed (zero events), and the
     // `MessageEnd` arrives back under `handle` — where it must seal nothing.
     let mut conn = server();

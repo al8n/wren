@@ -798,7 +798,7 @@ async fn a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget() {
 
   // Ten owed Pongs coalesce into one post-Close batch of 100 bytes, which
   // cannot fit, so the write wedges with `carries_close == false` and
-  // `close_owed == None` — Codex's path exactly.
+  // `close_owed == None` — the unbounded path exactly.
   const {
     assert!(
       PINGS * PONG_LEN > PIPE_CAPACITY,
@@ -2510,9 +2510,9 @@ async fn observation_reads_behind_a_wedged_write_recycle_their_buffers() {
   );
   // The same bound, scale-free. What is left in the total is the flush loop's
   // own per-pass cost — an `event_listener` node and a timer, neither of them
-  // a read buffer and neither of them this round's subject — at about 600
-  // bytes a pass, so the TOTAL above would stop holding somewhere past
-  // twenty-five reads while the property it is testing still did. The defect
+  // a read buffer — at about 600 bytes a pass, so the TOTAL above would stop
+  // holding somewhere past twenty-five reads while the property it is testing
+  // still did. The defect
   // was two 16 KiB buffers per read; a kilobyte per read is not that, at any
   // length of flood.
   assert!(
@@ -2614,7 +2614,7 @@ async fn a_compressed_bomb_behind_a_wedged_write_is_not_inflated() {
   use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
   use websocket_proto::negotiation::DeflateParams;
 
-  // The R7 finding: discarding at the assembler rather than the protocol discards
+  // Discarding at the assembler rather than the protocol discards
   // the EVENT, and with `deflate` the event is produced only after
   // `Connection::handle` has inflated the payload into the decompressor's
   // buffer and kept its capacity. So a peer that keeps sending compressed
@@ -2741,7 +2741,7 @@ async fn a_compressed_bomb_behind_a_wedged_write_is_not_inflated() {
 async fn a_message_begun_before_observation_is_not_delivered_truncated() {
   use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
 
-  // The cross-family review's probe. The peer opens a fragmented Binary
+  // The peer opens a fragmented Binary
   // message and one non-final frame arrives while the driver is still
   // RECEIVING, so `MessageAssembler` holds it. The application then closes,
   // the peer wedges the Pong batch, and every later read is observed — and an
@@ -2923,7 +2923,7 @@ async fn a_poisoned_compressed_message_is_dropped_not_delivered_empty() {
   use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
   use websocket_proto::negotiation::DeflateParams;
 
-  // The cross-family review's second probe. Observation poisons the inflate
+  // Observation poisons the inflate
   // context (by design), the wedge then drains, and the driver returns to
   // `handle` for the rest of the connection's life. Every later compressed
   // message is skipped by the protocol — `MessageStart` + `MessageEnd`, no

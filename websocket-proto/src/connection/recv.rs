@@ -1553,18 +1553,14 @@ where
     // process data". So every owed pong goes, here at §7.1.7's own entrance,
     // rather than being filtered out at drain time by a second rule.
     // The count is "pre-close pongs currently queued", and a cleared queue has
-    // none — so it goes with them. F3's discard arm already does this; now every
-    // site that empties the queue does.
+    // none — so it goes with them. The CloseSent discard arm already does
+    // this; now every site that empties the queue does.
     //
-    // MEASURED to be a no-op today, and kept anyway. On the `!close_sent` path
-    // below, `force_close` calls `queue_close(code, "", 0)` with the slot
-    // already emptied above, so the count is recomputed to 0 there. On the
-    // `close_sent` path nothing recomputes it — but a POSITIVE count with
-    // `close_sent` is unreachable: the close drains only once the prefix is
-    // exhausted or the slot is empty, and nothing empties the slot except
-    // draining. So neither branch can leave a stale number, and deleting this
-    // line reds no test. It stays because it makes the rule true AT the site
-    // that empties the queue rather than by two arguments about other sites,
+    // MEASURED to be a no-op today, and kept anyway: two arguments about other
+    // sites already hold the count at 0 on both paths, so deleting this line
+    // reds no test (they are named on
+    // `failing_the_connection_clears_the_pre_close_count_with_the_pongs`). It
+    // stays because it makes the rule true AT the site that empties the queue,
     // and because the second of those arguments is one line of `poll_transmit`
     // away from being false.
     self.conn.send.pending_pong = None;
@@ -2154,7 +2150,7 @@ mod tests {
     );
   }
 
-  /// C2: failing the connection leaves no pong, and no count describing one.
+  /// Failing the connection leaves no pong, and no count describing one.
   ///
   /// **This test pins the behaviour, not the new line.** `fail` clears the queue
   /// — §7.1.7 (line 2399 of `.rfc-cache/rfc6455.txt`) has an endpoint told to
@@ -2211,7 +2207,7 @@ mod tests {
     );
   }
 
-  /// F4: the public half of the post-Close-Ping rule — one batch carrying
+  /// The public half of the post-Close-Ping rule — one batch carrying
   /// `[Close, Ping]`.
   ///
   /// `Events::next` returns `None` once the connection is terminal, so the
@@ -2267,7 +2263,7 @@ mod tests {
     assert!(conn.send.pending_pong.is_none());
   }
 
-  /// F2: shedding an entry that lies inside the frozen pre-close prefix must
+  /// Shedding an entry that lies inside the frozen pre-close prefix must
   /// shrink the prefix with it.
   ///
   /// At capacity the overflow queue evicts its front to make room. That entry
