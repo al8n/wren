@@ -565,10 +565,14 @@ http_semantics::media::weight_for_with
 http_semantics::negotiation
 http_semantics::negotiation::Acceptability
 http_semantics::negotiation::Acceptability::AcceptableByDefault
+http_semantics::negotiation::Acceptability::NotAdvertised
 http_semantics::negotiation::Acceptability::Unmentioned
 http_semantics::negotiation::Acceptability::Weighed
 http_semantics::negotiation::Acceptability::is_acceptable
 http_semantics::negotiation::Acceptability::weight
+http_semantics::negotiation::Direction
+http_semantics::negotiation::Direction::Request
+http_semantics::negotiation::Direction::Response
 http_semantics::negotiation::Element
 http_semantics::negotiation::Element::LanguageRange
 http_semantics::negotiation::Element::Token

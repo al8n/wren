@@ -208,7 +208,7 @@ use http_semantics::{
   grammar::{ParamSyntax, ParamValue, parameterised_list},
   media::{media_type, weight_for},
   negotiation::{
-    Acceptability, VaryMember, accept_charset, accept_encoding, accept_language,
+    Acceptability, Direction, VaryMember, accept_charset, accept_encoding, accept_language,
     encoding_acceptability, vary,
   },
   range::{ContentRange, RangesSpecifier, Resolved},
@@ -2014,15 +2014,25 @@ no_panic_shim! {
   /// alone. One adapter type per shim still holds; the adapter is just not the
   /// one written at the call site.
   ///
+  /// `direction` is an ARGUMENT and `black_box`ed at every call site, for the
+  /// reason `shim_parameterised_list`'s `syntax` is: it selects between rule 1
+  /// and the no-verdict answer at a `match` inside, and a constant would let
+  /// LLVM fold the other arm away and prove nothing about it.
+  ///
   /// Encodes the whole answer so no arm is folded away: a fault is 0, the
-  /// default is 1, an unmentioned coding is 2, and a weighed one is its
-  /// thousandths past 3.
-  fn shim_encoding_acceptability(coding: Option<&[u8]>, lines: &[&[u8]]) -> usize {
-    match encoding_acceptability(coding, lines.iter().copied()) {
+  /// default is 1, an unmentioned coding is 2, an unadvertised one is 3, and a
+  /// weighed one is its thousandths past 4.
+  fn shim_encoding_acceptability(
+    direction: Direction,
+    coding: Option<&[u8]>,
+    lines: &[&[u8]],
+  ) -> usize {
+    match encoding_acceptability(direction, coding, lines.iter().copied()) {
       Err(_) => 0,
       Ok(Acceptability::AcceptableByDefault) => 1,
       Ok(Acceptability::Unmentioned) => 2,
-      Ok(Acceptability::Weighed(weight)) => usize::from(weight.thousandths()).wrapping_add(3),
+      Ok(Acceptability::NotAdvertised) => 3,
+      Ok(Acceptability::Weighed(weight)) => usize::from(weight.thousandths()).wrapping_add(4),
     }
   }
 }
@@ -2031,44 +2041,134 @@ no_panic_shim! {
 fn encoding_acceptability_is_panic_free() {
   // Rule 1, which is about the field's presence and reaches no member at all.
   assert_eq!(
-    shim_encoding_acceptability(black_box(Some(b"gzip".as_slice())), black_box(&[])),
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(Some(b"gzip".as_slice())),
+      black_box(&[])
+    ),
     1
   );
   assert_eq!(
-    shim_encoding_acceptability(black_box(None), black_box(&[])),
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(None),
+      black_box(&[])
+    ),
     1
   );
   // RFC 9110 §12.5.3's own example, asked as a named coding, as `identity`, and
   // as a representation with no coding at all.
   let example: &[&[u8]] = &[b"gzip;q=1.0, identity; q=0.5, *;q=0"];
   assert_eq!(
-    shim_encoding_acceptability(black_box(Some(b"gzip".as_slice())), black_box(example)),
-    1003
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(Some(b"gzip".as_slice())),
+      black_box(example)
+    ),
+    1004
   );
   assert_eq!(
-    shim_encoding_acceptability(black_box(None), black_box(example)),
-    503
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(None),
+      black_box(example)
+    ),
+    504
   );
   assert_eq!(
-    shim_encoding_acceptability(black_box(Some(b"br".as_slice())), black_box(example)),
-    3
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(Some(b"br".as_slice())),
+      black_box(example)
+    ),
+    4
   );
   // §12.4.3's unmentioned value, and rule 2's default behind a non-zero
   // wildcard that does not reach it.
   assert_eq!(
     shim_encoding_acceptability(
+      black_box(Direction::Request),
       black_box(Some(b"br".as_slice())),
       black_box(&[b"gzip".as_slice()])
     ),
     2
   );
+  // A non-zero wildcard does NOT reach the no-coding state, so this is rule 2's
+  // default and carries no weight; only `*;q=0` reaches it, and excludes.
   assert_eq!(
-    shim_encoding_acceptability(black_box(None), black_box(&[b"*;q=0.5".as_slice()])),
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(None),
+      black_box(&[b"*;q=0.5".as_slice()])
+    ),
     1
+  );
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(None),
+      black_box(&[b"*;q=0".as_slice()])
+    ),
+    4
+  );
+  // Rule 2's default, which needs a field naming neither `identity` nor `*`.
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(None),
+      black_box(&[b"gzip".as_slice()])
+    ),
+    1
+  );
+  // And `identity` by name is the same state, over a field that does not name
+  // it — the arm that used to answer `Unmentioned` here.
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Direction::Request),
+      black_box(Some(b"identity".as_slice())),
+      black_box(&[b"gzip".as_slice()])
+    ),
+    1
+  );
+  // The other `Direction` arm, so neither is folded away: a response with no
+  // field at all is `NotAdvertised`, and a response with one is read exactly as
+  // a request's is.
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Direction::Response),
+      black_box(Some(b"gzip".as_slice())),
+      black_box(&[])
+    ),
+    3
+  );
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Direction::Response),
+      black_box(None),
+      black_box(&[])
+    ),
+    3
+  );
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Direction::Response),
+      black_box(None),
+      black_box(example)
+    ),
+    504
+  );
+  assert_eq!(
+    shim_encoding_acceptability(
+      black_box(Direction::Response),
+      black_box(Some(b"gzip".as_slice())),
+      black_box(&[b"gzip;p=1".as_slice()])
+    ),
+    0
   );
   // The empty field, over RFC 9110 §5.2's lines, and the walk's own faults.
   assert_eq!(
     shim_encoding_acceptability(
+      black_box(Direction::Request),
       black_box(Some(b"gzip".as_slice())),
       black_box(&[b"".as_slice()])
     ),
@@ -2076,13 +2176,15 @@ fn encoding_acceptability_is_panic_free() {
   );
   assert_eq!(
     shim_encoding_acceptability(
+      black_box(Direction::Request),
       black_box(Some(b"gzip".as_slice())),
       black_box(&[b"gzip;q=1.0".as_slice(), b"", b"*;q=0"])
     ),
-    1003
+    1004
   );
   assert_eq!(
     shim_encoding_acceptability(
+      black_box(Direction::Request),
       black_box(Some(b"gzip".as_slice())),
       black_box(&[b"gzip;p=1".as_slice()])
     ),
@@ -2090,6 +2192,7 @@ fn encoding_acceptability_is_panic_free() {
   );
   assert_eq!(
     shim_encoding_acceptability(
+      black_box(Direction::Request),
       black_box(Some([0xffu8].as_slice())),
       black_box(&[[0x67u8, 0x3b, 0x71, 0x3d, 0xff].as_slice()])
     ),

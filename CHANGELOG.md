@@ -1,5 +1,215 @@
 # UNRELEASED
 
+## `http-semantics` — why `encoding_acceptability` has no corpus, recorded where its tests are
+
+The three differential harnesses here grade a reader over records that are
+BYTES. That shape cannot express this function's input, and the gap is in the
+ARGUMENTS rather than in the bytes: presence is not a byte string (zero field
+lines and one empty line are different inputs with different answers), direction
+is not in the field, and the question itself is an `Option<coding>` the caller
+passes. Records would need roughly `{ direction, field_lines, coding }`, and the
+harness would be a differential over arguments as well as bytes, which none of
+the three existing ones is.
+
+One narrowing on that, derived rather than taken: for THIS reader a single-value
+record loses only the zero-lines case and not every line split. The walk is
+`lines.flat_map(list_elements)` and RFC 9110 §5.2's join inserts a comma no
+element may hold, so any non-empty set of lines answers as its joined value
+does — pinned for two fields by existing tests. What a value cannot carry is the
+difference between no lines and some, which is exactly where rule 1 and the
+response case live.
+
+The note sits at the head of the acceptability tests, where someone looking for
+the missing corpus will be.
+
+## `http-semantics` — an absent response advertises nothing, and now says so
+
+Zero field lines always answered `AcceptableByDefault`. RFC 9110 §12.5.3's
+absence rule names its direction — "If no Accept-Encoding header field is in the
+request, any content coding is considered acceptable by the user agent." — and
+gives a response's field meaning only when it is PRESENT: "When the
+Accept-Encoding header field is present in a response, it indicates what content
+codings the resource was willing to accept in the associated request." A
+response carrying no such field has advertised nothing, and the old answer told a
+client that a server which said nothing accepts everything, which the client can
+act on by encoding its next request.
+
+The previous round labelled this an extrapolation. A label is not a fix: naming
+an extrapolation is not the same as declining to make one.
+
+### Added
+
+- `negotiation::Direction`, with `Request` and `Response`.
+  `encoding_acceptability` takes it as its first argument — the function is new
+  and unreleased, so the signature was free.
+- `Acceptability::NotAdvertised`, for a response with no field. It is **not a
+  verdict**, so `Acceptability::is_acceptable` now returns `Option<bool>` and
+  answers `None` there: both bools would be wrong, since `true` says a server
+  that advertised nothing accepts this coding and `false` says it refuses one it
+  may well accept. `weight` is `None` there too.
+
+### The totality table, re-checked against the direction axis
+
+Rule 1 is the only entry that moves: it now requires no lines AND
+`Direction::Request`. Rule 7 is about a field that is THERE and still reads as
+such — rules 2 to 6 evaluate a present response field exactly as a request's,
+which is what that rule says — so `direction` reaches no arm of the walk and no
+arm of the verdict match. It decides the zero-line case and nothing else.
+`an_absent_response_advertises_nothing` asserts both halves: the four-way
+split on absence, and that five present fields answer identically in both
+directions for three different codings.
+
+## `http-semantics` — the wildcard reaches the uncoded representation only at zero
+
+The previous round had `"*"` lend its weight to a representation with no content
+coding, on the ground that nothing bounded rule 2's reach to a zero. An external
+reviewer read it the other way, and re-deriving it selects the reviewer's
+reading. Both readings were computed from the public walk over the same nine
+fields before anything changed, so the choice is between two measured answers
+rather than two arguments.
+
+### The test that settles it: which reading makes rule 2's own clause do work
+
+If `"*"` matched this state generally, rule 2's `*;q=0` clause would follow from
+the asterisk sentence plus §12.4.2 — and so would `identity;q=0`, and so would
+"without a more specific entry for `identity`". Everything after "acceptable by
+default" would restate machinery stated elsewhere. If `"*"` does not match it,
+rule 2 is the only source of the `*;q=0` exclusion and the precedence sub-clause
+is what keeps an explicit `identity` entry ahead of it. A reading that gives a
+sentence the RFC wrote something to do beats one that makes it ornament.
+
+**And this section marks its restatements.** Rule 3 restates §12.4.2 and says so
+in its own parenthesis: "As defined in Section 12.4.2, a qvalue of 0 means "not
+acceptable"." Rule 2 carries no such marker.
+
+Two further anchors, both textual:
+
+- The asterisk sentence matches "any available content coding not explicitly
+  listed in the field", and §8.4 has a representation's codings listed in
+  `Content-Encoding` with `identity` reserved out of it — so this state has no
+  available content coding for that sentence to range over.
+- `codings          = content-coding / "identity" / "*"` gives `identity` an
+  alternative beside `content-coding`, so a rule quantified over a
+  `content-coding` does not reach it. That separation is SEMANTIC: the three
+  alternatives derive one language, which is why one `Element` arm reads them
+  all, and it is the meanings that are distinct.
+
+**The section's own example is neutral and is reported as such.**
+`Accept-Encoding: gzip;q=1.0, identity; q=0.5, *;q=0` pairs an explicit
+`identity` entry with `*;q=0`; under both readings that `*;q=0` excludes the
+uncoded representation and the explicit entry overrides it, so both make the
+spelling natural and both give it identical answers. It is not evidence either
+way and is not used as any.
+
+**What the rejected reading actually cost, which is the reverse of how the
+previous round read it.** Over `Accept-Encoding: *;q=0.001, gzip;q=0.5` it hands
+the uncoded representation `Weighed(1)`, ranking it BELOW `gzip` — turning a
+status rule 2 states unconditionally into a near-refusal the field never wrote.
+That is not preserving the client's ordering; it is inventing one, in the
+direction that most damages the representation rule 2 protects.
+
+### Fixed
+
+- A wildcard reaches the no-coding state only at zero. The identity/`None`
+  normalisation is untouched — the two halves are independent, and only the
+  second moved.
+- The pin names the reading NOT taken and its answers, so the next reader meets
+  both sides: under it the three parting fields answer `Weighed(500)`,
+  `Weighed(500)` and `Weighed(1)` where this reader answers rule 2's default.
+  Measured over both readings; they part on exactly one shape — a non-zero
+  wildcard with no explicit `identity` entry — and agree everywhere else,
+  including on every field asked about a coding the representation has.
+
+### Added
+
+- `the_sections_own_example_line_parses_and_answers` pins §12.5.3's own example
+  at `.rfc-cache/rfc9110.txt:5555`. Its `identity; q=0.5` carries OWS AFTER the
+  semicolon, which §12.4.2's `weight = OWS ";" OWS "q=" qvalue` brackets, where
+  this reader's refusals are around the `=` that production writes bare. A
+  specification's own example is an input no reader has licence to refuse, so it
+  is pinned rather than assumed: three preferences at 1000 / 500 / 0, and the
+  four answers `encoding_acceptability` gives over it.
+
+## `http-semantics` — the domain `encoding_acceptability` answers over is narrower than its section's subject
+
+Totality holds — every rule RFC 9110 §12.5.3 states about acceptability is
+expressible from the two inputs — but two narrowings sit between the function
+and the section, and neither is visible from the signature. Both are now stated.
+
+### Changed
+
+- **One coding, where a representation may carry several.** §12.5.3: "A
+  representation could be encoded with multiple content codings.", and §8.4 has
+  the sender list them in the order they were applied, so
+  `Content-Encoding: gzip, br` is one representation with two. This answers
+  about one — the unit the section's own rules are stated over — and a caller
+  holding two asks twice. The conjunction is the caller's composition, not a
+  sentence this crate can cite, and `a_representation_with_two_codings_is_two_questions`
+  says so where a reader will look for an `is_acceptable` over a list.
+- **A field that is there.** Rule 7 carries the response direction for a field
+  that is PRESENT — "When the Accept-Encoding header field is present in a
+  response, it indicates what content codings the resource was willing to accept
+  in the associated request." — while rule 1's absence case is written about the
+  REQUEST. So answering `AcceptableByDefault` for a RESPONSE carrying no such
+  field extends rule 1 past the direction it names. It is the only answer that
+  keeps one function serving both directions, and the alternative is a direction
+  argument for a case §12.5.3 does not rule on, so the extrapolation is taken and
+  named rather than hidden.
+
+## `http-semantics` — `identity` and no coding are one state, and the wildcard reaches it
+
+`encoding_acceptability` gave one representation two answers depending on how a
+caller spelled it. Measured with a probe crate against the branch before the
+fix: `(Some(b"identity"), [b"gzip"])` answered `Unmentioned` where
+`(None, [b"gzip"])` answered `AcceptableByDefault`, and over `[b"*;q=0.5"]` the
+two were `Weighed(500)` and `AcceptableByDefault`. The test that was supposed to
+cover this passed `Some(b"identity")` only over a field that NAMES identity,
+where the two paths coincide.
+
+### The derivation, because this reverses a reading the branch had pinned
+
+**A representation does not HAVE the coding `identity`.** RFC 9110 §12.5.3: "An
+"identity" token is used as a synonym for "no encoding" in order to communicate
+when no encoding is preferred." §8.4 makes that exclusive rather than idiomatic:
+"Note that the coding named "identity" is reserved for its special role in
+Accept-Encoding and thus SHOULD NOT be included." — in a `Content-Encoding` —
+and §18.6's registry gives the name the description `Reserved`, pointing at
+§12.5.3 rather than at §8.4.1 where the real codings are defined. So `None` and
+`Some(b"identity")` name one state and are normalised onto one path,
+case-insensitively per §8.4.1.
+
+**The `"*"` entry reaches that state at whatever weight it carries.** Rule 2
+establishes the reach itself: it has the field "stating either `identity;q=0` or
+`*;q=0`" exclude a representation with no content coding. What no sentence
+establishes is a weight boundary. Rule 2 is a rule about EXCLUSION — "acceptable
+by default unless specifically excluded" — so it enumerates what excludes, and
+by §12.4.2 only a zero does. Its naming `*;q=0` and not `*;q=0.5` is explained
+entirely by what the sentence is about.
+
+The branch read it the other way, so the wildcard reached this state only when
+its weight was zero — **a discontinuity no sentence states**, resting on what
+rule 2 does not say. The cost was measurable: over
+`Accept-Encoding: *;q=0.001, gzip;q=0.5` the uncoded representation answered
+`AcceptableByDefault` with NO weight, so a caller could not rank it against
+`gzip` and the client's own ordering was discarded — while the same bytes asked
+about `identity` by name answered `Weighed(1)`.
+
+### Fixed
+
+- `Some(b"identity")` normalises onto the no-coding path, and the match arm for
+  the wildcard no longer tests for zero: `(_, None, Some(w)) => Weighed(w)`.
+  Rule 2's `*;q=0` clause now falls out of that arm and §12.4.2 rather than
+  being a case of its own, and what is left of rule 2 is its default — the one
+  place the no-coding state parts from a named coding, since §12.4.3 answers
+  `Unmentioned` there.
+- `identity_and_no_coding_are_one_state_however_a_caller_spells_it` asks all
+  three spellings over seven fields that do NOT name `identity`, which is where
+  the paths part if they part at all, and pins that `identityx` and `ident` are
+  ordinary codings the normalisation does not swallow.
+- The pinned rule-2 test now asserts the consistent reading —
+  `acceptability(None, [b"*;q=0.5"])` is `Weighed(500)` — and carries the
+  measured field that showed the harm.
+
 ## `http-semantics` — the rustdoc `-Dwarnings` build was red, and no gate here was looking at it
 
 `doc-check` documents private items, so it resolves links this crate's own
