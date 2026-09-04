@@ -20,7 +20,9 @@
 use std::{
   cell::{Cell, RefCell},
   collections::VecDeque,
+  pin::Pin,
   rc::Rc,
+  task::Poll,
   time::Instant,
 };
 
@@ -463,34 +465,103 @@ fn stream_gone() -> Error {
   Error::Io(std::io::Error::from(std::io::ErrorKind::ResourceBusy))
 }
 
+/// What one drive resolved to.
+pub(crate) enum DriveOutcome {
+  /// The batch finished, or failed; the frame states are settled.
+  Written(Result<(), Error>),
+  /// Inbound bytes arrived while the write was blocked. Reachable only when
+  /// the caller hands over a read buffer.
+  Input(std::io::Result<usize>),
+}
+
+/// The same, before the frame states are settled.
+enum RawDrive {
+  Written(std::io::Result<()>),
+  Input(std::io::Result<usize>),
+}
+
 /// Drives the guard's pending write to the wire: byte cursor loop, then
 /// flush, then frame-state transitions. The cursor advances only on
 /// completed sub-writes, so cancellation mid-batch resumes losslessly.
+///
+/// With `read_into`, a write that CANNOT progress also polls the inbound
+/// direction and yields whatever arrives. The two directions are independent,
+/// and after our Close has flushed the peer's Close is the thing that ends the
+/// handshake — leaving it unread until a blocked Pong batch times out turns a
+/// handshake that completed at once into an unclean close at the deadline.
+/// Written by hand rather than as two futures because both halves are
+/// `Pin<&mut S>` calls on one poll-based stream, so there is nothing to split.
+///
+/// The write is polled FIRST and the read only on its `Pending`: the batch is
+/// what this phase exists to finish, and reading while a write can still
+/// progress would take inbound backpressure off a peer we are already behind
+/// on. Which callers may hand over a buffer is Phase 3's decision, and it
+/// hands one over on exactly one of its three bounds.
 async fn drive_pending_write<Ro, S: Duplex>(
   io: &mut PumpIo<'_, Ro, S>,
   doorbell: &Doorbell,
-) -> Result<(), Error> {
-  let Some(stream) = io.stream.as_mut() else {
-    return Err(stream_gone());
-  };
-  let Some(pending) = io.write.as_mut() else {
-    return Ok(());
-  };
-  let result = 'drive: {
-    while pending.cursor < pending.bytes.len() {
-      match stream.write(&pending.bytes[pending.cursor..]).await {
-        Ok(0) => break 'drive Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
-        Ok(n) => pending.cursor += n,
-        Err(e) => break 'drive Err(e),
+  read_into: Option<&mut [u8]>,
+) -> DriveOutcome {
+  let raw = {
+    let PumpIo {
+      stream,
+      write: batch,
+      ..
+    } = &mut *io;
+    let Some(stream) = stream.as_mut() else {
+      return DriveOutcome::Written(Err(stream_gone()));
+    };
+    let Some(pending) = batch.as_mut() else {
+      return DriveOutcome::Written(Ok(()));
+    };
+    let mut read_into = read_into;
+    futures_util::future::poll_fn(move |cx| {
+      loop {
+        if pending.cursor < pending.bytes.len() {
+          let rest = pending.bytes.get(pending.cursor..).unwrap_or(&[]);
+          match Pin::new(&mut *stream).poll_write(cx, rest) {
+            Poll::Ready(Ok(0)) => {
+              return Poll::Ready(RawDrive::Written(Err(std::io::Error::from(
+                std::io::ErrorKind::WriteZero,
+              ))));
+            }
+            Poll::Ready(Ok(n)) => {
+              pending.cursor = pending.cursor.saturating_add(n);
+              continue;
+            }
+            Poll::Ready(Err(e)) => return Poll::Ready(RawDrive::Written(Err(e))),
+            Poll::Pending => {}
+          }
+        } else {
+          // The batch is fully handed to the transport; flush puts buffered
+          // bytes (the adapter's, TLS records) on the wire. Idempotent, so a
+          // cancellation between the last write and here re-flushes on resume.
+          match Pin::new(&mut *stream).poll_flush(cx) {
+            Poll::Ready(result) => return Poll::Ready(RawDrive::Written(result)),
+            Poll::Pending => {}
+          }
+        }
+        // The write is blocked. Without a buffer this parks exactly as the
+        // `.await`-per-sub-write version did.
+        return match read_into.as_deref_mut() {
+          Some(buf) => match Pin::new(&mut *stream).poll_read(cx, buf) {
+            Poll::Ready(result) => Poll::Ready(RawDrive::Input(result)),
+            Poll::Pending => Poll::Pending,
+          },
+          None => Poll::Pending,
+        };
       }
-    }
-    // The batch is fully handed to the transport; flush puts buffered
-    // bytes (the adapter's, TLS records) on the wire. Idempotent, so a
-    // cancellation between the last write and here re-flushes on resume.
-    stream.flush().await
+    })
+    .await
   };
-  let pending = io.write.take().expect("checked above");
-  match result {
+  let result = match raw {
+    RawDrive::Input(result) => return DriveOutcome::Input(result),
+    RawDrive::Written(result) => result,
+  };
+  let Some(pending) = io.write.take() else {
+    return DriveOutcome::Written(result.map_err(Error::Io));
+  };
+  DriveOutcome::Written(match result {
     Ok(()) => {
       for state in &pending.states {
         state.set(FrameState::Written);
@@ -530,7 +601,7 @@ async fn drive_pending_write<Ro, S: Duplex>(
       doorbell.notify(usize::MAX);
       Err(Error::Io(e))
     }
-  }
+  })
 }
 
 /// Direct write of one encoded frame. Only reachable unsplit — `split()`
@@ -558,7 +629,12 @@ async fn send_frame<Ro: role::Role, S: Duplex>(
         None => return Ok(()),
       }
     }
-    drive_pending_write(&mut io, doorbell).await?;
+    match drive_pending_write(&mut io, doorbell, None).await {
+      DriveOutcome::Written(result) => result?,
+      // No read buffer was handed over, so nothing reads here. Looping
+      // re-drives the same batch, which is what this path would want anyway.
+      DriveOutcome::Input(_) => {}
+    }
   }
 }
 
@@ -696,11 +772,11 @@ fn effective_deadline<Ro: role::Role, S>(guard: &Inner<Ro, S>) -> Option<Instant
     return None;
   }
   match guard.close_flushed_at {
-    // Overflow: unreachable, hence later than `at`, hence the answer.
-    Some(flushed) => match flushed.checked_add(guard.close_budget) {
-      Some(echo_at) => Some(at.max(echo_at)),
-      None => None,
-    },
+    // Overflow answers `None`: unreachable, hence later than `at`, hence the
+    // deadline — and there is no such instant to return.
+    Some(flushed) => flushed
+      .checked_add(guard.close_budget)
+      .map(|echo_at| at.max(echo_at)),
     None => Some(at),
   }
 }
@@ -905,10 +981,20 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
     // and it still listens to the doorbell: a close requested mid-flush
     // re-enters as a bounded flush (the dropped drive's progress survives in
     // the cursor).
+    //
+    // The post-Close arm — and ONLY it — also polls a read while its write is
+    // blocked. The peer's Close travels the independent inbound direction and
+    // is what ends the handshake, so leaving it unread until this batch's
+    // budget expires reports a handshake that completed at once as unclean at
+    // the deadline. The other two arms must not: the close-carrying arm has to
+    // write its Close whatever arrives, and the unbounded arm reading while a
+    // plain flush is wedged would take inbound backpressure off a peer we are
+    // already behind on.
     while inner.borrow().pending_write.is_some() {
       // `None` is the unbounded plain flush; `Some(d)` is what is LEFT of this
-      // flush's slice of the close budget.
-      let bound: Option<core::time::Duration> = {
+      // flush's slice of the close budget. `race_read` marks the post-Close
+      // arm, the one that also listens to the peer.
+      let (bound, race_read): (Option<core::time::Duration>, bool) = {
         let guard = inner.borrow();
         let carries_close = guard
           .pending_write
@@ -929,20 +1015,27 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
           // It resolves to the whole budget rather than to no bound, because
           // an unbounded close flush is the defect `close_timeout` exists to
           // prevent and a lost anchor must not reintroduce it.
-          Some(
-            guard
-              .close_requested_at
-              .map_or(guard.close_budget, remaining),
+          (
+            Some(
+              guard
+                .close_requested_at
+                .map_or(guard.close_budget, remaining),
+            ),
+            false,
           )
         } else {
-          guard.close_flushed_at.map(remaining)
+          (
+            guard.close_flushed_at.map(remaining),
+            guard.close_flushed_at.is_some(),
+          )
         }
       };
+      let mut read_scratch = race_read.then(|| vec![0u8; READ_CHUNK]);
       let mut io = PumpIo::take(inner);
       let outcome = if bound.is_some_and(|remaining| remaining.is_zero()) {
         FlushArm::Budget
       } else {
-        let drive = drive_pending_write(&mut io, doorbell).fuse();
+        let drive = drive_pending_write(&mut io, doorbell, read_scratch.as_deref_mut()).fuse();
         let timer = async {
           match bound {
             Some(remaining) => sleep_for(remaining).await,
@@ -960,7 +1053,10 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
           FlushArm::Reconsider
         } else {
           futures_util::select_biased! {
-            result = drive => FlushArm::Done(result),
+            result = drive => match result {
+              DriveOutcome::Written(result) => FlushArm::Done(result),
+              DriveOutcome::Input(result) => FlushArm::Input(result),
+            },
             () = timer => FlushArm::Budget,
             () = bell => FlushArm::Reconsider,
           }
@@ -979,6 +1075,37 @@ pub(crate) async fn next_message<Ro: role::Role, S: Duplex>(
         // Re-evaluate the bound (the guard restores the partial batch);
         // ordinary sender wake-ups simply resume the flush.
         FlushArm::Reconsider => drop(io),
+        // Inbound bytes beat the blocked write. The guard restores the
+        // partial batch, so Phase 1 feeds these bytes, Phase 2 skips building
+        // (a batch is already in progress), and this loop resumes the SAME
+        // batch under the same monotone remaining time. A peer Close with our
+        // Close already flushed completes the handshake in Phase 1 and takes
+        // this batch with it.
+        FlushArm::Input(Ok(0)) => {
+          drop(io);
+          // The same reading Phase 4 gives it.
+          debug!("transport EOF before the close handshake completed");
+          return Some(Err(Error::Io(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof,
+          ))));
+        }
+        FlushArm::Input(Ok(n)) => {
+          drop(io);
+          trace!(
+            bytes = n,
+            "transport read behind a blocked post-close write"
+          );
+          let read = read_scratch.as_deref().and_then(|b| b.get(..n));
+          inner
+            .borrow_mut()
+            .pending_input
+            .extend_from_slice(read.unwrap_or(&[]));
+          continue 'pump;
+        }
+        FlushArm::Input(Err(e)) => {
+          drop(io);
+          return Some(Err(Error::Io(e)));
+        }
       }
     }
 
@@ -1065,6 +1192,7 @@ enum FlushArm {
   Done(Result<(), Error>),
   Budget,
   Reconsider,
+  Input(std::io::Result<usize>),
 }
 
 #[cfg(test)]

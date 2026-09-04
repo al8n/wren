@@ -692,10 +692,19 @@ async fn a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget() {
   // bound `close_timeout` documents is defeated. Nothing on `main` reached here:
   // post-Close Pongs were suppressed, and this branch created the case.
   //
-  // The pipe is 64 bytes: the 64 KiB carrying batch still drains through it (the
+  // The pipe is 64 bytes: the 4 KiB carrying batch still drains through it (the
   // drainer just reads more times), but the ten 10-byte masked Pongs the driver
-  // owes (100 bytes) cannot fit once the peer stops reading.
-  let (c, s) = duplex_with_capacity(64);
+  // owes (100 bytes) cannot fit once the peer stops reading. 4 KiB rather than
+  // the model's 64 KiB because every byte of it crosses a 64-byte pipe one
+  // read at a time, and a drain that does not finish inside the close budget
+  // fails this test on a loaded machine for a reason it is not about.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  // A masked client Pong for a 4-byte payload: 2 header + 4 mask key + 4.
+  const PONG_LEN: usize = 10;
+
+  let (c, s) = duplex_with_capacity(PIPE_CAPACITY);
   let negotiated = Negotiated::none();
   let client = WebSocket::<ClientRole, _>::client(
     c.into_duplex(),
@@ -706,11 +715,11 @@ async fn a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget() {
   );
   let (mut cread, mut cwrite) = client.split();
 
-  // 64 KiB queued without waiting for delivery, then the Close: one carrying
-  // batch, exactly as the model test builds it.
+  // Queued without waiting for delivery, then the Close: one carrying batch,
+  // exactly as the model test builds it.
   {
     use std::future::Future;
-    let payload = vec![0xDD_u8; 64 * 1024];
+    let payload = vec![0xDD_u8; 4 * 1024];
     let mut fut = Box::pin(cwrite.send_binary(&payload));
     futures_util::future::poll_fn(|cx| {
       assert!(fut.as_mut().poll(cx).is_pending());
@@ -751,24 +760,51 @@ async fn a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget() {
     }
     sr
   });
-  let _sr = compio::time::timeout(std::time::Duration::from_secs(5), drainer)
+  let mut sr = compio::time::timeout(std::time::Duration::from_secs(5), drainer)
     .await
     .expect("the carrying batch drains")
     .unwrap();
+  // The quiet window above is a heuristic; THIS is the fact the rest of the
+  // test rests on. `WriteHalf::close` resolves when the batch carrying the
+  // Close reaches the wire, so an `Ok` here says `close_flushed_at` is anchored
+  // and the third bound — the remaining echo budget — is the one under test.
+  // Without it a scheduling pause could leave the original close-carrying batch
+  // still in flight, and the FIRST bound would produce the timeout asserted
+  // below.
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes once the peer drains")
+    .unwrap()
+    .expect("the Close flushes once the peer drains");
 
   // From here the peer never reads again. The Close is on the wire and the echo
   // budget is running.
   let t0 = std::time::Instant::now();
   let mut pings = Vec::new();
-  for _ in 0..10 {
-    pings.extend_from_slice(&[0x89, 0x04, b'p', b'i', b'n', b'g']);
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
   }
+  let sent = pings.len();
+  assert!(
+    sent <= PIPE_CAPACITY,
+    "the pings fit the pipe, so one write takes all of them"
+  );
   let compio_buf::BufResult(written, _) = sw.write(pings).await;
-  written.expect("60 bytes of pings fit the 64-byte pipe");
+  assert_eq!(
+    written.expect("the pings"),
+    sent,
+    "a short write would leave too few pongs owed to block the batch"
+  );
 
   // Ten owed Pongs coalesce into one post-Close batch of 100 bytes, which
   // cannot fit, so the write wedges with `carries_close == false` and
   // `close_pending == false` — Codex's path exactly.
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the owed Pongs must not fit what is left of the pipe"
+    );
+  }
   let (ended, cread) = compio::time::timeout(std::time::Duration::from_secs(2), reader)
     .await
     .expect(
@@ -803,7 +839,37 @@ async fn a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget() {
     "within the 200 ms budget plus slack, not merely eventually: {elapsed:?}"
   );
 
-  let _ = compio::time::timeout(std::time::Duration::from_secs(2), closer).await;
+  // The wire says the batch was ABANDONED at the bound rather than completed
+  // after it: the peer holds exactly what fit before the write blocked, and it
+  // starts at a Pong. Both numbers come from the two constants above — widen
+  // `PIPE_CAPACITY` past `PINGS * PONG_LEN` and the whole batch fits, no write
+  // ever blocks, and this is the assertion that says so (the timeout ones do
+  // not: a normal Phase 4 close deadline satisfies them just as well).
+  let mut tail = Vec::new();
+  loop {
+    match compio::time::timeout(
+      std::time::Duration::from_millis(200),
+      sr.read(Vec::with_capacity(4096)),
+    )
+    .await
+    {
+      Err(_elapsed) => break,
+      Ok(compio_buf::BufResult(Ok(0) | Err(_), _)) => break,
+      Ok(compio_buf::BufResult(Ok(n), buf)) => tail.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+    }
+  }
+  assert_eq!(
+    tail.len(),
+    PIPE_CAPACITY,
+    "only what fit before the write blocked, not all {} Pong bytes",
+    PINGS * PONG_LEN
+  );
+  assert_eq!(
+    tail.first().copied(),
+    Some(0x8A),
+    "the wedged prefix starts at the first Pong: {:02x?}",
+    tail.get(..8).unwrap_or(&[])
+  );
 }
 
 #[compio::test]
@@ -1304,5 +1370,179 @@ async fn a_queued_ping_is_not_written_after_both_close_frames() {
   assert!(
     cread.closed().expect("the handshake completes").clean(),
     "both Closes were exchanged"
+  );
+}
+
+#[compio::test]
+async fn a_peer_close_reaches_the_pump_through_a_wedged_post_close_write() {
+  use compio_io::{AsyncRead as _, AsyncWrite as _, util::Splittable as _};
+
+  // The post-Close Pong wedge of
+  // `a_post_close_pong_flush_is_bounded_by_the_remaining_echo_budget`, with the
+  // peer FINISHING the handshake instead of going silent. The two transport
+  // directions are independent, so the peer's Close is readable the instant it
+  // is written while the Pong batch is still blocked. Phase 3 polled only the
+  // write, the timer and the doorbell, so those bytes sat unread until the
+  // remaining echo budget expired and a handshake that completed at once was
+  // reported unclean at the deadline.
+  //
+  // No queued payload and no drainer here: that test needs a SLOW flush to
+  // pin where the budget starts, and this one needs only a flushed Close, so
+  // the Close goes out on its own and the peer takes it in one read. What is
+  // left is the wedge itself.
+  const PIPE_CAPACITY: usize = 64;
+  const PINGS: usize = 10;
+  const PING_FRAME: [u8; 6] = [0x89, 0x04, b'p', b'i', b'n', b'g'];
+  // A masked client Pong for a 4-byte payload: 2 header + 4 mask key + 4.
+  const PONG_LEN: usize = 10;
+  // A masked client Close carrying a code and no reason: 2 + 4 + 2.
+  const CLOSE_LEN: usize = 8;
+  const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
+  let (c, s) = duplex_with_capacity(PIPE_CAPACITY);
+  let negotiated = Negotiated::none();
+  let client = WebSocket::<ClientRole, _>::client(
+    c.into_duplex(),
+    &negotiated,
+    &crate::options::ClientOptions::default().with_close_timeout(BUDGET),
+    Vec::new(),
+  );
+  let (mut cread, mut cwrite) = client.split();
+  // Shared state, read from the test to learn WHEN the Pong batch is wedged:
+  // the pump has no await between counting the last Ping and blocking on the
+  // Pong write, so `pings_seen == PINGS` observed from another task means the
+  // write is blocked. A sleep would only guess at that.
+  let probe = cread.inner.clone();
+  let closer = compio_runtime::spawn(async move { cwrite.close(CloseCode::Normal, "").await });
+  let reader = compio_runtime::spawn(async move {
+    let mut ended = None;
+    while let Some(m) = cread.next().await {
+      if let Err(e) = m {
+        ended = Some(e);
+        break;
+      }
+    }
+    (ended, cread)
+  });
+  // `WriteHalf::close` resolves when the batch carrying the Close reaches the
+  // wire, so an `Ok` here says `close_flushed_at` is anchored and the bound
+  // under test is the third one, the remaining echo budget.
+  compio::time::timeout(std::time::Duration::from_secs(2), closer)
+    .await
+    .expect("the Close flushes")
+    .unwrap()
+    .expect("the Close flushes");
+  let (mut sr, mut sw) = s.split();
+  let compio_buf::BufResult(res, ours) = sr.read(Vec::with_capacity(PIPE_CAPACITY)).await;
+  let n = res.expect("the peer drains our Close");
+  assert_eq!(
+    ours.get(..n).and_then(<[u8]>::first).copied(),
+    Some(0x88),
+    "our Close, masked: {:02x?}",
+    ours.get(..n).unwrap_or(&[])
+  );
+  assert_eq!(
+    n, CLOSE_LEN,
+    "the whole pipe is free for the Pong batch that follows"
+  );
+
+  // From here the peer never reads again, and the echo budget is running.
+  let t0 = std::time::Instant::now();
+  let mut pings = Vec::new();
+  for _ in 0..PINGS {
+    pings.extend_from_slice(&PING_FRAME);
+  }
+  let sent = pings.len();
+  assert!(sent <= PIPE_CAPACITY, "the pings fit the pipe in one write");
+  let compio_buf::BufResult(res, _) = sw.write(pings).await;
+  assert_eq!(
+    res.expect("the pings"),
+    sent,
+    "every ping reaches the driver"
+  );
+  while probe.borrow().pings_seen < PINGS {
+    assert!(
+      t0.elapsed() < BUDGET,
+      "the driver owes {PINGS} pongs well before the budget"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(1)).await;
+  }
+  // `PINGS * PONG_LEN` bytes of Pongs cannot fit `PIPE_CAPACITY`, so the batch
+  // is wedged now. The peer's Close goes the other way, where there is room.
+  const {
+    assert!(
+      PINGS * PONG_LEN > PIPE_CAPACITY,
+      "the Pong batch cannot fit"
+    );
+  }
+  let compio_buf::BufResult(res, _) = sw.write(vec![0x88_u8, 0x02, 0x03, 0xE8]).await;
+  res.expect("the peer's Close");
+
+  // The OUTCOME is what this bounds, so it is timed where it is RECORDED. What
+  // follows it — the teardown's close_notify against the same wedged peer —
+  // has its own budget and its own regression
+  // (`teardown_is_bounded_when_close_notify_wedges`), so timing the reader's
+  // return would measure that one instead.
+  let mut recorded = None;
+  while recorded.is_none() {
+    assert!(
+      t0.elapsed() < BUDGET * 2,
+      "the peer's Close was readable at once; the pump must not park forever"
+    );
+    compio::time::sleep(std::time::Duration::from_millis(1)).await;
+    recorded = probe.borrow().closed;
+  }
+  let elapsed = t0.elapsed();
+  let closed = recorded.expect("checked by the loop");
+  assert!(
+    closed.clean(),
+    "the peer's Close arrived on the inbound direction while the outbound one was wedged, \
+     yet the outcome is {closed:?} after {elapsed:?}"
+  );
+  assert!(
+    elapsed < BUDGET / 2,
+    "the handshake completed at once, not at the deadline: {elapsed:?}"
+  );
+
+  let (ended, cread) = compio::time::timeout(std::time::Duration::from_secs(5), reader)
+    .await
+    .expect("the reader runs to completion")
+    .unwrap();
+  assert!(
+    ended.is_none(),
+    "a completed handshake is not an error: {ended:?}"
+  );
+  assert_eq!(
+    cread.closed(),
+    Some(closed),
+    "the reader reports the outcome the pump recorded"
+  );
+
+  // The wedged prefix, and nothing more: the Pong batch was abandoned at the
+  // completed handshake rather than finished after it.
+  let mut tail = Vec::new();
+  loop {
+    match compio::time::timeout(
+      std::time::Duration::from_millis(200),
+      sr.read(Vec::with_capacity(4096)),
+    )
+    .await
+    {
+      Err(_elapsed) => break,
+      Ok(compio_buf::BufResult(Ok(0) | Err(_), _)) => break,
+      Ok(compio_buf::BufResult(Ok(n), buf)) => tail.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+    }
+  }
+  assert_eq!(
+    tail.len(),
+    PIPE_CAPACITY,
+    "only what fit before the write blocked, not all {} Pong bytes",
+    PINGS * PONG_LEN
+  );
+  assert_eq!(
+    tail.first().copied(),
+    Some(0x8A),
+    "the wedged prefix starts at the first Pong: {:02x?}",
+    tail.get(..8).unwrap_or(&[])
   );
 }
