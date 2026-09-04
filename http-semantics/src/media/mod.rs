@@ -213,12 +213,17 @@ pub(crate) fn is_media_name(name: &[u8]) -> bool {
 /// Interprets ASCII-by-construction bytes as `str`.
 ///
 /// A `token` is ASCII by RFC 9110 §5.6.2's `tchar`, so the `Err` arm is
-/// unreachable for anything [`is_media_name`] admitted. It still has to compile
-/// to something, and under the crate's link-time no-panic proof that something
-/// may not be a panic: hence the checked form with an empty-string arm rather
-/// than `unwrap`.
+/// unreachable for anything [`is_media_name`] admitted — and for anything
+/// `is_token` admitted, which is what [`crate::negotiation`] hands it. It
+/// still has to compile to something, and under the crate's link-time no-panic
+/// proof that something may not be a panic: hence the checked form with an
+/// empty-string arm rather than `unwrap`.
+///
+/// Crate-visible rather than module-private for that second caller and no
+/// other reason. One implementation keeps one place where the
+/// ASCII-by-construction claim above is argued.
 #[inline]
-const fn ascii(bytes: &[u8]) -> &str {
+pub(crate) const fn ascii(bytes: &[u8]) -> &str {
   match core::str::from_utf8(bytes) {
     Ok(s) => s,
     Err(_) => "",

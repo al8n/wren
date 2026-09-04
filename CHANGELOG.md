@@ -1,5 +1,63 @@
 # UNRELEASED
 
+## `http-semantics` — the rest of RFC 9110 §12.5, over an element that carries no parameters
+
+`Accept` and its ranking shipped in this crate; §12.5's other four fields had no
+reader at all. The three that rank share one shape and one walk — a §5.6.1 list
+of a bare name with §12.4.2's weight optionally hung off it — and differ only in
+which names the element production admits.
+
+### Added
+
+- `negotiation`, a module for the §12.5 fields whose element is a bare name, and
+  `negotiation::accept_encoding` — §12.5.3's
+  `Accept-Encoding  = #( codings [ weight ] )` over
+  `codings          = content-coding / "identity" / "*"`. It takes a field's
+  lines like `media::accept` does, yields one `Preference` per element in wire
+  order, and latches on the first fault.
+- `negotiation::Preference`, with `name` (`None` for the wildcard `*`),
+  `is_wildcard` and `weight`; and `negotiation::NegotiationError`, whose three
+  variants are `NotAnElement`, `NotAWeight` and `BadWeight`. It is
+  `#[non_exhaustive]`.
+
+### §12.5.1's `q` rule is not inherited, and that is a refusal rather than an omission
+
+§12.5.1 tells a recipient to process any parameter named `q` as weight
+regardless of ordering. An `Accept` reader needs that because a `media-range`
+CARRIES `parameters` and the weight is whichever of them is named `q`. An
+element here carries none — `content-coding   = token`, and then the ABNF is out
+of alternatives — so the only production a `;` can open is `[ weight ]`, there
+is at most one, and there is nothing for it to be ordered against.
+
+Importing `Accept`'s parameter handling would have ADDED three things the
+grammar does not have, and each moves an answer:
+
+- **A quoted value.** §5.6.6 makes a parameter's quoted and unquoted values
+  equivalent, so `Accept: text/plain;q="0.5"` weighs 0.5. `weight` spells its
+  value `qvalue` with no `quoted-string` alternative, so
+  `Accept-Encoding: gzip;q="0.5"` is malformed. Both halves of that pair are one
+  test.
+- **A repetition.** `parameters      = *( OWS ";" OWS [ parameter ] )` repeats
+  where `[ weight ]` brackets one, so `gzip;q=0.5;p=1` is a media range's shape
+  and no element of this field.
+- **A comma inside a value.** The one that moves a BOUNDARY rather than a
+  verdict: nothing reachable from an element here admits a DQUOTE, so every
+  comma is §5.6.1's separator and the elements are exactly what
+  `grammar::list_elements` splits. That is also why walking a field's lines and
+  walking §5.2's joined value cannot part.
+
+### `coding-corpus` grades none of these productions, and the module says so
+
+A new reader owes an answer to whether it is a second reader of a production
+that harness already grades, because several readers of one production is how
+al8n/wren#76 happened. This one is not, twice over. `content-coding   = token`
+is not `transfer-coding    = token *( OWS ";" OWS transfer-parameter )` under
+another name — `chunked;p=1`, which that corpus is built to exercise, is a
+`transfer-coding` and is no `codings`. And the three productions this module
+does share with existing readers are reached by CALLING the one implementation
+of each — `grammar::list_elements`, `grammar::is_token` and
+`media::parse_qvalue` — so there is no second reading to diverge from.
+
 ## `http-semantics` — the export that was going to unblock three readers was not one
 
 al8n/wren#70's Phase 2 says one line unblocks three of the four fields it adds:

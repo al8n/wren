@@ -207,6 +207,7 @@ use http_semantics::{
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
   grammar::{ParamSyntax, ParamValue, parameterised_list},
   media::{media_type, weight_for},
+  negotiation::accept_encoding,
   range::{ContentRange, RangesSpecifier, Resolved},
   validator::{EntityTag, TagList},
 };
@@ -1719,6 +1720,84 @@ fn auth_info_is_panic_free() {
   assert_eq!(shim_auth_info(black_box(&[b"".as_slice()])), 0);
   assert_eq!(
     shim_auth_info(black_box(&[[0xffu8, 0x3d, 0x22].as_slice()])),
+    0
+  );
+}
+
+// ── §12.5's bare-element negotiation fields ───────────────────────────────────
+
+no_panic_shim! {
+  /// Shim over `negotiation::accept_encoding` — RFC 9110 §12.5.3's
+  /// `Accept-Encoding  = #( codings [ weight ] )`, driven over a field's LINES
+  /// so that one body holds the §5.6.1 split, the cut between an element and
+  /// its `[ weight ]`, and §12.4.2's `qvalue` reader behind that.
+  ///
+  /// Driven through `Copied`, and every other shim over this module through an
+  /// adapter of its own, for the reason this file's `fn`-pointer section gives:
+  /// two shims sharing ONE instantiation of a generic walk is the shape that
+  /// empties both proofs at once. The walk here carries no `fn` pointer for an
+  /// indirect call to survive on — its element rule is an enum matched inside —
+  /// so this is the remedy applied where the hazard is not currently present,
+  /// which keeps the proof from depending on that staying true.
+  ///
+  /// Returns what it read, so a call whose result is dead cannot take the
+  /// shim's body with it.
+  fn shim_accept_encoding(lines: &[&[u8]]) -> usize {
+    let mut seen = 0usize;
+    for item in accept_encoding(lines.iter().copied()) {
+      let Ok(preference) = item else { break };
+      seen = seen.wrapping_add(preference.name().map_or(0, str::len));
+      seen = seen.wrapping_add(usize::from(preference.weight().thousandths()));
+    }
+    seen
+  }
+}
+
+#[test]
+fn accept_encoding_is_panic_free() {
+  // A conforming field: the wildcard, `identity`, and a weight at each of
+  // §12.4.2's two `qvalue` alternatives.
+  assert_eq!(
+    shim_accept_encoding(black_box(&[
+      b"gzip;q=1.0, identity; q=0.5, *;q=0".as_slice()
+    ])),
+    1512
+  );
+  // Spread over RFC 9110 §5.2's field lines, including an empty one.
+  assert_eq!(
+    shim_accept_encoding(black_box(&[b"compress".as_slice(), b"", b"gzip;q=0.001"])),
+    1013
+  );
+  // Every fault the walk has, each latching the walk at its own member.
+  assert_eq!(shim_accept_encoding(black_box(&[b"gz ip".as_slice()])), 0);
+  assert_eq!(
+    shim_accept_encoding(black_box(&[b"gzip;p=1".as_slice()])),
+    0
+  );
+  assert_eq!(
+    shim_accept_encoding(black_box(&[b"gzip;q=\"0.5\"".as_slice()])),
+    0
+  );
+  assert_eq!(
+    shim_accept_encoding(black_box(&[b"gzip;q=1.5".as_slice()])),
+    0
+  );
+  // The element boundaries §5.6.1.2 skips, and the empty field.
+  assert_eq!(
+    shim_accept_encoding(black_box(&[b", ,gzip, ,".as_slice()])),
+    1004
+  );
+  assert_eq!(shim_accept_encoding(black_box(&[])), 0);
+  assert_eq!(shim_accept_encoding(black_box(&[b"".as_slice()])), 0);
+  // Bytes no `token` holds, at the head and inside the weight.
+  assert_eq!(
+    shim_accept_encoding(black_box(&[[0xffu8, 0x3b, 0x71].as_slice()])),
+    0
+  );
+  assert_eq!(
+    shim_accept_encoding(black_box(&[
+      [0x67u8, 0x3b, 0x71, 0x3d, 0x30, 0x2e, 0xff].as_slice()
+    ])),
     0
   );
 }
