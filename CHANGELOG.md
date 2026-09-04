@@ -1,5 +1,42 @@
 # UNRELEASED
 
+## `websocket-proto` — the bounds a thread-per-core driver needs asserted rather than true
+
+A thread-per-core, zero-allocation `io_uring` server keeps one `Connection` per
+accepted socket in a preallocated slab, so the struct's size is a number it
+multiplies by its connection count and pays as resident memory before a byte
+arrives. That makes the size a property of the crate rather than an
+implementation detail — and a property with no gate is one that drifts. These
+changes turn properties this crate already had into properties something checks.
+
+### Added
+
+- **`size_of::<Connection<_, _>>()` is now a `const` assertion, at the measured
+  value.** `connection/mod.rs` carries a private `Nanos(u64)` clock and
+  `const _: () = assert!(size_of::<Connection<Nanos, Server>>() <= N)` per
+  storage tier, in the shape `handshake/h1/server.rs` already uses for
+  `RequestView`. Being `const` is what makes it a gate on every tier and every
+  target rather than a test somebody has to remember to run: it is evaluated by
+  `cargo check`, so the `thumbv6m-none-eabi` and `thumbv7em-none-eabihf` steps
+  in the `no-std` job evaluate it for a 32-bit `usize` too.
+
+  The clock is a newtype this crate defines rather than `std::time::Instant`
+  because the bound is meant to be about THIS crate's state. `std::time::Instant`
+  is 16 bytes on Linux and 8 on macOS and does not exist at all on the bare tier
+  — a budget written against it would move underneath the crate without anything
+  here changing, and would be absent where it matters most.
+
+  `N` is the measurement and **not** a round number above it. A budget with slack
+  only fails once the struct has already grown past what anyone measured, which
+  is precisely the growth it exists to report; a budget equal to the measurement
+  fails on the first byte and names the field that added it. Measured 2026-09-04
+  at `e42b30d` on aarch64-apple-darwin with a probe binary outside the workspace
+  that prints `core::mem::size_of::<Connection<Nanos, Server>>()`:
+  536 bytes at `--no-default-features`, 568 with `std` / `alloc` / `no-atomic`
+  (the `pong_overflow` `VecDeque`), 592 with `deflate` (the two boxed codec
+  handles and the negotiated parameters). The bound was measured to bite: set to
+  535, the bare tier fails `cargo check` with
+  `error[E0080]: evaluation panicked`.
 ## `http-semantics` — RFC 9110 §12.5's other four fields, over an element that carries no parameters
 
 `Accept` and its ranking shipped in this crate; §12.5's other four fields had no

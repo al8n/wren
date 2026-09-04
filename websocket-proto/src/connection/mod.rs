@@ -137,6 +137,89 @@ pub struct Connection<I, Ro> {
   pub(crate) _clock: core::marker::PhantomData<I>,
 }
 
+/// The clock the budget below is taken over: a `u64` nanosecond counter, which
+/// is the shape a thread-per-core driver keeps anyway (an `io_uring` timeout is
+/// a `__kernel_timespec`, not an opaque handle). Taking the bound over a clock
+/// THIS crate defines is the whole point of the newtype — the size of
+/// [`std::time::Instant`] is the platform's business and differs between
+/// targets, so a budget written against it would move underneath this crate
+/// without anything here changing, and would not exist at all on the bare tier
+/// where the assertion matters most.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Nanos(u64);
+
+impl Instant for Nanos {
+  fn checked_add_duration(self, dur: core::time::Duration) -> Option<Self> {
+    u64::try_from(dur.as_nanos())
+      .ok()
+      .and_then(|nanos| self.0.checked_add(nanos))
+      .map(Self)
+  }
+
+  fn checked_duration_since(self, earlier: Self) -> Option<core::time::Duration> {
+    self
+      .0
+      .checked_sub(earlier.0)
+      .map(core::time::Duration::from_nanos)
+  }
+}
+
+/// `size_of::<Connection<Nanos, Server>>()` as MEASURED, per storage tier.
+///
+/// A driver that keeps one `Connection` per accepted socket — a thread-per-core
+/// `io_uring` server with a preallocated slab, say — multiplies this number by
+/// its connection count and pays it as resident memory before a single byte
+/// arrives. That makes the size a published property of the crate rather than
+/// an implementation detail, and a published property with no gate is one that
+/// drifts. This is the gate, and it is `const`, so it is evaluated by every
+/// `cargo check` on every tier and every target rather than by a test somebody
+/// has to run.
+///
+/// The value is the measurement and NOT a round number above it. A budget with
+/// slack in it only fails once the struct has already grown past what anyone
+/// measured, which is exactly the growth it exists to report; a budget equal to
+/// the measurement fails on the first byte and names the field that added it.
+/// Widening it is therefore a deliberate edit with a new measurement beside it,
+/// which is the review this number should get.
+///
+/// Measured 2026-09-04 at `e42b30d` on aarch64-apple-darwin (64-bit `usize`),
+/// with a probe binary outside the workspace that depends on this crate by path
+/// and prints `core::mem::size_of::<Connection<Nanos, Server>>()`:
+///
+/// ```text
+/// cargo run --quiet --no-default-features          # 536
+/// cargo run --quiet --features std                 # 568
+/// cargo run --quiet --features alloc               # 568
+/// cargo run --quiet --features no-atomic           # 568
+/// cargo run --quiet --features alloc,deflate       # 592
+/// ```
+///
+/// The three tiers are three numbers because they are three structs: the heap
+/// tiers add `RecvState::pong_overflow` (a `VecDeque`, 32 bytes), and `deflate`
+/// adds the two boxed codec handles and the negotiated parameters on top. A
+/// 32-bit target (`thumbv6m-none-eabi`) lands strictly under every one of them —
+/// `control_len` and the `VecDeque`'s three fields are `usize` — so `<=` is the
+/// right comparison and the bare-tier check still bites where it is checked.
+#[cfg(not(any(
+  feature = "alloc",
+  feature = "std",
+  feature = "no-atomic",
+  feature = "deflate"
+)))]
+const CONNECTION_SIZE_BUDGET: usize = 536;
+
+#[cfg(all(
+  not(feature = "deflate"),
+  any(feature = "alloc", feature = "std", feature = "no-atomic")
+))]
+const CONNECTION_SIZE_BUDGET: usize = 568;
+
+#[cfg(feature = "deflate")]
+const CONNECTION_SIZE_BUDGET: usize = 592;
+
+const _: () =
+  assert!(core::mem::size_of::<Connection<Nanos, role::Server>>() <= CONNECTION_SIZE_BUDGET);
+
 /// Connection lifecycle (close handshake per RFC 6455 §7).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum Lifecycle {
