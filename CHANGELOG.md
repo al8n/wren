@@ -1,5 +1,123 @@
 # UNRELEASED
 
+## `xtask` — a code span that wrapped, a citation that wrapped, and a block whose marks do not pair
+
+Three ways a quotation left `quote-check` without being graded, counted or
+reported, and each one's failure was watched before it was written down. Closes
+al8n/wren#84.
+
+### Fixed
+
+- **The masking unit is a paragraph** (`mask_paragraph`), and it was a line. A
+  code span that wraps across two comment lines met no closing backtick on the
+  first of them, so the masker emitted the rest of that line as prose and every
+  quote character inside the span leaked into the block. `quoted_spans` pairs
+  marks left to right, so an ODD number of leaked ones displaces every real
+  quotation after it: the author's opening mark is consumed as a closer and the
+  closing mark becomes an opener with nothing to close on. Where the prose
+  between the leak and the quotation falls under the five-word and
+  twenty-four-character floors, `grade` returns before it counts anything —
+  nothing prints, nothing fails, and the quotation is **never graded, never
+  counted and never reported**. That is the escape #75 closed in `abnf_spans`,
+  arriving through the quotation path.
+
+  The paragraph is the unit a Markdown code span may wrap across and the unit
+  `abnf_spans` already read. Both paths now go through one reading of a code
+  span (`code_spans`), pairing backtick RUNS the way rustdoc does, so what the
+  mask erases and what the ABNF path admits can no longer disagree.
+
+  Demonstrated before it was fixed, on a constructed block whose code span wraps
+  and holds one DQUOTE, followed by a quotation of RFC 9110 §5.6.1.2 with its
+  last word altered. `main` at `e42b30d` is **exit 0**, `1139 quotations
+  checked`, and no line naming the file. This branch is **exit 1**, `1140
+  quotations checked`, and `quote_span_demo.rs:5: quoted words are not
+  rfc9110's`. `a_code_span_wrapped_across_lines_does_not_leak_its_quotes` and
+  `a_leaked_quote_can_take_a_quotation_out_of_the_gate_without_a_trace` hold
+  both halves — the displaced span and the silence — in the suite.
+
+  **Not the whole block**, which is the other way to close the leak and the way
+  the issue's own measurement was taken. A code span may not cross a blank line,
+  so pairing over a block pairs two paragraphs' unrelated stray backticks and
+  masks the quotation between them; run over this workspace that baseline
+  invented a span in `quote_check.rs`'s own module doc. Under the paragraph unit
+  it does not, and `a_stray_backtick_pairs_no_further_than_its_own_paragraph` is
+  the boundary — constructed, because this workspace holds no block the two
+  units read differently today, and a corpus that cannot spell the case cannot
+  witness the rule.
+
+  What moved, workspace-wide, measured by running the real extraction under both
+  units over every file the command reads: **43 extracted spans lost and none
+  gained**, in 14 files, every one of them a sub-prose code fragment the leak
+  had manufactured (`=`, `x`, `trailers`, `*/*`, `c, Digest realm=z`). **No span
+  large enough to be graded changed at all** — no comment starts being graded
+  that was not, and no verdict moves. Every printed total is what it was.
+
+- **A citation wrapped where Markdown indents past is still a citation.**
+  `markdown_quotations` joined a paragraph's lines RAW into the comment block
+  and TRIMMED into the paragraph the code-span reader gets — two readings of one
+  line. The raw one put the next line's layout indentation between `RFC` and its
+  number, and `cited_rfcs` takes the digits immediately after that space, so a
+  citation wrapped at exactly that point was invisible. `CHANGELOG.md` wraps
+  there several times. One buffer now feeds both, and it holds the trimmed line.
+
+  Its own commit because it is its own behaviour change, measured on its own:
+  with the raw line restored and the paragraph mask otherwise untouched the run
+  prints `1024 … 115`, which is `main`'s narrow-fallback split exactly; with the
+  trimmed line it prints `1025 … 114`. One quotation moves from being graded
+  against any loaded spec to being graded against the spec its own block names.
+  It was verbatim before and is verbatim now — the target set only narrowed.
+
+- **A block whose quotation marks do not pair is reported, and held.** The
+  pairing above is block-wide, so one leftover mark cuts every quotation behind
+  it in the wrong place and drops the last of them entirely — the same
+  disappearance, arriving from the author's own prose rather than from a code
+  span. This workspace was holding that off by CONVENTION: a `gate-exempt:`
+  marker naming a value whose quoted-string never closes is kept out of the doc
+  comment below it, in a block of its own, because its lone mark would otherwise
+  shift every pairing in that block by one.
+
+  A convention people have to remember is a guard at one entrance, and the run
+  finds the entrance that was already open: `http-semantics/src/auth/mod.rs`
+  puts four such markers directly under its module doc with no blank line
+  between them, so a `//` line continues the `//!` block and the module doc's
+  own block holds seventeen marks. It is harmless only by position — the lone
+  mark is the last of the seventeen, so the sixteen in front of it still pair
+  with each other. Move a marker or add one and the module doc's quotations
+  start being cut somewhere else.
+
+  The run prints the count every time and holds the split per file against
+  `UNPAIRED`, the way `UNTRIAGED` holds the attribution backlog; the two tables
+  run on one rule (`drift`) and differ only in the repair they name. Also
+  demonstrated: a constructed block with a stray mark in front of a real
+  quotation leaves `7f798b9` at **exit 0** and `1139 quotations checked` — the
+  same number as with no such file at all, so the quotation in it was never
+  graded — and leaves this branch at **exit 1** with
+  `unpaired_demo.rs:4: the block beginning at line 1 holds 3 quotation mark(s)`.
+
+  **Eight blocks stood when the check was first run**, and the table says what
+  each is. One was a real comment in this crate and is repaired —
+  `doc_check.rs`'s `the opening '"'` now says DQUOTE, which is the repair this
+  table asks of anyone who lands in it. Seven remain: one comment worth changing
+  (`http-semantics/src/auth/mod.rs`, left alone because that crate is not this
+  change's to edit), two deliberate markers, and four blocks that are not
+  comments at all — continuation lines of multi-line Rust string literals whose
+  contents hold a `//` or a `///`, where the lone mark is the one CLOSING the
+  Rust string. `trailing_comment_at` cannot see past that: a string left open at
+  end of line ends its walk, so the line after it is read as fresh code.
+
+### Added
+
+- **The measurement is a test.** The claim that no quotation in this workspace
+  is affected by the masking unit was reproducible only by re-applying an
+  instrumentation patch, so it decayed the moment anybody edited a comment.
+  `the_two_masking_units_agree_on_every_graded_span_in_this_workspace` runs the
+  REAL extraction over both units — `take_paragraph` takes the masker as a
+  parameter, so the counterfactual shares the whole loop rather than
+  reimplementing it beside one — and compares every graded-size span in every
+  file the command reads. A detector that reports zero because it cannot fail
+  reports zero too, so `the_differential_reports_a_leak_it_is_given` hands the
+  same helper a block that does leak.
+
 ## `http-semantics` — the auth recovery invented a challenge out of a parameter's own data
 
 `challenges()` could hand a caller a challenge no origin server sent, built out
