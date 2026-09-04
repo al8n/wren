@@ -606,9 +606,14 @@ const UNTRIAGED: &[(&str, usize)] = &[
 /// Same reason [`UNTRIAGED`] holds counts: a block is identified by the line
 /// it starts on, and every edit above it moves that line. A count per file is
 /// stable under editing and still fails on a block that APPEARS, which is the
-/// case this exists to catch. What it cannot see is one unpaired block
-/// replacing another in the same file — the same limit that constant records,
-/// and for the same reason.
+/// case this exists to catch.
+///
+/// What neither table can see is one entry replacing another in the same file
+/// at the same count — a block balanced and a different one unbalanced in one
+/// edit here, a span triaged and another appearing there. It is ONE limit
+/// shared by the two tables, not two independent oversights, and it is the
+/// price of identifying a site by a count instead of by a line number that
+/// every edit above it moves.
 ///
 /// # What is in here, and why each one is
 ///
@@ -2140,6 +2145,19 @@ fn char_literal_ends(bytes: &[u8], at: usize) -> usize {
 /// [`quoted_spans`] reads: a mark inside a code span is not one of the block's
 /// to pair, and counting before the mask would report every comment that
 /// names a quote character.
+///
+/// # The limit, stated rather than left to be rediscovered
+///
+/// This sees a BLOCK, not a quotation. Parity is the whole of the test, so an
+/// EVEN number of stray or leaked marks is still mis-paired and still
+/// unreported: every quotation between the first stray and the last is cut at
+/// the wrong place, and the count comes out even, and nothing here says a
+/// word. That is the shape #84's own opening case had — the comment that
+/// surfaced the leak held TWO wrapped code spans, which is why it produced
+/// false spans rather than a disappearance. So this narrows the class along
+/// one axis and leaves the other open. Nothing available here closes it: what
+/// would is knowing which mark the author meant, and a rule that guesses that
+/// is a rule that invents failures.
 fn unpaired_mark(block: &str, marks: &[(usize, usize)]) -> Option<Unpaired> {
   let quotes = block.matches('"').count();
   if quotes.is_multiple_of(2) {

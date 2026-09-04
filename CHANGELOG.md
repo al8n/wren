@@ -94,12 +94,22 @@ al8n/wren#84.
   graded — and leaves this branch at **exit 1** with
   `unpaired_demo.rs:4: the block beginning at line 1 holds 3 quotation mark(s)`.
 
+  **What it does not see, said in the code rather than left to be
+  rediscovered:** parity sees a BLOCK, not a quotation, so an EVEN number of
+  stray or leaked marks is still mis-paired and still unreported — the shape
+  #84's own opening case had, since the comment that surfaced the leak held two
+  wrapped code spans. This narrows the class along one axis and leaves the other
+  open. `UNPAIRED`'s own limit is `UNTRIAGED`'s: a per-file count cannot see one
+  entry replacing another at the same count, which is one shared consequence of
+  identifying a site by a count rather than by a line every edit moves.
+
   **Eight blocks stood when the check was first run**, and the table says what
   each is. One was a real comment in this crate and is repaired —
   `doc_check.rs`'s `the opening '"'` now says DQUOTE, which is the repair this
   table asks of anyone who lands in it. Seven remain: one comment worth changing
   (`http-semantics/src/auth/mod.rs`, left alone because that crate is not this
-  change's to edit), two deliberate markers, and four blocks that are not
+  change's to edit — repaired in this branch after all, see below), two
+  deliberate markers, and four blocks that are not
   comments at all — continuation lines of multi-line Rust string literals whose
   contents hold a `//` or a `///`, where the lone mark is the one CLOSING the
   Rust string. `trailing_comment_at` cannot see past that: a string left open at
@@ -117,6 +127,34 @@ al8n/wren#84.
   file the command reads. A detector that reports zero because it cannot fail
   reports zero too, so `the_differential_reports_a_leak_it_is_given` hands the
   same helper a block that does leak.
+
+## `http-semantics` — a blank line is what keeps four markers out of the module doc
+
+### Fixed
+
+- **`auth/mod.rs`'s four `gate-exempt:` markers sat inside the module doc's
+  comment block**, because a `//` line CONTINUES a `//!` block rather than
+  starting one. The module doc's block therefore held seventeen quotation marks,
+  the seventeenth being the lone one the third of them carries in a value whose
+  quoted-string never closes, and
+  `quote-check` pairs marks left to right across a whole block. It was correct
+  **only by position** — the lone mark is last, so the sixteen in front of it
+  still paired with each other. Adding a marker, moving one, or writing another
+  sentence of module doc past it would have changed that silently.
+
+  A blank line ends the block. The markers are their own now, the way
+  `websocket-proto/src/negotiation.rs` already keeps its own, and the note under
+  them is there because the gate cannot defend the line: `UNPAIRED` counts one
+  odd block in this file either way, so deleting the blank line is a change the
+  run would not fail. Found by the check added to `quote-check` in the same
+  branch.
+
+  Nothing else moves, measured rather than assumed: before and after, the file
+  yields the same four markers, the same six production candidates exempted by
+  them, no exempted quotations either way, 80 admitted and 4 uncited candidates,
+  and 51 extracted spans with an identical digest. Only which block is the odd
+  one changes — the module doc at line 1 holding 17 marks becomes the marker
+  block at line 225 holding 5.
 
 ## `http-semantics` — the auth recovery invented a challenge out of a parameter's own data
 
