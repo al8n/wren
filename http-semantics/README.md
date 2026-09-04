@@ -4,9 +4,9 @@
 <div align="center">
 
 Version-independent HTTP semantics — the rules RFC 9110 states once and every
-wire format inherits: field grammar, media types, dates, validators,
-conditional requests, range requests, authentication fields, and the status
-vocabulary they answer in.
+wire format inherits: field grammar, media types, content negotiation, dates,
+validators, conditional requests, range requests, authentication fields, and
+the status vocabulary they answer in.
 
 `no_std`, no-alloc capable, panic-free.
 

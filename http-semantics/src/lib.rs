@@ -45,6 +45,7 @@ pub mod conditional;
 pub mod date;
 pub mod grammar;
 pub mod media;
+pub mod negotiation;
 pub mod range;
 pub mod status;
 pub mod validator;
