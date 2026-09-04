@@ -470,3 +470,90 @@ fn the_language_walk_skips_empty_elements_and_latches_like_the_other() {
   assert!(walk.next().is_none());
   assert!(walk.next().is_none());
 }
+
+// ── RFC 9110 §12.5.2's Accept-Charset ────────────────────────────────────────
+
+#[test]
+fn the_sections_own_charset_example_reads_as_it_reads() {
+  // RFC 9110 §12.5.2: "Accept-Charset: iso-8859-5, unicode-1-1;q=0.8".
+  let mut walk = accept_charset([b"iso-8859-5, unicode-1-1;q=0.8".as_slice()]);
+  let first = walk.next().expect("one").expect("well formed");
+  assert_eq!(first.name(), Some("iso-8859-5"));
+  assert_eq!(first.weight(), Weight::ONE);
+  let second = walk.next().expect("two").expect("well formed");
+  assert_eq!(second.name(), Some("unicode-1-1"));
+  assert_eq!(second.weight().thousandths(), 800);
+  assert!(walk.next().is_none());
+}
+
+#[test]
+fn the_charset_wildcard_is_the_wildcard() {
+  // RFC 9110 §12.5.2: "The special value "*", if present in the Accept-Charset
+  // header field, matches every charset that is not mentioned elsewhere in the
+  // field."
+  let star = accept_charset([b"*;q=0".as_slice()])
+    .next()
+    .expect("one")
+    .expect("well formed");
+  assert!(star.is_wildcard());
+  assert_eq!(star.name(), None);
+  assert_eq!(star.weight(), Weight::ZERO);
+}
+
+#[test]
+fn the_charset_element_is_the_token_the_field_spells() {
+  // `Accept-Charset = #( ( token / "*" ) [ weight ] )` (RFC 9110 §12.5.2) —
+  // there is no `charset` production in RFC 9110 to read instead. §8.3.2's Note
+  // says the one difference that makes: RFC 2978's `mime-charset` admits `{`
+  // and `}`, which §5.6.2's `token` does not, and this field spells `token`.
+  assert_eq!(
+    accept_charset([b"a{b}".as_slice()])
+      .next()
+      .expect("one")
+      .expect_err("malformed"),
+    NegotiationError::NotAnElement
+  );
+  // Everything a `token` is, this field admits — including the shapes the other
+  // two fields refuse or read differently.
+  for good in [b"utf-8".as_slice(), b"UTF-8", b"x_y", b"abcdefghi", b"1-en"] {
+    let pref = accept_charset([good])
+      .next()
+      .expect("one")
+      .expect("well formed");
+    assert!(!pref.is_wildcard(), "{good:?}");
+  }
+}
+
+#[test]
+fn charset_and_encoding_read_one_element_language() {
+  // The two entry points share `Element::Token` because RFC 9110 §12.5.2's
+  // `( token / "*" )` and §12.5.3's
+  // `codings          = content-coding / "identity" / "*"` derive the SAME
+  // strings: `content-coding   = token`, `identity` is a `token`, and `*` is a
+  // `tchar`. So nothing an element may SAY tells the two fields apart, and this
+  // pins that rather than leaving it as a coincidence of one implementation.
+  for line in [
+    b"gzip".as_slice(),
+    b"identity",
+    b"*",
+    b"utf-8",
+    b"a{b}",
+    b"gz ip",
+    b"gzip;q=0.5",
+    b"gzip;q=\"0.5\"",
+    b"gzip;p=1",
+    b"",
+  ] {
+    let charset = accept_charset([line]).next();
+    let encoding = accept_encoding([line]).next();
+    match (charset, encoding) {
+      (None, None) => {}
+      (Some(Ok(a)), Some(Ok(b))) => {
+        assert_eq!(a.name(), b.name(), "{line:?}");
+        assert_eq!(a.weight(), b.weight(), "{line:?}");
+      }
+      (Some(Err(a)), Some(Err(b))) => assert_eq!(a, b, "{line:?}"),
+      _ => panic!("the two fields parted over {line:?}"),
+    }
+  }
+}

@@ -1,11 +1,13 @@
 //! The RFC 9110 §12.5 content negotiation fields whose element carries no
-//! parameters: §12.5.3's `Accept-Encoding` and §12.5.4's `Accept-Language`.
+//! parameters: §12.5.2's `Accept-Charset`, §12.5.3's `Accept-Encoding` and
+//! §12.5.4's `Accept-Language`.
 //!
 //! One walk serves them. Each is a §5.6.1 list of a bare name with RFC 9110
 //! §12.4.2's weight optionally hung off it, and the only thing that separates
 //! one from another is which names its element production admits:
 //!
 //! ```text
+//! Accept-Charset = #( ( token / "*" ) [ weight ] )
 //! Accept-Encoding  = #( codings [ weight ] )
 //! codings          = content-coding / "identity" / "*"
 //! content-coding   = token
@@ -40,9 +42,9 @@
 //! the sender's choice.
 //!
 //! An element here carries none. `codings` is `content-coding / "identity" /
-//! "*"` and `content-coding` is `token`; RFC 4647 §2.1's `language-range` is
-//! ALPHA, DIGIT and `-`, and no other byte at all. Each is a name, and then the
-//! ABNF is out of alternatives. So the only production a `;` inside such an
+//! "*"` and `content-coding` is `token`; §12.5.2's is `( token / "*" )`; RFC
+//! 4647 §2.1's `language-range` is ALPHA, DIGIT and `-`, and no other byte at
+//! all. Each is a name, and then the ABNF is out of alternatives. So the only production a `;` inside such an
 //! element can open is `[ weight ]`, there is at most one of them, and ORDER is
 //! not a question anybody can ask — there is nothing for the weight to be
 //! ordered against. §12.5.1's rule is not inherited here and not re-implemented
@@ -94,7 +96,10 @@
 //!   `transfer-coding    = token *( OWS ";" OWS transfer-parameter )`, so
 //!   `chunked;p=1` — a value that corpus is built to exercise — is a
 //!   `transfer-coding` and is no `codings`. RFC 4647's `language-range` is not
-//!   in it either, and is not in RFC 9110 at all.
+//!   in it either, and is not in RFC 9110 at all. §12.5.2's element is §5.6.2's
+//!   `token`, which that corpus's `oracle` derives from the RFC and which no
+//!   PAIR there grades — its own summary says every reader in it reaches one
+//!   `tchar` table, so no pair parts on that layer.
 //! - **This module adds no second READING of anything shared.** The three
 //!   productions it does share with existing readers are reached by CALLING
 //!   the one implementation of each rather than by writing another:
@@ -166,14 +171,21 @@ pub enum NegotiationError {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Element {
   /// RFC 9110 §5.6.2's `token          = 1*tchar`, which is the whole of what
-  /// §12.5.3's `codings` admits.
+  /// §12.5.3's `codings` admits and the whole of what §12.5.2's element does.
   ///
   /// `codings = content-coding / "identity" / "*"` names three alternatives
   /// and derives one language. `content-coding   = token` is the first;
   /// `identity` is eight `tchar`s and so is a `token` too; and `*` is a
-  /// `tchar`, so the third is as well. Nothing an element may SAY separates
-  /// them — what separates them is what §12.5.3 says each MEANS, and that is
-  /// the caller's to read off [`Preference::name`].
+  /// `tchar`, so the third is as well. §12.5.2 writes
+  /// `Accept-Charset = #( ( token / "*" ) [ weight ] )`, whose two alternatives
+  /// collapse the same way. So the two fields share this arm because their
+  /// element productions DERIVE THE SAME STRINGS, which is a fact about the
+  /// grammar rather than a convenience: nothing an element of either may SAY
+  /// separates them.
+  ///
+  /// What separates them is what each section says a name MEANS — §12.5.3's
+  /// `identity` and each field's `*` — and that is the caller's to read off
+  /// [`Preference::name`] and [`Preference::is_wildcard`].
   Token,
   /// RFC 4647 §2.1's basic language range, which RFC 9110 §12.5.4's
   /// `language-range  = <language-range, see [RFC4647], Section 2.1>` hands out
@@ -284,12 +296,17 @@ impl<'a> Preference<'a> {
   /// matches any available content coding not explicitly listed in the field."
   /// That is a different thing from a coding whose name happens to be one
   /// character, so it is a different answer rather than a `Some("*")` every
-  /// caller would have to remember to test for.
+  /// caller would have to remember to test for. Each field's own section says
+  /// what its wildcard matches — §12.5.2 for a charset, §12.5.3 for a coding,
+  /// and §12.4.3 over all of them — and this reports only that the sender wrote
+  /// one.
   ///
-  /// `identity` is NOT the wildcard and reports `Some("identity")`. RFC 9110
-  /// §12.5.3: "An "identity" token is used as a synonym for "no encoding" in
-  /// order to communicate when no encoding is preferred." — a name with a
-  /// meaning, which is the caller's to act on.
+  /// A name that MEANS something is still a name. `identity` reports
+  /// `Some("identity")` and is not the wildcard, though RFC 9110 §12.5.3 gives
+  /// it a meaning of its own: "An "identity" token is used as a synonym for "no
+  /// encoding" in order to communicate when no encoding is preferred." What a
+  /// name means is the caller's to act on; what this answers is which name the
+  /// sender wrote.
   #[inline]
   pub const fn name(&self) -> Option<&'a str> {
     match self.name {
@@ -477,6 +494,59 @@ where
   I: IntoIterator<Item = &'a [u8]>,
 {
   preferences(lines, Element::LanguageRange)
+}
+
+/// Walks an `Accept-Charset` field's charsets (RFC 9110 §12.5.2).
+///
+/// `Accept-Charset = #( ( token / "*" ) [ weight ] )`. Yields one
+/// [`Preference`] per element in wire order, with [`Preference::name`] `None`
+/// for the wildcard: §12.5.2 says "The special value "*", if present in the
+/// Accept-Charset header field, matches every charset that is not mentioned
+/// elsewhere in the field."
+///
+/// # This field is deprecated, and what is deprecated is SENDING it
+///
+/// RFC 9110 §12.5.2's Note: "Accept-Charset is deprecated because UTF-8 has
+/// become nearly ubiquitous and sending a detailed list of user-preferred
+/// charsets wastes bandwidth, increases latency, and makes passive
+/// fingerprinting far too easy". Every clause of that is about a sender —
+/// "Most general-purpose user agents do not send Accept-Charset unless
+/// specifically configured to do so." — and this crate is on the other side of
+/// the wire. A recipient still meets the field, because a deprecation does not
+/// unsend what is already deployed, and a recipient that cannot read it has no
+/// way to honour or to ignore it deliberately.
+///
+/// So the Note is the reason this reader EXISTS, and it is also the reason
+/// nothing in this crate writes an `Accept-Charset`. There is no encoder here
+/// and none is owed: a caller that generates one is doing the deprecated half,
+/// and that decision is not this crate's to make for it.
+///
+/// # The element is `token` — the RFC spells no `charset` rule
+///
+/// RFC 9110 §12.5.2's ABNF writes `( token / "*" )` and not a `charset`
+/// production, and §8.3.2 defines charset names in prose instead — in theory
+/// out of RFC 2978 §2.3's `mime-charset` rule, of which §8.3.2's Note says:
+/// "That rule allows two characters that are not included in "token" ("{" and
+/// "}"), but no charset name registered at the time of this writing includes
+/// braces". This reader implements the rule the FIELD spells — §5.6.2's
+/// `token` — so `a{b}` is refused here, which is what §12.5.2's own grammar
+/// says of it whatever a registry might one day hold.
+///
+/// # Errors
+///
+/// Each item is a [`NegotiationError`]:
+/// [`NotAnElement`](NegotiationError::NotAnElement),
+/// [`NotAWeight`](NegotiationError::NotAWeight) or
+/// [`BadWeight`](NegotiationError::BadWeight). The walk yields nothing after
+/// the first.
+#[inline]
+pub fn accept_charset<'a, I>(
+  lines: I,
+) -> impl Iterator<Item = Result<Preference<'a>, NegotiationError>>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  preferences(lines, Element::Token)
 }
 
 #[cfg(test)]

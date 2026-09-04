@@ -18,6 +18,8 @@ which names the element production admits.
 - `negotiation::accept_language` — RFC 9110 §12.5.4's
   `Accept-Language = #( language-range [ weight ] )`, over the element §12.5.4
   does NOT spell.
+- `negotiation::accept_charset` — RFC 9110 §12.5.2's
+  `Accept-Charset = #( ( token / "*" ) [ weight ] )`.
 - `negotiation::Preference`, with `name` (`None` for the wildcard `*`),
   `is_wildcard` and `weight`; and `negotiation::NegotiationError`, whose three
   variants are `NotAnElement`, `NotAWeight` and `BadWeight`. It is
@@ -81,6 +83,33 @@ grammar does not have, and each moves an answer:
   comma is §5.6.1's separator and the elements are exactly what
   `grammar::list_elements` splits. That is also why walking a field's lines and
   walking §5.2's joined value cannot part.
+
+### `Accept-Charset` is deprecated to SEND, and this is the receiving side
+
+RFC 9110 §12.5.2's Note deprecates the field, and every clause of it is about a
+sender: sending a detailed list wastes bandwidth, increases latency and makes
+passive fingerprinting easy, and most general-purpose user agents do not send
+one. A recipient still meets the field, because a deprecation does not unsend
+what is deployed, and a recipient that cannot read it can neither honour it nor
+ignore it deliberately. So the Note is the reason `accept_charset` exists AND
+the reason nothing in this crate writes an `Accept-Charset`; there is no encoder
+here and none is owed.
+
+**The element is `token`, and the ledger's `charset` is not a production RFC
+9110 has.** §12.5.2's ABNF is `Accept-Charset = #( ( token / "*" ) [ weight ] )`
+— measured against the cached text at line 5506 and against Appendix A's
+collected grammar — and §8.3.2 defines charset names in prose rather than in
+ABNF. Its Note says where the difference falls: RFC 2978's `mime-charset` admits
+`{` and `}`, which §5.6.2's `token` does not. This reads the rule the field
+spells, so `a{b}` is refused.
+
+**It shares its element rule with `Accept-Encoding` as a fact about the
+grammar.** RFC 9110 §12.5.2's `( token / "*" )` and §12.5.3's
+`codings          = content-coding / "identity" / "*"` derive the SAME strings —
+§8.4.1's `content-coding   = token`, `identity` is a `token`, `*` is a `tchar` —
+so nothing an element may say tells the two fields apart. A test holds the two
+entry points to identical answers over ten values, so the sharing is pinned
+rather than left as a property of one implementation.
 
 ### `coding-corpus` grades none of these productions, and the module says so
 
