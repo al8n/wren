@@ -64,6 +64,30 @@ range is satisfiable belongs here — §14.1.2 settles it and the length is an
 argument; deciding whether credentials are valid does not, because RFC 9110
 settles their syntax and nothing about their verification.
 
+### Which HTTP roles it serves
+
+**An origin server and a user agent. An intermediary is out of scope.** That is
+a ruling and not a gap, and it settles the rules RFC 9110 writes for an
+intermediary alone: they are STATED where a caller meets the value they govern,
+so that a caller acting as one can obey them, and they are not enforced here.
+RFC 9110 §12.5.5's "A proxy MUST NOT generate "*" in a Vary field value." is one
+such rule, stated at `negotiation::VaryMember::Wildcard`; §7.6.2's
+`Max-Forwards` and §7.6.3's `Via` are out of scope by this same sentence rather
+than missing.
+
+Enforcing one of them would mean shipping half an intermediary. This crate
+writes no `Vary`, no `Via` and no `Max-Forwards`, and it strips no hop-by-hop
+field a §7.6.1 `Connection` names; a crate that enforced a single prohibition
+and left the rest unwritten would give an intermediary author a floor that is
+not there. What it owes such a caller instead is the FACT each rule turns on —
+`negotiation::VaryMember::Wildcard` is that fact for §12.5.5 — so obeying the
+rule needs no second parse and no reading of the section at the call site.
+
+This is a rule about ROLES, and it is not the membership rule above. An item
+whose subject is version-independent and whose answer is a function of its input
+still belongs here when only an intermediary would read it; what this rule
+settles is whether a MUST that binds an intermediary is enforced, and it is not.
+
 ## Feature flags
 
 | Feature | Default | Enables |

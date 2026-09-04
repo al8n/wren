@@ -1,5 +1,44 @@
 # UNRELEASED
 
+## `http-semantics` — the roles this crate serves, as a scope rule and not a note
+
+al8n/wren#70 records two items resting on the ABSENCE of a scope rule: neither
+README says whether an intermediary is served, so §7.6.2's `Max-Forwards` and
+§7.6.3's `Via` sat in neither the implemented bucket nor the out-of-scope one.
+One sentence settles them, and it belongs where a reader looks for scope rather
+than at the one value that happens to have raised it.
+
+### Changed
+
+- **`http-semantics`'s README gains a role rule**: this crate serves an origin
+  server and a user agent, and an intermediary is out of scope. The rules RFC
+  9110 writes for an intermediary alone are STATED where a caller meets the
+  value they govern, so a caller acting as one can obey them, and are not
+  enforced here. RFC 9110 §12.5.5's "A proxy MUST NOT generate "*" in a Vary
+  field value." is named as one such rule; §7.6.2 and §7.6.3 are out of scope by
+  the same sentence rather than missing, which resolves #70's two pending items.
+
+  The rule says why enforcing one of them would be worse than stating it:
+  shipping a single prohibition while writing no `Vary`, no `Via`, no
+  `Max-Forwards` and stripping no hop-by-hop field a §7.6.1 `Connection` names
+  gives an intermediary author a floor that is not there. What the crate owes
+  such a caller instead is the FACT each rule turns on —
+  `negotiation::VaryMember::Wildcard` is that fact for §12.5.5 — so obeying it
+  needs no second parse and no reading of the section at the call site.
+
+  It is a rule about ROLES and is explicitly not the membership rule above it:
+  an item still belongs here when only an intermediary would read it. What this
+  settles is whether a MUST that binds an intermediary is enforced.
+
+- `VaryMember::Wildcard` now reads as the restatement it is, and points at the
+  README as where the ruling is settled once.
+- `encoding_acceptability` says why it walks the field once per coding asked
+  about: answering several candidates in one pass means remembering a weight per
+  candidate, which is storage a no-alloc reader cannot grow and would have to
+  bound the way `MAX_TRACKED_PARAMS` bounds `weight_for`'s per-instance match.
+  These fields hold a handful of members, and a caller that wants one pass has
+  `accept_encoding`.
+
 ## `xtask` — two gates disagreed about what a citation is, and four correct quotations sat in the backlog for it
 
 `doc-check` requires a comment quoting an RFC sentence with an inline reference
@@ -75,25 +114,27 @@ the three ranked readers beside it.
   `NotAFieldName`. Both carry `#[non_exhaustive]` where a variant could be
   added.
 
-### The §12.5.5 rule that is not enforced, and what enforcing it would take
+### The §12.5.5 rule that is stated and not enforced, and the ruling behind it
 
 RFC 9110 §12.5.5: "A proxy MUST NOT generate "*" in a Vary field value." It is
-stated at `VaryMember::Wildcard` and nothing checks it, and both halves of that
-are deliberate.
+stated at `VaryMember::Wildcard` and nothing checks it. **That is a decision,
+not an omission**, and `VaryMember::Wildcard` is where it is written down.
 
-The rule binds a GENERATOR that is a proxy. This crate generates no `Vary` — it
-holds no encoder for the field — so there is no site the rule could be applied
-at, and adding one in order to have something to check would be inventing the
-machinery the rule governs rather than obeying it. Enforcement needs a `Vary`
-writer plus the knowledge that the caller is an intermediary, and the second is
-not a fact about any bytes this crate reads. Whether this workspace serves an
-intermediary at all is an open ruling in al8n/wren#70 — the same absence that
-leaves §7.6.2's `Max-Forwards` and §7.6.3's `Via` unfiled — so the rule is
-unenforced pending a decision recorded there rather than by oversight here.
+**An intermediary is out of scope for this crate**, which resolves the open
+question al8n/wren#70 records. Enforcing this rule needs a `Vary` writer, which
+does not exist here, and the knowledge that the caller is an intermediary, which
+is no fact about any bytes this crate reads. Adding both to satisfy one
+prohibition would be worse than leaving it stated: a proxy needs far more than a
+single MUST NOT — §7.6.3's `Via`, §7.6.2's `Max-Forwards`, §7.6.1's `Connection`
+and the hop-by-hop fields it names — and shipping this one without the rest
+gives an intermediary author a FALSE FLOOR, a crate that looks like it has taken
+a position on forwarding when it has taken one and left the others unwritten.
+The same answer covers `Via` and `Max-Forwards`, which is why they are unfiled
+rather than pending.
 
-What a proxy that does generate a `Vary` needs in order to obey it is the fact
-the variant is: a caller re-emitting the members it read knows from the variant
-alone which one it may not write.
+What this crate owes an intermediary is the fact it needs in order to obey the
+rule itself, and that fact is the variant: a proxy re-emitting the members it
+read knows from the variant alone which one it may not write.
 
 ### The wildcard is a member, not a state of the whole value
 

@@ -624,6 +624,19 @@ impl Acceptability {
 /// reasons unrelated to content codings MUST NOT include the Accept-Encoding
 /// header field".
 ///
+/// # One walk per coding asked about, deliberately
+///
+/// A caller ranking five candidates walks the field five times. That is the
+/// trade a no-alloc reader makes: answering all five in one pass means
+/// remembering a weight per candidate, which is storage this crate has no way
+/// to grow and would have to bound the way [`MAX_TRACKED_PARAMS`] bounds
+/// [`weight_for`]'s per-instance match. These fields hold a handful of members,
+/// the walk borrows and copies nothing, and a caller that wants one pass has
+/// [`accept_encoding`] and can keep whatever record it can afford.
+///
+/// [`MAX_TRACKED_PARAMS`]: crate::media::MAX_TRACKED_PARAMS
+/// [`weight_for`]: crate::media::weight_for
+///
 /// # A coding the field names twice
 ///
 /// RFC 9110 settles no rule for a repeated entry, so this takes one and says
@@ -832,28 +845,37 @@ pub enum VaryMember<'a> {
   /// `Vary = #( "*" / field-name )`, so `*, accept-encoding` is one list of two
   /// members and this is the first of them.
   ///
-  /// # The §12.5.5 rule this crate does not enforce, and what would enforce it
+  /// # The §12.5.5 rule this crate states and does not enforce, and the ruling
+  /// behind that
   ///
   /// RFC 9110 §12.5.5: "A proxy MUST NOT generate "*" in a Vary field value."
-  /// It is STATED here and nothing checks it, and both halves of that are
-  /// deliberate.
+  /// It is STATED here and nothing checks it. **That is a decision, not an
+  /// omission**, and this is where it is written down so the next reader does
+  /// not have to guess which it was.
   ///
-  /// It binds a GENERATOR that is a proxy. This crate generates no `Vary` at
-  /// all — there is no encoder for this field here — so there is no site the
-  /// rule could be applied at, and adding one to have something to check would
-  /// be inventing the machinery the rule governs rather than obeying it. What
-  /// enforcement needs is a `Vary` writer plus the knowledge that the caller is
-  /// an intermediary, and the second of those is not a fact about any bytes
-  /// this crate reads.
+  /// **An intermediary is out of scope for this crate**, which is a rule of the
+  /// crate's own and lives in its README beside the membership rule; what
+  /// follows is its restatement at the value it governs. Enforcing this MUST
+  /// NOT would need two things this crate does not have: a `Vary` writer, which
+  /// does not exist here, and the knowledge that the caller is an intermediary,
+  /// which is no fact about any bytes this crate reads.
   ///
-  /// Whether this workspace serves an intermediary at all is an open ruling in
-  /// al8n/wren#70 — the same absence that leaves §7.6.2's `Max-Forwards` and
-  /// §7.6.3's `Via` unfiled — so the rule is unenforced pending a decision that
-  /// is recorded elsewhere rather than by oversight here.
+  /// Adding those to satisfy this one prohibition would be worse than leaving
+  /// it stated. A proxy needs far more than a single MUST NOT — §7.6.3's `Via`,
+  /// §7.6.2's `Max-Forwards`, §7.6.1's `Connection` and the hop-by-hop fields
+  /// it names, stripped rather than forwarded — and shipping this one without
+  /// the rest would give an intermediary author a FALSE FLOOR: a crate that
+  /// looks like it has taken a position on forwarding when it has taken one
+  /// position and left the others unwritten. That is the ruling on the open
+  /// question al8n/wren#70 records, and the README's role rule is where it is
+  /// settled once: the same sentence answers §7.6.2's `Max-Forwards` and
+  /// §7.6.3's `Via`, which is why they are out of scope rather than pending.
   ///
-  /// What a proxy that DOES generate a `Vary` needs in order to obey it is the
-  /// fact that this variant is: a caller re-emitting the members it read knows
-  /// from the variant alone which one it may not write.
+  /// **What this crate owes an intermediary is the fact it needs in order to
+  /// obey the rule itself, and that fact is this variant.** A proxy
+  /// re-emitting the members it read knows from the variant alone which one it
+  /// may not write — no registry, no second parse, no reading of §12.5.5 at
+  /// the call site.
   Wildcard,
   /// The `field-name` alternative — RFC 9110 §5.1's
   /// `field-name     = token`.
