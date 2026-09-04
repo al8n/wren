@@ -9,25 +9,60 @@ which names the element production admits.
 
 ### Added
 
-- `negotiation`, a module for the §12.5 fields whose element is a bare name, and
-  `negotiation::accept_encoding` — §12.5.3's
+- `negotiation`, a module for the RFC 9110 §12.5 fields whose element is a bare
+  name, and `negotiation::accept_encoding` — §12.5.3's
   `Accept-Encoding  = #( codings [ weight ] )` over
   `codings          = content-coding / "identity" / "*"`. It takes a field's
   lines like `media::accept` does, yields one `Preference` per element in wire
   order, and latches on the first fault.
+- `negotiation::accept_language` — RFC 9110 §12.5.4's
+  `Accept-Language = #( language-range [ weight ] )`, over the element §12.5.4
+  does NOT spell.
 - `negotiation::Preference`, with `name` (`None` for the wildcard `*`),
   `is_wildcard` and `weight`; and `negotiation::NegotiationError`, whose three
   variants are `NotAnElement`, `NotAWeight` and `BadWeight`. It is
   `#[non_exhaustive]`.
+- `4647` in `quote_check`'s `FETCHED`, and RFC 4647's text in the cache CI
+  grades against.
+
+### RFC 9110 §12.5.4 hands its element out, and the workspace did not have the spec
+
+`language-range  = <language-range, see [RFC4647], Section 2.1>` is a
+`prose-val`: RFC 9110 holds no grammar for `Accept-Language`'s element, so a
+transcription of that rule was gradeable against nothing this workspace had
+loaded, and a comment carrying it would have been invisible to `quote-check`
+rather than checked by it. RFC 4647 joins `FETCHED` the way RFC 2046 did for the
+multipart writer, and the rule is transcribed from RFC 4647 §2.1's own text:
+`language-range   = (1*8ALPHA *("-" 1*8alphanum)) / "*"` over
+`alphanum         = ALPHA / DIGIT`.
+
+Two things that rule says which reading it off §12.5.4's examples would miss.
+The two subtag positions are different productions — `1*8ALPHA` in front and
+`1*8alphanum` behind — so `en-us-1` is a range and `1-en` is not; and the
+eight-character bound applies at EVERY position, not only the first. RFC 4647
+§2.1 also names the digit as a correction to the rule it replaced, of which it
+says: "is incorrect, since it disallows the use of digits anywhere in the
+'language-range'".
+
+It is §2.1's BASIC range and not §2.2's `extended-language-range`, which admits
+a `*` in any subtag position: §12.5.4's `prose-val` names §2.1, so `en-*` is no
+element of this field.
+
+RFC 4647's range is NARROWER than RFC 9110 §5.6.2's `token` and inside it —
+ALPHA, DIGIT and `-` are all `tchar`s — so no `language-range` can move an
+element boundary, and the narrowing is checked rather than widened away. A test
+holds both halves of that over its own samples: every range in the list is a
+token, and five of the thirteen are tokens and no range.
 
 ### §12.5.1's `q` rule is not inherited, and that is a refusal rather than an omission
 
-§12.5.1 tells a recipient to process any parameter named `q` as weight
+RFC 9110 §12.5.1 tells a recipient to process any parameter named `q` as weight
 regardless of ordering. An `Accept` reader needs that because a `media-range`
 CARRIES `parameters` and the weight is whichever of them is named `q`. An
-element here carries none — `content-coding   = token`, and then the ABNF is out
-of alternatives — so the only production a `;` can open is `[ weight ]`, there
-is at most one, and there is nothing for it to be ordered against.
+element here carries none — §8.4.1's `content-coding   = token`, and then the
+ABNF is out of alternatives — so the only production a `;` can open is
+`[ weight ]`, there is at most one, and there is nothing for it to be ordered
+against.
 
 Importing `Accept`'s parameter handling would have ADDED three things the
 grammar does not have, and each moves an answer:
@@ -37,9 +72,10 @@ grammar does not have, and each moves an answer:
   value `qvalue` with no `quoted-string` alternative, so
   `Accept-Encoding: gzip;q="0.5"` is malformed. Both halves of that pair are one
   test.
-- **A repetition.** `parameters      = *( OWS ";" OWS [ parameter ] )` repeats
-  where `[ weight ]` brackets one, so `gzip;q=0.5;p=1` is a media range's shape
-  and no element of this field.
+- **A repetition.** RFC 9110 §5.6.6's
+  `parameters      = *( OWS ";" OWS [ parameter ] )` repeats where `[ weight ]`
+  brackets one, so `gzip;q=0.5;p=1` is a media range's shape and no element of
+  this field.
 - **A comma inside a value.** The one that moves a BOUNDARY rather than a
   verdict: nothing reachable from an element here admits a DQUOTE, so every
   comma is §5.6.1's separator and the elements are exactly what
@@ -50,9 +86,10 @@ grammar does not have, and each moves an answer:
 
 A new reader owes an answer to whether it is a second reader of a production
 that harness already grades, because several readers of one production is how
-al8n/wren#76 happened. This one is not, twice over. `content-coding   = token`
-is not `transfer-coding    = token *( OWS ";" OWS transfer-parameter )` under
-another name — `chunked;p=1`, which that corpus is built to exercise, is a
+al8n/wren#76 happened. This one is not, twice over. RFC 9110 §8.4.1's
+`content-coding   = token` is not §10.1.4's
+`transfer-coding    = token *( OWS ";" OWS transfer-parameter )` under another
+name — `chunked;p=1`, which that corpus is built to exercise, is a
 `transfer-coding` and is no `codings`. And the three productions this module
 does share with existing readers are reached by CALLING the one implementation
 of each — `grammar::list_elements`, `grammar::is_token` and

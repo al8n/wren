@@ -207,7 +207,7 @@ use http_semantics::{
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
   grammar::{ParamSyntax, ParamValue, parameterised_list},
   media::{media_type, weight_for},
-  negotiation::accept_encoding,
+  negotiation::{accept_encoding, accept_language},
   range::{ContentRange, RangesSpecifier, Resolved},
   validator::{EntityTag, TagList},
 };
@@ -1798,6 +1798,70 @@ fn accept_encoding_is_panic_free() {
     shim_accept_encoding(black_box(&[
       [0x67u8, 0x3b, 0x71, 0x3d, 0x30, 0x2e, 0xff].as_slice()
     ])),
+    0
+  );
+}
+
+no_panic_shim! {
+  /// Shim over `negotiation::accept_language` — RFC 9110 §12.5.4's
+  /// `Accept-Language = #( language-range [ weight ] )`, whose element rule is
+  /// RFC 4647 §2.1's and is the other arm of the enum
+  /// `shim_accept_encoding` drives the first of.
+  ///
+  /// `map(|line| *line)` where `copied()` reads better, and clippy says so, for
+  /// the reason `shim_weight_for` records at length: one adapter type per shim
+  /// keeps each its own instantiation of the generic walk beneath it, so no two
+  /// proofs here can be emptied together. Between the two shims `Copied` and
+  /// `Map` are both covered.
+  ///
+  /// Returns what it read, so a call whose result is dead cannot take the
+  /// shim's body with it.
+  #[allow(clippy::map_clone)]
+  fn shim_accept_language(lines: &[&[u8]]) -> usize {
+    let mut seen = 0usize;
+    for item in accept_language(lines.iter().map(|line| *line)) {
+      let Ok(preference) = item else { break };
+      seen = seen.wrapping_add(preference.name().map_or(0, str::len));
+      seen = seen.wrapping_add(usize::from(preference.weight().thousandths()));
+    }
+    seen
+  }
+}
+
+#[test]
+fn accept_language_is_panic_free() {
+  // RFC 9110 §12.5.4's own example, and the same list over RFC 9110 §5.2's
+  // field lines.
+  assert_eq!(
+    shim_accept_language(black_box(&[b"da, en-gb;q=0.8, en;q=0.7".as_slice()])),
+    2509
+  );
+  assert_eq!(
+    shim_accept_language(black_box(&[b"da".as_slice(), b"", b"en-gb;q=0.8"])),
+    1807
+  );
+  // The wildcard, which carries no name.
+  assert_eq!(
+    shim_accept_language(black_box(&[b"*;q=0.5".as_slice()])),
+    500
+  );
+  // Each way RFC 4647 §2.1's two subtag positions refuse a name, and the weight
+  // faults behind a name it accepts.
+  assert_eq!(shim_accept_language(black_box(&[b"1-en".as_slice()])), 0);
+  assert_eq!(
+    shim_accept_language(black_box(&[b"abcdefghi".as_slice()])),
+    0
+  );
+  assert_eq!(shim_accept_language(black_box(&[b"en--gb".as_slice()])), 0);
+  assert_eq!(shim_accept_language(black_box(&[b"en;p=1".as_slice()])), 0);
+  assert_eq!(
+    shim_accept_language(black_box(&[b"en;q=\"0.5\"".as_slice()])),
+    0
+  );
+  assert_eq!(shim_accept_language(black_box(&[])), 0);
+  assert_eq!(shim_accept_language(black_box(&[b"".as_slice()])), 0);
+  assert_eq!(
+    shim_accept_language(black_box(&[[0x65u8, 0x6e, 0x2d, 0xff].as_slice()])),
     0
   );
 }

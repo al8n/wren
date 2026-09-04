@@ -306,3 +306,167 @@ fn every_qvalue_shape_the_abnf_spells_reaches_the_reader() {
     );
   }
 }
+
+// ── RFC 9110 §12.5.4's Accept-Language ───────────────────────────────────────
+
+/// What the `Accept-Language` walk yields for its `n`th member, rendered as
+/// `(name, thousandths)`.
+fn language<'a>(lines: &[&'a [u8]], n: usize) -> Option<(Option<&'a str>, u16)> {
+  let item = nth(accept_language(lines.iter().copied()), n)?;
+  let pref = item.expect("well formed");
+  Some((pref.name(), pref.weight().thousandths()))
+}
+
+#[test]
+fn the_sections_own_language_example_reads_as_it_reads() {
+  // RFC 9110 §12.5.4: "Accept-Language: da, en-gb;q=0.8, en;q=0.7".
+  let lines = [b"da, en-gb;q=0.8, en;q=0.7".as_slice()];
+  assert_eq!(language(&lines, 0), Some((Some("da"), 1000)));
+  assert_eq!(language(&lines, 1), Some((Some("en-gb"), 800)));
+  assert_eq!(language(&lines, 2), Some((Some("en"), 700)));
+  assert_eq!(language(&lines, 3), None);
+}
+
+#[test]
+fn the_wildcard_range_is_the_wildcard_and_nothing_else_can_be() {
+  // RFC 4647 §2.1's `language-range   = (1*8ALPHA *("-" 1*8alphanum)) / "*"`
+  // has no ALPHA that `*` satisfies, so the first alternative cannot derive it
+  // and the wildcard reading is the only one.
+  let star = accept_language([b"*".as_slice()])
+    .next()
+    .expect("one")
+    .expect("well formed");
+  assert!(star.is_wildcard());
+  assert_eq!(star.name(), None);
+  // RFC 4647 §2.2's `extended-language-range` would admit a `*` in a later
+  // subtag; §12.5.4 names §2.1, which does not.
+  assert_eq!(
+    accept_language([b"en-*".as_slice()])
+      .next()
+      .expect("one")
+      .expect_err("malformed"),
+    NegotiationError::NotAnElement
+  );
+}
+
+#[test]
+fn both_subtag_positions_are_read_as_their_own_rule() {
+  // `(1*8ALPHA *("-" 1*8alphanum))` — ALPHA in front, `alphanum` behind, and
+  // `alphanum         = ALPHA / DIGIT` (RFC 4647 §2.1).
+  for good in [
+    b"en".as_slice(),
+    b"en-gb",
+    b"zh-Hans-CN",
+    b"en-us-1",
+    b"abcdefgh",
+    b"en-12345678",
+    b"x-a",
+  ] {
+    let pref = accept_language([good])
+      .next()
+      .expect("one")
+      .expect("well formed");
+    assert!(!pref.is_wildcard(), "{good:?}");
+  }
+  for bad in [
+    b"1-en".as_slice(), // a DIGIT in the primary subtag
+    b"abcdefghi",       // nine ALPHA where 1*8 bounds it at eight
+    b"en-123456789",    // nine alphanum in a later subtag
+    b"en-",             // 1* admits no empty subtag
+    b"-gb",
+    b"en--gb",
+    b"en_gb", // `_` is a tchar and no part of this rule
+    b"en.gb",
+  ] {
+    assert_eq!(
+      accept_language([bad])
+        .next()
+        .expect("one")
+        .expect_err("malformed"),
+      NegotiationError::NotAnElement,
+      "{bad:?}"
+    );
+  }
+}
+
+#[test]
+fn every_language_range_is_a_token_and_not_every_token_is_a_range() {
+  // The two element rules this module carries are NESTED, which is what keeps a
+  // `language-range` from ever moving an element boundary: RFC 4647 §2.1 spells
+  // it out of ALPHA, DIGIT and `-`, and all three are RFC 9110 §5.6.2 `tchar`s.
+  let mut narrower = 0usize;
+  for sample in [
+    b"*".as_slice(),
+    b"en",
+    b"en-gb",
+    b"zh-Hans-CN",
+    b"en-us-1",
+    b"1-en",
+    b"abcdefghi",
+    b"en-",
+    b"en--gb",
+    b"en_gb",
+    b"gzip",
+    b"identity",
+    b"x-a",
+  ] {
+    if is_language_range(sample) {
+      assert!(
+        crate::grammar::is_token(sample),
+        "{sample:?} is a language-range and no token"
+      );
+    } else if crate::grammar::is_token(sample) {
+      narrower += 1;
+    }
+  }
+  // And the nesting is PROPER, so the narrower rule is doing work. Five of the
+  // thirteen samples are a `token` and no `language-range` — `1-en`,
+  // `abcdefghi`, `en-`, `en--gb` and `en_gb` — while `gzip` and `identity` are
+  // BOTH, which is the half of this that a coding-shaped reading of the list
+  // gets wrong.
+  assert_eq!(narrower, 5);
+}
+
+#[test]
+fn the_weight_behind_a_language_range_is_the_same_weight() {
+  // One `read_weight`, so §12.5.4 gets §12.5.3's answers: no `quoted-string`
+  // alternative, no `BWS` around the `"q="` literal, and one bracketed weight.
+  assert_eq!(
+    accept_language([b"en;q=\"0.5\"".as_slice()])
+      .next()
+      .expect("one")
+      .expect_err("malformed"),
+    NegotiationError::BadWeight
+  );
+  assert_eq!(
+    accept_language([b"en;q = 0.5".as_slice()])
+      .next()
+      .expect("one")
+      .expect_err("malformed"),
+    NegotiationError::NotAWeight
+  );
+  assert_eq!(
+    accept_language([b"en;p=1".as_slice()])
+      .next()
+      .expect("one")
+      .expect_err("malformed"),
+    NegotiationError::NotAWeight
+  );
+  let zero = accept_language([b"en;Q=0".as_slice()])
+    .next()
+    .expect("one")
+    .expect("well formed");
+  assert_eq!(zero.weight(), Weight::ZERO);
+}
+
+#[test]
+fn the_language_walk_skips_empty_elements_and_latches_like_the_other() {
+  let mut walk = accept_language([b", da ,, en_gb, en".as_slice()]);
+  assert_eq!(walk.next().expect("one").expect("ok").name(), Some("da"));
+  assert_eq!(
+    walk.next().expect("two").expect_err("malformed"),
+    NegotiationError::NotAnElement
+  );
+  assert!(walk.next().is_none());
+  assert!(walk.next().is_none());
+}

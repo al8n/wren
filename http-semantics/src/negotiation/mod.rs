@@ -1,5 +1,5 @@
 //! The RFC 9110 §12.5 content negotiation fields whose element carries no
-//! parameters: §12.5.3's `Accept-Encoding`.
+//! parameters: §12.5.3's `Accept-Encoding` and §12.5.4's `Accept-Language`.
 //!
 //! One walk serves them. Each is a §5.6.1 list of a bare name with RFC 9110
 //! §12.4.2's weight optionally hung off it, and the only thing that separates
@@ -9,8 +9,16 @@
 //! Accept-Encoding  = #( codings [ weight ] )
 //! codings          = content-coding / "identity" / "*"
 //! content-coding   = token
+//! Accept-Language = #( language-range [ weight ] )
+//! language-range  = <language-range, see [RFC4647], Section 2.1>
 //! weight = OWS ";" OWS "q=" qvalue
 //! ```
+//!
+//! §12.5.4's element is the one RFC 9110 does not spell. That `prose-val` sends
+//! a reader to RFC 4647 §2.1, whose rule is transcribed at
+//! [`Element::LanguageRange`] and whose text this workspace now fetches — a
+//! comment quoting a spec `quote-check` has never loaded is graded against
+//! nothing.
 //!
 //! # §12.5.1's `Accept` is not here, and this is not where it belongs
 //!
@@ -32,12 +40,13 @@
 //! the sender's choice.
 //!
 //! An element here carries none. `codings` is `content-coding / "identity" /
-//! "*"` and `content-coding` is `token`: a name, and then the ABNF is out of
-//! alternatives. So the only production a `;` inside such an element can open
-//! is `[ weight ]`, there is at most one of them, and ORDER is not a question
-//! anybody can ask — there is nothing for the weight to be ordered against.
-//! §12.5.1's rule is not inherited here and not re-implemented here; over this
-//! grammar it has no work to do.
+//! "*"` and `content-coding` is `token`; RFC 4647 §2.1's `language-range` is
+//! ALPHA, DIGIT and `-`, and no other byte at all. Each is a name, and then the
+//! ABNF is out of alternatives. So the only production a `;` inside such an
+//! element can open is `[ weight ]`, there is at most one of them, and ORDER is
+//! not a question anybody can ask — there is nothing for the weight to be
+//! ordered against. §12.5.1's rule is not inherited here and not re-implemented
+//! here; over this grammar it has no work to do.
 //!
 //! **Importing `Accept`'s parameter handling would not be harmless, which is
 //! why this is a refusal rather than a note.** §5.6.6's `parameter` admits
@@ -84,7 +93,8 @@
 //!   `content-coding   = token` where §10.1.4 writes
 //!   `transfer-coding    = token *( OWS ";" OWS transfer-parameter )`, so
 //!   `chunked;p=1` — a value that corpus is built to exercise — is a
-//!   `transfer-coding` and is no `codings`.
+//!   `transfer-coding` and is no `codings`. RFC 4647's `language-range` is not
+//!   in it either, and is not in RFC 9110 at all.
 //! - **This module adds no second READING of anything shared.** The three
 //!   productions it does share with existing readers are reached by CALLING
 //!   the one implementation of each rather than by writing another:
@@ -105,6 +115,11 @@ use crate::{
 
 /// RFC 9110 §12.4.3's wildcard, spelled once.
 const WILDCARD: &[u8] = b"*";
+
+/// The longest subtag RFC 4647 §2.1's
+/// `language-range   = (1*8ALPHA *("-" 1*8alphanum))` admits, in either
+/// position.
+const MAX_SUBTAG: usize = 8;
 
 /// Why a content negotiation walk stopped.
 ///
@@ -160,6 +175,31 @@ enum Element {
   /// them — what separates them is what §12.5.3 says each MEANS, and that is
   /// the caller's to read off [`Preference::name`].
   Token,
+  /// RFC 4647 §2.1's basic language range, which RFC 9110 §12.5.4's
+  /// `language-range  = <language-range, see [RFC4647], Section 2.1>` hands out
+  /// to that spec rather than spelling:
+  ///
+  /// ```text
+  /// language-range   = (1*8ALPHA *("-" 1*8alphanum)) / "*"
+  /// alphanum         = ALPHA / DIGIT
+  /// ```
+  ///
+  /// Narrower than [`Token`](Self::Token) and inside it: ALPHA, DIGIT and `-`
+  /// are all §5.6.2 `tchar`s, so every `language-range` is a `token` and no
+  /// `language-range` can hold a byte that would move an element boundary. The
+  /// narrowing is real all the same — `x_y` and `verylongsubtag` are `token`s
+  /// and are no basic language range — and it is checked rather than widened to
+  /// `token` for convenience, because RFC 4647 §2.1 says what an ill-formed
+  /// range is worth: "Such ill-formed ranges will probably not match anything."
+  ///
+  /// The `*` alternative is unambiguous here in a way it is not for a `token`
+  /// element: `*` is no ALPHA, so `(1*8ALPHA *("-" 1*8alphanum))` cannot derive
+  /// it and the wildcard is the only reading.
+  ///
+  /// This is §2.1's BASIC range and not §2.2's `extended-language-range`, which
+  /// admits a `*` in any subtag position. §12.5.4's `prose-val` names §2.1, and
+  /// widening to §2.2 would admit `en-*-GB` in a field whose own spec does not.
+  LanguageRange,
 }
 
 impl Element {
@@ -168,8 +208,48 @@ impl Element {
   fn admits(self, name: &[u8]) -> bool {
     match self {
       Self::Token => is_token(name),
+      Self::LanguageRange => is_language_range(name),
     }
   }
+}
+
+/// Whether `name` is RFC 4647 §2.1's
+/// `language-range   = (1*8ALPHA *("-" 1*8alphanum)) / "*"`, over
+/// `alphanum         = ALPHA / DIGIT`.
+///
+/// Read as the rule GENERATES, not off the examples RFC 9110 §12.5.4 shows.
+/// `da`, `en-gb` and `en` are three shapes it derives and are not the whole of
+/// it, and the two subtag positions are NOT the same rule: the primary one is
+/// `1*8ALPHA` and every later one is `1*8alphanum`, so `en-us-1` is a
+/// `language-range` and `1-en` is not.
+///
+/// A subtag of zero characters is refused at both positions, since `1*` is the
+/// repetition on both sides of the hyphen: `en-`, `-gb` and `en--gb` derive
+/// nothing. So is one of nine characters, at either position — the bound is
+/// [`MAX_SUBTAG`] and not only the first subtag's.
+///
+/// The DIGIT in the later position is RFC 4647's correction to the rule it
+/// replaced, and reading the replaced one instead would refuse values this
+/// field carries. RFC 4647 §2.1, of RFC 2616's version: "is incorrect, since it
+/// disallows the use of digits anywhere in the 'language-range'".
+fn is_language_range(name: &[u8]) -> bool {
+  if name == WILDCARD {
+    return true;
+  }
+  let mut subtags = name.split(|&b| b == b'-');
+  // A `split` over any slice yields a first part, so the primary subtag is
+  // always there; the default is what makes that an argument rather than an
+  // `unwrap`, and an empty `name` arrives as one empty part and fails below.
+  let primary = subtags.next().unwrap_or_default();
+  if primary.is_empty() || primary.len() > MAX_SUBTAG {
+    return false;
+  }
+  if !primary.iter().all(u8::is_ascii_alphabetic) {
+    return false;
+  }
+  subtags.all(|subtag| {
+    !subtag.is_empty() && subtag.len() <= MAX_SUBTAG && subtag.iter().all(u8::is_ascii_alphanumeric)
+  })
 }
 
 /// One member of a content negotiation list: a name, and the RFC 9110 §12.4.2
@@ -183,9 +263,12 @@ impl Element {
 /// spelled by a different section for each field this type serves. A derive
 /// here would compare the bytes as WRITTEN, and every name it can hold is
 /// matched case-insensitively by the section that defines it — RFC 9110 §8.4.1
-/// for a content coding: "All content codings are case-insensitive". So `gzip`
-/// and `GZIP` would compare unequal while naming one coding. A caller compares
-/// [`name`](Self::name) with `str::eq_ignore_ascii_case`.
+/// for a content coding: "All content codings are case-insensitive"; RFC 4647
+/// §2.1 for a language range: "Matching of language tags to language ranges
+/// MUST be done in a case-insensitive manner." So `gzip` and `GZIP` would
+/// compare unequal while naming one coding, and `en-GB` and `en-gb` unequal
+/// while naming one range. A caller compares [`name`](Self::name) with
+/// `str::eq_ignore_ascii_case`.
 ///
 /// [`MediaRange`]: crate::media::MediaRange
 #[derive(Debug, Copy, Clone)]
@@ -349,6 +432,51 @@ where
   I: IntoIterator<Item = &'a [u8]>,
 {
   preferences(lines, Element::Token)
+}
+
+/// Walks an `Accept-Language` field's ranges (RFC 9110 §12.5.4).
+///
+/// `Accept-Language = #( language-range [ weight ] )`, over the basic language
+/// range RFC 9110 hands out to RFC 4647 §2.1 — see
+/// [`Element::LanguageRange`] for the rule and for which of RFC 4647's two
+/// ranges it is. Yields one [`Preference`] per element in wire order, and
+/// [`Preference::name`] is `None` for the wildcard `*`.
+///
+/// # Wire order is not priority, and this hands over the order it read
+///
+/// RFC 9110 §12.5.4: "Note that some recipients treat the order in which
+/// language tags are listed as an indication of descending priority,
+/// particularly for tags that are assigned equal quality values (no value is
+/// the same as q=1). However, this behavior cannot be relied upon." So the
+/// order is a fact about the field rather than a ranking this crate may apply,
+/// and the walk yields elements in the order the sender wrote them without
+/// deriving anything from it. Ranking is [`Preference::weight`]'s, which is the
+/// derivation §12.4.2 settles.
+///
+/// # Matching is not here
+///
+/// RFC 9110 §12.5.4: "For matching, Section 3 of \[RFC4647\] defines several
+/// matching schemes. Implementations can offer the most appropriate matching
+/// scheme for their requirements." Which scheme is appropriate is not a
+/// function of the field's bytes — it depends on the representations a
+/// responder holds — so it is the caller's, exactly as choosing a
+/// representation from an `Accept` weight is.
+///
+/// # Errors
+///
+/// Each item is a [`NegotiationError`]:
+/// [`NotAnElement`](NegotiationError::NotAnElement),
+/// [`NotAWeight`](NegotiationError::NotAWeight) or
+/// [`BadWeight`](NegotiationError::BadWeight). The walk yields nothing after
+/// the first.
+#[inline]
+pub fn accept_language<'a, I>(
+  lines: I,
+) -> impl Iterator<Item = Result<Preference<'a>, NegotiationError>>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  preferences(lines, Element::LanguageRange)
 }
 
 #[cfg(test)]
