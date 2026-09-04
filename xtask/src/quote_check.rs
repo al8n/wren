@@ -1608,6 +1608,31 @@ fn grade_production<'a>(segment: &str, specs: &'a [Spec], checked: &mut usize) -
 /// here rather than folded into the ABNF pipeline. [`markdown_exempted_spans`]
 /// is the other spelling, for a file with no `//` syntax to spell it with, and
 /// [`exempted_spans_for`] is what dispatches a file to the right one.
+///
+/// # One syntax, two ATTACHMENT rules — written down because they differ
+///
+/// `doc-check` reads the identical marker under a different rule, and nothing
+/// said so until a one-line edit made for this gate broke that one. Both are
+/// stated here and in `doc_check`'s `exemption_reason`, in the same words:
+///
+/// - **`quote-check` attaches a marker to the FILE.** This function reads
+///   every line of the source regardless of block, item or position, and
+///   `run` suppresses any extracted span whose text is in the set — anywhere
+///   in that file. A marker at the bottom exempts a span at the top.
+/// - **`doc-check` attaches a marker to the ITEM**: one run of consecutive
+///   comment lines plus the code beneath it, up to the next such run. A marker
+///   exempts only the mentions in its own item's comments, so a blank line
+///   between a marker and the mention it was written for severs them. The one
+///   widening is a module: an item documented with `//!` takes the file's
+///   leading comment run instead, so a module's markers are the ones at the
+///   top of its file, blank lines or not.
+///
+/// The difference is not cosmetic. `http-semantics/src/auth/mod.rs` holds four
+/// markers whose text carries a lone `"`; this gate needs a blank line above
+/// them so that mark does not join the module doc's block ([`UNPAIRED`]), and
+/// adding that line took the markers out of the module doc's ITEM and red
+/// `doc-check` five times. The module widening on that side is what makes the
+/// blank line free.
 fn exempted_spans(source: &str) -> HashSet<String> {
   let mut out = HashSet::new();
   for line in source.lines() {

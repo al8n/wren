@@ -128,6 +128,48 @@ al8n/wren#84.
   reports zero too, so `the_differential_reports_a_leak_it_is_given` hands the
   same helper a block that does leak.
 
+## `xtask` — one marker syntax, two attachment rules, and neither was written down
+
+`quote-check` and `doc-check` read the identical `// gate-exempt: <text> —
+<reason>` comment under DIFFERENT attachment rules, and nothing said so. A blank
+line added to `http-semantics/src/auth/mod.rs` for the first gate red the second
+five times on CI (al8n/wren#87).
+
+### Fixed
+
+- **A module doc is checked against its MODULE, not against the first code run
+  beneath it.** `doc-check`'s items are runs of consecutive comment lines plus
+  the code under them, so a `//!` block became an item whose body was whatever
+  code happened to follow and whose exemptions were whatever markers happened to
+  be glued to it. Both are facts about layout. `callee_scope` gives a `//!` item
+  the split it should have had all along — its leading comments are the file's
+  PROLOGUE (the comment run before any code) and its body is everything after
+  that prologue — so the answer no longer depends on where the blank lines are.
+
+  Not the whole file for the body, which was written first and is wrong:
+  `names_identifier` is deliberately loose about what counts as a use, so the
+  module doc's own sentence would satisfy the check about itself and every
+  module-doc mention would pass forever. Not the whole file for the markers
+  either: that silenced one more mention than `main` had — `outbound.rs`'s
+  module-doc mention of `validate::host_value_is_valid`, over a marker three
+  hundred lines below it. With the prologue on both halves the run prints `26
+  mentions checked, 15 exempt, 0 unresolved`, which is `main`'s line exactly.
+
+  **The rule is the fix, so no comment moves.** Three files sit in the position
+  that broke: `auth/mod.rs`, `validator/mod.rs` and `range/mod.rs` all glue
+  markers to a module doc. Inserting the blank line into each, under the old
+  item rule, fails 5, 2 and 4 mentions; under the module rule all three answer 0
+  with the line and 0 without it. `validator` and `range` are untouched and
+  stay green either way.
+
+- **Both attachment rules are now written where the marker syntax is
+  documented**, in `exemption_reason` and in `exempted_spans`, in the same
+  words: `quote-check` attaches a marker to the FILE (every line is read, and a
+  marker anywhere suppresses a matching span anywhere), `doc-check` attaches it
+  to the ITEM (a marker exempts only the mentions in its own comment run), with
+  the module widening as the single exception. Nothing said this before, which
+  is why one gate could be satisfied and the other broken by the same line.
+
 ## `http-semantics` — a blank line is what keeps four markers out of the module doc
 
 ### Fixed
@@ -149,12 +191,19 @@ al8n/wren#84.
   run would not fail. Found by the check added to `quote-check` in the same
   branch.
 
-  Nothing else moves, measured rather than assumed: before and after, the file
-  yields the same four markers, the same six production candidates exempted by
-  them, no exempted quotations either way, 80 admitted and 4 uncited candidates,
-  and 51 extracted spans with an identical digest. Only which block is the odd
-  one changes — the module doc at line 1 holding 17 marks becomes the marker
-  block at line 225 holding 5.
+  Nothing else moves under `quote-check`, measured rather than assumed: before
+  and after, the file yields the same four markers, the same six production
+  candidates exempted by them, no exempted quotations either way, 80 admitted
+  and 4 uncited candidates, and 51 extracted spans with an identical digest.
+  Only which block is the odd one changes — the module doc at line 1 holding 17
+  marks becomes the marker block at line 225 holding 5.
+
+  `doc-check` was a different matter and is the subject of the entry above: the
+  same line took the `use` statement out of the module doc's item and its
+  markers out of the module doc's comment run, and red that gate five times. The
+  measurement recorded here was made against `quote-check` alone, which is
+  exactly the failure this branch exists to stop — a gate reporting green
+  because the wrong question was asked of it.
 
 ## `http-semantics` — the auth recovery invented a challenge out of a parameter's own data
 

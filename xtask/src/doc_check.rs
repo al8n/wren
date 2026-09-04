@@ -1696,16 +1696,19 @@ fn callees(root: &Path, report: &mut Report) -> Result<(), Error> {
     let text = fs::read_to_string(file)?;
     let display = report::site(file.strip_prefix(root).unwrap_or(file));
     for item in items_in(&text) {
-      let (comments, _) = split_comments(&item);
+      let (comments, body) = split_comments(&item);
+      // The same scope the failures are decided in ([`callee_scope`]), so the
+      // printed count and the gate cannot disagree about what is exempt.
+      let (markers, _) = callee_scope(&comments, &body, &text);
       for (path, _) in assertive_mentions(&comments) {
         mentions += 1;
-        if exemption_reason(&comments, &path).is_some_and(|reason| !reason.trim().is_empty()) {
+        if exemption_reason(markers, &path).is_some_and(|reason| !reason.trim().is_empty()) {
           exempt += 1;
         } else if matches!(module_half(&modules, &path), ModuleHalf::Unresolvable) {
           unresolved += 1;
         }
       }
-      for problem in callee_problems(&item, &modules) {
+      for problem in callee_problems(&item, &text, &modules) {
         report.fail(format!("{display}: {problem}"));
       }
     }
@@ -1877,11 +1880,12 @@ fn split_comments(item: &str) -> (String, String) {
 /// ([`ModuleHalf::Unresolvable`]). [`callees`] prints how many of a run's
 /// mentions are in that position, so the number this check verified in full
 /// is never inferred from the number it looked at.
-fn callee_problems(item: &str, modules: &HashMap<String, String>) -> Vec<String> {
+fn callee_problems(item: &str, file: &str, modules: &HashMap<String, String>) -> Vec<String> {
   let mut problems = Vec::new();
   let (comments, body) = split_comments(item);
+  let (markers, used) = callee_scope(&comments, &body, file);
   for (path, name) in assertive_mentions(&comments) {
-    if let Some(reason) = exemption_reason(&comments, &path) {
+    if let Some(reason) = exemption_reason(markers, &path) {
       if reason.trim().is_empty() {
         problems.push(format!(
           "`{path}` is exempted without a reason after the em dash — an \
@@ -1900,7 +1904,7 @@ fn callee_problems(item: &str, modules: &HashMap<String, String>) -> Vec<String>
          `// gate-exempt: {path} — <why this path is written this way>`"
       ));
     }
-    if !names_identifier(&body, &name) {
+    if !names_identifier(used, &name) {
       problems.push(format!(
         "the comment names `{path}`, asserting it is what this item uses, but \
          the item never names `{name}`.\n  \
@@ -1910,6 +1914,94 @@ fn callee_problems(item: &str, modules: &HashMap<String, String>) -> Vec<String>
     }
   }
   problems
+}
+
+/// What one item's mentions are read against: where a `gate-exempt:` marker
+/// counts, and what text has to name the callee.
+///
+/// The item's own comments and its own body — EXCEPT for an item documented
+/// with `//!`, where both are the whole file.
+///
+/// # Why the exception is the rule and not a special case
+///
+/// `//!` is an INNER doc comment: it documents the module it sits inside, and
+/// a module's body is the file, not whatever code happens to follow the
+/// comment. [`items_in`] cannot know that — it ends an item at the next
+/// comment run — so a module doc was being checked against the first code run
+/// beneath it and exempted only by markers glued to it with no blank line
+/// between. Both are facts about LAYOUT rather than about the module, and both
+/// broke the moment a blank line was inserted for an unrelated reason: five
+/// mentions in `http-semantics/src/auth/mod.rs` began failing because the
+/// `use` statement that named them was no longer in the same item, and one
+/// more because its marker was no longer in the same comment run. Three files
+/// in this workspace sit in that position today.
+///
+/// So the module doc's mentions are asked the question the module doc is
+/// actually making a claim about — does this MODULE use it, and has this
+/// MODULE marked it exempt — and the answer stops depending on where the
+/// blank lines are.
+///
+/// # It is the same split, over a wider extent
+///
+/// [`split_comments`] cuts an item into its LEADING comments and everything
+/// after them, and both halves matter: the mention is read from the comments
+/// and the callee is looked for in what follows. A module is that split over
+/// the file — its leading comments are the file's [`prologue`], and its body
+/// is everything after the prologue.
+///
+/// Taking the whole FILE as the body instead was written first and is wrong,
+/// which the test below caught: [`names_identifier`] is deliberately loose
+/// about what counts as a use, so the module doc's own sentence — which is in
+/// the file — satisfies the check that the module uses what that sentence
+/// names. Every module-doc mention would have passed, always, and the gate
+/// would have reported a coverage number with nothing under it. Excluding the
+/// prologue is what keeps the claim and the evidence apart.
+///
+/// The marker half is the prologue for a second reason as well: a marker
+/// written against some function three hundred lines down was written for
+/// that function. Reading the whole file for markers was measured and
+/// rejected — it silenced `http1-proto/src/connection/outbound.rs`'s
+/// module-doc mention of `validate::host_value_is_valid` with a marker
+/// attached to an item far below it, one more exempt mention than `main` had.
+/// The prologue admits a marker whether or not a blank line separates it from
+/// the `//!` run, which is the whole point, and admits nothing else — so this
+/// change moves no verdict and no printed count.
+///
+/// An inline `mod x { //! … }` would take the FILE's prologue rather than its
+/// own, which is the wrong markers. No such module exists in the gated crates
+/// — every `//!` line in them is above the first line of code — and the
+/// direction of that error is a false failure, which is the one this gate's
+/// own doc says it must not produce, so it is named here rather than guarded
+/// against something that cannot happen yet.
+fn callee_scope<'a>(comments: &'a str, body: &'a str, file: &'a str) -> (&'a str, &'a str) {
+  if comments
+    .lines()
+    .any(|line| line.trim_start().starts_with("//!"))
+  {
+    let head = prologue(file);
+    return (head, file.get(head.len()..).unwrap_or_default());
+  }
+  (comments, body)
+}
+
+/// A file's leading run of comment and blank lines: everything before its
+/// first line of code.
+///
+/// Where a module's own `gate-exempt:` markers live, and the one thing about
+/// their position that matters. Whether a blank line separates them from the
+/// `//!` block above is a layout choice — `quote-check` reads the same markers
+/// under a different rule and wants that blank line there ([`exemption_reason`]
+/// carries both rules) — so this admits them either way.
+fn prologue(file: &str) -> &str {
+  let mut end = 0usize;
+  for line in file.lines() {
+    let trimmed = line.trim_start();
+    if !trimmed.is_empty() && !trimmed.starts_with("//") {
+      break;
+    }
+    end = end.saturating_add(line.len()).saturating_add(1);
+  }
+  file.get(..end.min(file.len())).unwrap_or(file)
 }
 
 /// The path-qualified mentions in `comments` that sit on an ASSERTIVE
@@ -2170,6 +2262,35 @@ const KNOWN_MODULES: &[&str] = &[
 /// have to learn. The difference here is that the REASON is load-bearing: a
 /// quotation's exemption only has to name its span, but an empty reason here
 /// is [`callee_problems`]'s own failure, not silent success.
+///
+/// # One syntax, two ATTACHMENT rules — written down because they differ
+///
+/// Nothing said this until a one-line edit made for one gate broke the other,
+/// so both rules are stated here and in [`exempted_spans`](crate::quote_check),
+/// where the same sentence appears:
+///
+/// - **`quote-check` attaches a marker to the FILE.** `exempted_spans` reads
+///   every line of the source, collects the marker texts into a set, and
+///   suppresses any extracted span whose text is in it — anywhere in that
+///   file. Position is irrelevant; a marker at the bottom exempts a span at
+///   the top.
+/// - **`doc-check` attaches a marker to the ITEM.** This function is handed
+///   one item's comments, and a marker exempts only the mentions read from
+///   those same comments — where an item is one run of consecutive comment
+///   lines plus the code beneath it, up to the next such run ([`items_in`]).
+///   A blank line between a marker and the mention it was written for severs
+///   them. The one widening is a module: an item documented with `//!` takes
+///   the file's [`prologue`] instead, so a module's markers are the ones at
+///   the top of its file, blank lines or not ([`callee_scope`]).
+///
+/// The two rules are why `http-semantics/src/auth/mod.rs` could satisfy one
+/// gate and red the other from a single blank line. `quote-check` wanted the
+/// line — the markers carry a lone quotation mark, and its block reading pairs
+/// marks across the whole comment run — and `doc-check` was broken by it,
+/// five times, because the markers and the `use` statement left the module
+/// doc's item with it. [`callee_scope`] is what makes that layout choice
+/// invisible to this side; the rules still differ, and a reader changing
+/// either gate needs both in front of them.
 fn exemption_reason(comments: &str, path: &str) -> Option<String> {
   for line in comments.lines() {
     let trimmed = line.trim_start();
@@ -2868,7 +2989,7 @@ fn switch_or_fault(view: &HeadView<'_>) -> bool {
   has_close_option(view)
 }";
     let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
-    let problems = super::callee_problems(item, &modules);
+    let problems = super::callee_problems(item, item, &modules);
     assert_eq!(problems.len(), 1);
     assert!(problems[0].contains("ends_persistence"));
   }
@@ -2883,7 +3004,97 @@ fn switch_or_fault(view: &HeadView<'_>) -> bool {
   has_close_option(view)
 }";
     let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
-    assert!(super::callee_problems(item, &modules).is_empty());
+    assert!(super::callee_problems(item, item, &modules).is_empty());
+  }
+
+  // A module doc is the module's, not the first code run beneath it. The blank
+  // line below is the whole test: `quote-check` wants it there (a marker's lone
+  // quote mark must not join the module doc's block), and before `callee_scope`
+  // existed putting it there took the `use` statement out of the module doc's
+  // item and its markers out of the module doc's comment run — so the module
+  // doc began asserting callees against an EMPTY body, with its own exemptions
+  // out of reach. Five mentions in `http-semantics/src/auth/mod.rs` failed that
+  // way, on CI, from a one-line edit made for the other gate.
+  #[test]
+  fn a_module_doc_is_checked_against_its_module_across_a_blank_line() {
+    let file = "\
+//! Reads the value through `validate::ends_persistence`, and names
+//! `grammar::list_elements` for contrast.
+
+// gate-exempt: grammar::list_elements — the walker this module cannot route
+// through; naming it is the point of the sentence.
+
+use crate::validate::ends_persistence;
+
+/// Unrelated item, so the module doc is not the last one in the file.
+fn f() {}";
+    let modules = modules(&[
+      ("validate", "pub(crate) fn ends_persistence() {}"),
+      ("grammar", "pub(crate) fn list_elements() {}"),
+    ]);
+    let problems = super::items_in(file)
+      .iter()
+      .flat_map(|item| super::callee_problems(item, file, &modules))
+      .collect::<Vec<_>>();
+    assert!(problems.is_empty(), "{problems:#?}");
+
+    // Not a blanket pass. Take the `use` away and the module doc is asserting a
+    // callee its module never uses — which is the check doing its job over the
+    // wider extent, and the reason the module's body is the file WITHOUT its
+    // prologue: with the prologue in, the module doc's own sentence would name
+    // `ends_persistence` and satisfy the check about itself.
+    let missing = file.replace("use crate::validate::ends_persistence;\n", "");
+    let problems = super::items_in(&missing)
+      .iter()
+      .flat_map(|item| super::callee_problems(item, &missing, &modules))
+      .collect::<Vec<_>>();
+    assert_eq!(problems.len(), 1, "{problems:#?}");
+    assert!(problems[0].contains("ends_persistence"), "{problems:#?}");
+  }
+
+  // The marker half of that scope is the file's PROLOGUE and not the file: a
+  // marker written against an item far below a module doc was written for that
+  // item. Reading the whole file for markers silenced one more mention than
+  // `main` had — `http1-proto/src/connection/outbound.rs`'s module-doc mention
+  // of `validate::host_value_is_valid`, over a marker three hundred lines down.
+  #[test]
+  fn a_marker_below_the_prologue_does_not_exempt_the_module_doc() {
+    // The module half is what fails here, so the assertion turns on the marker
+    // rather than on whether some line happens to name the callee: `validate`
+    // does not declare `ends_persistence` at all.
+    let modules = modules(&[("validate", "pub(crate) fn something_else() {}")]);
+    let below = "\
+//! Reads the value through `validate::ends_persistence`.
+
+use crate::other::thing;
+
+// gate-exempt: validate::ends_persistence — written for the item below, not
+// for the module doc above.
+/// An item of its own.
+fn f() {}";
+    let problems = super::items_in(below)
+      .iter()
+      .flat_map(|item| super::callee_problems(item, below, &modules))
+      .collect::<Vec<_>>();
+    assert_eq!(problems.len(), 1, "{problems:#?}");
+    assert!(problems[0].contains("never names"), "{problems:#?}");
+
+    // The same marker inside the prologue does exempt it, blank line and all.
+    let inside = "\
+//! Reads the value through `validate::ends_persistence`.
+
+// gate-exempt: validate::ends_persistence — written for the module doc above,
+// and separated from it by the blank line `quote-check` wants there.
+
+use crate::other::thing;
+
+/// An item of its own.
+fn f() {}";
+    let problems = super::items_in(inside)
+      .iter()
+      .flat_map(|item| super::callee_problems(item, inside, &modules))
+      .collect::<Vec<_>>();
+    assert!(problems.is_empty(), "{problems:#?}");
   }
 
   #[test]
@@ -2893,7 +3104,7 @@ fn switch_or_fault(view: &HeadView<'_>) -> bool {
 /// Asks `has_close_option`, NOT `validate::ends_persistence`.
 fn switch_or_fault(view: &HeadView<'_>) -> bool { has_close_option(view) }";
     let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
-    let problems = super::callee_problems(item, &modules);
+    let problems = super::callee_problems(item, item, &modules);
     assert_eq!(problems.len(), 1);
     assert!(problems[0].contains("reason"));
   }
@@ -2990,7 +3201,7 @@ fn open_request(view: &HeadView<'_>) -> bool {
   has_close_option(view)
 }";
     let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
-    assert!(super::callee_problems(item, &modules).is_empty());
+    assert!(super::callee_problems(item, item, &modules).is_empty());
   }
 
   // `sentences` must not treat a section or version number's internal
@@ -3498,7 +3709,7 @@ fn switch_or_fault(view: &HeadView<'_>) -> bool {
       ("grammar", "pub(crate) fn token_is_valid() {}"),
       ("validate", "pub(crate) fn ends_persistence() {}"),
     ]);
-    let problems = super::callee_problems(item, &modules);
+    let problems = super::callee_problems(item, item, &modules);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("grammar"), "{}", problems[0]);
   }
@@ -3515,7 +3726,7 @@ fn f(bytes: &[u8]) {
   from_utf8(bytes);
 }";
     let modules = modules(&[("validate", "pub(crate) fn ends_persistence() {}")]);
-    assert!(super::callee_problems(item, &modules).is_empty());
+    assert!(super::callee_problems(item, item, &modules).is_empty());
     assert!(matches!(
       super::module_half(&modules, "core::str::from_utf8"),
       super::ModuleHalf::Unresolvable
