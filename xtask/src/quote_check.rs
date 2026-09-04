@@ -1740,13 +1740,13 @@ fn markdown_quotations_masked(source: &str, mask: Masker) -> Extracted {
       flush(&mut block, &mut marks, &mut pending);
       continue;
     }
-    // The RAW line, and [`take_paragraph`] trims a copy for [`abnf_spans`]:
-    // the indentation Markdown uses to lay a paragraph out belongs inside a
-    // code span that wraps across two of its lines and does not belong to a
-    // production read from one. Two readings of one line, which is what it
-    // was before the paragraph unit and is left standing here so that unit is
-    // the only thing this commit changes.
-    paragraph.push((index + 1, raw));
+    // Trimmed, where the block used to be handed the raw line: a paragraph's
+    // lines are JOINED before [`mask_paragraph`] reads them, and the
+    // indentation Markdown uses to lay a paragraph out would otherwise land
+    // inside a span that wraps across one of them. One buffer now feeds both
+    // the mask and [`abnf_spans`], so there is no second, untrimmed reading of
+    // the same line left to disagree with this one.
+    paragraph.push((index + 1, raw.trim()));
   }
   take_paragraph(&mut paragraph, &mut pending, &mut block, &mut marks, mask);
   flush(&mut block, &mut marks, &mut pending);
@@ -2144,14 +2144,7 @@ fn take_paragraph(
   marks: &mut Vec<(usize, usize)>,
   mask: Masker,
 ) {
-  // Trimmed for the ABNF path alone: a `.rs` body arrives trimmed already
-  // ([`comment_body`]) and a `.md` line arrives raw, and a production is not
-  // its paragraph's layout indentation.
-  let trimmed: Vec<(usize, &str)> = paragraph
-    .iter()
-    .map(|(line, body)| (*line, body.trim()))
-    .collect();
-  for (line, span) in abnf_spans(&trimmed) {
+  for (line, span) in abnf_spans(paragraph) {
     pending.push(Candidate {
       line,
       rule: span.clone(),
