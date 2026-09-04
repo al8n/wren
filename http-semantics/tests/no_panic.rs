@@ -207,7 +207,7 @@ use http_semantics::{
   date::{HttpDate, IMF_FIXDATE_LEN, format_imf_fixdate, parse_http_date, parse_http_date_from},
   grammar::{ParamSyntax, ParamValue, parameterised_list},
   media::{media_type, weight_for},
-  negotiation::{accept_charset, accept_encoding, accept_language},
+  negotiation::{VaryMember, accept_charset, accept_encoding, accept_language, vary},
   range::{ContentRange, RangesSpecifier, Resolved},
   validator::{EntityTag, TagList},
 };
@@ -1918,6 +1918,62 @@ fn accept_charset_is_panic_free() {
     shim_accept_charset(black_box(&[[0xffu8, 0x2c, 0x3b].as_slice()])),
     0
   );
+}
+
+no_panic_shim! {
+  /// Shim over `negotiation::vary` — RFC 9110 §12.5.5's
+  /// `Vary = #( "*" / field-name )`, which is the module's other walk: no
+  /// `[ weight ]` bracket, and an element rule of its own.
+  ///
+  /// `copied()` rather than a fourth adapter type, and that is not the rule
+  /// this file's `fn`-pointer section states being broken. That rule is about
+  /// two shims reaching ONE instantiation; `vary` is a different generic
+  /// function from the walk `shim_accept_encoding` drives, so at the same
+  /// adapter the two are still two instantiations and neither can empty the
+  /// other.
+  ///
+  /// Returns what it read — a wildcard as one, a field name as its length — so
+  /// a call whose result is dead cannot take the shim's body with it.
+  fn shim_vary(lines: &[&[u8]]) -> usize {
+    let mut seen = 0usize;
+    for item in vary(lines.iter().copied()) {
+      let Ok(member) = item else { break };
+      seen = seen.wrapping_add(match member {
+        VaryMember::Wildcard => 1,
+        VaryMember::FieldName(name) => name.len(),
+      });
+    }
+    seen
+  }
+}
+
+#[test]
+fn vary_is_panic_free() {
+  // RFC 9110 §12.5.5's own example, and the wildcard as a member of a list.
+  assert_eq!(
+    shim_vary(black_box(&[b"accept-encoding, accept-language".as_slice()])),
+    30
+  );
+  assert_eq!(
+    shim_vary(black_box(&[b"*, accept-encoding".as_slice()])),
+    16
+  );
+  // Spread over RFC 9110 §5.2's field lines, with the empty elements §5.6.1.2
+  // skips.
+  assert_eq!(
+    shim_vary(black_box(&[b"*".as_slice(), b"", b",accept-encoding,"])),
+    16
+  );
+  // The one fault this walk has, at a byte no `token` holds and at the `;`
+  // that opens a weight in the other three fields and nothing here.
+  assert_eq!(shim_vary(black_box(&[b"accept encoding".as_slice()])), 0);
+  assert_eq!(
+    shim_vary(black_box(&[b"accept-encoding;q=0.5".as_slice()])),
+    0
+  );
+  assert_eq!(shim_vary(black_box(&[])), 0);
+  assert_eq!(shim_vary(black_box(&[b"".as_slice()])), 0);
+  assert_eq!(shim_vary(black_box(&[[0xffu8, 0x2c, 0x2a].as_slice()])), 0);
 }
 
 // ── the lie-check: this file's own guard against going vacuous ────────────────
