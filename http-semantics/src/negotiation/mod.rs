@@ -138,6 +138,12 @@ use crate::{
 /// RFC 9110 §12.4.3's wildcard, spelled once.
 const WILDCARD: &[u8] = b"*";
 
+/// RFC 9110 §12.5.3's synonym for no encoding, spelled once.
+///
+/// "An "identity" token is used as a synonym for "no encoding" in order to
+/// communicate when no encoding is preferred."
+const IDENTITY: &[u8] = b"identity";
+
 /// The longest subtag RFC 4647 §2.1's
 /// `language-range   = (1*8ALPHA *("-" 1*8alphanum))` admits, in either
 /// position.
@@ -468,6 +474,232 @@ where
   preferences(lines, Element::Token)
 }
 
+/// What RFC 9110 §12.5.3 says about one content coding, for one
+/// `Accept-Encoding` field.
+///
+/// Three states, because that section reaches its verdict through three
+/// different sentences and collapsing them would report one where the reader
+/// needs the other. [`is_acceptable`](Self::is_acceptable) is the verdict
+/// §12.5.3 asks for; [`weight`](Self::weight) is the number §12.4.2 assigns,
+/// when the field assigns one at all.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Acceptability {
+  /// Acceptable, with NO weight named for it.
+  ///
+  /// Two of §12.5.3's rules land here, and neither states a weight. Rule 1:
+  /// "If no Accept-Encoding header field is in the request, any content coding
+  /// is considered acceptable by the user agent." Rule 2's default, for a
+  /// representation with no content coding that the field does not
+  /// specifically exclude.
+  ///
+  /// [`weight`](Self::weight) is `None` here rather than [`Weight::ONE`],
+  /// because §12.4.2's default of 1 is what an ABSENT `q` on a PRESENT member
+  /// means, and there is no member in either of these cases. Inventing a
+  /// number would put a rank on a coding the field never ranked.
+  AcceptableByDefault,
+  /// The field named this weight for the coding — through an entry that names
+  /// it, through the `"*"` entry that stands in for one, or through rule 2's
+  /// `*;q=0`.
+  ///
+  /// Acceptable iff the weight is not [`Weight::ZERO`]. RFC 9110 §12.4.2: "a
+  /// value of 0 means "not acceptable"".
+  Weighed(Weight),
+  /// Unacceptable because the field mentions it nowhere and carries no
+  /// wildcard to stand in.
+  ///
+  /// RFC 9110 §12.4.3: "If no wildcard is present, values that are not
+  /// explicitly mentioned in the field are considered unacceptable." A
+  /// separate state from `Weighed(Weight::ZERO)` because the field said
+  /// NOTHING here, where that one says zero: a caller reporting why it refused
+  /// a coding can tell "you excluded it" from "you never mentioned it", and
+  /// the two come from different sections.
+  Unmentioned,
+}
+
+impl Acceptability {
+  /// The verdict RFC 9110 §12.5.3 asks for: "A server tests whether a content
+  /// coding for a given representation is acceptable using these rules".
+  #[inline]
+  pub const fn is_acceptable(self) -> bool {
+    match self {
+      Self::AcceptableByDefault => true,
+      Self::Weighed(weight) => weight.thousandths() != Weight::ZERO.thousandths(),
+      Self::Unmentioned => false,
+    }
+  }
+
+  /// The weight the field named, or `None` where it named none.
+  ///
+  /// `None` is not "zero": [`Unmentioned`](Self::Unmentioned) is unacceptable
+  /// with no weight, and [`AcceptableByDefault`](Self::AcceptableByDefault) is
+  /// acceptable with no weight. Ranking is what this is for, and RFC 9110
+  /// §12.5.3 ranks only among codings the field weighed: "When selecting
+  /// between multiple content codings that have the same purpose, the
+  /// acceptable content coding with the highest non-zero qvalue is preferred."
+  #[inline]
+  pub const fn weight(self) -> Option<Weight> {
+    match self {
+      Self::Weighed(weight) => Some(weight),
+      Self::AcceptableByDefault | Self::Unmentioned => None,
+    }
+  }
+}
+
+/// Whether one content coding is acceptable to an `Accept-Encoding` field
+/// (RFC 9110 §12.5.3).
+///
+/// `coding` is the representation's content coding, or `None` where the
+/// representation HAS none — which is rule 2's subject and not a missing
+/// argument. `lines` is the field's lines, and NO lines is an absent field,
+/// which is rule 1's subject: a field is present exactly when at least one
+/// field line names it, so `Accept-Encoding:` arrives as one line whose value
+/// is empty and an absent field arrives as none at all.
+///
+/// Bytes rather than `&str` for the coding because a caller holds a scanned
+/// `Content-Encoding` value, and because §8.4.1 settles the comparison: "All
+/// content codings are case-insensitive".
+///
+/// # Every rule §12.5.3 states about acceptability, and where it is read
+///
+/// The section's three numbered rules do not close the question on their own —
+/// they say nothing about a coding the field neither lists nor covers with
+/// `"*"` — so two more sentences are read, and both are named here rather than
+/// left inside the code.
+///
+/// 1. **Rule 1**, "If no Accept-Encoding header field is in the request, any
+///    content coding is considered acceptable by the user agent." — no lines,
+///    so [`Acceptability::AcceptableByDefault`], whatever `coding` is.
+/// 2. **Rule 2**, "If the representation has no content coding, then it is
+///    acceptable by default unless specifically excluded by the Accept-Encoding
+///    header field stating either `identity;q=0` or `*;q=0` without a more
+///    specific entry for `identity`." — `coding` is `None`. An entry naming
+///    `identity` is that "more specific entry" and governs, weight and all; a
+///    `*;q=0` with no such entry excludes; anything else is the default.
+///    Note what this does NOT do: a `*;q=0.5` does not weigh a representation
+///    that has no coding, because rule 2 names only `*;q=0` as reaching it.
+/// 3. **Rule 3**, "If the representation's content coding is one of the content
+///    codings listed in the Accept-Encoding field value, then it is acceptable
+///    unless it is accompanied by a qvalue of 0." — an entry naming `coding`
+///    governs.
+/// 4. **§12.5.3's asterisk sentence**, "The asterisk "*" symbol in an
+///    Accept-Encoding field matches any available content coding not explicitly
+///    listed in the field." — a listed coding with no entry of its own takes
+///    the `"*"` entry's weight.
+/// 5. **§12.4.3**, "If no wildcard is present, values that are not explicitly
+///    mentioned in the field are considered unacceptable." —
+///    [`Acceptability::Unmentioned`]. This is the sentence that makes the
+///    answer total; without it rules 1 to 3 leave a case with no verdict.
+/// 6. **§12.5.3's empty-field sentence**, "An Accept-Encoding header field with
+///    a field value that is empty implies that the user agent does not want any
+///    content coding in response." — read as a CONSEQUENCE of 2, 3 and 5 rather
+///    than as a case of its own: a field with no members mentions nothing and
+///    carries no wildcard, so every coding is `Unmentioned` and a representation
+///    with none is acceptable by default. That is what the sentence says, and a
+///    special case for it would be a second answer to a question already
+///    answered.
+/// 7. **§12.5.3's response direction**, "The field value is evaluated the same
+///    way as in a request." — so this one function serves both, and the
+///    direction is not an argument.
+///
+/// # Two rules of §12.5.3 that this deliberately does not answer
+///
+/// Neither is an acceptability rule, and each needs an input that is not this
+/// field and not this coding — the set of representations the responder holds.
+///
+/// - "When selecting between multiple content codings that have the same
+///   purpose, the acceptable content coding with the highest non-zero qvalue is
+///   preferred." That is a choice among alternatives, and it also needs to know
+///   which codings have the same PURPOSE, which is in no field. What it ranks
+///   by is [`Acceptability::weight`], asked once per candidate.
+/// - "If a non-empty Accept-Encoding header field is present in a request and
+///   none of the available representations for the response have a content
+///   coding that is listed as acceptable, the origin server SHOULD send a
+///   response without any content coding unless the identity coding is
+///   indicated as unacceptable." That is how to build a response, over the
+///   available representations.
+///
+/// Nothing here generates an `Accept-Encoding` either, so §12.5.3's own sender
+/// rule is stated and not enforced, exactly as §12.5.5's is at
+/// [`VaryMember::Wildcard`]: "servers that fail a request with a 415 status for
+/// reasons unrelated to content codings MUST NOT include the Accept-Encoding
+/// header field".
+///
+/// # A coding the field names twice
+///
+/// RFC 9110 settles no rule for a repeated entry, so this takes one and says
+/// so. A zero ANYWHERE among the entries naming a coding makes it
+/// `Weighed(Weight::ZERO)`, which is rule 3's own wording read plainly — a
+/// coding listed twice, once with `q=0`, is a coding "accompanied by a qvalue
+/// of 0" — and it is the reading that does not depend on order, so two
+/// recipients cannot disagree by reading the same field from different ends.
+/// Where no entry is zero, the LAST in wire order gives the weight, which is
+/// the rule this crate already applies to a repeated `q` inside one member.
+///
+/// # Errors
+///
+/// [`NegotiationError`], from the walk beneath this: the field must parse
+/// before it can be asked anything. The walk latches, so this reports the first
+/// fault and nothing after it.
+pub fn encoding_acceptability<'a, I>(
+  coding: Option<&[u8]>,
+  lines: I,
+) -> Result<Acceptability, NegotiationError>
+where
+  I: IntoIterator<Item = &'a [u8]>,
+{
+  // Rule 2's "more specific entry" is an entry naming `identity`, so a
+  // representation with no coding is matched against that name. RFC 9110
+  // §12.5.3: "An "identity" token is used as a synonym for "no encoding" in
+  // order to communicate when no encoding is preferred."
+  let wanted = coding.unwrap_or(IDENTITY);
+  let mut lines_seen = 0usize;
+  let mut named: Option<Weight> = None;
+  let mut wildcard: Option<Weight> = None;
+  for member in accept_encoding(
+    lines
+      .into_iter()
+      .inspect(|_| lines_seen = lines_seen.saturating_add(1)),
+  ) {
+    let preference = member?;
+    match preference.name() {
+      None => wildcard = Some(absorbing_zero(wildcard, preference.weight())),
+      Some(name) if name.as_bytes().eq_ignore_ascii_case(wanted) => {
+        named = Some(absorbing_zero(named, preference.weight()));
+      }
+      Some(_) => {}
+    }
+  }
+  if lines_seen == 0 {
+    // Rule 1. Asked before anything else, because it is about the field's
+    // presence and not about its content.
+    return Ok(Acceptability::AcceptableByDefault);
+  }
+  Ok(match (coding, named, wildcard) {
+    // Rules 2 and 3: an entry that names it governs, whatever it says.
+    (_, Some(weight), _) => Acceptability::Weighed(weight),
+    // Rule 2, the `*;q=0` half: it is the only weight a wildcard entry lends a
+    // representation that has no coding at all.
+    (None, None, Some(weight)) if weight == Weight::ZERO => Acceptability::Weighed(Weight::ZERO),
+    // Rule 2's default, reached with no `identity` entry and no `*;q=0`.
+    (None, None, _) => Acceptability::AcceptableByDefault,
+    // §12.5.3's asterisk sentence: `*` stands in for a coding not listed.
+    (Some(_), None, Some(weight)) => Acceptability::Weighed(weight),
+    // §12.4.3: nothing mentions it and there is no wildcard.
+    (Some(_), None, None) => Acceptability::Unmentioned,
+  })
+}
+
+/// Folds a second weight for one name onto the first, with zero absorbing.
+///
+/// See [`encoding_acceptability`]'s own doc for why a repeat is resolved this
+/// way and what RFC 9110 does and does not settle about it.
+fn absorbing_zero(seen: Option<Weight>, found: Weight) -> Weight {
+  match seen {
+    Some(previous) if previous == Weight::ZERO => previous,
+    _ => found,
+  }
+}
+
 /// Walks an `Accept-Language` field's ranges (RFC 9110 §12.5.4).
 ///
 /// `Accept-Language = #( language-range [ weight ] )`, over the basic language
@@ -495,6 +727,12 @@ where
 /// function of the field's bytes — it depends on the representations a
 /// responder holds — so it is the caller's, exactly as choosing a
 /// representation from an `Accept` weight is.
+///
+/// That sentence is why there is no `Accept-Language` counterpart to
+/// [`encoding_acceptability`]. §12.5.3 states its acceptability rules itself
+/// and they are answerable from a coding and a field; §12.5.4 states none and
+/// hands the question to RFC 4647 §3's several schemes, so a function here
+/// would be picking one of them on the caller's behalf.
 ///
 /// # Errors
 ///

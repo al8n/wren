@@ -660,3 +660,204 @@ fn the_vary_walk_skips_empty_elements_latches_and_reads_lines_as_the_join() {
   assert!(vary(absent).next().is_none());
   assert!(vary([b"".as_slice()]).next().is_none());
 }
+
+// ── RFC 9110 §12.5.3's acceptability rules ───────────────────────────────────
+
+/// One acceptability answer, rendered so a test can compare it without naming
+/// a `Weight` this module cannot construct: `(is_acceptable, thousandths)`.
+///
+/// The pair separates all three states. `AcceptableByDefault` is
+/// `(true, None)`, `Unmentioned` is `(false, None)`, and a `Weighed` is
+/// `(_, Some(_))`.
+fn acceptability(coding: Option<&[u8]>, lines: &[&[u8]]) -> (bool, Option<u16>) {
+  let answer =
+    encoding_acceptability(coding, lines.iter().copied()).expect("the field is well formed");
+  (
+    answer.is_acceptable(),
+    answer.weight().map(Weight::thousandths),
+  )
+}
+
+#[test]
+fn rule_1_is_about_the_fields_presence_and_zero_lines_is_absent() {
+  // RFC 9110 §12.5.3 rule 1: "If no Accept-Encoding header field is in the
+  // request, any content coding is considered acceptable by the user agent."
+  // A field is present exactly when a line names it, so no lines is rule 1's
+  // subject and one empty line is not.
+  assert_eq!(acceptability(Some(b"gzip"), &[]), (true, None));
+  assert_eq!(acceptability(Some(b"br"), &[]), (true, None));
+  assert_eq!(acceptability(None, &[]), (true, None));
+
+  // The same question one line later is a different rule, and a different
+  // answer: §12.4.3's "If no wildcard is present, values that are not
+  // explicitly mentioned in the field are considered unacceptable."
+  assert_eq!(acceptability(Some(b"gzip"), &[b""]), (false, None));
+}
+
+#[test]
+fn rule_3_reads_the_entry_that_names_the_coding() {
+  // RFC 9110 §12.5.3 rule 3: "If the representation's content coding is one of
+  // the content codings listed in the Accept-Encoding field value, then it is
+  // acceptable unless it is accompanied by a qvalue of 0."
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip, compress"]),
+    (true, Some(1000))
+  );
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip;q=0.5"]),
+    (true, Some(500))
+  );
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip;q=0"]),
+    (false, Some(0))
+  );
+  // §8.4.1: "All content codings are case-insensitive".
+  assert_eq!(
+    acceptability(Some(b"GZIP"), &[b"gzip;q=0.5"]),
+    (true, Some(500))
+  );
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"GZIP;q=0.5"]),
+    (true, Some(500))
+  );
+}
+
+#[test]
+fn the_asterisk_stands_in_for_a_coding_the_field_does_not_list() {
+  // RFC 9110 §12.5.3: "The asterisk "*" symbol in an Accept-Encoding field
+  // matches any available content coding not explicitly listed in the field."
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"gzip;q=1, *;q=0.5"]),
+    (true, Some(500))
+  );
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"gzip;q=1, *;q=0"]),
+    (false, Some(0))
+  );
+  // An entry that names it is more specific and wins wherever it stands.
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"*;q=0, br;q=0.5"]),
+    (true, Some(500))
+  );
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"br;q=0.5, *;q=0"]),
+    (true, Some(500))
+  );
+}
+
+#[test]
+fn a_coding_the_field_never_mentions_is_its_own_state() {
+  // RFC 9110 §12.4.3: "If no wildcard is present, values that are not
+  // explicitly mentioned in the field are considered unacceptable." Not the
+  // same answer as a weight of zero — the field said nothing, rather than
+  // saying no — so a caller can report which it met.
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"gzip, compress"]),
+    (false, None)
+  );
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"gzip;q=0"]),
+    (false, None),
+    "another coding's zero is not this coding's"
+  );
+  assert_eq!(acceptability(Some(b"br"), &[b"br;q=0"]), (false, Some(0)));
+}
+
+#[test]
+fn rule_2_governs_a_representation_that_has_no_coding() {
+  // RFC 9110 §12.5.3 rule 2: "If the representation has no content coding,
+  // then it is acceptable by default unless specifically excluded by the
+  // Accept-Encoding header field stating either "identity;q=0" or "*;q=0"
+  // without a more specific entry for "identity"."
+  assert_eq!(acceptability(None, &[b"gzip, compress"]), (true, None));
+  assert_eq!(acceptability(None, &[b"identity;q=0"]), (false, Some(0)));
+  assert_eq!(acceptability(None, &[b"identity;q=0.5"]), (true, Some(500)));
+  assert_eq!(acceptability(None, &[b"*;q=0"]), (false, Some(0)));
+  // The clause that makes rule 2 more than two exclusions: a `*;q=0` with a
+  // more specific entry for `identity` does NOT exclude.
+  assert_eq!(
+    acceptability(None, &[b"*;q=0, identity;q=0.5"]),
+    (true, Some(500))
+  );
+  assert_eq!(
+    acceptability(None, &[b"*;q=0, identity;q=0"]),
+    (false, Some(0))
+  );
+  // And the direction rule 2 does NOT run in: a non-zero `*` lends no weight
+  // to a representation with no coding, because rule 2 names only `*;q=0` as
+  // reaching it. The answer is the default, with no weight, not `Some(500)`.
+  assert_eq!(acceptability(None, &[b"*;q=0.5"]), (true, None));
+  assert_eq!(acceptability(None, &[b"gzip;q=1, *;q=0.5"]), (true, None));
+}
+
+#[test]
+fn the_empty_field_sentence_falls_out_of_the_other_rules() {
+  // RFC 9110 §12.5.3: "An Accept-Encoding header field with a field value that
+  // is empty implies that the user agent does not want any content coding in
+  // response." Read as a consequence of rules 2 and 3 and §12.4.3 rather than
+  // as a case of its own — so this test is what says the consequence holds,
+  // and there is no branch anywhere that spells it.
+  for empty in [b"".as_slice(), b" ", b",", b", ,"] {
+    assert_eq!(
+      acceptability(Some(b"gzip"), &[empty]),
+      (false, None),
+      "{empty:?}"
+    );
+    assert_eq!(acceptability(None, &[empty]), (true, None), "{empty:?}");
+  }
+}
+
+#[test]
+fn the_sections_own_example_answers_every_way_round() {
+  // RFC 9110 §12.5.3: "Accept-Encoding: gzip;q=1.0, identity; q=0.5, *;q=0".
+  let field: &[&[u8]] = &[b"gzip;q=1.0, identity; q=0.5, *;q=0"];
+  assert_eq!(acceptability(Some(b"gzip"), field), (true, Some(1000)));
+  assert_eq!(acceptability(Some(b"identity"), field), (true, Some(500)));
+  // A representation with no coding reaches the same entry, because rule 2's
+  // "more specific entry" is the one naming `identity`.
+  assert_eq!(acceptability(None, field), (true, Some(500)));
+  assert_eq!(acceptability(Some(b"br"), field), (false, Some(0)));
+}
+
+#[test]
+fn a_repeated_entry_is_resolved_the_way_the_doc_says() {
+  // RFC 9110 settles no rule for a repeat. A zero anywhere excludes, which is
+  // rule 3's own wording read plainly and does not depend on the order the
+  // field is read in; otherwise the last in wire order gives the weight.
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip;q=1, gzip;q=0"]),
+    (false, Some(0))
+  );
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip;q=0, gzip;q=1"]),
+    (false, Some(0))
+  );
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip;q=0.5, gzip;q=1"]),
+    (true, Some(1000))
+  );
+  assert_eq!(
+    acceptability(Some(b"br"), &[b"*;q=1, *;q=0"]),
+    (false, Some(0))
+  );
+}
+
+#[test]
+fn the_lines_are_walked_as_the_join_would_and_a_fault_is_reported() {
+  // RFC 9110 §5.2's join, over the same field the example above uses.
+  let split: &[&[u8]] = &[b"gzip;q=1.0", b"identity; q=0.5", b"*;q=0"];
+  assert_eq!(acceptability(Some(b"gzip"), split), (true, Some(1000)));
+  assert_eq!(acceptability(None, split), (true, Some(500)));
+  assert_eq!(acceptability(Some(b"br"), split), (false, Some(0)));
+
+  // A malformed field is answered with the walk's own fault rather than with a
+  // verdict taken over the members in front of it.
+  assert_eq!(
+    encoding_acceptability(Some(b"gzip"), [b"gzip, br;p=1".as_slice()]).expect_err("malformed"),
+    NegotiationError::NotAWeight
+  );
+  assert_eq!(
+    encoding_acceptability(None, [b"identity;q=blah".as_slice()]).expect_err("malformed"),
+    NegotiationError::BadWeight
+  );
+}
