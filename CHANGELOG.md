@@ -876,6 +876,55 @@ five times on CI (al8n/wren#87).
   send it with `encode_pong`. Changing when pongs drain after a close is a wire
   decision that deserves its own review.
 
+## CI — two gates the workspace claimed and no job ran
+
+### Added
+
+- **`cargo check -p websocket-proto --no-default-features --target
+  thumbv6m-none-eabi`.** The `no-std` job checked websocket-proto on
+  `thumbv6m-none-eabi` only with `--features no-atomic`, and `no-atomic` links
+  `alloc` (`lib.rs`'s `extern crate alloc as std`) — so that is the HEAP tier on
+  a CAS-less core, not the no-alloc one. The bare tier's only check anywhere was
+  clippy on the host. The `http-semantics` pair a few lines below has done both
+  tiers for a while; this is that shape applied to the crate.
+
+  It PASSES today (37 s, measured at `e42b30d`), so it is proof rather than a
+  repair — and it was measured to be able to FAIL, by the case that makes the
+  cross-compile worth its half-minute rather than by any compile error at all.
+  A `core::sync::atomic::AtomicUsize::fetch_add` added under
+  `cfg(not(feature = "std"))` leaves the HOST bare check at exit 0 with zero
+  errors, and reds the new line with `error[E0599]: no method named `fetch_add`
+  found for reference `&Atomic<usize>``. Cortex-M0+ has atomic load/store and no
+  CAS; the host has both, and no other step in this workspace can see the
+  difference. (The plainer demonstration also holds: a `std::string::String`
+  under the same gate reds the line with `E0433: cannot find module or crate
+  `std``.)
+
+- **`handshake-corpus` now has a step, and it is not the obvious one.**
+  `handshake-corpus` is a workspace member (`Cargo.toml` line 2) that no
+  workflow ran — its only mention across `.github/` was `loc.yml:49` calling it
+  dev-only. The obvious repair, `cargo test -p handshake-corpus` beside
+  `-p auth-corpus` and `-p coding-corpus`, would be DECORATION, and the count is
+  what says so: the crate is a binary with no `#[test]` anywhere and no `tests/`
+  directory, so that command reports `running 0 tests` / `0 passed` and exits 0
+  forever. Measured; the line was not added.
+
+  What it has instead is a `main` that GENERATES the corpus, and nothing ran
+  that either. `clippy --workspace` compiles it, which catches a type error and
+  nothing more; `xtask handshake-diff` is the instrument that reads it and needs
+  TWO revisions, so like `auth-diff` it cannot run on a commit. Between those
+  sits every failure of the generator itself — a case builder that panics, a
+  sweep that silently stops emitting — and neither job could see it.
+
+  So the step runs it and requires records: exit 0 and 2004 records at this
+  commit. `--features deflate` is load-bearing rather than tidy — without it
+  `main` is one `eprintln!` and `exit(2)`, measured, which would red the step
+  for the wrong reason. The floor is `> 0` and not a pinned total on purpose:
+  the corpus is MEANT to move between revisions, that movement is what
+  `handshake-diff` reads, and a step pinning the count would fight the
+  instrument. Both of the step's failure modes were measured — the missing
+  feature exits 2, an empty corpus exits 1 on the floor.
+
 ## `http-semantics` — the auth recovery invented a challenge out of a parameter's own data
 
 `challenges()` could hand a caller a challenge no origin server sent, built out
