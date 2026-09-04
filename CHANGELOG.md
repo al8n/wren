@@ -156,6 +156,69 @@ and the section, and neither is visible from the signature. Both are now stated.
   argument for a case §12.5.3 does not rule on, so the extrapolation is taken and
   named rather than hidden.
 
+## `http-semantics` — `NotAWeight`'s doc named a case the code answers `BadWeight`
+
+The variant's doc said it covered "a second one behind the first". Measured,
+`gzip;q=0.5;q=0.7`, `gzip;q=0.5;p=1` and `gzip;q=0.5;` all answer `BadWeight`.
+
+### Fixed
+
+The production decides, and the CODE was right. RFC 9110 §12.5.3's
+`Accept-Encoding  = #( codings [ weight ] )` brackets one weight, so once
+§12.4.2's `"q="` literal has matched there is nothing left for a second `;` to
+open and everything to the element's end is the `qvalue` slot —
+`gzip;q=0.5;q=0.7` puts `0.5;q=0.7` in it, which is no `qvalue`. `NotAWeight` is
+what the literal FAILING to match earns: a parameter by another name, a `q` with
+§5.6.3's `BWS` in front of the `=`, or nothing behind the `;` at all.
+
+`what_follows_a_matched_q_is_the_qvalue_slot` pins both sides of that partition
+over six values each, so the doc and the code cannot drift apart again in
+silence.
+
+## `http-semantics` — one crate, one answer to the repeated-entry tie
+
+The RFC search that established RFC 9110 settles nothing about a field naming
+one value twice was right, and it stands. What it missed is that this crate had
+already broken the tie: `media::weight_for` resolves a repeated media range by
+FIELD ORDER, first standing, and its own comment rejects the alternative in
+writing: relaxing its `<` to `<=` is recorded there as what would send every tie
+to the last range instead of the first. §12.5.1 gets the same silence that
+§12.5.3
+does, so a second reader picking the other end made one crate answer one
+unsettled question two ways.
+
+Measured before the change:
+`weight_for(text/plain, ["text/plain;q=0.25, text/plain;q=0.75"])` is **250**;
+`encoding_acceptability(Some(b"gzip"), ["gzip;q=0.25, gzip;q=0.75"])` was
+**750**.
+
+### Fixed
+
+- `fold_repeated_entry` takes the FIRST entry in field order where no entry is
+  zero, following `media`. Its doc keeps the search that shows RFC 9110 settles
+  nothing, and gains the reason the tie is nevertheless not this module's to
+  break. `media` is untouched.
+
+### The half that still differs, and why that is licensed
+
+`weight_for` absorbs no zero — measured,
+`weight_for(text/plain, ["text/plain;q=1, text/plain;q=0"])` is **1000** — and
+it should not: §12.5.1 has no counterpart to §12.5.3 rule 3's "unless it is
+accompanied by a qvalue of 0", which is the sentence this reader has and that
+one does not. So the two readers agree wherever the RFC is silent and part only
+where it speaks to one of them. The test asserts both halves, calling
+`weight_for` directly so the comparison is between two readers rather than
+between one reader and a remembered number.
+
+### Which assertion catches which reading is measured, and it is not what was predicted
+
+The mirror assertion was written to exclude a largest-wins reading. Under
+first-wins it excludes a **smallest**-wins one instead: three mutations of
+`fold_repeated_entry`, each run and then restored from a copy, put last-in-field-
+order and zero-absorbing-largest-wins on the FIRST assertion (750 against 250)
+and zero-absorbing-smallest-wins on the MIRROR (250 against 750). The comment
+now says so.
+
 ## `http-semantics` — `identity` and no coding are one state, and the wildcard reaches it
 
 `encoding_acceptability` gave one representation two answers depending on how a
@@ -214,8 +277,8 @@ about `identity` by name answered `Weighed(1)`.
 
 `doc-check` documents private items, so it resolves links this crate's own
 published documentation cannot. CI's `doc` job does not: it runs
-`RUSTDOCFLAGS="--cfg docsrs -Dwarnings" cargo doc -p http-semantics
---all-features --no-deps`, which exited **101** on four errors in
+`cargo doc -p http-semantics --all-features --no-deps` under
+`RUSTDOCFLAGS: --cfg docsrs -Dwarnings`, which exited **101** on four errors in
 `negotiation/mod.rs` — three `rustdoc::private_intra_doc_links` and one
 `rustdoc::redundant_explicit_links`.
 
@@ -232,8 +295,7 @@ published documentation cannot. CI's `doc` job does not: it runs
 - The fourth was `[`list_elements`](crate::grammar::list_elements)` in the module
   summary, redundant because the name is imported.
 
-`RUSTDOCFLAGS="--cfg docsrs -Dwarnings" cargo doc -p http-semantics
---all-features --no-deps` now exits 0.
+That command now exits 0.
 
 ## `http-semantics` — two shims with one body are one symbol, and one of the two proved nothing
 
@@ -492,9 +554,9 @@ the mistake the split is there to prevent:
 - **Derived.** A zero anywhere among the entries naming a coding excludes it.
   Rule 3's own wording read plainly, and independent of order, so two recipients
   reading the same field from opposite ends agree whatever rule each took.
-- **Chosen, and derived from nothing.** Where no entry is zero, the last in wire
-  order gives the weight. Nothing chooses between that, the first, and the
-  largest.
+- **Chosen, and not by this module.** Where no entry is zero, the FIRST in
+  field order gives the weight — see the section below, which is the correction
+  to what this originally shipped.
 
 **The undecidedness is now visible rather than implied.**
 `a_repeated_entry_is_undecided_and_this_is_the_reading_taken` asserts the

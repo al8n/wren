@@ -1002,44 +1002,80 @@ fn a_repeated_entry_is_undecided_and_this_is_the_reading_taken() {
     (false, Some(0))
   );
 
-  // The half that is CHOSEN. Nothing in RFC 9110 picks between the last entry,
-  // the first, and the largest, so the pair below is asserted both ways round —
-  // one of them alone would be satisfied by a "largest wins" reading too, and
-  // the mirror is what excludes it. A future reading that takes the first entry
-  // reds on the first assertion; one that takes the largest reds on the second.
+  // The half that is CHOSEN, and what chose it. RFC 9110 picks between the
+  // first entry, the last and the largest nowhere; `media::weight_for` had
+  // already resolved the same open tie for `Accept` by field order, first
+  // standing, so this follows it rather than making one crate answer one
+  // unsettled question two ways. The pair is asserted BOTH ways round because
+  // neither assertion alone pins the ORDER: the first is also satisfied by a
+  // smallest-wins reading and the second by a largest-wins one, and it takes
+  // both to exclude a rule that reads the weights rather than their positions.
   //
-  // What would settle it: a sentence saying which entry a recipient reads when
-  // a field names one value more than once with different weights. There is
-  // none. If one is ever added, this test is what has to be re-argued rather
+  // What would settle it in the RFC: a sentence saying which entry a recipient
+  // reads when a field names one value more than once with different weights.
+  // There is none. If one is ever added, this test has to be re-argued rather
   // than merely re-blessed.
   //
-  // Both claims above are measured, not predicted. Replacing
-  // `fold_repeated_entry`'s body with `seen.unwrap_or(found)` — first in wire
-  // order — reds this test, and replacing it with a zero-absorbing
-  // largest-wins reds it on the mirror assertion below, naming that message.
-  // Run as `cargo test -p http-semantics --lib
-  // negotiation::tests::a_repeated_entry`, once per mutation, with the file
-  // restored from a copy afterwards.
+  // Which assertion catches which reading is MEASURED, and it is not what I
+  // predicted — the mirror catches smallest-wins, not largest-wins. Three
+  // mutations of `fold_repeated_entry`, each run as `cargo test -p
+  // http-semantics --lib negotiation::tests::a_repeated_entry` with the file
+  // restored from a copy afterwards and `cmp`d byte-identical:
+  //
+  // - last in field order (`Some(_) => found`) reds the FIRST assertion, 750
+  //   against 250;
+  // - a zero-absorbing largest-wins reds the FIRST as well, on the same values;
+  // - a zero-absorbing smallest-wins reds the MIRROR, 250 against 750, naming
+  //   that assertion's own message.
   assert_eq!(
     acceptability(Some(b"gzip"), &[b"gzip;q=0.25, gzip;q=0.75"]),
-    (true, Some(750)),
-    "last in wire order; the first-in-wire-order reading answers 250 here"
+    (true, Some(250)),
+    "first in field order, as media::weight_for reads the same tie; the \
+     last-in-field-order reading answers 750 here"
   );
   assert_eq!(
     acceptability(Some(b"gzip"), &[b"gzip;q=0.75, gzip;q=0.25"]),
-    (true, Some(250)),
-    "and the mirror: a largest-wins reading answers 750 here, and this pins the \
-     ORDER rather than a value that happens to be the larger of the two"
+    (true, Some(750)),
+    "and the mirror: a smallest-wins reading answers 250 here, and this pins the \
+     ORDER rather than a value that happens to be the smaller of the two"
   );
   // The same undecidedness reaches the wildcard entry, and takes the same
   // reading there, since one fold serves both.
   assert_eq!(
     acceptability(Some(b"br"), &[b"*;q=0.25, *;q=0.75"]),
-    (true, Some(750))
+    (true, Some(250))
   );
   assert_eq!(
     acceptability(Some(b"br"), &[b"*;q=0.75, *;q=0.25"]),
-    (true, Some(250))
+    (true, Some(750))
+  );
+
+  // Where the two readers part, and why that is licensed rather than a second
+  // divergence: `weight_for` absorbs no zero, because §12.5.1 has no
+  // counterpart to rule 3's "unless it is accompanied by a qvalue of 0".
+  // Measured: `weight_for(text/plain, ["text/plain;q=1, text/plain;q=0"])` is
+  // 1000, where this reader answers zero on the analogous field. The two agree
+  // wherever the RFC is silent and part only where it speaks to one of them.
+  let candidate = crate::media::media_type(b"text/plain").expect("a media type");
+  assert_eq!(
+    crate::media::weight_for(&candidate, [b"text/plain;q=1, text/plain;q=0".as_slice()])
+      .expect("well formed")
+      .thousandths(),
+    1000
+  );
+  assert_eq!(
+    acceptability(Some(b"gzip"), &[b"gzip;q=1, gzip;q=0"]),
+    (false, Some(0))
+  );
+  // And where they agree, which is the point of this commit.
+  assert_eq!(
+    crate::media::weight_for(
+      &candidate,
+      [b"text/plain;q=0.25, text/plain;q=0.75".as_slice()]
+    )
+    .expect("well formed")
+    .thousandths(),
+    250
   );
 }
 
