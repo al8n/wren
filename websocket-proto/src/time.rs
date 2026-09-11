@@ -18,6 +18,34 @@ use core::time::Duration;
 /// source. Mixing instants from different sources is undefined behaviour
 /// at the protocol level (deadlines may fire spuriously or never).
 ///
+/// The `now` a caller hands across calls on ONE
+/// [`Connection`](crate::Connection) must be non-decreasing, and the crate
+/// checks it rather than trusting it. FOUR entry points take a `now` —
+/// `handle`, `observe`, `poll_transmit` and `handle_timeout` — over three
+/// refusal sites, because `handle` and `observe` share one implementation and
+/// so one check. Each compares `now` against the latest instant that
+/// connection has been given and refuses a strictly earlier one with a
+/// `ClockWentBackwards` error, leaving the connection untouched. An EQUAL
+/// instant is accepted, so a driver that reads its clock once per wakeup may
+/// hand the same one to every call in a batch.
+///
+/// The refusal is **returned** — a rewound clock is a bug in the caller's
+/// timekeeping, and whether it should kill the process, drop the connection or
+/// be logged and retried is the driver's decision. What the crate owes is that
+/// the fact is reachable; before the check, a rewound `now` was silently
+/// tolerated and deadlines simply fired late.
+///
+/// **Unless the `assert-contracts` feature is on**, in which case this exact
+/// condition panics instead of returning, by design: the refusal routes through
+/// `contract::contract_violation`, which is that feature's whole purpose. A
+/// binary that enables it has asked for the abort. Nothing a PEER's bytes can
+/// cause panics under any feature.
+///
+/// [`Connection::poll_timeout`](crate::Connection::poll_timeout) takes no `now`
+/// and never refuses — but see its own docs before feeding its answer back in:
+/// the deadline it returns can be OLDER than the last instant this connection
+/// was given, and handing that value to `handle_timeout` is a rewind.
+///
 /// All arithmetic is checked: implementations return `None` on overflow
 /// or when subtracting a later instant from an earlier one, rather than
 /// panicking. The proto crate is `#![deny(clippy::arithmetic_side_effects)]`

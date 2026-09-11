@@ -78,6 +78,19 @@ impl<Ro, S> Drop for ReadHalf<Ro, S> {
   fn drop(&mut self) {
     let mut inner = self.inner.borrow_mut();
     inner.read_half_alive = false;
+    // The same fact one type over: with the pump gone, nothing will read what
+    // an inbound byte would assemble. Set beside the flag it follows from, so
+    // "no reader exists" is written wherever it becomes true rather than
+    // argued from `read_half_alive` at the point of use. Nothing reads on this
+    // path today — the transport goes below — so it is a totality, not a
+    // reachable saving.
+    inner.inbound_unread = true;
+    // And nothing will read what is already held: the folder's partial and
+    // every complete message behind it are unreachable the moment this half
+    // is gone, so they are dropped here rather than kept alive by whatever
+    // still holds the shared state.
+    inner.assembler.reset();
+    inner.ready.clear();
     // Nothing will ever pump these; fail the waiting senders loudly.
     while let Some(frame) = inner.outbound.pop_front() {
       frame.state.set(FrameState::Orphaned);
@@ -144,7 +157,7 @@ impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
         return Err(Error::Closed);
       }
       inner.conn.close(code, reason)?;
-      inner.close_pending = true;
+      inner.close_owed.get_or_insert(std::time::Instant::now());
     }
     // Empty marker frame: the pump coalesces the queue and the protocol
     // transmits into one write, so its `Written` transition means the write
@@ -162,6 +175,14 @@ impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
       if !inner.read_half_alive {
         return Err(Error::ReadHalfGone);
       }
+      // The protocol's `Terminal` refusal covers the ENCODE step that ran
+      // before this one; this covers the QUEUE. Nothing put here after the
+      // handshake completed would ever be written — §5.5.1 (line 2023 of
+      // `.rfc-cache/rfc6455.txt`) — so it is refused rather than parked on a
+      // pump that will not pick it up.
+      if inner.closed.is_some() {
+        return Err(Error::Closed);
+      }
       inner.outbound.push_back(OutboundFrame {
         bytes: frame,
         state: state.clone(),
@@ -174,6 +195,10 @@ impl<Ro: role::Role, S: crate::into_duplex::Duplex> WriteHalf<Ro, S> {
         FrameState::Written => return Ok(()),
         FrameState::Failed(kind) => return Err(Error::Io(kind.into())),
         FrameState::Orphaned => return Err(Error::ReadHalfGone),
+        // Not `Io` (the transport is fine) and not `ReadHalfGone` (the pump
+        // is alive and just finished the handshake): the connection closed
+        // under a frame that was legal when it was encoded.
+        FrameState::ClosedBeforeWrite => return Err(Error::Closed),
       }
       let listener = self.doorbell.listen();
       if state.get() != FrameState::Queued {

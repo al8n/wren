@@ -1,5 +1,813 @@
 # UNRELEASED
 
+## `websocket-proto` — the bounds a thread-per-core driver needs asserted rather than true
+
+A thread-per-core, zero-allocation `io_uring` server keeps one `Connection` per
+accepted socket in a preallocated slab, so the struct's size is a number it
+multiplies by its connection count and pays as resident memory before a byte
+arrives. That makes the size a property of the crate rather than an
+implementation detail — and a property with no gate is one that drifts. These
+changes turn properties this crate already had into properties something checks.
+
+### Breaking
+
+- **A Pong owed when this endpoint has sent — but not received — a Close is now
+  sent.** Two defects, one clause. RFC 6455 §5.5.2 (line 2042 of
+  `.rfc-cache/rfc6455.txt`) makes a Pong a MUST "unless it already received a
+  Close frame", and a Close this endpoint SENT is not one it received. §5.5.3
+  (line 2064) licenses answering only the most recently processed Ping; it
+  licenses answering none.
+
+  * `poll_transmit` answered `None` for the life of the connection once the
+    close drained, so a Ping arriving while we awaited the peer's Close got
+    nothing.
+  * And `encode_control` refused every non-`Open` lifecycle, so the workaround
+    this crate's own docs pointed a caller at — answer it yourself with
+    `encode_pong` — returned `EncodeError::Closing`. The documented escape hatch
+    was shut.
+
+  Both are fixed. Control frames are now refused only once the connection is
+  **terminal**, which is §5.5.2's own condition; §5.5.1 (line 2002) bans further
+  *data* frames after a Close, not control frames, and data sends still stop at
+  `close()` exactly as before.
+
+  **The order is queue-time first-in-first-out, and it is chosen for liveness.**
+  Whichever of the owed pong and the queued close was queued first drains first,
+  and a Ping arriving after `close()` cannot overtake the Close. Neither clause
+  forbids either order — §5.5.1 (line 2002) bans only further *data* frames
+  after a Close — so the order is argued:
+
+  * §5.5.2 (line 2043) asks for the Pong "as soon as is practical", and for a
+    Ping received while our Close was queued but not yet on the wire the next
+    frame written IS the earliest practical one. So a pre-close pong goes first.
+  * But **unconditional pong priority permits unbounded Close starvation.** A
+    driver that alternates one inbound Ping with exactly one `poll_transmit`
+    emits a Pong every time and never reaches its Close, so `close_deadline`
+    never arms. The queue cap does not help — only one pong is outstanding at a
+    time — and this crate cannot assume a drain-to-`None` schedule, because the
+    public API neither enforces nor can express one.
+
+  `SendState::pongs_before_close` is frozen when the close is queued and only
+  ever decremented, so **the Close is emitted within `pongs_before_close + 1`
+  calls** — at most 18, and exactly 1 when nothing was owed. A counter rather
+  than a flag because the heap tiers can owe several at that instant.
+
+  **This is a behavioural change on the wire, measured in both directions.**
+  `Ping → close() → Ping → drain` emits Pong(before), Close, Pong(after) — the
+  middle one moved. `close() → drain → Ping → drain` still emits the late pong
+  after the close and still accepts `encode_pong` by hand. And
+  `a_close_cannot_be_starved_by_a_ping_per_poll` runs the adversarial schedule
+  itself: one Ping in, exactly one poll out, and the Close must appear by poll 2
+  with `close_deadline` armed on that drain. Under the old rule it never
+  appeared at all.
+
+- **A later peer Close no longer retroactively discards a Pong already owed.**
+  For `Ping → peer Close` in one input batch the Ping queues a Pong before the
+  Close is parsed; parsing the Close made the connection terminal, and a
+  lifecycle gate in `poll_transmit` then swallowed that Pong and emitted only
+  the echo. §5.5.2 (line 2042 of `.rfc-cache/rfc6455.txt`) does not say that:
+  "Upon receipt of a Ping frame, an endpoint MUST send a Pong frame in response,
+  unless it already received a Close frame" makes the exemption a property of
+  **the moment the Ping arrives**. A Close that arrives later cancels nothing.
+
+  The question is now settled where the Ping lands, in `Events::queue_pong`,
+  and the drain-time gate is gone — one decision, at the point the clause is
+  about. So the same batch emits **Pong then Close**, while a Ping arriving
+  after a received Close still owes nothing (and cannot even be offered:
+  `handle` refuses input once terminal). `fail` clears the owed pongs itself,
+  because §7.1.7 (line 2399) is a different rule with a different answer — an
+  endpoint told to _Fail the WebSocket Connection_ "MUST NOT continue to attempt
+  to process data" — and it is applied at its own entrance rather than filtered
+  for at drain time.
+
+  **Two tests had pinned the nonconforming reading** and both are rewritten
+  rather than deleted: the same-batch regression now expects Pong-then-Close and
+  says in its own comment that it used to assert the opposite, and the boundary
+  test is split so that each half of §5.5.2's sentence has its own assertion.
+
+- **A `now` that goes backwards is refused, not tolerated.** The `now`-taking
+  entry points compare deadlines by `Ord`, and a clock that rewound was
+  silently absorbed: deadlines fired late and nothing said so. Each now
+  compares `now` against the latest instant that connection has been given and
+  refuses a strictly earlier one —
+  `HandleError::ClockWentBackwards`, `EncodeError::ClockWentBackwards` and the
+  new `TimeoutError::ClockWentBackwards`. **This is a behavioural change**: a
+  call that used to succeed quietly can now fail.
+
+  An EQUAL instant is accepted, because a driver that reads its clock once per
+  wakeup and fans it across a batch is the shape this crate is written for. The
+  refusal touches nothing — the comparison runs before any store, so `data` is
+  unread, nothing is written to `out`, no lifecycle moves, and the call is
+  retryable with a correct instant. And it RETURNS: a rewound clock is a bug in
+  the caller's timekeeping, so whether it kills the process, drops the
+  connection or is logged and retried is the driver's decision, which is the
+  layering `deny(clippy::panic)` and the link proof already make structural.
+  `poll_timeout()` takes no `now` and is unchanged.
+
+  **Four entry points, three refusal sites.** `handle`, `observe`,
+  `poll_transmit` and `handle_timeout` all take a `now` and all advance the
+  recorded instant; `handle` and `observe` are two names for one `feed` and
+  share its single check, while the other two have their own. The rewind,
+  equal-instant and `assert-contracts` regressions cover all four.
+
+  The recorded instant is an `I`, not an `Option<I>`: `Connection::new` already
+  takes a `now`, so there is no "no clock yet" state to encode and no first call
+  that skips the check — and an `Option` would cost eight more bytes on every
+  connection rather than eight. Against `main` the field is this release's only
+  size growth: **536 → 544** bare, **568 → 576** with `std` / `alloc` /
+  `no-atomic`, and **592 → 592** with `deflate`, where the eight bytes land in
+  existing padding. The `const` budget moved with it, and caught the growth
+  rather than a reviewer: adding the field reddened `cargo check` with
+  `error[E0080]: evaluation panicked` before a test existed.
+
+  `handle_timeout` is now link-checked in `tests/no_panic.rs` — it is the
+  shallowest of the four entry points and reaches the same comparison, so the
+  new leaf is covered by `no-panic` and not only by the lint wall. All eight of
+  the crate's shims are defined at distinct addresses (checked against the
+  binary's symbol table, not assumed).
+
+  **One existing test passed a smaller `now` and it was not deliberate.**
+  `keepalive_pings_on_inbound_silence` ticked `handle_timeout(4_999_999)` and
+  then drained with `poll_transmit(TestInstant(0))`; the `0` was incidental —
+  the line asserts that nothing is queued yet, which no instant changes — so it
+  is spelled at `4_999_999` now and says the same thing. Nothing else in the
+  workspace rewound. `wren-compio`'s two `handle_timeout` call sites use
+  `std::time::Instant::now()`, where the refusal is unreachable; both spell the
+  arm out and `warn!` rather than unwrapping, because a driver must not panic on
+  a clock it does not own.
+
+### Added
+
+- **`size_of::<Connection<_, _>>()` is now a `const` assertion, at the measured
+  value.** `connection/mod.rs` carries a private `Nanos(u64)` clock and
+  `const _: () = assert!(size_of::<Connection<Nanos, Server>>() <= N)` per
+  storage tier, in the shape `handshake/h1/server.rs` already uses for
+  `RequestView`. Being `const` is what makes it a gate on every tier and every
+  target rather than a test somebody has to remember to run: it is evaluated by
+  `cargo check`, so the `thumbv6m-none-eabi` and `thumbv7em-none-eabihf` steps
+  in the `no-std` job evaluate it for a 32-bit `usize` too.
+
+  The clock is a newtype this crate defines rather than `std::time::Instant`
+  because the bound is meant to be about THIS crate's state. `std::time::Instant`
+  is 16 bytes on Linux and 8 on macOS and does not exist at all on the bare tier
+  — a budget written against it would move underneath the crate without anything
+  here changing, and would be absent where it matters most.
+
+  `N` is the measurement and **not** a round number above it. A budget with slack
+  only fails once the struct has already grown past what anyone measured, which
+  is precisely the growth it exists to report; a budget equal to the measurement
+  fails on the first byte and names the field that added it. Measured 2026-09-04
+  at `e42b30d` on aarch64-apple-darwin with a probe binary outside the workspace
+  that prints `core::mem::size_of::<Connection<Nanos, Server>>()`:
+  536 bytes at `--no-default-features`, 568 with `std` / `alloc` / `no-atomic`
+  (the `pong_overflow` `VecDeque`), 592 with `deflate` (the two boxed codec
+  handles and the negotiated parameters). The bound was measured to bite: set to
+  535, the bare tier fails `cargo check` with
+  `error[E0080]: evaluation panicked`. The numbers this release ships at are
+  **544 / 576 / 600** — the `+8` on the first two tiers is `last_now`, under
+  **Breaking** above, and the `deflate` tier also carries the queue-order byte.
+
+  **What the bound does not say**, stated where it is asserted: it is taken at
+  one instantiation, `Connection<Nanos, Server>` — an 8-byte `Copy + Ord` clock
+  and a zero-sized role. A caller's own `I` and `Ro` are not bounded by it. The
+  struct holds three `I`-shaped fields, and with a 16-byte clock the bare tier
+  measures **568** rather than the 448 a field-by-field count predicted — which
+  is why that figure is measured in the doc rather than reasoned.
+
+- **`Connection::observe` — framing, boundaries, control frames and Close, with
+  no work on the payload.** A second byte-taking entry point beside `handle`,
+  same signature, differing in one thing: the cursor it returns is in
+  observation mode, and data payload bytes are advanced over instead of
+  decoded. Every header-level rule is unchanged (opcode and RSV validation, the
+  mask-bit rule, fragment sequencing, control-frame length, the clock check and
+  the terminal short-circuit), control frames are processed identically — a
+  Ping still queues its Pong, the peer's Close still echoes and terminates —
+  and `MessageStart`/`MessageEnd` still surface so a caller's assembler can
+  track boundaries. What does not happen is the unmask, the UTF-8 validation,
+  the inflate, the size accounting and the chunk event.
+
+  **For the driver that has stopped consuming**: `wren-compio` reads the
+  inbound direction while a post-Close write is blocked, to see the peer's
+  Close. It used to feed those bytes to `handle` and throw the resulting events
+  away — one layer too late under `deflate`, where the payload had already been
+  inflated into the decompressor's buffer. MEASURED on the new regression:
+  **9 688 bytes of wire — less than one 16 KiB read — inflated to 8 388 627
+  bytes** and grew the retained inflate buffer from 8 192 to 65 536 bytes,
+  before a single event was discarded. Through `observe` both numbers are
+  unchanged from the baseline.
+
+  Skipping the UTF-8 check is not a relaxation of RFC 6455 §8.1 (line 2643 of
+  `.rfc-cache/rfc6455.txt`): its obligation is conditioned on interpreting the
+  bytes — "When an endpoint is to interpret a byte stream as UTF-8 but finds
+  that the byte stream is not, in fact, a valid UTF-8 stream, that endpoint
+  MUST _Fail the WebSocket Connection_." — and an observer does not interpret
+  them. §5.6 (line 2098) says "the whole message MUST contain valid UTF-8" of
+  what a sender puts on the wire, and routes the receiver's handling to §8.1
+  rather than stating a second obligation.
+
+  **A message is skipped WHOLE, and that is connection state rather than a
+  per-call mode.** The two entry points can feed one message between them, and
+  a message half of which was never decoded must not be decoded from the
+  middle: for text, validating a tail whose head was skipped can split a
+  multi-byte character and fail a conforming peer with 1007. `MessageState`
+  therefore carries a `skipped` flag, set at the message's start under
+  observation and at any run a cursor walks past, and cleared only at the
+  message boundary. It costs no bytes — the flag lands in the enum's existing
+  padding.
+
+  **permessage-deflate and context takeover, ruled explicitly.** Skipping a
+  compressed message's bytes means the inflater never saw them. With
+  `no_context_takeover` on the inbound direction that costs nothing: each
+  message is its own DEFLATE stream and the next one resets. With context
+  takeover the window is now missing that message's output, so every later
+  compressed message would back-reference bytes this endpoint never produced —
+  decoding to garbage, or failing as a 1007 the peer did not cause. Observing a
+  compressed data frame under takeover therefore **poisons** the inbound
+  inflate context, and from then on `handle` skips compressed data frames the
+  same way: `MessageStart`/`MessageEnd`, no chunks, no error. Uncompressed
+  messages are unaffected. The connection has sent its Close and its
+  application has said it is done; a dictionary that cannot be rebuilt is a
+  consequence of that, not a protocol violation.
+
+  The poison is a `RecvState` flag beside the `Option<Box<InflateBox>>` and not
+  a field inside the box, because the box may not exist when the poison has to
+  be recorded — the first compressed message of a connection can be the one
+  observation skips, and creating the box to hold a flag would allocate the
+  ~32 KiB dictionary that skipping exists to avoid. It costs nothing: the tier
+  sizes stay **544 / 576 / 600**.
+
+- **`Connection::close_sent` — has this endpoint's Close been handed to
+  `poll_transmit`'s caller?** A driver that coalesces `poll_transmit` output
+  into wire batches has to know which batch holds the Close, and its own "a
+  close is owed" flag cannot answer: it stays set while the Close sits
+  unflushed, so it labels every batch built until the Close lands, including
+  ones carrying no Close at all. RFC 6455 §5.5.1 (line 2023 of
+  `.rfc-cache/rfc6455.txt`) makes that a protocol violation rather than a
+  bookkeeping slip — a batch mislabelled as the close-carrying one lets a frame
+  be written past a completed handshake and reports its flush as the Close's.
+
+  Deliberately NOT "is on the wire", which belongs to whoever owns the
+  transport. Its doc says how it differs from `is_terminal`, which answers about
+  the close EXCHANGE rather than about our half of it.
+
+- **`MessageAssembler::buffered` — how much the assembler is holding right
+  now.** `max_message_size` answers how large one message may become, not how
+  much is retained at this instant, and only the second question bounds an
+  inbound stream nobody is draining.
+
+- **`prepare_binary` / `prepare_text`: the zero-copy send is now the obvious
+  one.** A whole message with no payload copy was spelled
+  `prepare_fragment(FragmentKind::BinaryStart, true, payload)` — correct, and
+  reading like fragmentation — while `encode_binary`, which COPIES the payload
+  into the output buffer, read like the main path. The two new methods are thin
+  aliases with the same lifecycle and sequencing rules, documented as the path a
+  `writev` / `IORING_OP_WRITEV` driver takes: the header comes back as an
+  `EncodedHeader`, the payload is masked in place, and for a 64 KiB message that
+  is 64 KiB of `memcpy` per send that does not happen.
+
+  `prepare_text` takes `&mut [u8]` rather than `encode_text`'s `&str`, and the
+  difference is forced: masking rewrites the bytes, and a masked UTF-8 string is
+  not UTF-8, so writing through a `&mut str` would break that type's invariant —
+  which a `forbid(unsafe_code)` crate cannot do at all. RFC 6455 §8.1 validity
+  is checked instead, before anything is masked, so a rejected send leaves the
+  buffer byte-identical for a retry.
+
+  Both are link-checked in `tests/no_panic.rs` over the CLIENT role, which is
+  the one whose `prepare_*` writes to the payload. Their bodies answer different
+  types over different opcodes so identical code folding cannot satisfy two
+  declared shims with one body — a sibling branch found the linker doing exactly
+  that, leaving one proof empty while `shim-check` read green. Verified from the
+  symbol table rather than argued: `shim_prepare_text` and `shim_prepare_binary`
+  are defined at distinct addresses (`0x…0ed0` and `0x…1100`), and no two of the
+  crate's seven shims share one.
+
+  `prepare_fragment` and `plan_data_send` (and the two new forwarders) gained
+  `#[inline]`, and that is load-bearing rather than a codegen guess: this crate's
+  `no-panic` step runs WITHOUT fat LTO on purpose, and without the annotation
+  the release link reds with `ERROR[no-panic]: detected panic in function
+  `shim_prepare_text`` and the same for `shim_prepare_binary`. Bisected:
+  `plan_data_send` alone still reds both, `prepare_fragment` + `plan_data_send`
+  links clean. `CARGO_PROFILE_RELEASE_LTO=fat` also links clean, which is how
+  the failure was identified as cross-CGU opacity rather than a real panic edge
+  — moving this crate's step to fat LTO is what its own comments forbid, so the
+  annotation is the fix and the profile is unchanged.
+
+- **Feature `assert-contracts`: caller-contract violations panic; protocol
+  errors never do.** Off by default, so the crate's panic-freedom proof is
+  exactly what it was. On, a caller breaking this crate's API stops the process
+  instead of receiving an `Err` — the TigerBeetle stance that a program which
+  has already violated its own invariants should not continue on state nobody
+  reasoned about, made opt-in.
+
+  The line that matters is which errors are eligible. A **contract** error is
+  the caller's bug — a `now` that went backwards, and others as the audit
+  reaches them. A **protocol** error is anything a peer's bytes can cause: a
+  malformed header, an unmasked client frame, invalid UTF-8, an oversize
+  payload. Those never panic under any feature, because a peer-triggerable
+  panic is a denial-of-service entrance — one crafted frame and the process is
+  gone. The rule is enforced by WHICH ERRORS REACH `contract::contract_violation`
+  rather than by a comment saying so, and a protocol error routed through it
+  acquires a panic in a diff a reviewer can see. Exactly one error class is
+  routed there in this change: the clock-backwards refusal. Nothing existing was
+  reclassified.
+
+  The lint wall is left standing rather than relaxed: `deny(clippy::panic)` still
+  covers the crate with the feature on, and one
+  `#[cfg_attr(feature = "assert-contracts", allow(clippy::panic))]` on the helper
+  is the only place in this crate a panic can be written at all. A stray
+  `panic!` anywhere else still reds clippy under `--all-features`.
+
+  The feature is for a **final binary**, not a library: cargo unifies features
+  across the build graph, so a library enabling it decides the question for
+  every dependent, including ones that chose a returned `Err` deliberately.
+
+  The two returned-`Err` clock tests are gated OFF under the feature — there is
+  no `Err` to inspect and no surviving state to compare when the process is
+  going down — and four mirrors run in their place: one `#[should_panic]` per
+  entry point, matching the CONTRACT's own words rather than "panicked" so a
+  panic from anywhere else does not pass for it, plus one asserting that an
+  EQUAL instant still does not panic. 266 unit tests without the feature, 268
+  with.
+
+- **The feature's panic is gated at the rewinding CALL SITE, not at the shim,
+  so `--all-features` stays coherent.** `cargo test -p websocket-proto
+  --all-features` is a CI step, and with `test-no-panic` and `assert-contracts`
+  both on a proof test that drives `last_now` to `u64::MAX` and then passes zero
+  meets the exact condition the feature turns into a panic — exit 101, measured.
+
+  Only the REWINDING CALL SITE is gated out under the feature, not the shim.
+  `xtask shim-check` fails any shim carrying a `cfg` except the single
+  `shim_lie` control ("a shim the proof build does not contain is a shim nothing
+  proves"), so a gated `shim_handle_timeout` — or a second gated control shim —
+  would red that gate instead. Gating the call keeps the shim in every build and
+  makes `--all-features` coherent.
+
+  `shim_handle_timeout` remains the must-fail control's subject, and needs no
+  `cfg` to be one: without the feature its body is panic-free and the proof
+  passes; with it the clock refusal becomes a reachable `panic!` and the release
+  link fails naming it. That is the `shim_lie` pattern with the gate supplied by
+  the feature under test. The feature-on behaviour keeps its own coverage in
+  `connection::tests::assert_contracts`, deliberately outside the proof file.
+
+  **The control's SHAPE is constrained by that `shim-check` rule rather than
+  chosen.** One gated shim per file, named `shim_lie`, blocks any second
+  must-fail control a crate might legitimately want — filed as an `xtask`
+  defect, not recorded as a limitation of this design.
+
+- **The taxonomy names the NARROW class, and settles at one candidate.**
+  `contract.rs` names the panic-eligible class as the **non-peer-triggerable**
+  one — in both value and state — rather than "caller misuse", which is far too
+  wide and is exactly how a peer-triggerable panic gets in. It says outright
+  that feeding a terminal connection is not in that class, because the peer's
+  Close is what makes a connection terminal and it can land between a caller's
+  check and its call.
+
+  The worked list is now a table, and it settles at **one** candidate:
+  `EncodeError::FragmentSequence`, because nothing on the wire chooses this
+  endpoint's outbound fragmentation order. `Terminal`, `Closing`,
+  `ControlTooLong`, `ReasonTooLong`, `InvalidCloseCode`, `InvalidUtf8` and
+  `BufferTooSmall` are each peer-inducible — by value or by timing — and none of
+  them may ever panic.
+
+- **The criterion for what may become a panic is the VALUE, not the caller.**
+  It is not "the caller broke the API" but **could
+  the value that triggers this refusal have come off the wire?** A caller is
+  entitled to relay peer data back into this API — echo a received close code,
+  answer a ping with the payload it carried — so a refusal keyed on such a value
+  is peer-triggerable no matter who typed the call.
+
+  Walked over every variant of `HandleError` and `EncodeError`, and none of
+  these may become panics:
+  `EncodeError::{ControlTooLong, ReasonTooLong, InvalidCloseCode}` each refuse a
+  VALUE a caller may be relaying; `HandleError::Terminal` and
+  `EncodeError::Closing` follow peer-driven state, since the peer's Close is
+  what makes a connection terminal and it can land between a caller's check and
+  its call. `EncodeError::FragmentSequence` is the one that clearly may: nothing
+  on the wire chooses this endpoint's outbound fragmentation order. The
+  criterion is written at the helper, where the next person to route an error
+  will read it.
+
+### Changed
+
+- **The panic wall's claim is narrowed to what it enforces, and the gap is a
+  number.** `contract.rs` said the one `allow` on `contract_violation` was the
+  only place a panic could be written in this crate. That is stronger than the
+  lints deliver: `clippy::panic` catches the `panic!` macro, and
+  `clippy::panic_in_result_fn` catches assertions only inside functions that
+  return `Result` and does not inspect their callees — so an `assert!` in a
+  non-`Result` helper on a peer-byte path is denied by nothing.
+
+  Checked against this toolchain rather than assumed. Of the lints that could
+  cover assertion macros, `clippy::{unreachable, todo, unimplemented,
+  indexing_slicing, arithmetic_side_effects}` were ALREADY in the wall; the only
+  one missing was `clippy::assertions_on_constants`, which is now denied and
+  found nothing. `clippy-driver -W help` on 1.91 lists no lint that denies a
+  bare `assert!` outside a `Result`-returning function, which is why the claim
+  is narrowed rather than the wall widened.
+
+  What covers callees is the link-time proof, and only for the shimmed entry
+  points — `FrameHeader::{decode, encode}`, `mask`, `Utf8Validator::feed`, the
+  internal base64 encoder, and `Connection::{prepare_binary, prepare_text,
+  handle_timeout}`. Counted so the next batch has a target rather than an
+  intention: of the **47** public functions taking a `&[u8]` / `&mut [u8]` /
+  `&str`, **7** are shim-covered and **40** are not, headed by
+  `Connection::handle` and the whole `handshake::h1` surface;
+  `Connection::observe` shares `handle`'s tree and joins the uncovered side.
+  `contract.rs` carries the command the number is derived from, so it is
+  re-derivable rather than merely asserted. Widening the proof is deliberately
+  left for a later release — `tests/no_panic.rs` records why the connection tree
+  does not inline into one shim.
+
+- **The receipt-time terminal check is paired rather than merely present.**
+  `Events::queue_pong`
+  refuses a Ping received after a Close — §5.5.2's own condition — and that
+  refusal **cannot fire through the public API**: `Events::next` opens by
+  returning `None` once the connection is terminal, so a Ping later in the same
+  batch is never decoded, and `handle` refuses a subsequent call outright.
+  Deleting the check would therefore red nothing, which is the shape this crate
+  has twice mistaken for coverage.
+
+  It is kept, because the short-circuit is about ignoring the rest of the input
+  (§1.4) while the check is about §5.5.2's obligation, and a refactor separating
+  them would reintroduce the defect silently. But it is now **pinned**:
+  `a_post_close_ping_owes_no_pong_even_past_the_cursor_short_circuit` reaches the
+  state `next` refuses to walk into — terminal, with a Ping still buffered — and
+  shows the guard refusing. The doc names both halves of the pair and the test
+  that proves each.
+
+- **Every "returns rather than panics" now names the `assert-contracts`
+  exception.** `time.rs` said the backwards-clock refusal was "never panicked",
+  and under that feature it panics for exactly that condition — the two claims
+  shipped in the same release. Grepped for the phrasing and qualified each site:
+  the [`Instant`] trait doc, `Connection::handle_timeout`,
+  `Connection::poll_transmit` and the private `accept_now`.
+
+- **`poll_timeout` documents that its answer is a *when*, not a *what*.** The
+  deadline it returns can already be OLDER than the last instant the connection
+  was given — a keepalive armed at `t+5` is stale once a `poll_transmit(t+20)`
+  has gone by, because `last_now` advances on every entry point while the
+  deadline does not. Feeding that value straight back to `handle_timeout` is a
+  rewind, and the monotonicity check refuses it. Arrange the timer for it, then
+  call with a fresh reading of your clock.
+
+### What was NOT consolidated, and the sequence that decides it
+
+- **`SendState::pending_close` and `RecvState::pending_pong` are NOT merged into
+  one tagged slot.** They are 125 bytes each and empty almost always, and one
+  tagged slot holds everything either could ever transmit in 127 — 128 bytes off
+  every tier, measured, and refused. What licenses the merge is the reasoning
+  that a queued close drains first and `poll_transmit` answers `None`
+  afterwards, so an owed pong could never reach the wire anyway; that describes
+  an implementation and not the RFC. §5.5.2 (line 2042 of
+  `.rfc-cache/rfc6455.txt`) owes a Pong until a Close is RECEIVED, so the
+  machine has to hold a queued close and an owed pong at the same time, and one
+  slot cannot. Merging would codify the gap rather than close it.
+
+  **A smaller `Connection` does not license a nonconformance.** The sizes this
+  release ships — 544 / 576 / 600 — are the ones with both buffers in place.
+
+- **`RecvState::control_buf` — the inbound accumulator — stays its own buffer.**
+  Sharing it with the outbound slot is tempting because a pong's payload *is*
+  the ping's accumulated payload, so the echo could be a tag flip rather than a
+  copy. It is not sound, and one sequence settles it: a ping completes (its echo
+  owed, payload in the shared buffer), then the peer sends an unsolicited **Pong**
+  — or the first bytes of any control frame, since RFC 6455 §5.5 lets a control
+  payload split across reads. Those bytes accumulate over the echo we still owe,
+  and `poll_transmit` then puts a frame on the wire whose body is neither ping's.
+  RFC 6455 §5.5.3 (line 2060 of `.rfc-cache/rfc6455.txt`): "A Pong frame sent in
+  response to a Ping frame must have identical 'Application data' as found in
+  the message body of the Ping frame being replied to."
+
+  §5.5.3's most-recent-ping licence (line 2064) does not cover it. It permits
+  answering "only the most recently processed Ping frame" — a *processed* one. A
+  half-received ping has not been processed, and an inbound Pong or Close is not
+  a ping at all, so dropping the owed echo when one of those arrives is a §5.5.2
+  MUST left unanswered with nothing licensing it. Dropping the echo at the first
+  accumulated byte and keeping it are both wrong; keeping the buffer is right.
+
+  The inbound **close** case that motivated the question is in fact the benign
+  one — a received close makes the connection terminal and only the close echo
+  drains — which is exactly why it is not the sequence to reason from.
+
+## `websocket-proto` + `wren-compio` — the event tells the truth about a skipped message
+
+"This message's payload will never be delivered" is a fact the protocol knows
+and a folder — this crate's `MessageAssembler`, or a caller's own — cannot see
+from the events alone. Two ways a folder then acts on a message that is already
+gone, and both are closed by making the EVENT carry the fact.
+
+### Added
+
+- **`MessageStart::skipped`** — "no chunk will follow for this message; a
+  consumer holds nothing for it". Set for a message that starts under
+  `Connection::observe`, and for a compressed message arriving after the
+  inbound inflate context is poisoned. `SliceAssembler::push` and
+  `MessageAssembler::push` both read it and discard to the boundary instead of
+  opening an accumulator.
+
+  **What it fixes**: after the poison, `handle` — the ordinary receive path,
+  for the rest of the connection's life — yields `MessageStart` + `MessageEnd`
+  with nothing between for every later compressed message, and `push` sealed
+  that into a fabricated empty `Message::Binary(b"")` where the peer had sent
+  bytes. Measured on the new driver regression, a 300-byte compressed message
+  after the poison: `delivered=[0, 0, 4]` unfixed against `[4]` fixed.
+
+- **`Event::MessageAbandoned`** — "the message in progress will not be
+  delivered: drop what you hold for it". Emitted exactly ONCE per message, at
+  the first payload run the machine skips of a message whose `MessageStart` was
+  already emitted saying otherwise; its `MessageEnd` still arrives at the
+  boundary. A message whose start already said `skipped` never gets it.
+  Both assemblers act on it in `push`.
+
+  **What it fixes**: a message whose head was assembled under `handle` and
+  whose continuations were then observed is not finished by the peer as far as
+  this endpoint is concerned — but its `MessageEnd` still arrives, under
+  `handle`, once the wedged write drains, and it sealed the stale accumulator
+  as a COMPLETE message. The application received 125 bytes of a 50 125-byte
+  message and a clean close, with no way to tell it from a message the peer
+  really ended there. Measured: `delivered=[125]` unfixed against `[]` fixed.
+
+  **It is an event and not a method a caller must call**, and that is the
+  point. Delivering the notice as an obligation instead — "call this before
+  each observed feed" — would be "the event tells the truth" with one site left
+  to the caller, and a contract prose cannot enforce. `Event` is
+  `#[non_exhaustive]`, so the variant costs no caller a compile error; what it
+  buys is that there is nothing left to remember. `Connection::observe`'s
+  documentation describes what a consumer is TOLD rather than what it owes.
+
+  The inflate poison adds no second cause, walked rather than assumed: the
+  poison is written only where a message is marked skipped, that site acts on
+  the message in flight, and only one message is ever in flight — so a poisoned
+  message in flight is unreachable, and every later compressed message is
+  marked at its own start where `MessageStart::skipped` carries it.
+
+- **`MessageAssembler::reset` and `SliceAssembler::reset`** — drop the message
+  in progress and return to `Idle`, for a fact learned OUTSIDE the event
+  stream. `push`'s terminal arms cover every way a connection's end arrives as
+  an event; two ways it does not are a close-handshake budget that elapses with
+  no reply (the driver's own timer, no peer frame, nothing to push) and a
+  caller that will never read again. `wren-compio` calls it when the settle
+  records a close from `handle_timeout` — the partial goes, `ready` is KEPT,
+  because the pump promises to hand out complete messages before it answers
+  `None` — and on every no-reader transition, where the partial goes and
+  `ready` is cleared because nothing can receive either.
+
+### Changed
+
+- **Both assemblers' documented event loop: push EVERY event.** The type-level
+  docs described `CloseReceived` and `Closed` as pass-through control events
+  and told callers to "route them separately before calling `push`". A caller
+  following that pattern never reaches the terminal arms and keeps its partial
+  — up to `max_message_size` — and its non-idle state for as long as it keeps
+  the folder. The docs now say control handling happens IN ADDITION to the
+  push, never instead of it, and `MessageAssembler` carries a doctest that
+  implements the loop: match for your own handling, then push unconditionally.
+
+- **`wren-compio`'s Phase 1 calls `push` for every event in both modes and
+  nothing else.** The assembler carries no mode and the driver takes no action
+  of its own: the protocol says which messages carry no payload
+  (`MessageStart::skipped`) and which one already in progress is being given up
+  on (`Event::MessageAbandoned`).
+
+## `wren-compio` — the read buffers a comment said were reused
+
+### Changed
+
+- **Observation is chosen at the PROTOCOL, not one layer above it.** Discarding
+  the EVENTS a read produces is one layer too late under `deflate`: producing
+  the event is what inflates the payload into the decompressor's buffer, so a
+  peer that keeps sending compressed fragments after our Close would turn each
+  read into megabytes of output before anything was discarded — bounded only by
+  `max_message_size`, on a connection whose application has already said it is
+  done. Phase 1 calls [`Connection::observe`] when the taken
+  `observation_input` flag is set and `handle` otherwise; the event loop is
+  shared.
+
+  **And whenever nobody is left to read at all.** `Inner::inbound_unread` is
+  the consumer-side twin of that flag — `observation_input` says where the
+  bytes came from, this says there is no reader for what they would assemble —
+  set by the unsplit `close()`, which consumes the handle and discards every
+  message its own loop is handed, and wherever `read_half_alive` becomes
+  false. Without it the ordinary echo wait, with nothing blocked and no wedge
+  anywhere, still inflated and assembled a peer's compressed bomb in full one
+  line before throwing it away: measured, **6 851 257 bytes allocated against
+  5 585** for 77 845 bytes of wire inflating to 4 194 304. A split connection
+  whose `ReadHalf` is alive is unaffected — it may still receive after
+  `WriteHalf::close()`. The transition also drops what was already held: the
+  folder's partial and every complete message queued behind it, since nothing
+  can receive either.
+
+  **And irreversible transport termination has ONE entrance.** `terminate_io`
+  records the sticky condition, fails the queue and releases what the folder
+  holds — the partial and the completed messages behind it — at every site
+  that ends a connection through the transport rather than the protocol: the
+  close flush expiring before the Close entered a batch, the write-fault
+  poison, EOF in the parked read and behind a blocked post-Close write, and a
+  fatal read error on either. `ready` is cleared rather than delivered because
+  the sticky check runs before Phase 1 and long before delivery, so nothing
+  left there could ever be handed out; the one site that DOES deliver first —
+  the close-flush settle with a protocol verdict — is a protocol outcome
+  rather than an I/O termination and keeps `ready` deliberately. Three of the
+  six sites released nothing before this, which is a fact written in six
+  places and true in three.
+
+  It is total over what a termination STRANDS, not only over what it retains:
+  it fails the active batch as well as the queue — taking `pending_write` from
+  the state, and accepting the batch a caller still holds as a required
+  parameter, so a caller holding one cannot pass without saying so — and it
+  rings the doorbell, because the sticky poison means no later pump pass will
+  settle anything and a sender parked on a `Queued` frame would wait for the
+  life of the process. The doorbell is a parameter for that reason: a
+  `#[must_use]` obligation is silenced by `let _ =`, while a caller that has
+  to hand the bell over cannot forget to ring it.
+
+  Measured through the counting allocator, on a fragmented compressed bomb
+  behind a wedged write: **77 845 bytes of wire inflating to 4 194 304**, over
+  10 observation reads, allocated **6 209 bytes — against 180 625 with the
+  discard back at the assembler**. That second number is the inflate buffer's
+  growth rather than the inflating, because the buffer is reused across frames;
+  `websocket-proto`'s own regression measures the work and reads 8 388 627
+  bytes inflated for 9 688 bytes of wire.
+
+### Fixed
+
+- **Every read behind a blocked write allocated two 16 KiB buffers, under a
+  comment claiming they were reused — and recycling them kept two.**
+  `read_scratch` was declared inside the outer `'pump` loop and the arm that
+  reads leaves that loop with `continue 'pump`, which dropped it; Phase 1 then
+  `mem::take`'d the `pending_input` the bytes had been copied into and dropped
+  that as well. So a peer that keeps sending after our Close drove a fresh
+  chunk allocation plus a fresh stash allocation on every read, and the budget
+  bounding that flood may be `Duration::MAX`. Phase 4's parked read allocated
+  its own `vec![0u8; READ_CHUNK]` per pass on top. Recycling the two buffers on
+  `Inner` stopped the churn but left the pair: swapped on every read and each
+  resized back to a full chunk, any connection that had read once retained
+  ~32 KiB, and an oversized handshake leftover was never given back.
+
+  What ownership across the `.await` actually needs is the buffer MOVED out of
+  the `RefCell` for the duration of the read; it never needed a second
+  allocation. So there is now ONE inbound vector on `Inner`: unconsumed bytes
+  at the front, the next read's window in the space behind them. A read arms it
+  to `len + READ_CHUNK`, fills from `len` on, and truncates to what it got;
+  Phase 1 feeds the whole of it and clears it, keeping the allocation; it
+  travels into `PumpIo` with the stream exactly as the stream does and comes
+  back on the guard's drop; and every commit ends in `shrink_to(READ_CHUNK)`,
+  so a handshake leftover that briefly forced a longer vector gives the excess
+  back as soon as it drains. Both reads — Phase 4's parked read and the
+  read-behind that races a blocked write — use it. **The retained inbound bound
+  is exactly one `READ_CHUNK` per connection.**
+
+  One vector has a cost two did not, and the guard pays it. The vector's `len`
+  is the protocol's unconsumed input, so an armed-but-uncommitted window is
+  16 KiB of zeros this driver wrote sitting where the peer's bytes go — and a
+  caller that drops `next()` from inside the read has no exit to commit on.
+  The guard records the arm and truncates back to it on drop, so a cancelled
+  pass gives the window back exactly as it gives the stream back. A scratch
+  buffer separate from the input carried no such meaning in its `len`; this is
+  what replaces that separation, and a regression cancels a parked read and
+  reads the vector's length off the connection.
+
+  **Two oracles, because neither alone can see both defects.** Bytes allocated
+  is the only one that can see the churn: a buffer freed and reallocated at the
+  same size reads identically by capacity, and that is that defect exactly. The
+  test binary therefore carries a `#[cfg(test)] #[global_allocator]` wrapping
+  `System` and counting bytes on the calling thread while armed — per thread
+  because `cargo test` runs tests in parallel and a compio runtime's tasks live
+  on the thread that made them, and const-initialised so the counter itself
+  never allocates from inside `alloc`. MEASURED across 20 observation reads
+  behind a wedged write: **12 369 bytes allocated, against 487 502 unfixed** —
+  29.8 read chunks, about 24 KiB per read, which is the two buffers. Retained
+  capacity is the only one that can see the pair, which allocates nothing at
+  all once warm: a `#[cfg(test)]` accessor reads the live vector's capacity off
+  the commit that just filled it, and a regression drives at least eight reads
+  down each of the two paths. MEASURED: **16 384 retained in one vector, against
+  32 768 across `pending_input` and `read_scratch` unfixed.**
+
+## CI — three gates the workspace claimed and no job ran
+
+### Added
+
+- **A must-fail control for `assert-contracts`.** A feature that turns on
+  panics and has never been observed to produce one is a feature nothing
+  checks: it could be misspelled in `Cargo.toml`, `cfg`'d out, or routed past
+  by a later refactor, and every job would stay green while the crate answered
+  `Err` exactly as before. So the `no-panic` job now builds
+  `--features assert-contracts,test-no-panic` in release and requires it to FAIL
+  to link — and to fail naming the shim that reaches
+  `contract::contract_violation`, not merely to fail. Measured:
+  `ERROR[no-panic]: detected panic in function `shim_handle_timeout``, and only
+  that shim. The step's own inversion was measured too: pointed at a build that
+  links, it exits 1 on its `::error::`.
+
+  `shim_handle_timeout` is the subject because `handle_timeout` is the
+  shallowest of the four `now`-taking entry points and the only one this crate
+  link-checks. Naming the shim rather than accepting any failure is the
+  lie-check's discipline: "it did not build" is satisfied by a typo or an
+  unrelated breakage, which would turn the step green while proving nothing.
+  The default proof is untouched — the step above it still runs
+  `--features test-no-panic` with no `assert-contracts`, still links clean at 9
+  tests, and `shim-check` reads that same binary.
+
+  The `clippy` job also runs the crate once at
+  `--no-default-features --features assert-contracts`, which is a different
+  question from the `--all-features` run above it: the bare `no_std` tier with
+  the feature, where the wall and the single `allow` have to agree without an
+  allocator in scope. The wall is deliberately not relaxed by the feature, so a
+  stray `panic!` anywhere else still reds there.
+
+- **`cargo check -p websocket-proto --no-default-features --target
+  thumbv6m-none-eabi`.** The `no-std` job checked websocket-proto on
+  `thumbv6m-none-eabi` only with `--features no-atomic`, and `no-atomic` links
+  `alloc` (`lib.rs`'s `extern crate alloc as std`) — so that is the HEAP tier on
+  a CAS-less core, not the no-alloc one. The bare tier's only check anywhere was
+  clippy on the host. The `http-semantics` pair a few lines below has done both
+  tiers for a while; this is that shape applied to the crate.
+
+  It PASSES today (37 s, measured at `e42b30d`), so it is proof rather than a
+  repair — and it was measured to be able to FAIL, by the case that makes the
+  cross-compile worth its half-minute rather than by any compile error at all.
+  A `core::sync::atomic::AtomicUsize::fetch_add` added under
+  `cfg(not(feature = "std"))` leaves the HOST bare check at exit 0 with zero
+  errors, and reds the new line with `error[E0599]: no method named `fetch_add`
+  found for reference `&Atomic<usize>``. Cortex-M0+ has atomic load/store and no
+  CAS; the host has both, and no other step in this workspace can see the
+  difference. (The plainer demonstration also holds: a `std::string::String`
+  under the same gate reds the line with `E0433: cannot find module or crate
+  `std``.)
+
+- **`handshake-corpus` now has a step, and it is not the obvious one.**
+  `handshake-corpus` is a workspace member (`Cargo.toml` line 2) that no
+  workflow ran — its only mention across `.github/` was `loc.yml:49` calling it
+  dev-only. The obvious repair, `cargo test -p handshake-corpus` beside
+  `-p auth-corpus` and `-p coding-corpus`, would be DECORATION, and the count is
+  what says so: the crate is a binary with no `#[test]` anywhere and no `tests/`
+  directory, so that command reports `running 0 tests` / `0 passed` and exits 0
+  forever. Measured; the line was not added.
+
+  What it has instead is a `main` that GENERATES the corpus, and nothing ran
+  that either. `clippy --workspace` compiles it, which catches a type error and
+  nothing more; `xtask handshake-diff` is the instrument that reads it and needs
+  TWO revisions, so like `auth-diff` it cannot run on a commit. Between those
+  sits every failure of the generator itself — a case builder that panics, a
+  sweep that silently stops emitting — and neither job could see it.
+
+  So the step runs it and requires records: exit 0 and 2004 records at this
+  commit. `--features deflate` is load-bearing rather than tidy — without it
+  `main` is one `eprintln!` and `exit(2)`, measured, which would red the step
+  for the wrong reason. The floor is `> 0` and not a pinned total on purpose:
+  the corpus is MEANT to move between revisions, that movement is what
+  `handshake-diff` reads, and a step pinning the count would fight the
+  instrument. Both of the step's failure modes were measured — the missing
+  feature exits 2, an empty corpus exits 1 on the floor.
+
+### Fixed
+
+- **Three gates this branch's own code broke, none of which the local gate
+  list ran.** All three were green locally and red on CI, which is the finding
+  as much as the fixes are: the local list was a subset of the workflow's, so
+  it could only ever confirm.
+
+  **`cargo hack test -p websocket-proto --each-feature`, shape 6 of 10
+  (`--no-default-features --features deflate`)**, failed `-D warnings` on
+  `dead_code`: five `#[cfg(test)]` accessors onto the inbound decompressor
+  (`Connection::{inflate_buf_capacity, inflated_ever, inflate_is_poisoned}`
+  and `InflateBox::{buf_capacity, inflated_ever}`) had no caller on that
+  shape, because every caller is in a test module gated
+  `#[cfg(all(test, feature = "std"))]` and that shape has no `std`. Measured:
+  it runs **0 lib tests**, so a `test`-only gate there is a gate on nothing.
+  Each accessor — and the `inflated_ever` field, its initialiser and its write
+  site, which would otherwise be written and never read — now carries the
+  UNION of what its callers carry, never a blanket `allow(dead_code)`.
+
+  **`test (windows-latest)`** died before `cargo` ran: the `handshake-corpus`
+  step above is the only shell script in the only multi-OS job, and with no
+  `shell:` key GitHub picks the runner default — `pwsh` on Windows, which has
+  neither `VAR=value` nor `${VAR:-default}`. It now names `shell: bash`. The
+  other twelve steps of that job are bare `cargo test -p <crate>` lines with
+  no shell syntax, and every other bash-syntax `run:` block in the file is in
+  an `ubuntu-latest`-only job — left alone deliberately, because an explicit
+  `bash` adds `-o pipefail` that the implicit default does not.
+
+- **The first two `#[cfg_attr(miri, ignore)]`/`cfg(miri)` decisions in this
+  crate, and the rule they follow.** `xtask miri-test websocket-proto` was
+  killed on its 4000 s per-crate budget. The census names the cause exactly:
+  of the 3956.6 s the run had spent when it died, **3859.8 s (97.6 %) was two
+  tests** — `observation_skips_a_compressed_bomb_and_poisons_the_context` at
+  1934.5 s and `no_context_takeover_survives_an_observed_message` at 1925.3 s
+  — and every other new test on the branch totals 2.4 s. Both build the same
+  256-frame, 8 MiB compressed bomb; the interpreter charges for allocation,
+  and that is all a bomb is.
+
+  They are treated differently because their SUBJECTS differ. The first
+  asserts an allocation bound — capacity and `inflated_ever` unmoved across a
+  bomb — which miri cannot make wrong and which shrinking would delete rather
+  than cheapen, so it takes the sanctioned exemption. The second's subject is
+  semantic (with `no_context_takeover` nothing is poisoned and the next
+  message still arrives), and those assertions hold at any size, so its data
+  scales under `cfg(miri)` to 8 frames of 16 KiB instead — still fragmented,
+  still more than one growth step of the output buffer, and still running on
+  every non-miri gate at full size.
+
 ## `http-semantics` — RFC 9110 §12.5's other four fields, over an element that carries no parameters
 
 `Accept` and its ranking shipped in this crate; §12.5's other four fields had no

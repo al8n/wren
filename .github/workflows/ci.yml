@@ -57,6 +57,16 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-features --tests --examples -- -D warnings
+      # `assert-contracts` on its own, because `--all-features` above is not the
+      # same question. That run has `std`; this one is the bare `no_std` tier
+      # with the feature, which is where the crate's `deny(clippy::panic)` wall
+      # and the single `allow` on `contract::contract_violation` have to agree
+      # without an allocator in scope. The wall is deliberately NOT relaxed by
+      # the feature — that one `allow` is the only place a panic may be written
+      # even with it on — so a stray `panic!` added anywhere else still reds
+      # here rather than being waved through by the flag that made panicking
+      # legal in one function.
+      - run: cargo clippy -p websocket-proto --no-default-features --features assert-contracts --all-targets -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features alloc -- -D warnings
       - run: cargo clippy -p websocket-proto --no-default-features --features deflate -- -D warnings
@@ -193,6 +203,61 @@ jobs:
       # instead of shortening the run and staying green. That is #77's finding
       # about `auth-corpus` above, applied to the corpus written after it.
       - run: cargo test -p coding-corpus
+      # `handshake-corpus` is a workspace member (`Cargo.toml` line 2) that no
+      # job ran. `cargo test -p handshake-corpus` beside the two lines above
+      # would be DECORATION and the count says so: it is a binary crate with no
+      # `#[test]` anywhere and no `tests/` directory, so that command reports
+      # `running 0 tests` / `0 passed` and exits 0 forever — measured. A step
+      # that cannot fail is the shape these comments keep finding, so it is not
+      # what this adds.
+      #
+      # What the crate has instead is a `main` that GENERATES the corpus, and
+      # nothing in CI ran that either. `clippy --workspace` in the `lint` job
+      # compiles it, which catches a type error and nothing else;
+      # `xtask handshake-diff` is the instrument that reads it and needs TWO
+      # revisions, so like `auth-diff` it cannot run on a commit. Between them
+      # sits every failure of the generator itself — a case builder that panics,
+      # a sweep that stops emitting — visible to neither.
+      #
+      # So run it, and require records. The `--features deflate` is not
+      # optional: without it `main` is one `eprintln!` and `exit(2)` (see the
+      # crate's `Cargo.toml`), which would red this step for the wrong reason.
+      # The floor is `> 0` rather than a pinned count deliberately — the corpus
+      # is MEANT to change between revisions, that change is what
+      # `handshake-diff` reads, and a step pinning the total would fight the
+      # instrument. Measured at this commit: exit 0, 2004 records.
+      - name: handshake-corpus generates its records
+        # `shell: bash` is REQUIRED, not stylistic. This is the only step in
+        # the only job that runs on more than one OS, and the only one of them
+        # whose `run:` is a shell script rather than a bare `cargo` line. With
+        # no `shell:` key GitHub picks the runner's default, which is `pwsh` on
+        # Windows and `bash` on Linux and macOS, so `out="${RUNNER_TEMP:-.}/..."`
+        # reached PowerShell, which has no `VAR=value` assignment and no
+        # `${VAR:-default}` — it read the whole line as a command name and the
+        # step died before `cargo` ran. Naming `bash` gets Git-Bash on Windows,
+        # which the runner image ships.
+        #
+        # It cannot be verified from this repository: there is no Windows here,
+        # and `act` runs Linux containers, where the bug is invisible because
+        # the default is already bash. The rule is GitHub's, not inferred —
+        # "Using a specific shell" and the `defaults.run.shell` table in
+        # docs.github.com/actions/writing-workflows/workflow-syntax-for-github-actions
+        # give the per-OS defaults (`bash` on Linux/macOS, `pwsh` on Windows).
+        #
+        # Only this step is changed. The other twelve steps of this job are
+        # bare `cargo test -p <crate>` lines with no shell syntax at all, so
+        # they run identically under either shell, and every other bash-syntax
+        # `run:` block in this file (`fuzz-smoke`, `no-panic`) is in an
+        # `ubuntu-latest`-only job. Adding `shell: bash` to those would not be
+        # a no-op — an explicit `bash` runs with `-o pipefail`, which the
+        # implicit default does not — so they are left exactly as verified.
+        shell: bash
+        run: |
+          out="${RUNNER_TEMP:-.}/handshake-corpus.tsv"
+          cargo run -p handshake-corpus --features deflate > "$out"
+          records=$(wc -l < "$out")
+          echo "handshake-corpus emitted $records records"
+          test "$records" -gt 0
 
   no-std:
     runs-on: ubuntu-latest
@@ -213,6 +278,27 @@ jobs:
       # (CAS via a `critical-section` impl the final binary provides). thumbv7em
       # above HAS atomics, so it does not exercise this path.
       - run: cargo check -p websocket-proto --no-default-features --features no-atomic --target thumbv6m-none-eabi
+      # The BARE tier on thumbv6m, which nothing here checked. The line above it
+      # carries `--features no-atomic`, and `no-atomic` links `alloc`
+      # (`lib.rs`'s `extern crate alloc as std`), so it is a HEAP tier on a
+      # CAS-less core rather than the no-alloc one; the only place
+      # `--no-default-features` alone was checked was clippy on the host. The
+      # `http-semantics` pair below has done both for a while, and this is that
+      # pair's shape applied to the crate the corpus of this workspace is named
+      # after.
+      #
+      # It PASSES today rather than repairing a break — measured at `e42b30d`,
+      # 37 s — so what it adds is proof, not a fix. That it can FAIL was
+      # measured too, and by the case that makes cross-compiling worth 30 s
+      # rather than by any compile error: a `core::sync::atomic::AtomicUsize`
+      # `fetch_add` added under `cfg(not(feature = "std"))` leaves
+      # `cargo check -p websocket-proto --no-default-features` on the HOST at
+      # exit 0 with zero errors, and reds this line with
+      # `error[E0599]: no method named `fetch_add` found for reference
+      # `&Atomic<usize>``. Cortex-M0+ has atomic load/store and no CAS, and the
+      # host has both — that difference is invisible to every other step in
+      # this workspace.
+      - run: cargo check -p websocket-proto --no-default-features --target thumbv6m-none-eabi
       # MUST-FAIL: `no-atomic` + `deflate` (without std) is a contradictory
       # combo — deflate's `alloc` dependency drags the atomic-CAS backends in,
       # defeating the tier. lib.rs raises a compile_error!; pin that it fires.
@@ -532,3 +618,39 @@ jobs:
           lie_check http3-proto
           lie_check http1-proto CARGO_PROFILE_RELEASE_LTO=fat
           lie_check http-semantics CARGO_PROFILE_RELEASE_LTO=fat
+      # MUST-FAIL, and the same argument one flag over. `assert-contracts` turns
+      # CALLER-CONTRACT violations into panics — a `now` that went backwards is
+      # the one error routed there so far — so with it on, the link proof has to
+      # go RED, and red naming the shim that reaches
+      # `contract::contract_violation`. A feature that turns on panics and has
+      # never been observed to produce one is a feature nothing checks: it could
+      # be misspelled in `Cargo.toml`, `cfg`'d out, or routed past by a later
+      # refactor, and every job here would stay green while the crate answered
+      # `Err` exactly as before. This step is what disagrees.
+      #
+      # `shim_handle_timeout` is the subject because `handle_timeout` is the
+      # shallowest of the three `now`-taking entry points and the only one this
+      # crate link-checks (`handle` and `poll_transmit` reach the same
+      # comparison; see the module doc in `tests/no_panic.rs` for why their call
+      # trees are held by the lint wall instead). Naming the SHIM rather than
+      # grepping for any failure is the same discipline as the lie-check above:
+      # "it did not build" is satisfied by a typo or an unrelated breakage,
+      # which would turn this step green while proving nothing.
+      #
+      # The default proof is untouched by this: the step above still runs
+      # `--features test-no-panic` with no `assert-contracts` and still links
+      # clean, and `shim-check` reads that same binary.
+      - name: assert-contracts turns the clock refusal into a real panic (MUST FAIL)
+        run: |
+          log="$(mktemp)"
+          ! cargo test -p websocket-proto --release \
+            --features assert-contracts,test-no-panic --test no_panic >"$log" 2>&1 || {
+            echo "::error::websocket-proto linked WITH assert-contracts — the feature panics nowhere"
+            exit 1
+          }
+          grep -q 'ERROR\[no-panic\]: detected panic in function `shim_handle_timeout`' "$log" || {
+            echo "::error::the assert-contracts build failed, but not with no-panic's link error naming shim_handle_timeout"
+            cat "$log"
+            exit 1
+          }
+          echo "assert-contracts: the contract panic reached the linker, naming shim_handle_timeout"

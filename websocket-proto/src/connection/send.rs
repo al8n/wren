@@ -49,6 +49,11 @@ pub enum EncodeError {
   #[error("close reason too long")]
   ReasonTooLong,
 
+  /// `now` is earlier than an instant this connection has already been given.
+  /// See [`Connection::poll_transmit`].
+  #[error("`now` is earlier than an instant this connection has already been given")]
+  ClockWentBackwards,
+
   /// Compressed send was requested but permessage-deflate was not negotiated,
   /// or the outbound window-bits negotiated below 15 (miniz_oxide cannot bound
   /// its 32 KiB compression window to fewer bits — RFC-legal to send plain
@@ -76,11 +81,43 @@ pub(crate) enum SendMessageState {
   InBinary,
 }
 
+/// The outbound control frames awaiting [`Connection::poll_transmit`].
+///
+/// **Two slots, not one, and the second is a conformance requirement rather
+/// than a convenience.** An earlier revision of this crate merged them, on the
+/// reasoning that `poll_transmit` drained a queued close first and answered
+/// `None` for ever after, so an owed pong could never reach the wire anyway.
+/// That reasoning described the code and not RFC 6455: §5.5.2 (line 2042 of
+/// `.rfc-cache/rfc6455.txt`) makes the Pong a MUST that runs until *this*
+/// endpoint "already received a Close frame", and a close this endpoint SENT is
+/// not one it received. §5.5.3 (line 2064) permits answering only the most
+/// recently processed Ping; it does not permit answering none. So the machine
+/// has to be able to hold a queued close and an owed pong at the same time, and
+/// two slots is what that costs — 254 bytes rather than 127. A smaller
+/// `Connection` does not license a nonconformance.
+///
+/// Application-sent control frames do not come through here at all:
+/// `encode_ping` / `encode_pong` serialize straight into the caller's buffer.
 #[derive(Debug)]
 pub(crate) struct SendState {
   pub(crate) message: SendMessageState,
-  /// Close frame queued by the protocol or the application.
+  /// The close frame queued by the protocol or the application. Ordered against
+  /// [`Self::pending_pong`] by QUEUE TIME, not by priority — see
+  /// [`Connection::poll_transmit`] and [`Self::pongs_before_close`].
   pub(crate) pending_close: Option<([u8; MAX_CONTROL_PAYLOAD], u8)>,
+  /// The pong owed for the most recently processed ping (§5.5.3). On the heap
+  /// tiers `RecvState::pong_overflow` queues the ones behind it.
+  pub(crate) pending_pong: Option<([u8; MAX_CONTROL_PAYLOAD], u8)>,
+  /// How many owed pongs were queued BEFORE the close was, and so drain ahead
+  /// of it. Frozen by `queue_close` and only decremented from there — by drains
+  /// and by shedding — so a Ping arriving after the close cannot join the group
+  /// on its own, which is what bounds the close. The one exception is the
+  /// epoch boundary: the peer's Close arriving with ours still queued
+  /// recomputes this ONCE from the live queue and turns the connection
+  /// terminal, so it cannot grow again. See [`Connection::poll_transmit`] for
+  /// the ordering it implements, both epochs' bounds, and why a counter rather
+  /// than a flag.
+  pub(crate) pongs_before_close: u8,
   pub(crate) close_sent: bool,
   /// The close code from the first `queue_close` call (for `handle_timeout`).
   pub(crate) queued_code: Option<CloseCode>,
@@ -97,6 +134,8 @@ impl SendState {
     Self {
       message: SendMessageState::Idle,
       pending_close: None,
+      pending_pong: None,
+      pongs_before_close: 0,
       close_sent: false,
       queued_code: None,
       pending_ping: false,
@@ -109,15 +148,65 @@ impl SendState {
   /// truncated at a char boundary by the caller before queueing). The first
   /// queued close wins — a later one (e.g. an echo after we already sent our
   /// own close) is dropped.
-  pub(crate) fn queue_close(&mut self, code: CloseCode, reason: &str) {
-    let mut buf = [0u8; MAX_CONTROL_PAYLOAD];
-    let len = match encode_close_payload(code, reason, &mut buf) {
+  ///
+  /// It does not touch the pong slot. The two frames are independent
+  /// obligations: §5.5.1 (line 2002) bans further *data* frames after a Close,
+  /// not control frames, and §5.5.2's Pong MUST runs until a Close is
+  /// RECEIVED.
+  pub(crate) fn queue_close(&mut self, code: CloseCode, reason: &str, queued_behind: usize) {
+    if self.pending_close.is_some() {
+      return;
+    }
+    // Freeze the pongs already owed. They drain ahead of this close; anything a
+    // later Ping owes drains behind it. `queued_behind` is what
+    // `RecvState::queued_pongs` reports — zero on the bare tier, which has no
+    // queue — and the slot itself is the `+1`.
+    let owed = usize::from(self.pending_pong.is_some()).saturating_add(queued_behind);
+    self.pongs_before_close = u8::try_from(owed).unwrap_or(u8::MAX);
+    let mut payload = [0u8; MAX_CONTROL_PAYLOAD];
+    let len = match encode_close_payload(code, reason, &mut payload) {
       Ok(n) => n,
-      Err(_) => encode_close_payload(code, "", &mut buf).unwrap_or_default(),
+      Err(_) => encode_close_payload(code, "", &mut payload).unwrap_or_default(),
     };
-    if self.pending_close.is_none() {
-      self.pending_close = Some((buf, u8::try_from(len).unwrap_or(0)));
-      self.queued_code = Some(code);
+    self.pending_close = Some((payload, u8::try_from(len).unwrap_or(0)));
+    self.queued_code = Some(code);
+  }
+
+  /// Replaces an EARLIER queued close with this failure close. The receive
+  /// path's `fail` is the only caller: the failure code is what must reach the
+  /// wire, or a peer would see the benign close of a connection we are failing.
+  ///
+  /// Nothing is left queued ahead of it: the receive path's `fail` clears the
+  /// owed pongs first, because §7.1.7 (line 2399 of `.rfc-cache/rfc6455.txt`)
+  /// has an endpoint instructed to _Fail the WebSocket Connection_ proceed to
+  /// close it and "MUST NOT continue to attempt to process data". Passing `0`
+  /// here says the same thing about the ordering group.
+  pub(crate) fn force_close(&mut self, code: CloseCode) {
+    self.pending_close = None;
+    self.queued_code = None;
+    self.queue_close(code, "", 0);
+  }
+
+  /// Records the pong owed for a received ping, replacing one already owed —
+  /// §5.5.3 (line 2064) permits answering "only the most recently processed
+  /// Ping frame", which is what the single slot does on the bare tier. A queued
+  /// close is not consulted: it is a different frame with its own slot.
+  pub(crate) fn offer_pong(&mut self, payload: [u8; MAX_CONTROL_PAYLOAD], len: u8) {
+    // Replacing an occupied slot SHEDS drain position 0. If a close is queued,
+    // position 0 is inside the frozen prefix whenever that prefix is non-empty,
+    // so the prefix loses an entry and must shrink with it — otherwise the
+    // replacement (a post-close pong by identity) inherits the departed one's
+    // place ahead of the close. `saturating_sub` IS the "iff the prefix is
+    // non-empty" condition; a separate `>= 1` guard would restate it and be a
+    // guard with no subject.
+    //
+    // On the heap tiers this branch never fires: `queue_pong` reaches
+    // `offer_pong` only with an empty slot. One site serves both tiers with no
+    // `cfg`, and a decrement outside a close window is harmless — `queue_close`
+    // recomputes the count from the live queue, and `poll_transmit` reads it
+    // only while a close is waiting.
+    if self.pending_pong.replace((payload, len)).is_some() {
+      self.pongs_before_close = self.pongs_before_close.saturating_sub(1);
     }
   }
 }
@@ -204,6 +293,23 @@ where
   /// rules.
   ///
   /// [`encode_fragment`]: Connection::encode_fragment
+  // `#[inline]` here is load-bearing for `tests/no_panic.rs`, not a codegen
+  // guess. This crate's `no-panic` step runs WITHOUT fat LTO on purpose (see
+  // that file's LTO section and the `no-panic` job): its shims wrap leaves that
+  // inline into the shim under the default profile, and the missing LTO is what
+  // the lie-check's reason-grep stands on. The `prepare_*` shims wrap a
+  // GENERIC method whose tree spans several functions, and without this
+  // annotation the release link reds with `ERROR[no-panic]: detected panic in
+  // function `shim_prepare_text`` and the same for `shim_prepare_binary` —
+  // core's panic paths are still separate codegen units. MEASURED, by bisecting
+  // the set: `plan_data_send` alone still reds both shims; `prepare_fragment` +
+  // `plan_data_send` links clean; so those two are the minimum and the two
+  // one-line forwarders below carry it as well, because a proof that depends on
+  // the optimizer's CGU placement for a one-liner is a proof on a knife edge.
+  // (`CARGO_PROFILE_RELEASE_LTO=fat` also links clean, which is how the failure
+  // was identified as cross-CGU opacity rather than a real panic edge — but
+  // moving this crate's step to fat LTO is exactly what its comments forbid.)
+  #[inline]
   pub fn prepare_fragment(
     &mut self,
     kind: FragmentKind,
@@ -243,6 +349,50 @@ where
     })
   }
 
+  /// A whole unfragmented **binary** message with no payload copy: the
+  /// zero-copy twin of [`encode_binary`](Connection::encode_binary).
+  ///
+  /// This is the path a vectored driver wants. `encode_binary` copies the
+  /// payload into `out` behind the header; this masks `payload` **in place**
+  /// (clients; servers leave it untouched) and hands back the header for the
+  /// driver to write first — `writev([header.as_slice(), payload])`, or an
+  /// `io_uring` `IORING_OP_WRITEV` over the same two iovecs. For a 64 KiB
+  /// message that is 64 KiB of `memcpy` per send that does not happen.
+  ///
+  /// It is exactly `prepare_fragment(FragmentKind::BinaryStart, true, payload)`
+  /// and exists because that spelling reads like fragmentation when what it
+  /// says is "one whole message". The lifecycle and sequencing rules are
+  /// [`prepare_fragment`](Connection::prepare_fragment)'s, unchanged: a whole
+  /// message is a `*Start` that is also `fin`, so it requires no message in
+  /// progress and leaves none.
+  ///
+  /// Rejection leaves `payload` byte-identical and the fragmentation state
+  /// unchanged — everything fallible is checked before a byte is masked — so
+  /// the same buffer can be retried.
+  #[inline]
+  pub fn prepare_binary(&mut self, payload: &mut [u8]) -> Result<EncodedHeader, EncodeError> {
+    self.prepare_fragment(FragmentKind::BinaryStart, true, payload)
+  }
+
+  /// A whole unfragmented **text** message with no payload copy: the zero-copy
+  /// twin of [`encode_text`](Connection::encode_text). See
+  /// [`prepare_binary`](Connection::prepare_binary) for what "no copy" buys and
+  /// how the header is written.
+  ///
+  /// **The payload is `&mut [u8]`, not `&str`**, and the difference is forced
+  /// rather than chosen: masking rewrites the bytes in place, and a masked
+  /// UTF-8 string is not UTF-8 — writing those bytes through a `&mut str` would
+  /// break the type's invariant, which this crate cannot do at all
+  /// (`forbid(unsafe_code)`) and should not do in any case. Validity is checked
+  /// instead: the bytes must be valid UTF-8 (RFC 6455 §8.1) and the message
+  /// must end on a character boundary, both BEFORE anything is masked, so a
+  /// rejected send leaves the buffer byte-identical for a retry. Pass
+  /// `some_string.as_bytes()` through a mutable buffer you own.
+  #[inline]
+  pub fn prepare_text(&mut self, payload: &mut [u8]) -> Result<EncodedHeader, EncodeError> {
+    self.prepare_fragment(FragmentKind::TextStart, true, payload)
+  }
+
   /// Encodes a ping with an application payload (≤ 125 bytes).
   pub fn encode_ping(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, EncodeError> {
     self.encode_control(Opcode::Ping, payload, out)
@@ -257,6 +407,22 @@ where
   /// close frame for [`poll_transmit`](Connection::poll_transmit) and stops
   /// further data sends. The reason is capped at 123 bytes (truncate at a
   /// char boundary before calling, or it is rejected).
+  ///
+  /// **The close is not the last frame this side sends.** A Ping that arrives
+  /// between this call and the peer's Close is still answered: §5.5.2 (line
+  /// 2042 of `.rfc-cache/rfc6455.txt`) makes the Pong a MUST "unless it already
+  /// received a Close frame", and a Close this endpoint SENT is not one it
+  /// received. That echo drains from
+  /// [`poll_transmit`](Connection::poll_transmit) **behind** this close, because
+  /// it was queued behind it — a Ping arriving after `close()` cannot overtake
+  /// the Close, which is what stops a peer starving it. A pong already owed when
+  /// this is called goes first, for the same queue-time reason. The caller may
+  /// also answer by hand with [`encode_pong`](Connection::encode_pong), which
+  /// works in this state.
+  ///
+  /// Data sends do stop here, and that half IS §5.5.1's (line 2002): "The
+  /// application MUST NOT send any more data frames after sending a Close
+  /// frame."
   pub fn close(&mut self, code: CloseCode, reason: &str) -> Result<(), EncodeError> {
     if !matches!(self.lifecycle, Lifecycle::Open) {
       return Err(EncodeError::Closing);
@@ -267,36 +433,118 @@ where
     if reason.len() > MAX_CONTROL_PAYLOAD.saturating_sub(2) {
       return Err(EncodeError::ReasonTooLong);
     }
-    self.send.queue_close(code, reason);
+    let queued_behind = self.recv.queued_pongs();
+    self.send.queue_close(code, reason, queued_behind);
     self.lifecycle = Lifecycle::CloseSent;
     Ok(())
   }
 
-  /// Drains one queued protocol frame (close → pong echo → keepalive ping)
-  /// into `out`. Returns the byte count, or `None` when nothing is pending.
-  /// Arms `close_deadline` at the moment the close frame actually drains.
+  /// Drains one queued protocol frame (owed pong → close → keepalive ping) into
+  /// `out`. Returns the byte count, or `None` when nothing is pending. Arms
+  /// `close_deadline` at the moment the close frame actually drains.
+  ///
+  /// Answers [`EncodeError::ClockWentBackwards`] when `now` is EARLIER than an
+  /// instant already handed to this connection; an equal instant is fine, and
+  /// the refusal writes nothing and dequeues nothing. The rule, and the
+  /// `assert-contracts` exception to "returns rather than panics", is on
+  /// [`crate::time::Instant`].
+  ///
+  /// # The order, derived
+  ///
+  /// **Queue-time first-in-first-out between the two slots.** Whichever of the
+  /// owed pong and the queued close was queued first drains first, and a Ping
+  /// that arrives after `close()` cannot overtake the Close — until the peer's
+  /// own Close arrives with ours still queued, which promotes every surviving
+  /// echo ahead of it exactly once (see the two-epoch bound below). Neither
+  /// RFC 6455 clause forbids either order — §5.5.1 (line 2002 of
+  /// `.rfc-cache/rfc6455.txt`) bans only further *data* frames after a Close —
+  /// so the order is chosen, and it is chosen for liveness:
+  ///
+  /// * §5.5.2 (line 2043) asks for the Pong "as soon as is practical", and for
+  ///   a Ping received while our Close was queued but not yet on the wire, the
+  ///   next frame written IS the earliest practical one. So a pre-close pong
+  ///   goes first.
+  /// * But **unconditional** pong priority permits unbounded Close starvation.
+  ///   A driver that alternates one inbound Ping with exactly one
+  ///   `poll_transmit` emits a Pong every time and never reaches its Close, so
+  ///   `close_deadline` never arms. The queue cap does not help: only one pong
+  ///   is outstanding at a time. This crate cannot assume a drain-to-`None`
+  ///   schedule — the public API neither enforces nor can express one.
+  ///
+  /// # The invariant, on every tier
+  ///
+  /// While a close is queued and undrained, **the first `pongs_before_close`
+  /// entries in drain order are exactly the surviving pongs that were queued
+  /// before it.** Drain order is the slot (position 0), then `pong_overflow`
+  /// front to back (positions 1..). Three things maintain it, and the third is
+  /// the one an earlier revision was missing:
+  ///
+  /// * `queue_close` FREEZES the count from the live queue;
+  /// * a drain DECREMENTS it;
+  /// * and SHEDDING an entry that lies inside the prefix decrements it too —
+  ///   `offer_pong` when it replaces an occupied slot (position 0, the bare
+  ///   tier), and `queue_pong` when a full overflow queue evicts its front
+  ///   (position 1, the heap tiers). Without that, the replacement inherits the
+  ///   departed entry's place ahead of the close, and the invariant is false
+  ///   exactly on the tiers capable of replacement. §5.5.3 (line 2064) permits
+  ///   dropping the older echo; it does not permit the newer one to overtake
+  ///   the close.
+  ///
+  /// # The bound, in two epochs
+  ///
+  /// The count is frozen at `close()` and only SHRINKS — by drains and by
+  /// shedding — while ours is the only Close in play. It is NOT monotone over
+  /// the connection's life, and a bound stated as if it were is false:
+  /// `Events::step` RECOMPUTES it once, from the live queue, when the peer's
+  /// Close arrives with our close still queued. `close(); 17 Pings; peer Close`
+  /// takes it from 0 to 17 and moves the Close from poll 1 to poll 18. The
+  /// promotion is deliberate — those echoes were owed for Pings that arrived
+  /// before the peer's Close, §5.5.2 does not let a later Close cancel an
+  /// obligation that already existed, and there is still a frame ahead of them
+  /// to be written — so the bound is stated from each epoch's start instead:
+  ///
+  /// * **Before any peer Close:** the Close is emitted within
+  ///   `pongs_before_close + 1` polls of `close()` — at most
+  ///   `MAX_PENDING_PONGS + 1 + 1` = 18 on the heap tiers, at most 2 on the
+  ///   bare one, and exactly 1 when nothing was owed.
+  /// * **After the promotion:** within the recomputed count + 1 polls of the
+  ///   peer's Close. The recomputation reads the live queue, which holds at
+  ///   most `MAX_PENDING_PONGS + 1` entries (the slot plus the capped
+  ///   overflow), so that is 18 again.
+  ///
+  /// There is no third epoch: the same branch turns the connection terminal,
+  /// and `Events::queue_pong` refuses every Ping from there on, so the count
+  /// cannot grow a second time. The LIFETIME bound is therefore the sum —
+  /// `2 * (MAX_PENDING_PONGS + 1) + 1` = 35 polls on the heap tiers, and, the
+  /// bare tier having only the slot to promote, `2 * 1 + 1` = 3.
+  ///
+  /// A counter rather than a flag because the heap tiers can owe several at
+  /// that instant (`MAX_PENDING_PONGS` behind the slot), and all of them
+  /// precede the close.
+  ///
+  /// # Which frames stop, and when
+  ///
+  /// The close drains ONCE (`close_sent`). Pongs keep draining after it, because
+  /// §5.5.2's MUST is discharged only by a Close this endpoint has **received**.
+  /// That question is settled where the Ping lands, in
+  /// `Events::queue_pong` — a Ping received after a Close owes nothing, and a
+  /// pong already owed when the Close arrives is not cancelled by it — so there
+  /// is no lifecycle gate here at all.
   pub fn poll_transmit(&mut self, now: I, out: &mut [u8]) -> Result<Option<usize>, EncodeError> {
-    // Close first: once it goes out, nothing else ever follows (§5.5.1).
-    if !self.send.close_sent {
-      if let Some((payload, len)) = self.send.pending_close {
-        let len = usize::from(len);
-        let n = self.write_frame(
-          Opcode::Close,
-          true,
-          false,
-          payload.get(..len).unwrap_or(&[]),
-          out,
-        )?;
-        self.send.close_sent = true;
-        self.send.pending_close = None;
-        // Arm the close deadline NOW (at drain time, not at close() time).
-        self.close_deadline = now.checked_add_duration(self.config.close_timeout);
-        return Ok(Some(n));
-      }
-    } else {
-      return Ok(None);
+    // Before anything is written or dequeued, so a refusal leaves the queue and
+    // the lifecycle exactly as they were and the call is retryable.
+    if !self.accept_now(now) {
+      return Err(crate::contract::contract_violation(
+        EncodeError::ClockWentBackwards,
+        crate::contract::CLOCK_IS_MONOTONIC,
+      ));
     }
-    if let Some((payload, len)) = self.recv.pending_pong {
+    // One pong arm, one condition: it goes now unless a close is queued and
+    // undrained AND this pong was queued behind it. See "The order, derived".
+    let close_waiting = !self.send.close_sent && self.send.pending_close.is_some();
+    if (!close_waiting || self.send.pongs_before_close > 0)
+      && let Some((payload, len)) = self.send.pending_pong
+    {
       let len = usize::from(len);
       let n = self.write_frame(
         Opcode::Pong,
@@ -305,20 +553,41 @@ where
         payload.get(..len).unwrap_or(&[]),
         out,
       )?;
+      self.send.pongs_before_close = self.send.pongs_before_close.saturating_sub(1);
       // Refill the slot from the overflow queue so the next `poll_transmit`
       // emits the following pong (every ping answered where a heap exists).
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       {
-        self.recv.pending_pong = self.recv.pong_overflow.pop_front();
+        self.send.pending_pong = self.recv.pong_overflow.pop_front();
       }
       #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
       {
-        self.recv.pending_pong = None;
+        self.send.pending_pong = None;
       }
       return Ok(Some(n));
     }
+    // The close, once.
+    if !self.send.close_sent
+      && let Some((payload, len)) = self.send.pending_close
+    {
+      let len = usize::from(len);
+      let n = self.write_frame(
+        Opcode::Close,
+        true,
+        false,
+        payload.get(..len).unwrap_or(&[]),
+        out,
+      )?;
+      self.send.close_sent = true;
+      self.send.pending_close = None;
+      // Arm the close deadline NOW (at drain time, not at close() time).
+      self.close_deadline = now.checked_add_duration(self.config.close_timeout);
+      return Ok(Some(n));
+    }
     // Keepalive ping (empty payload, no mask key for server; masked for client).
-    if self.send.pending_ping {
+    // Only while `Open`: a ping armed before `close()` must not follow the close
+    // onto the wire, and there is no keepalive to keep alive once we are closing.
+    if matches!(self.lifecycle, Lifecycle::Open) && self.send.pending_ping {
       let n = self.write_frame(Opcode::Ping, true, false, &[], out)?;
       self.send.pending_ping = false;
       return Ok(Some(n));
@@ -353,6 +622,7 @@ where
   /// §5.6 allows a single fragment to split a codepoint, so a non-`fin`
   /// fragment may end mid-character; only a `fin` fragment must land on a
   /// character boundary.
+  #[inline]
   fn plan_data_send(
     &self,
     opcode: Opcode,
@@ -436,7 +706,16 @@ where
     payload: &[u8],
     out: &mut [u8],
   ) -> Result<usize, EncodeError> {
-    if !matches!(self.lifecycle, Lifecycle::Open) {
+    // TERMINAL, not "not Open". A control frame after our own Close is
+    // permitted — §5.5.1 (line 2002) bans further *data* frames only — and
+    // refusing one in `CloseSent` made this crate's own documented workaround
+    // impossible: the caller was told to answer a post-close Ping with
+    // `encode_pong` and then handed `EncodeError::Closing` when it tried.
+    // §5.5.2 (line 2043) keeps the Pong owed until a Close is RECEIVED, and
+    // §5.5.2 (line 2047) lets an endpoint send a Ping "any time after the
+    // connection is established and before the connection is closed" — which
+    // §7.1.4 makes the TCP close, not our Close frame.
+    if matches!(self.lifecycle, Lifecycle::Terminal) {
       return Err(EncodeError::Closing);
     }
     if payload.len() > MAX_CONTROL_PAYLOAD {
@@ -1136,6 +1415,112 @@ mod deflate_tests {
   }
 }
 
+/// Bare-tier regressions — the ONLY tests `cargo test -p websocket-proto
+/// --no-default-features` executes, because every other test module in this
+/// crate is gated on `std`.
+///
+/// It has to be its own module rather than a `cfg` inside the `std` one: the
+/// behaviour under test differs by tier, and on the bare tier there is no
+/// allocator, so no `Vec`, no `format!`, and no `time::testing::TestInstant`
+/// (which is itself `std`-gated). Everything here is fixed-size.
+#[cfg(all(
+  test,
+  not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
+))]
+mod bare_tests {
+  use crate::{
+    connection::{Connection, ConnectionConfig, role::Server},
+    frame::{CloseCode, FrameHeader, Opcode, mask as apply_mask},
+    negotiation::Negotiated,
+    time::Instant,
+  };
+
+  /// A microsecond counter — the bare tier's stand-in for `TestInstant`.
+  #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+  struct Tick(u64);
+
+  impl Instant for Tick {
+    fn checked_add_duration(self, dur: core::time::Duration) -> Option<Self> {
+      u64::try_from(dur.as_micros())
+        .ok()
+        .and_then(|micros| self.0.checked_add(micros))
+        .map(Tick)
+    }
+
+    fn checked_duration_since(self, earlier: Self) -> Option<core::time::Duration> {
+      self
+        .0
+        .checked_sub(earlier.0)
+        .map(core::time::Duration::from_micros)
+    }
+  }
+
+  /// One masked client→server ping, written into a caller-owned buffer.
+  fn masked_ping<'b>(buf: &'b mut [u8; 16], payload: &[u8]) -> &'b mut [u8] {
+    const KEY: [u8; 4] = [3, 1, 4, 1];
+    let header = FrameHeader::new(Opcode::Ping, payload.len() as u64).with_mask(Some(KEY));
+    let n = header.encode(buf).unwrap();
+    let end = n + payload.len();
+    buf[n..end].copy_from_slice(payload);
+    apply_mask(&mut buf[n..end], KEY, 0);
+    &mut buf[..end]
+  }
+
+  fn server() -> Connection<Tick, Server> {
+    Connection::new(
+      &Negotiated::none(),
+      ConnectionConfig::default(),
+      Server::new(),
+      Tick(0),
+    )
+  }
+
+  /// F2, bare tier: replacing the slot sheds drain position 0, so the frozen
+  /// pre-close prefix must shrink and the survivor lands BEHIND the close.
+  ///
+  /// There is no overflow queue here, so a second ping replaces the first —
+  /// RFC 6455 §5.5.3 (line 2064 of `.rfc-cache/rfc6455.txt`) permits answering
+  /// "only the most recently processed Ping frame". But the survivor is
+  /// post-close BY IDENTITY, so it must not inherit the departed pong's place
+  /// ahead of the close. Before the fix this emitted Pong(B) then the Close.
+  #[test]
+  fn a_replaced_pre_close_pong_leaves_the_prefix_and_lands_behind_the_close() {
+    let mut conn = server();
+
+    let mut a_buf = [0u8; 16];
+    let a = masked_ping(&mut a_buf, b"A");
+    {
+      let mut ev = conn.handle(Tick(0), a).unwrap();
+      while ev.next().is_some() {}
+    }
+
+    conn.close(CloseCode::GoingAway, "").unwrap();
+
+    let mut b_buf = [0u8; 16];
+    let b = masked_ping(&mut b_buf, b"B");
+    {
+      let mut ev = conn.handle(Tick(0), b).unwrap();
+      while ev.next().is_some() {}
+    }
+
+    let mut out = [0u8; 32];
+    let n = conn.poll_transmit(Tick(0), &mut out).unwrap().unwrap();
+    assert_eq!(
+      &out[..n],
+      &[0x88, 0x02, 0x03, 0xE9],
+      "poll 1 must be the close: B replaced A in the slot, so the frozen prefix \
+       lost its only entry and must shrink to 0"
+    );
+    let n = conn.poll_transmit(Tick(0), &mut out).unwrap().unwrap();
+    assert_eq!(
+      &out[..n],
+      &[0x8A, 0x01, b'B'],
+      "poll 2 is the surviving pong, behind the close it was queued after"
+    );
+    assert!(conn.poll_transmit(Tick(0), &mut out).unwrap().is_none());
+  }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
@@ -1320,6 +1705,75 @@ mod tests {
       .unwrap();
   }
 
+  /// The two whole-message aliases, checked against the copying encoders they
+  /// are the no-copy twin of: the same bytes on the wire, and the same
+  /// fragmentation state left behind.
+  ///
+  /// The comparison is the assertion. `prepare_binary` reading like the main
+  /// path is the whole reason it exists, so what has to hold is that it IS the
+  /// main path — a driver that switches `encode_binary` for it must not have
+  /// changed what the peer receives.
+  #[test]
+  fn prepare_binary_and_text_are_the_copying_encoders_without_the_copy() {
+    for text in [false, true] {
+      let body: &[u8] = if text { b"Hello" } else { &[0x00, 0xFF, 0x7F] };
+
+      // The copying encoder, into its own buffer.
+      let mut copying = client();
+      let mut out = [0u8; 32];
+      let n = if text {
+        copying.encode_text("Hello", &mut out).unwrap()
+      } else {
+        copying.encode_binary(body, &mut out).unwrap()
+      };
+      let copied = out[..n].to_vec();
+
+      // The no-copy twin, from an identically-seeded client so the mask keys
+      // match frame for frame.
+      let mut preparing = client();
+      let mut payload = body.to_vec();
+      let header = if text {
+        preparing.prepare_text(&mut payload).unwrap()
+      } else {
+        preparing.prepare_binary(&mut payload).unwrap()
+      };
+      let mut vectored = header.as_slice().to_vec();
+      vectored.extend_from_slice(&payload);
+
+      assert_eq!(vectored, copied, "text={text}");
+
+      // Both left the connection between messages, so a second whole message
+      // is accepted by either.
+      preparing.encode_binary(b"next", &mut out).unwrap();
+      copying.encode_binary(b"next", &mut out).unwrap();
+    }
+  }
+
+  /// `prepare_text` is `encode_text`'s §8.1 gate too, and it refuses BEFORE it
+  /// masks: the rejected buffer is byte-identical, so the caller may fix the
+  /// bytes and retry the same allocation. That ordering is what makes the
+  /// no-copy path safe to offer as the default — a driver that masked first
+  /// would hand back a buffer it had already scrambled.
+  #[test]
+  fn prepare_text_refuses_invalid_utf8_without_touching_the_buffer() {
+    let mut conn = client();
+    let mut payload = [0xFFu8, 0xFE];
+    assert!(matches!(
+      conn.prepare_text(&mut payload),
+      Err(EncodeError::InvalidUtf8)
+    ));
+    assert_eq!(&payload, &[0xFF, 0xFE], "a refused send masks nothing");
+
+    // Binary takes the same bytes, since §8.1 governs text alone.
+    conn
+      .prepare_binary(&mut payload)
+      .expect("binary accepts arbitrary bytes");
+
+    // And the connection is still usable for a text message afterwards.
+    let mut good = *b"ok";
+    conn.prepare_text(&mut good).expect("text after a refusal");
+  }
+
   /// RFC 6455 §5.6: a fragment may split a codepoint — only the assembled
   /// message must be valid UTF-8. "é" (0xC3 0xA9) sent as TextStart(0xC3,
   /// fin=false) + Continue(0xA9, fin=true) is LEGAL and must keep working.
@@ -1484,12 +1938,16 @@ mod tests {
   }
 
   #[test]
-  fn peer_close_echo_is_queued_and_close_first_priority() {
+  fn a_pong_owed_before_the_peer_close_still_drains_ahead_of_the_echo() {
     use crate::frame::{Opcode, encode_close_payload, mask as apply_mask};
     let mut conn = server();
-    // Peer ping then close in one buffer: pong is pending, then close
-    // arrives → the close echo takes priority and the pong never goes out
-    // after it (close ends the stream).
+    // Peer ping then close in one buffer. THIS TEST PINNED THE DEFECT: it used
+    // to assert the echo was the only frame that drained, reading §5.5.2's
+    // exemption (line 2043, "unless it already received a Close frame") as
+    // though a later Close cancelled an obligation that already existed. It does
+    // not. The exemption is a property of the moment the PING arrives, and when
+    // this ping arrived no Close had been received — so the pong is owed, and it
+    // is queued before the close, so queue-time order puts it first.
     let key = [1, 2, 3, 4];
     let mut bytes = Vec::new();
     let h = FrameHeader::new(Opcode::Ping, 1).with_mask(Some(key));
@@ -1513,20 +1971,455 @@ mod tests {
       while events.next().is_some() {}
     }
     let mut out = [0u8; 64];
-    // First drain: the close echo.
+    // First drain: the owed pong.
     let n = conn
       .poll_transmit(TestInstant(0), &mut out)
       .unwrap()
       .unwrap();
+    assert_eq!(out[0], 0x8A, "the owed pong, not the echo");
+    assert_eq!(&out[..n], &[0x8A, 0x01, b'p']);
+    // Then the close echo.
+    let n = conn
+      .poll_transmit(TestInstant(0), &mut out)
+      .unwrap()
+      .expect("the close echo");
     assert_eq!(out[0], 0x88);
     let _ = n;
-    // Nothing after a sent close — the pending pong is dropped.
+    // And nothing behind it.
     assert!(
       conn
         .poll_transmit(TestInstant(0), &mut out)
         .unwrap()
         .is_none()
     );
+  }
+
+  /// `SendState`'s slot rules, asserted on the state directly rather than
+  /// through a `Connection`, because one of them has no reachable sequence.
+  ///
+  /// "The first queued close wins" is guarded in `queue_close`, and every path
+  /// that reaches it is ALREADY guarded elsewhere: `Connection::close` refuses
+  /// unless the lifecycle is `Open`, the peer-close echo is behind
+  /// `if !matches!(lifecycle, CloseSent)`, and `fail` goes through
+  /// `force_close`, which clears the slot first. Deleting the guard therefore
+  /// reds nothing at the `Connection` level — measured, not assumed — and an
+  /// unreachable guard with no subject is one a later caller can walk past
+  /// without a single test disagreeing. Naming it here is what keeps the rule
+  /// stated: a fourth writer that queues a second close must not silently
+  /// replace the first, because `queued_code` is what `handle_timeout` reports
+  /// and the payload is what the peer reads.
+  ///
+  /// The other half is the INDEPENDENCE of the two slots, which is what the
+  /// conformance fix turns on: neither erases the other, in either order.
+  #[test]
+  fn the_close_slot_and_the_pong_slot_do_not_erase_each_other() {
+    let mut send = SendState::new();
+
+    // A pong owed, then a close: BOTH are held. An earlier revision merged
+    // these into one tagged slot, and the close displaced the pong; §5.5.2
+    // (line 2042) owes that pong until a Close is RECEIVED, so displacing it
+    // dropped a frame the RFC requires.
+    send.offer_pong([b'p'; MAX_CONTROL_PAYLOAD], 1);
+    send.queue_close(CloseCode::GoingAway, "first", 0);
+    assert_eq!(send.queued_code, Some(CloseCode::GoingAway));
+    // And the queue-order group is frozen at what was owed: the slot's one pong.
+    assert_eq!(send.pongs_before_close, 1);
+    let (close, close_len) = send.pending_close.expect("a close is queued");
+    assert_eq!(&close[..usize::from(close_len)], b"\x03\xE9first");
+    let (pong, pong_len) = send.pending_pong.expect("the pong is still owed");
+    assert_eq!(&pong[..usize::from(pong_len)], b"p");
+
+    // A SECOND close does not replace the first — neither its code nor its
+    // payload — and does not touch the pong.
+    send.queue_close(CloseCode::PolicyViolation, "second", 7);
+    assert_eq!(send.queued_code, Some(CloseCode::GoingAway));
+    let (still, still_len) = send.pending_close.expect("the first close is still queued");
+    assert_eq!(&still[..usize::from(still_len)], b"\x03\xE9first");
+    assert!(send.pending_pong.is_some());
+
+    assert_eq!(
+      send.pongs_before_close, 1,
+      "a refused second close must not re-freeze the ordering group either"
+    );
+
+    // And the other direction: a pong owed AFTER the close replaces only the
+    // pong (§5.5.3's most-recent rule), leaving the close alone. It does NOT
+    // join the pre-close group — that is what bounds the close.
+    //
+    // This assertion USED TO SAY the count was unchanged, and that was the
+    // defect: replacing an occupied slot sheds drain position 0, which is
+    // inside the frozen prefix, so the prefix must shrink WITH it. Leaving the
+    // count alone let the replacement inherit the departed entry's place ahead
+    // of the close. The rule the test was reaching for holds more strongly
+    // now — the later pong does not join the group, and the one it displaced
+    // leaves it.
+    let before = send.pongs_before_close;
+    send.offer_pong([b'q'; MAX_CONTROL_PAYLOAD], 1);
+    let (newer, newer_len) = send.pending_pong.expect("the newer pong is owed");
+    assert_eq!(&newer[..usize::from(newer_len)], b"q");
+    let (after, after_len) = send.pending_close.expect("the first close is still queued");
+    assert_eq!(&after[..usize::from(after_len)], b"\x03\xE9first");
+    assert_eq!(
+      send.pongs_before_close,
+      before - 1,
+      "the replaced entry left the frozen prefix, so the prefix shrank with it"
+    );
+
+    // `force_close` is the one door that DOES replace a queued close: the
+    // failure code is what has to reach the wire. It leaves the pong alone —
+    // `poll_transmit`'s terminal gate is what silences that, in one place.
+    send.force_close(CloseCode::ProtocolError);
+    assert_eq!(send.queued_code, Some(CloseCode::ProtocolError));
+    let (failed, failed_len) = send.pending_close.expect("the failure close is queued");
+    assert_eq!(&failed[..usize::from(failed_len)], b"\x03\xEA");
+    assert!(send.pending_pong.is_some());
+  }
+
+  /// Builds one masked client→server ping frame with `payload`.
+  fn masked_ping(payload: &[u8]) -> Vec<u8> {
+    use crate::frame::{Opcode, mask as apply_mask};
+    const KEY: [u8; 4] = [7, 6, 5, 4];
+    let h = FrameHeader::new(Opcode::Ping, payload.len() as u64).with_mask(Some(KEY));
+    let mut f = vec![0u8; h.header_len() + payload.len()];
+    let n = h.encode(&mut f).unwrap();
+    f[n..].copy_from_slice(payload);
+    apply_mask(&mut f[n..], KEY, 0);
+    f
+  }
+
+  /// Drains every frame `poll_transmit` will give, as `(opcode_byte, body)`.
+  fn drain_all(conn: &mut Connection<TestInstant, Server>) -> Vec<(u8, Vec<u8>)> {
+    let mut out = [0u8; 64];
+    let mut got = Vec::new();
+    while let Some(n) = conn.poll_transmit(TestInstant(0), &mut out).unwrap() {
+      let decoded = match FrameHeader::decode(&out[..n]).unwrap() {
+        Decoded::Complete(d) => d,
+        _ => panic!("incomplete frame"),
+      };
+      got.push((out[0], out[decoded.consumed()..n].to_vec()));
+    }
+    got
+  }
+
+  /// **Conformance regression 1: `Ping → close() → Ping → drain`.**
+  ///
+  /// RFC 6455 §5.5.2 (line 2042 of `.rfc-cache/rfc6455.txt`) makes a Pong a MUST
+  /// "unless it already received a Close frame". A Close this endpoint SENT is
+  /// not one it received, so BOTH pings are owed a pong here — the second as
+  /// much as the first, since neither arrived after a received Close.
+  ///
+  /// **The ORDER is queue-time, and that is what this pins.** The pong owed
+  /// before `close()` precedes the close; the pong owed after it follows. An
+  /// earlier revision put every pong first unconditionally, which let a peer
+  /// alternating Pings with single `poll_transmit` calls starve the close
+  /// forever — see `a_close_cannot_be_starved_by_a_ping_per_poll`.
+  ///
+  /// Both echoes exist because a heap is available (Autobahn §2.10's rule); on
+  /// the bare tier the single slot coalesces to the most recent by §5.5.3 (line
+  /// 2064), and the close still emerges after exactly one pong.
+  #[test]
+  fn a_ping_before_a_local_close_precedes_it_and_one_after_follows_it() {
+    let mut conn = server();
+
+    let mut before = masked_ping(b"before");
+    {
+      let mut ev = conn.handle(TestInstant(0), &mut before).unwrap();
+      while ev.next().is_some() {}
+    }
+    conn.close(CloseCode::GoingAway, "bye").unwrap();
+    let mut after = masked_ping(b"after");
+    {
+      let mut ev = conn
+        .handle(TestInstant(0), &mut after)
+        .expect("input is still accepted in CloseSent");
+      while ev.next().is_some() {}
+    }
+
+    let got = drain_all(&mut conn);
+    let shape: Vec<(u8, &[u8])> = got.iter().map(|(op, b)| (*op, b.as_slice())).collect();
+    assert_eq!(
+      shape,
+      vec![
+        (0x8A, b"before".as_slice()),
+        (0x88, b"\x03\xE9bye".as_slice()),
+        (0x8A, b"after".as_slice()),
+      ],
+      "the pong queued before the close, then the close, then the one queued after"
+    );
+  }
+
+  /// `CloseSent → Ping → peer Close`, in its four public shapes.
+  ///
+  /// A Ping received after our own `close()` is queued BEHIND that close by
+  /// queue-time order. When the peer's Close then arrives the branch must say
+  /// what becomes of it, and the answer turns on whether our close already
+  /// LEFT — the same `close_sent` marker `poll_transmit` and `fail` use:
+  ///
+  /// * still queued → every owed pong can still be discharged ahead of it, so
+  ///   they are promoted into the pre-close prefix;
+  /// * already gone → both Close frames are exchanged and §5.5.1 (line 2023 of
+  ///   `.rfc-cache/rfc6455.txt`) says the endpoint "MUST close the underlying
+  ///   TCP connection". Nothing more goes out; the echoes are dropped.
+  ///
+  /// Before the fix (a) emitted the Close and then the Pong, and (b) emitted a
+  /// Pong after BOTH Close frames had been exchanged.
+  #[test]
+  fn a_peer_close_in_close_sent_promotes_owed_pongs_or_drops_them() {
+    fn peer_close(code: CloseCode) -> Vec<u8> {
+      use crate::frame::{Opcode, encode_close_payload, mask as apply_mask};
+      const KEY: [u8; 4] = [8, 6, 7, 5];
+      let mut payload = [0u8; 8];
+      let pn = encode_close_payload(code, "", &mut payload).unwrap();
+      let h = FrameHeader::new(Opcode::Close, pn as u64).with_mask(Some(KEY));
+      let mut f = vec![0u8; h.header_len() + pn];
+      let n = h.encode(&mut f).unwrap();
+      f[n..].copy_from_slice(&payload[..pn]);
+      apply_mask(&mut f[n..], KEY, 0);
+      f
+    }
+    fn feed(conn: &mut Connection<TestInstant, Server>, bytes: &mut [u8]) {
+      let mut ev = conn.handle(TestInstant(0), bytes).unwrap();
+      while ev.next().is_some() {}
+    }
+    fn shape(got: &[(u8, Vec<u8>)]) -> Vec<(u8, &[u8])> {
+      got.iter().map(|(op, b)| (*op, b.as_slice())).collect()
+    }
+
+    // (a) our close still queued: the owed pong is promoted ahead of it.
+    let mut conn = server();
+    conn.close(CloseCode::GoingAway, "").unwrap();
+    feed(&mut conn, &mut masked_ping(b"P"));
+    feed(&mut conn, &mut peer_close(CloseCode::Normal));
+    assert!(conn.is_terminal());
+    let got = drain_all(&mut conn);
+    assert_eq!(
+      shape(&got),
+      vec![(0x8A, b"P".as_slice()), (0x88, b"\x03\xE9".as_slice())],
+      "(a) our close had not left, so the owed pong is discharged ahead of it"
+    );
+
+    // (b) our close already left: both Closes are exchanged, nothing follows.
+    let mut conn = server();
+    conn.close(CloseCode::GoingAway, "").unwrap();
+    assert_eq!(
+      drain_all(&mut conn).len(),
+      1,
+      "(b) the close goes out first"
+    );
+    feed(&mut conn, &mut masked_ping(b"P"));
+    feed(&mut conn, &mut peer_close(CloseCode::Normal));
+    assert!(
+      drain_all(&mut conn).is_empty(),
+      "(b) §5.5.1 line 2023: after both Close frames are exchanged the endpoint \
+       MUST close the connection — no pong may follow"
+    );
+
+    // (c) the same ping, drained BEFORE the peer's close arrives: it goes out.
+    let mut conn = server();
+    conn.close(CloseCode::GoingAway, "").unwrap();
+    assert_eq!(drain_all(&mut conn).len(), 1);
+    feed(&mut conn, &mut masked_ping(b"P"));
+    let got = drain_all(&mut conn);
+    assert_eq!(
+      shape(&got),
+      vec![(0x8A, b"P".as_slice())],
+      "(c) still owed while only OUR close has been sent"
+    );
+    feed(&mut conn, &mut peer_close(CloseCode::Normal));
+    assert!(drain_all(&mut conn).is_empty(), "(c) and nothing after");
+
+    // (d) mixed: one pong owed before the close, one after, then the peer's.
+    let mut conn = server();
+    feed(&mut conn, &mut masked_ping(b"A"));
+    conn.close(CloseCode::GoingAway, "").unwrap();
+    feed(&mut conn, &mut masked_ping(b"B"));
+    feed(&mut conn, &mut peer_close(CloseCode::Normal));
+    let got = drain_all(&mut conn);
+    assert_eq!(
+      shape(&got),
+      vec![
+        (0x8A, b"A".as_slice()),
+        (0x8A, b"B".as_slice()),
+        (0x88, b"\x03\xE9".as_slice()),
+      ],
+      "(d) both pongs promoted ahead of the close that ends the handshake"
+    );
+  }
+
+  /// **The starvation bound, on the schedule that exposes it.** With
+  /// unconditional pong priority a driver that alternates one inbound Ping with
+  /// exactly ONE `poll_transmit` emits a Pong every time and never reaches its
+  /// Close, so `close_deadline` never arms. The queue cap does not help — only
+  /// one pong is outstanding at a time — and this crate cannot assume a
+  /// drain-to-`None` schedule, because the public API neither enforces nor can
+  /// express one.
+  ///
+  /// The bound queue-time order gives is exact within an epoch:
+  /// `pongs_before_close` is frozen when the close is queued and only shrinks
+  /// while ours is the only Close in play, so the close is emitted **within
+  /// `pongs_before_close + 1` polls**. No peer Close arrives here, so this is
+  /// that first epoch; the promotion that opens the second one, and the
+  /// lifetime bound over both, are on `poll_transmit`. Here one pong was owed
+  /// at `close()`, so the budget is **2**, and the test fails if it takes more —
+  /// under the old rule it never arrived at all. `close_deadline` must arm on
+  /// that drain, which is the whole reason the bound matters.
+  #[test]
+  fn a_close_cannot_be_starved_by_a_ping_per_poll() {
+    use core::time::Duration;
+    let config = ConnectionConfig::new().with_close_timeout(Duration::from_secs(3));
+    let mut conn: Connection<TestInstant, Server> =
+      Connection::new(&Negotiated::none(), config, Server::new(), TestInstant(0));
+
+    // One pong owed when the close is queued: the budget is 1 + 1 = 2 polls.
+    let mut first = masked_ping(b"p0");
+    {
+      let mut ev = conn.handle(TestInstant(0), &mut first).unwrap();
+      while ev.next().is_some() {}
+    }
+    conn.close(CloseCode::GoingAway, "").unwrap();
+    assert_eq!(conn.poll_timeout(), None, "the deadline arms on the drain");
+
+    // The adversarial schedule: one Ping in, exactly one poll out, forever.
+    let mut out = [0u8; 64];
+    let mut polls = 0usize;
+    let mut close_at = None;
+    for round in 0..64u32 {
+      let mut ping = masked_ping(format!("p{round}").as_bytes());
+      {
+        let mut ev = conn.handle(TestInstant(0), &mut ping).unwrap();
+        while ev.next().is_some() {}
+      }
+      let n = conn
+        .poll_transmit(TestInstant(0), &mut out)
+        .unwrap()
+        .expect("something is always owed on this schedule");
+      polls += 1;
+      if out[0] == 0x88 {
+        close_at = Some(polls);
+        let _ = n;
+        break;
+      }
+    }
+    assert_eq!(
+      close_at,
+      Some(2),
+      "the close must emerge within `pongs_before_close + 1` = 2 polls"
+    );
+    // And it armed the deadline as it went out.
+    assert_eq!(conn.poll_timeout(), Some(TestInstant(3_000_000)));
+  }
+
+  /// **Conformance regression 2: `close() → drain → Ping → drain`.**
+  ///
+  /// The `CloseSent` path. Two things were broken here and both are §5.5.2's
+  /// (line 2042) Pong MUST, which runs until a Close is RECEIVED:
+  ///
+  /// * the machine answered nothing after its own close had drained, because
+  ///   `poll_transmit` returned `None` for the life of the connection;
+  /// * and `encode_pong` — the workaround this crate's own docs pointed a
+  ///   caller at — answered `EncodeError::Closing`, because `encode_control`
+  ///   refused every non-`Open` lifecycle. The documented escape hatch was shut.
+  ///
+  /// Both are asserted, because a caller may reasonably use either.
+  #[test]
+  fn a_ping_after_our_close_has_drained_is_still_answered() {
+    let mut conn = server();
+    conn.close(CloseCode::Normal, "").unwrap();
+
+    let drained = drain_all(&mut conn);
+    assert_eq!(drained.len(), 1, "just the close");
+    assert_eq!(drained[0].0, 0x88);
+
+    let mut ping = masked_ping(b"late");
+    {
+      let mut ev = conn
+        .handle(TestInstant(0), &mut ping)
+        .expect("input is still accepted in CloseSent");
+      while ev.next().is_some() {}
+    }
+
+    // (a) The machine answers it, after the close rather than before — the
+    // close has already gone, so "as soon as is practical" is now.
+    let got = drain_all(&mut conn);
+    let shape: Vec<(u8, &[u8])> = got.iter().map(|(op, b)| (*op, b.as_slice())).collect();
+    assert_eq!(shape, vec![(0x8A, b"late".as_slice())]);
+
+    // (b) And the by-hand path works in `CloseSent` too. A Ping is legal here
+    // as well: §5.5.2 (line 2047) allows one "any time after the connection is
+    // established and before the connection is closed", and §7.1.4 makes that
+    // the TCP close.
+    let mut out = [0u8; 32];
+    let n = conn
+      .encode_pong(b"manual", &mut out)
+      .expect("encode_pong must work while awaiting the peer's close");
+    assert_eq!(&out[..n], b"\x8A\x06manual");
+    conn
+      .encode_ping(b"", &mut out)
+      .expect("encode_ping too, by the same clause");
+
+    // Data sends are still refused — that half IS §5.5.1 (line 2002).
+    assert!(matches!(
+      conn.encode_text("nope", &mut out),
+      Err(EncodeError::Closing)
+    ));
+  }
+
+  /// The boundary, and the SECOND thing this test used to get wrong. §5.5.2's
+  /// exemption (line 2043, "unless it already received a Close frame") is a
+  /// property of the moment a PING arrives, so it splits into two halves that
+  /// this test now pins separately:
+  ///
+  /// * a pong owed BEFORE the peer's Close still drains — ahead of the echo,
+  ///   by queue-time order — because a later Close does not cancel an
+  ///   obligation that already existed. This test asserted the opposite;
+  /// * a Ping arriving AFTER the Close owes nothing, and `encode_pong` is
+  ///   refused, because by then a Close has been received.
+  ///
+  /// Without the second half, "keep answering pings" would have had no end.
+  #[test]
+  fn a_received_close_splits_the_pong_obligation_at_the_moment_of_arrival() {
+    use crate::frame::{Opcode, encode_close_payload, mask as apply_mask};
+    let mut conn = server();
+
+    // One ping (pong owed), then the peer's close, in one batch.
+    let mut bytes = masked_ping(b"owed");
+    const KEY: [u8; 4] = [2, 4, 6, 8];
+    let mut payload = [0u8; 8];
+    let pn = encode_close_payload(CloseCode::Normal, "", &mut payload).unwrap();
+    let h = FrameHeader::new(Opcode::Close, pn as u64).with_mask(Some(KEY));
+    let mut f = vec![0u8; h.header_len() + pn];
+    let n = h.encode(&mut f).unwrap();
+    f[n..].copy_from_slice(&payload[..pn]);
+    apply_mask(&mut f[n..], KEY, 0);
+    bytes.extend(f);
+
+    {
+      let mut ev = conn.handle(TestInstant(0), &mut bytes).unwrap();
+      while ev.next().is_some() {}
+    }
+    assert!(conn.is_terminal());
+
+    let got = drain_all(&mut conn);
+    let shape: Vec<(u8, &[u8])> = got.iter().map(|(op, b)| (*op, b.as_slice())).collect();
+    assert_eq!(
+      shape,
+      vec![(0x8A, b"owed".as_slice()), (0x88, b"\x03\xE8".as_slice()),],
+      "the pong owed before the Close arrived, then the echo"
+    );
+
+    // The other half: a Ping that arrives after a Close was received owes
+    // nothing. `handle` refuses input once terminal, so the machine can never
+    // even be offered one — and the by-hand path is shut for the same reason.
+    let mut late = masked_ping(b"late");
+    assert!(matches!(
+      conn.handle(TestInstant(0), &mut late),
+      Err(crate::connection::HandleError::Terminal)
+    ));
+    let mut out = [0u8; 32];
+    assert!(matches!(
+      conn.encode_pong(b"x", &mut out),
+      Err(EncodeError::Closing)
+    ));
   }
 
   /// Regression (Autobahn 2.10): several pings arriving in one `handle` batch

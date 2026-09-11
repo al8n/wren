@@ -21,7 +21,13 @@
     clippy::unreachable,
     clippy::todo,
     clippy::unimplemented,
-    clippy::string_slice
+    clippy::string_slice,
+    // Catches `assert!(true)` / `assert!(false)` and nothing more — verified
+    // against this toolchain's `-W help` list, no clippy lint on 1.91 denies a
+    // bare `assert!` outside a `Result`-returning function, so this is the only
+    // assertion-shaped lint there is to add. `src/contract.rs` states what that
+    // leaves uncovered and what actually covers callees.
+    clippy::assertions_on_constants
   )
 )]
 
@@ -95,6 +101,10 @@ pub use time::Instant;
 pub mod error;
 
 pub use error::BufferTooSmallDetail;
+
+/// Caller-contract violations, and the one place the crate decides whether
+/// they return or panic (`assert-contracts`).
+mod contract;
 
 mod base64;
 
